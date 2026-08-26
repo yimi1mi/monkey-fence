@@ -4,6 +4,7 @@ use crate::provider::{self, AssistantBlock, ChatMessage, ToolCall};
 use crate::tools::{planner_tools, worker_tools, ToolCtx, ToolOutcome};
 use crate::types::*;
 use anyhow::Result;
+use mf_skills::Skill;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -18,10 +19,16 @@ pub struct Engine {
     root: PathBuf,
     stop: Arc<AtomicBool>,
     workers: usize,
+    skills: Vec<Skill>,
 }
 
 impl Engine {
-    pub fn start(db_path: impl AsRef<std::path::Path>, root: PathBuf, config: Config) -> Result<Self> {
+    pub fn start(
+        db_path: impl AsRef<std::path::Path>,
+        root: PathBuf,
+        config: Config,
+        skills: Vec<Skill>,
+    ) -> Result<Self> {
         let db = Arc::new(Db::open(db_path)?);
         let (tx, rx) = crossbeam_channel::bounded(4096);
         let workers = config.engine.workers.clamp(1, 8);
@@ -33,6 +40,7 @@ impl Engine {
             root,
             stop: Arc::new(AtomicBool::new(false)),
             workers,
+            skills,
         };
         engine.spawn_workers();
         Ok(engine)
@@ -45,11 +53,12 @@ impl Engine {
             let config = self.config.clone();
             let root = self.root.clone();
             let stop = self.stop.clone();
+            let skills = self.skills.clone();
             let name = format!("worker-{}", i + 1);
             std::thread::Builder::new()
                 .name(name.clone())
                 .spawn(move || {
-                    worker_loop(&name, db, events, config, root, stop);
+                    worker_loop(&name, db, events, config, root, stop, &skills);
                 })
                 .expect("spawn worker");
         }
@@ -235,6 +244,7 @@ fn worker_loop(
     config: Config,
     root: PathBuf,
     stop: Arc<AtomicBool>,
+    skills: &[Skill],
 ) {
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -242,7 +252,7 @@ fn worker_loop(
         }
         match db.claim_next_ready(name) {
             Ok(Some((task, dispatch_id))) => {
-                execute_task(name, task, dispatch_id, &db, &events, &config, &root);
+                execute_task(name, task, dispatch_id, &db, &events, &config, &root, skills);
             }
             Ok(None) => {
                 std::thread::sleep(Duration::from_millis(300));
@@ -263,10 +273,19 @@ fn execute_task(
     events: &crossbeam_channel::Sender<EngineEvent>,
     config: &Config,
     root: &PathBuf,
+    skills: &[Skill],
 ) {
     let _ = events.send(EngineEvent::TaskStatus(task.clone()));
     let provider_cfg = config.provider_for_role("worker");
-    let tools = worker_tools();
+    // 技能匹配:注入说明 + 收紧工具白名单
+    let matched = mf_skills::match_skills(skills, &task.spec);
+    let all = worker_tools();
+    let all_names: Vec<&str> = all.iter().map(|t| t.name).collect();
+    let allowed = mf_skills::allowed_tools(&matched, &all_names);
+    let tools: Vec<_> = all
+        .into_iter()
+        .filter(|t| allowed.contains(t.name))
+        .collect();
     let ctx = ToolCtx {
         root: root.clone(),
         db: db.clone(),
@@ -276,7 +295,7 @@ fn execute_task(
         events: events.clone(),
     };
 
-    let system = worker_system_prompt(&task, root);
+    let system = worker_system_prompt(&task, root, &matched);
     let mut messages = vec![
         ChatMessage::system(system),
         ChatMessage::user(format!(
@@ -430,7 +449,16 @@ fn workspace_tree_snippet(root: &PathBuf) -> String {
     out.into_iter().take(200).collect::<Vec<_>>().join("\n")
 }
 
-fn worker_system_prompt(task: &TaskView, _root: &PathBuf) -> String {
+fn worker_system_prompt(task: &TaskView, _root: &PathBuf, skills: &[&Skill]) -> String {
+    let skill_section = if skills.is_empty() {
+        String::new()
+    } else {
+        let bodies: Vec<String> = skills
+            .iter()
+            .map(|s| format!("## {}(来自技能 {})\n{}", s.meta.title, s.meta.id, s.body))
+            .collect();
+        format!("\n\n# 适用技能\n\n{}\n", bodies.join("\n\n"))
+    };
     format!(
         "你是 MonkeyFence 的工作者 agent(worker),负责完成任务 #{}。\n\
 执行纪律:\n\
@@ -439,9 +467,9 @@ fn worker_system_prompt(task: &TaskView, _root: &PathBuf) -> String {
 3. 需要进一步拆分工作时用 spawn_subtask 创建子任务并等待其完成(在依赖里声明)。\n\
 4. 遇到必须由人决策的问题用 ask_human,不要自行猜测关键决策。\n\
 5. 完成后调用 complete_task 提交总结;无法完成调用 report_failure 说明原因。\n\
-6. 只操作工作区内的文件。\n\n\
+6. 只操作工作区内的文件。{}\n\n\
 任务说明:\n{}",
-        task.id, task.spec
+        task.id, skill_section, task.spec
     )
 }
 
@@ -465,6 +493,7 @@ mod tests {
             tmp.path().join("orchestration.db"),
             root.clone(),
             config,
+            Vec::new(),
         )
         .unwrap();
         let run_id = engine

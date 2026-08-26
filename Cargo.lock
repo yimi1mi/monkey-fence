@@ -3227,6 +3227,7 @@ dependencies = [
  "crossbeam-channel",
  "dirs 5.0.1",
  "log",
+ "mf-skills",
  "parking_lot",
  "rusqlite",
  "serde",
@@ -3259,8 +3260,9 @@ name = "mf-skills"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "parking_lot",
+ "dirs 5.0.1",
  "serde",
+ "tempfile",
  "toml 0.8.23",
 ]
 
