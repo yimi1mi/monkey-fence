@@ -22,3 +22,4 @@ ropey.workspace = true
 nucleo-matcher.workspace = true
 parking_lot.workspace = true
 chrono.workspace = true
+unicode-segmentation = "1.11"

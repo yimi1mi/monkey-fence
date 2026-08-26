@@ -3094,6 +3094,7 @@ dependencies = [
  "nucleo-matcher",
  "parking_lot",
  "ropey",
+ "unicode-segmentation",
 ]
 
 [[package]]
