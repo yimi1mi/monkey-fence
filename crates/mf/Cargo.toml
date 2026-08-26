@@ -1,0 +1,24 @@
+[package]
+name = "mf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MonkeyFence — AI code editor with agent orchestration"
+
+[[bin]]
+name = "monkeyfence"
+path = "src/main.rs"
+
+[dependencies]
+mf-core.workspace = true
+mf-agent.workspace = true
+mf-vcs.workspace = true
+mf-skills.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
+anyhow.workspace = true
+log.workspace = true
+ropey.workspace = true
+nucleo-matcher.workspace = true
+parking_lot.workspace = true
+chrono.workspace = true

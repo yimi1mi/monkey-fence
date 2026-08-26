@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mf",
+    "crates/mf-core",
+    "crates/mf-agent",
+    "crates/mf-vcs",
+    "crates/mf-skills",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+mf-core = { path = "crates/mf-core" }
+mf-agent = { path = "crates/mf-agent" }
+mf-vcs = { path = "crates/mf-vcs" }
+mf-skills = { path = "crates/mf-skills" }
+
+# Zed 同源依赖(本地 checkout,保证 Windows DirectX 后端可用)
+gpui = { path = "D:/workspace/zed/crates/gpui" }
+gpui_platform = { path = "D:/workspace/zed/crates/gpui_platform" }
+
+anyhow = "1"
+log = "0.4"
+ropey = "1.6"
+rusqlite = { version = "0.32", features = ["bundled"] }
+notify = "6"
+ignore = "0.4"
+nucleo-matcher = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+crossbeam-channel = "0.5"
+ureq = { version = "2.10", features = ["json", "charset"] }
+git2 = { version = "0.19", default-features = false }
+similar = "2"
+chrono = "0.4"
+parking_lot = "0.12"
+dirs = "5"
+
+[profile.dev]
+opt-level = 0
+debug = 1
+
+[profile.release]
+opt-level = 2
