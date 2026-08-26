@@ -1,8 +1,11 @@
+mod agent_panel;
+mod diff_view;
 mod editor;
 mod file_index;
 mod file_tree;
 mod quick_open;
 mod theme;
+mod vcs_panel;
 mod workspace;
 
 use gpui::prelude::*;
@@ -12,8 +15,12 @@ use gpui::{
 use workspace::Workspace;
 
 fn main() {
-    // CLI:monkeyfence [项目路径]
-    let project = std::env::args().nth(1).map(std::path::PathBuf::from);
+    let args: Vec<String> = std::env::args().collect();
+    // CLI:monkeyfence [项目路径] | monkeyfence --agent-smoke [项目路径]
+    if args.iter().any(|a| a == "--agent-smoke") {
+        std::process::exit(agent_smoke(args.get(2).cloned()));
+    }
+    let project = args.get(1).map(std::path::PathBuf::from);
 
     gpui_platform::application().run(move |cx: &mut App| {
         bind_keys(cx);
@@ -57,8 +64,7 @@ macro_rules! bind_many {
     };
 }
 
-fn bind_keys(cx: &mut App) {
-    use editor as ed;
+fn bind_keys(cx: &mut App) {    use editor as ed;
     use quick_open as qo;
     use workspace as ws;
 
@@ -117,4 +123,75 @@ fn bind_keys(cx: &mut App) {
         ("up", qo::SelectPrev),
         ("down", qo::SelectNext),
     );
+}
+
+/// 无 GUI 的 agent 编排自测:规划 → 派发 → 执行 → 收敛,打印事件流
+fn agent_smoke(project: Option<String>) -> i32 {
+    let root = match project {
+        Some(p) => std::path::absolute(&p).unwrap_or_else(|_| std::path::PathBuf::from(p)),
+        None => std::env::current_dir().unwrap_or_else(|_| ".".into()),
+    };
+    println!("[agent-smoke] 工作区: {}", root.display());
+    let config = mf_agent::Config::load().unwrap_or_default();
+    let skills = mf_skills::load_skills(Some(&root));
+    println!("[agent-smoke] 提供方: planner={} worker={}", config.provider_for_role("planner").kind.kind_str(), config.provider_for_role("worker").kind.kind_str());
+    let db_path = root.join(".mf-agent").join("orchestration.db");
+    let engine = match mf_agent::Engine::start(&db_path, root.clone(), config, skills) {
+        Ok(e) => std::sync::Arc::new(e),
+        Err(e) => {
+            eprintln!("[agent-smoke] 引擎启动失败: {e}");
+            return 2;
+        }
+    };
+    let run_id = match engine.start_run("agent-smoke: 写一个 .mf-agent/REPORT.md 汇总本次任务流转") {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("[agent-smoke] 启动运行失败: {e}");
+            return 2;
+        }
+    };
+    println!("[agent-smoke] run #{run_id} 已启动");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    while std::time::Instant::now() < deadline {
+        match engine.events_rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(ev) => match ev {
+                mf_agent::EngineEvent::TaskCreated(t) => {
+                    println!("  + 任务 #{} [{}] {}", t.id, t.status.as_str(), t.spec.lines().next().unwrap_or(""));
+                }
+                mf_agent::EngineEvent::TaskStatus(t) => {
+                    println!("  ~ 任务 #{} → {}", t.id, t.status.label_cn());
+                }
+                mf_agent::EngineEvent::WorkerTool { task_id, tool, summary, .. } => {
+                    println!("  🔧 #{} {} {}", task_id, tool, summary.chars().take(80).collect::<String>());
+                }
+                mf_agent::EngineEvent::WorkerLog { worker, text, .. } => {
+                    println!("  💬 [{}] {}", worker, text.lines().next().unwrap_or("").chars().take(100).collect::<String>());
+                }
+                mf_agent::EngineEvent::QuestionOpened(q) => {
+                    println!("  ❓ {}", q.question);
+                    let _ = engine.answer_question(q.id, "继续(smoke 自动应答)");
+                }
+                mf_agent::EngineEvent::EngineError(e) => {
+                    println!("  ⚠ {e}");
+                }
+                mf_agent::EngineEvent::RunFinished(_, msg) => {
+                    println!("[agent-smoke] 结束: {msg}");
+                    let tasks = engine.tasks_of_run(run_id).unwrap_or_default();
+                    let ok = !tasks.is_empty()
+                        && tasks.iter().all(|t| t.status == mf_agent::TaskStatus::Completed);
+                    for t in &tasks {
+                        println!("  #{} {} — {}", t.id, t.status.label_cn(), t.result.as_deref().map(|r| r.lines().next().unwrap_or("")).unwrap_or(""));
+                    }
+                    engine.stop();
+                    return if ok { 0 } else { 1 };
+                }
+                _ => {}
+            },
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(_) => break,
+        }
+    }
+    eprintln!("[agent-smoke] 超时未收敛");
+    engine.stop();
+    1
 }

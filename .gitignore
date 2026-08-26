@@ -7,3 +7,6 @@ Cargo.lock.bak
 *.log
 .DS_Store
 Thumbs.db
+# agent 编排状态与项目级技能(用户可自行纳入版控)
+.mf-agent/
+.monkeyfence/

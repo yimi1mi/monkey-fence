@@ -11,6 +11,16 @@ pub enum ProviderKind {
     Anthropic,
 }
 
+impl ProviderKind {
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            ProviderKind::Mock => "mock",
+            ProviderKind::Openai => "openai",
+            ProviderKind::Anthropic => "anthropic",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct ProviderConfig {
     pub kind: ProviderKind,

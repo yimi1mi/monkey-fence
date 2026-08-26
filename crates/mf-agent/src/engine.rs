@@ -307,6 +307,7 @@ fn execute_task(
     ];
 
     let mut failure_reason = String::from("达到最大迭代次数");
+    let mut settled = false;
     let mut iterations = 0usize;
     'outer: while iterations < config.engine.max_iterations {
         iterations += 1;
@@ -353,6 +354,7 @@ fn execute_task(
                 }
                 ToolOutcome::Complete(summary) => {
                     failure_reason = String::new();
+                    settled = true;
                     settle(db, events, &task, dispatch_id, true, &summary, config);
                     break 'outer;
                 }
@@ -364,7 +366,10 @@ fn execute_task(
         }
     }
 
-    // 失败路径(或无总结的成功)
+    // 循环自然结束(未显式结算)才走兜底路径
+    if settled {
+        return;
+    }
     if failure_reason.is_empty() {
         settle(db, events, &task, dispatch_id, true, "(无总结)", config);
     } else {

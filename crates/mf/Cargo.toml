@@ -24,4 +24,5 @@ parking_lot.workspace = true
 chrono.workspace = true
 unicode-segmentation = "1.11"
 ignore.workspace = true
+crossbeam-channel.workspace = true
 notify.workspace = true

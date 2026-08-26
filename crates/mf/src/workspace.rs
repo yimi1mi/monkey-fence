@@ -1,11 +1,15 @@
 use gpui::*;
 use gpui::prelude::*;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::agent_panel::AgentPanel;
+use crate::diff_view::DiffView;
 use crate::editor::Editor;
 use crate::file_index::FileIndex;
 use crate::file_tree::FileTree;
 use crate::quick_open::{QuickItem, QuickOpen};
+use crate::vcs_panel::VcsPanel;
 
 actions!(
     workspace,
@@ -30,13 +34,44 @@ pub enum LeftPanel {
     Agent,
 }
 
+/// 标签页内容:编辑器或 diff 视图
+#[derive(Clone)]
+enum Tab {
+    Editor(Entity<Editor>),
+    Diff(Entity<DiffView>),
+}
+
+impl Tab {
+    fn title(&self, cx: &App) -> String {
+        match self {
+            Tab::Editor(ed) => {
+                let b = ed.read(cx).buffer.read(cx);
+                b.path()
+                    .and_then(|p| p.file_name())
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "未命名".into())
+            }
+            Tab::Diff(d) => format!("{} (diff)", d.read(cx).title()),
+        }
+    }
+
+    fn is_dirty(&self, cx: &App) -> bool {
+        match self {
+            Tab::Editor(ed) => ed.read(cx).buffer.read(cx).is_dirty(),
+            Tab::Diff(_) => false,
+        }
+    }
+}
+
 pub struct Workspace {
     pub root: Option<PathBuf>,
-    tabs: Vec<Entity<Editor>>,
+    tabs: Vec<Tab>,
     active: usize,
     file_index: Option<Entity<FileIndex>>,
     file_tree: Option<Entity<FileTree>>,
     quick_open: Option<Entity<QuickOpen>>,
+    vcs_panel: Option<Entity<VcsPanel>>,
+    agent_panel: Option<Entity<AgentPanel>>,
     left_panel: LeftPanel,
     status_message: SharedString,
     focus_handle: FocusHandle,
@@ -53,6 +88,8 @@ impl Workspace {
             file_index: None,
             file_tree: None,
             quick_open: None,
+            vcs_panel: None,
+            agent_panel: None,
             left_panel: LeftPanel::Explorer,
             status_message: "就绪".into(),
             focus_handle: cx.focus_handle(),
@@ -68,6 +105,8 @@ impl Workspace {
     // ---------- 项目与文件 ----------
 
     pub fn open_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        // 统一为绝对路径,保证 agent 沙箱与索引以同一坐标系工作
+        let path = std::path::absolute(&path).unwrap_or(path);
         self.root = Some(path.clone());
         self.tabs.clear();
         self.active = 0;
@@ -81,18 +120,50 @@ impl Workspace {
         });
         self.file_index = Some(index);
         self.file_tree = Some(tree);
+
+        // 版控面板(P4/Git 自动检测)
+        let vcs = cx.new(|cx| VcsPanel::new(path.clone(), cx));
+        let weak = cx.weak_entity();
+        vcs.update(cx, |v, _| {
+            v.set_on_open_diff(move |title, local_path, window, cx| {
+                weak.update(cx, |ws, cx| ws.open_diff(&title, &local_path, cx))
+                    .ok();
+                let _ = window;
+            });
+        });
+        self.vcs_panel = Some(vcs);
+
+        // Agent 面板 + 编排引擎(状态存项目内,git 忽略)
+        let agent = cx.new(|cx| AgentPanel::new(cx));
+        let db_dir = path.join(".mf-agent");
+        let _ = std::fs::create_dir_all(&db_dir);
+        let skills = mf_skills::load_skills(Some(&path));
+        let config = mf_agent::Config::load().unwrap_or_default();
+        if let Ok(engine) = mf_agent::Engine::start(
+            db_dir.join("orchestration.db"),
+            path.clone(),
+            config,
+            skills,
+        ) {
+            let engine = Arc::new(engine);
+            agent.update(cx, |a, cx| a.attach_engine(engine.clone(), &path, cx));
+        }
+        self.agent_panel = Some(agent);
+
         self.status_message = format!("已打开 {}", path.display()).into();
         cx.notify();
     }
 
     pub fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
-        if let Some(pos) = self.tabs.iter().position(|ed| {
-            ed.read(cx)
+        if let Some(pos) = self.tabs.iter().position(|t| match t {
+            Tab::Editor(ed) => ed
+                .read(cx)
                 .buffer
                 .read(cx)
                 .path()
                 .map(|p| p == path)
-                .unwrap_or(false)
+                .unwrap_or(false),
+            Tab::Diff(_) => false,
         }) {
             self.active = pos;
             self.focus_active(cx);
@@ -103,7 +174,7 @@ impl Workspace {
             Ok(buf) => {
                 let buffer = cx.new(|_| buf);
                 let editor = cx.new(|cx| Editor::new(buffer, cx));
-                self.tabs.push(editor);
+                self.tabs.push(Tab::Editor(editor));
                 self.active = self.tabs.len() - 1;
                 self.focus_active(cx);
                 cx.notify();
@@ -113,6 +184,29 @@ impl Workspace {
                 cx.notify();
             }
         }
+    }
+
+    /// 打开文件的工作区 diff 标签页(P4 优先,回退 Git)
+    pub fn open_diff(&mut self, title: &str, local_path: &Path, cx: &mut Context<Self>) {
+        let root = self.root.clone().unwrap_or_default();
+        let diff_text = {
+            let p4 = mf_vcs::p4::P4::new(&root);
+            match p4.diff_file(local_path) {
+                Ok(t) if !t.trim().is_empty() => t,
+                Ok(_) => "(无差异)".to_string(),
+                Err(_) => {
+                    // 回退 git
+                    let rel = local_path.strip_prefix(&root).unwrap_or(local_path);
+                    mf_vcs::git::Git::open(&root)
+                        .and_then(|g| g.diff_file(rel))
+                        .unwrap_or_else(|e| format!("获取 diff 失败: {e}"))
+                }
+            }
+        };
+        let view = cx.new(|_| DiffView::new(title, &diff_text));
+        self.tabs.push(Tab::Diff(view));
+        self.active = self.tabs.len() - 1;
+        cx.notify();
     }
 
     /// 请求聚焦当前编辑器(render 阶段执行,因为聚焦需要 window)
@@ -319,15 +413,7 @@ impl Workspace {
             .tabs
             .iter()
             .enumerate()
-            .map(|(i, ed)| {
-                let b = ed.read(cx).buffer.read(cx);
-                let name = b
-                    .path()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "未命名".into());
-                (name, i == self.active, b.is_dirty())
-            })
+            .map(|(i, t)| (t.title(cx), i == self.active, t.is_dirty(cx)))
             .collect();
         let mut el = div()
             .id("tab-strip")
@@ -437,25 +523,36 @@ impl Workspace {
                 .text_size(px(12.))
                 .text_color(rgb(crate::theme::Theme::FG_FAINT))
                 .child("尚未打开文件夹"),
-            (LeftPanel::Vcs, _) => div()
-                .p_3()
-                .text_size(px(12.))
-                .text_color(rgb(crate::theme::Theme::FG_FAINT))
-                .child("P4 / Git 面板(即将到来)"),
-            (LeftPanel::Agent, _) => div()
-                .p_3()
-                .text_size(px(12.))
-                .text_color(rgb(crate::theme::Theme::FG_FAINT))
-                .child("Agent 面板(即将到来)"),
+            (LeftPanel::Vcs, _) => match &self.vcs_panel {
+                Some(v) => div().size_full().flex().child(v.clone()),
+                None => div()
+                    .p_3()
+                    .text_size(px(12.))
+                    .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                    .child("尚未打开文件夹"),
+            },
+            (LeftPanel::Agent, _) => match &self.agent_panel {
+                Some(a) => div().size_full().flex().child(a.clone()),
+                None => div()
+                    .p_3()
+                    .text_size(px(12.))
+                    .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                    .child("尚未打开文件夹"),
+            },
+        };
+        let width = match self.left_panel {
+            LeftPanel::Agent => px(340.),
+            _ => px(250.),
         };
         div()
             .id("left-panel")
-            .w(px(240.))
+            .w(width)
             .flex()
             .flex_col()
             .bg(rgb(crate::theme::Theme::BG_PANEL))
             .border_r_1()
             .border_color(rgb(crate::theme::Theme::BORDER))
+            .overflow_hidden()
             .child(
                 div()
                     .h(px(32.))
@@ -476,10 +573,17 @@ impl Workspace {
             .as_ref()
             .map(|f| f.read(cx).len())
             .unwrap_or(0);
-        let cursor = self.tabs.get(self.active).map(|ed| {
-            let (row, col) = ed.read(cx).cursor_pos(cx);
-            format!("行 {}, 列 {}", row + 1, col + 1)
+        let cursor = self.tabs.get(self.active).and_then(|t| match t {
+            Tab::Editor(ed) => {
+                let (row, col) = ed.read(cx).cursor_pos(cx);
+                Some(format!("行 {}, 列 {}", row + 1, col + 1))
+            }
+            Tab::Diff(_) => None,
         });
+        let vcs_label = self
+            .vcs_panel
+            .as_ref()
+            .and_then(|v| v.read(cx).client_label().or_else(|| v.read(cx).branch_label()));
         let root_name = self
             .root
             .as_ref()
@@ -499,6 +603,7 @@ impl Workspace {
             .text_size(px(11.))
             .text_color(rgb(crate::theme::Theme::FG_DIM))
             .child(div().child(root_name))
+            .when_some(vcs_label, |d, v| d.child(div().text_color(rgb(crate::theme::Theme::ACCENT)).child(v)))
             .when(files > 0, |d| {
                 d.child(div().child(format!("{} 个文件", files)))
             })
@@ -515,23 +620,61 @@ impl Render for Workspace {
             window.focus(&handle, cx);
         } else if self.focus_editor_next && !self.tabs.is_empty() {
             self.focus_editor_next = false;
-            if let Some(ed) = self.tabs.get(self.active) {
+            if let Some(Tab::Editor(ed)) = self.tabs.get(self.active) {
                 let handle = ed.read(cx).focus_handle(cx);
                 window.focus(&handle, cx);
+            }
+        }
+        // agent 改动文件 → 重载对应编辑器
+        if let Some(agent) = &self.agent_panel {
+            let touched = agent.update(cx, |a, _| a.take_touched());
+            if !touched.is_empty() {
+                let root = self.root.clone().unwrap_or_default();
+                for rel in &touched {
+                    let abs = root.join(rel);
+                    for t in &mut self.tabs {
+                        if let Tab::Editor(ed) = t {
+                            let matches = ed
+                                .read(cx)
+                                .buffer
+                                .read(cx)
+                                .path()
+                                .map(|p| *p == abs)
+                                .unwrap_or(false);
+                            if matches {
+                                ed.update(cx, |ed, cx| {
+                                    ed.buffer.update(cx, |b, _| {
+                                        let _ = b.reload_from_disk();
+                                    });
+                                    cx.notify();
+                                });
+                            }
+                        }
+                    }
+                }
+                if let Some(tree) = &self.file_tree {
+                    tree.update(cx, |t, _| t.refresh_all());
+                }
             }
         }
         let center: AnyElement = if self.tabs.is_empty() {
             self.render_welcome().into_any_element()
         } else {
-            let active_editor = self.tabs.get(self.active).cloned();
+            let active_tab = self.tabs.get(self.active).cloned();
             let mut col = div()
                 .id("editor-col")
                 .flex()
                 .flex_col()
                 .flex_1()
                 .child(self.render_tabs(cx));
-            if let Some(ed) = active_editor {
-                col = col.child(div().flex_1().child(ed));
+            match active_tab {
+                Some(Tab::Editor(ed)) => {
+                    col = col.child(div().flex_1().child(ed));
+                }
+                Some(Tab::Diff(dv)) => {
+                    col = col.child(div().flex_1().child(dv));
+                }
+                None => {}
             }
             col.into_any_element()
         };
