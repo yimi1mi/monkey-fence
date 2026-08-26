@@ -1,43 +1,120 @@
 mod editor;
+mod file_index;
+mod file_tree;
+mod quick_open;
 mod theme;
+mod workspace;
 
-use gpui::{div, prelude::*, App, Bounds, Context, WindowBounds, WindowOptions, size, px};
+use gpui::prelude::*;
+use gpui::{
+    App, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, px, size,
+};
+use workspace::Workspace;
 
 fn main() {
-    gpui_platform::application().run(|cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1000.), px(700.0)), cx);
+    // CLI:monkeyfence [项目路径]
+    let project = std::env::args().nth(1).map(std::path::PathBuf::from);
+
+    gpui_platform::application().run(move |cx: &mut App| {
+        bind_keys(cx);
+        let bounds = Bounds::centered(None, size(px(1280.), px(800.0)), cx);
+        let project = project.clone();
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("MonkeyFence".into()),
+                    appears_transparent: false,
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
-            |_, cx| cx.new(|cx| EditorSmoke::new(cx)),
+            move |_, cx| {
+                cx.new(|cx| {
+                    let mut ws = Workspace::new(cx);
+                    if let Some(p) = &project {
+                        if p.is_dir() {
+                            ws.open_folder(p.clone(), cx);
+                        } else if p.is_file() {
+                            if let Some(parent) = p.parent() {
+                                ws.open_folder(parent.to_path_buf(), cx);
+                            }
+                            ws.open_path(p, cx);
+                        }
+                    }
+                    ws
+                })
+            },
         )
         .unwrap();
         cx.activate(true);
     });
 }
 
-/// 冒烟视图:加载自身 main.rs 的编辑器
-pub struct EditorSmoke {
-    pub editor: gpui::Entity<editor::Editor>,
+macro_rules! bind_many {
+    ($cx:expr, $ctx:expr; $(($key:expr, $action:expr)),+ $(,)?) => {
+        $( $cx.bind_keys([KeyBinding::new($key, $action, Some($ctx))]); )+
+    };
 }
 
-impl EditorSmoke {
-    fn new(cx: &mut Context<Self>) -> Self {
-        let buffer = cx.new(|_| {
-            let path = std::path::PathBuf::from("crates/mf/src/main.rs");
-            mf_core::buffer::Buffer::load(&path)
-                .unwrap_or_else(|_| mf_core::buffer::Buffer::empty(Some(path)))
-        });
-        let editor = cx.new(|cx| editor::Editor::new(buffer, cx));
-        Self { editor }
-    }
-}
+fn bind_keys(cx: &mut App) {
+    use editor as ed;
+    use quick_open as qo;
+    use workspace as ws;
 
-impl Render for EditorSmoke {
-    fn render(&mut self, _window: &mut gpui::Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let ed = self.editor.clone();
-        div().size_full().child(ed)
-    }
+    // 编辑器
+    bind_many!(cx, "Editor";
+        ("backspace", ed::Backspace),
+        ("delete", ed::Delete),
+        ("left", ed::Left),
+        ("right", ed::Right),
+        ("up", ed::Up),
+        ("down", ed::Down),
+        ("shift-left", ed::SelectLeft),
+        ("shift-right", ed::SelectRight),
+        ("shift-up", ed::SelectUp),
+        ("shift-down", ed::SelectDown),
+        ("home", ed::Home),
+        ("end", ed::End),
+        ("shift-home", ed::SelectHome),
+        ("shift-end", ed::SelectEnd),
+        ("pageup", ed::PageUp),
+        ("pagedown", ed::PageDown),
+        ("ctrl-left", ed::WordLeft),
+        ("ctrl-right", ed::WordRight),
+        ("ctrl-backspace", ed::DeleteWordBackward),
+        ("ctrl-delete", ed::DeleteWordForward),
+        ("ctrl-a", ed::SelectAll),
+        ("ctrl-z", ed::Undo),
+        ("ctrl-y", ed::Redo),
+        ("ctrl-shift-z", ed::Redo),
+        ("ctrl-s", ed::Save),
+        ("enter", ed::Newline),
+        ("tab", ed::Tab),
+        ("shift-tab", ed::Backtab),
+        ("ctrl-d", ed::DuplicateLine),
+        ("alt-up", ed::MoveLineUp),
+        ("alt-down", ed::MoveLineDown),
+    );
+
+    // 工作区
+    bind_many!(cx, "Workspace";
+        ("ctrl-shift-o", ws::OpenFolder),
+        ("ctrl-p", ws::QuickOpenFiles),
+        ("ctrl-shift-p", ws::CommandPalette),
+        ("ctrl-w", ws::CloseTab),
+        ("ctrl-tab", ws::NextTab),
+        ("ctrl-shift-tab", ws::PrevTab),
+        ("ctrl-b", ws::ToggleLeftPanel),
+        ("ctrl-shift-e", ws::ShowExplorer),
+        ("ctrl-shift-g", ws::ShowVcs),
+    );
+
+    // 快速打开浮层
+    bind_many!(cx, "QuickOpen";
+        ("enter", qo::ConfirmItem),
+        ("escape", qo::Dismiss),
+        ("up", qo::SelectPrev),
+        ("down", qo::SelectNext),
+    );
 }

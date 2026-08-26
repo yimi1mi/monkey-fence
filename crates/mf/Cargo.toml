@@ -23,3 +23,5 @@ nucleo-matcher.workspace = true
 parking_lot.workspace = true
 chrono.workspace = true
 unicode-segmentation = "1.11"
+ignore.workspace = true
+notify.workspace = true
