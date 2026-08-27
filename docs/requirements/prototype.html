@@ -1,0 +1,1352 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>MonkeyFence 交互原型 (prototype)</title>
+<style>
+  /* ============ 主题：Zed 深色风 ============ */
+  :root{
+    --bg:#1a1f26; --panel:#22272f; --panel2:#282e38; --edge:#333a45;
+    --fg:#d7dce3; --fg-dim:#8b95a3; --accent:#4d9fff;
+    --todo:#737373; --prog:#4d9fff; --review:#e0b23c; --done:#4ec97e; --fail:#e05c5c;
+    --mono:'Cascadia Code','Consolas',monospace; --sans:'Segoe UI',system-ui,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;overflow:hidden;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:13px}
+  button{font-family:inherit;color:inherit;background:none;border:none;cursor:pointer}
+  #app{display:grid;height:calc(100% - 26px);grid-template-columns:44px 284px 1fr 324px;grid-template-rows:1fr}
+
+  /* ============ 活动栏 ============ */
+  #activity{background:var(--panel);border-right:1px solid var(--edge);display:flex;flex-direction:column;align-items:center;padding-top:8px;gap:2px}
+  .act{width:34px;height:34px;border-radius:8px;display:grid;place-items:center;color:var(--fg-dim);position:relative;font-size:16px}
+  .act:hover{background:var(--panel2);color:var(--fg)}
+  .act.on{background:var(--panel2);color:var(--accent)}
+  .act .badge{position:absolute;top:2px;right:2px;min-width:14px;height:14px;border-radius:7px;background:var(--accent);color:#0c1117;font-size:9px;font-weight:700;display:grid;place-items:center;padding:0 3px}
+  .act .badge.warn{background:var(--review)}
+  .logo{font-size:18px;margin-bottom:6px}
+
+  /* ============ 左 dock ============ */
+  #leftdock{background:var(--panel);border-right:1px solid var(--edge);display:flex;flex-direction:column;min-height:0}
+  #docktabs{display:flex;border-bottom:1px solid var(--edge);padding:4px 6px;gap:2px}
+  .dtab{padding:4px 10px;border-radius:6px 6px 0 0;color:var(--fg-dim);font-size:12px}
+  .dtab.on{background:var(--panel2);color:var(--fg)}
+  .pane{flex:1;overflow:auto;min-height:0;padding:8px}
+  .pane.hidden{display:none}
+
+  /* 文件树 */
+  .tree .row{display:flex;gap:6px;padding:2px 4px;border-radius:4px;color:var(--fg-dim);cursor:pointer;white-space:nowrap}
+  .tree .row:hover{background:var(--panel2)}
+  .tree .row.cur{color:var(--accent)}
+  .tree .gm{font-size:10px;font-weight:700;margin-left:auto}
+  .gm.M{color:#e0a23c}.gm.A{color:#4ec97e}.gm.C{color:#e05c5c}
+
+  /* 卡片墙：列表形态 */
+  #boardhead{display:flex;align-items:center;gap:6px;margin-bottom:8px}
+  #boardhead .grp{font-weight:600;font-size:12px;color:var(--fg-dim)}
+  .iconbtn{width:24px;height:24px;border-radius:6px;display:grid;place-items:center;color:var(--fg-dim)}
+  .iconbtn:hover{background:var(--panel2);color:var(--fg)}
+  .card{background:var(--panel2);border:1px solid var(--edge);border-radius:10px;padding:9px 11px;margin-bottom:8px;cursor:pointer;position:relative;transition:border-color .15s}
+  .card:hover{border-color:#4a5361}
+  .card.sel{border-color:var(--accent)}
+  .card .top{display:flex;align-items:center;gap:8px}
+  .card .dot{width:8px;height:8px;border-radius:50%;background:var(--accent);flex:none}
+  .card .name{font-weight:600;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .badge{font-size:10px;padding:2px 8px;border-radius:10px;font-weight:600;flex:none;cursor:pointer;color:#0c1117}
+  .badge.todo{background:var(--todo);color:#fff}
+  .badge.in-progress{background:var(--prog)}
+  .badge.in-review{background:var(--review)}
+  .badge.completed{background:var(--done)}
+  .badge.failed{background:var(--fail);color:#fff}
+  .card .meta{color:var(--fg-dim);font-size:11px;margin-top:3px}
+  .card .cmt{color:var(--fg-dim);font-size:11px;font-style:italic;margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .chips{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
+  .achip{font-size:11px;background:#1d232c;border:1px solid var(--edge);border-radius:8px;padding:2px 8px;color:var(--fg-dim)}
+  .achip b{color:var(--fg)}
+  .st-idle{color:var(--fg-dim)} .st-run{color:var(--prog)} .st-done{color:var(--done)} .st-ask{color:var(--review)} .st-fail{color:var(--fail)}
+  .breath{display:inline-block;width:7px;height:7px;border-radius:50%;background:currentColor;animation:br 1.2s ease-in-out infinite}
+  @keyframes br{0%,100%{opacity:.25}50%{opacity:1}}
+
+  /* 卡片墙：泳道形态 */
+  #swim{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+  .swimcol{background:#1d222a;border-radius:10px;padding:6px;min-height:100px}
+  .swimcol h4{font-size:11px;color:var(--fg-dim);padding:2px 6px 8px;display:flex;justify-content:space-between}
+  .swimcol .cnt{font-weight:700}
+  .scard{background:var(--panel2);border:1px solid var(--edge);border-radius:8px;padding:7px 9px;margin-bottom:6px;cursor:grab;font-size:12px}
+  .scard:active{cursor:grabbing}
+  .scard.drag{opacity:.4}
+  .swimcol.over{outline:2px dashed var(--accent)}
+
+  /* ============ 中央区 ============ */
+  #center{display:flex;flex-direction:column;min-width:0;min-height:0}
+  #tabbar{display:flex;gap:6px;padding:6px 10px 0;border-bottom:1px solid var(--edge);align-items:center}
+  .tab{display:flex;align-items:center;gap:6px;padding:5px 14px;border-radius:9px 9px 0 0;background:transparent;color:var(--fg-dim);border:1px solid transparent;border-bottom:none;font-size:12px}
+  .tab.on{background:var(--panel2);color:var(--fg);border-color:var(--edge)}
+  .tab .x{opacity:.5;font-size:11px}.tab .x:hover{opacity:1}
+  .tab .rdiff{color:var(--review);font-size:10px}
+  #editor{flex:1;min-height:0;overflow:auto;background:var(--bg);font-family:var(--mono);font-size:var(--code-size,12.5px);line-height:1.55;position:relative}
+  .ln{display:flex}
+  .ln .no{width:44px;text-align:right;padding-right:14px;color:#4a5361;flex:none;user-select:none}
+  .ln.cur .no{color:var(--fg)}
+  .ln.cur{background:#21273133}
+  .kw{color:#c586c0}.ty{color:#4ec9b0}.fn{color:#dcdcaa}.st{color:#ce9178}.cm{color:#5a9970}.pn{color:#9cdcfe}
+  .hunk{margin:2px 0;border-radius:6px;position:relative}
+  .hunk.add{background:#12281c}
+  .hunk.del{background:#2d1618}
+  .hunk.kept{background:#12331f;opacity:1}
+  .hunk.rejected{opacity:.35;text-decoration:line-through}
+  .hunk .hbtns{position:absolute;right:10px;top:2px;display:flex;gap:6px}
+  .hbtn{background:#0008;border:1px solid var(--edge);border-radius:6px;padding:2px 8px;font-size:10px}
+  .hbtn.y{color:var(--done)}.hbtn.z{color:var(--fail)}
+  #reviewbar{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);background:#000c;border:1px solid var(--edge);border-radius:12px;padding:7px 12px;display:flex;gap:10px;align-items:center;box-shadow:0 8px 24px #000a}
+  #reviewbar .k{background:var(--panel2);border:1px solid var(--edge);border-radius:5px;padding:1px 6px;font-family:var(--mono);font-size:11px}
+  #reviewbar button{font-size:12px}
+  #reviewbar .y{color:var(--done)}#reviewbar .z{color:var(--fail)}
+
+  /* ============ 底 dock ============ */
+  #bottomdock{height:228px;border-top:1px solid var(--edge);background:var(--panel);display:flex;flex-direction:column;flex:none}
+  #bottomdock.hidden{display:none}
+  #bdocktabs{display:flex;gap:2px;padding:5px 10px 0;border-bottom:1px solid var(--edge);align-items:center}
+  .btab{padding:4px 12px;font-size:11px;letter-spacing:.5px;color:var(--fg-dim);border-radius:6px 6px 0 0}
+  .btab.on{background:var(--panel2);color:var(--fg)}
+  .bpane{flex:1;min-height:0;display:flex;flex-direction:column}
+  .bpane.hidden{display:none}
+  #sniff{font-size:11px;padding:4px 12px;border-bottom:1px solid var(--edge);color:var(--fg-dim);display:flex;gap:10px;align-items:center}
+  #sniff b{color:var(--fg)}
+  #termwrap{flex:1;overflow:auto;padding:8px 12px;font-family:var(--mono);font-size:12px;line-height:1.5}
+  .tl{white-space:pre-wrap;word-break:break-all}
+  .tl.dim{color:var(--fg-dim)} .tl.ok{color:var(--done)} .tl.err{color:var(--fail)} .tl.acc{color:var(--accent)}
+  #termin{display:flex;gap:8px;align-items:center;padding:6px 12px;border-top:1px solid var(--edge)}
+  #termin .pr{color:var(--accent);font-family:var(--mono)}
+  #termin input{flex:1;background:none;border:none;outline:none;color:var(--fg);font-family:var(--mono);font-size:12px}
+
+  /* SEARCH 面板 */
+  #searchbar{display:flex;gap:8px;padding:8px 12px;align-items:center}
+  #searchbar input{flex:1;background:var(--panel2);border:1px solid var(--edge);border-radius:8px;padding:5px 10px;color:var(--fg);outline:none}
+  .tg{width:26px;height:26px;border-radius:6px;border:1px solid var(--edge);color:var(--fg-dim);font-family:var(--mono);font-size:11px}
+  .tg.on{background:var(--accent);color:#0c1117;border-color:var(--accent)}
+  #searchres{flex:1;overflow:auto;padding:0 12px 8px}
+  .sfile{margin:8px 0 2px;font-weight:600;font-size:12px}
+  .sline{font-family:var(--mono);font-size:12px;padding:2px 6px;border-radius:4px;cursor:pointer;color:var(--fg-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sline:hover{background:var(--panel2);color:var(--fg)}
+  .sline mark{background:#3a5f8f;color:#fff;border-radius:3px;padding:0 1px}
+
+  /* TASKS 面板 */
+  #taskshead{display:flex;justify-content:space-between;align-items:center;padding:6px 12px}
+  #taskshead .run{font-weight:600;font-size:12px}
+  .mini{background:var(--panel2);border:1px solid var(--edge);border-radius:7px;padding:3px 10px;font-size:11px}
+  .mini:hover{border-color:var(--accent)}
+  #taskgrid{flex:1;overflow:auto;display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:8px;padding:4px 12px 10px;align-content:start}
+  .tcard{background:var(--panel2);border:1px solid var(--edge);border-radius:10px;padding:9px 11px;font-size:12px}
+  .tcard .tt{display:flex;gap:8px;align-items:center;font-weight:600}
+  .tdot{width:9px;height:9px;border-radius:50%;flex:none}
+  .tcard .dep{color:var(--fg-dim);font-size:11px;margin:4px 0}
+  .tcard .ops{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
+  .tcard .ops button{font-size:11px;border:1px solid var(--edge);border-radius:6px;padding:2px 8px}
+  .tcard .ops button:hover{border-color:var(--accent)}
+  .tcard .ops button:disabled{opacity:.35;cursor:not-allowed}
+
+  /* ============ 右 dock：Agent ============ */
+  #rightdock{background:var(--panel);border-left:1px solid var(--edge);display:flex;flex-direction:column;min-height:0}
+  #rightdock.hidden{display:none}
+  #agenthead{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;border-bottom:1px solid var(--edge);font-size:12px}
+  #msgs{flex:1;overflow:auto;padding:10px 12px;display:flex;flex-direction:column;gap:10px}
+  .msg{max-width:92%;border-radius:10px;padding:8px 11px;font-size:12.5px;line-height:1.5}
+  .msg.u{align-self:flex-end;background:#2c3a4d}
+  .msg.a{align-self:flex-start;background:var(--panel2);border:1px solid var(--edge)}
+  .msg .who{font-size:10px;color:var(--fg-dim);margin-bottom:3px}
+  .tool{align-self:flex-start;font-size:11.5px;color:var(--fg-dim);background:#1d232c;border:1px solid var(--edge);border-radius:8px;padding:5px 9px;cursor:pointer}
+  .tool .sum{color:var(--fg)}
+  .filechg{align-self:flex-start;font-size:11.5px;background:#12281c;border:1px solid #1e4a2f;border-radius:8px;padding:5px 9px}
+  .filechg button{color:var(--done);font-size:11px}
+  #askbar{margin:0 12px 8px;background:#2d2612;border:1px solid var(--review);border-radius:10px;padding:9px 11px;font-size:12px}
+  #askbar .q{margin-bottom:8px}
+  #askbar .ops{display:flex;gap:6px;flex-wrap:wrap}
+  #askbar .ops button{border:1px solid var(--review);color:var(--review);border-radius:7px;padding:3px 10px;font-size:11.5px}
+  #askbar .ops button:hover{background:var(--review);color:#0c1117}
+  #ctxchips{display:flex;gap:6px;padding:0 12px 6px;flex-wrap:wrap}
+  .chip{background:#1d232c;border:1px solid var(--edge);border-radius:8px;font-size:11px;padding:2px 8px;color:var(--fg-dim)}
+  .chip b{color:var(--accent);font-weight:600}
+  .chip .x{margin-left:4px;cursor:pointer}
+  #agentin{display:flex;gap:6px;padding:8px 12px;border-top:1px solid var(--edge);align-items:flex-end}
+  #agentin textarea{flex:1;background:var(--panel2);border:1px solid var(--edge);border-radius:9px;color:var(--fg);padding:7px 10px;font-family:inherit;font-size:12.5px;resize:none;height:60px;outline:none}
+  #agentin textarea:focus{border-color:var(--accent)}
+  .send{background:var(--accent);color:#0c1117;border-radius:9px;padding:8px 12px;font-weight:700;font-size:12px}
+  #agentfoot{padding:6px 12px;border-top:1px solid var(--edge);font-size:11px;color:var(--fg-dim);display:flex;justify-content:space-between}
+  #agentfoot .live{color:var(--prog)}
+
+  /* ============ 状态栏 ============ */
+  #status{height:26px;background:var(--panel);border-top:1px solid var(--edge);display:flex;align-items:center;padding:0 12px;gap:18px;font-size:11px;color:var(--fg-dim)}
+  #status .mid{flex:1;text-align:center}
+  #status .live{color:var(--prog)}
+  #status b{color:var(--fg);font-weight:600}
+
+  /* ============ 弹层 ============ */
+  .modal-bg{position:fixed;inset:0;background:#000a;display:grid;place-items:center;z-index:60}
+  .modal{background:var(--panel);border:1px solid var(--edge);border-radius:14px;padding:18px;width:430px;box-shadow:0 20px 60px #000c}
+  .modal h3{font-size:14px;margin-bottom:12px}
+  .modal label{display:block;font-size:11px;color:var(--fg-dim);margin:10px 0 4px}
+  .modal input[type=text],.modal select{width:100%;background:var(--panel2);border:1px solid var(--edge);border-radius:8px;color:var(--fg);padding:7px 10px;font-size:12.5px;outline:none}
+  .modal .row{display:flex;gap:8px;justify-content:flex-end;margin-top:16px}
+  .modal .row .mini{padding:6px 14px}
+  .modal .row .ok{background:var(--accent);color:#0c1117;border-color:var(--accent);font-weight:700}
+  .statmenu{position:fixed;background:var(--panel);border:1px solid var(--edge);border-radius:10px;padding:4px;z-index:70;box-shadow:0 10px 30px #000a}
+  .statmenu button{display:block;width:100%;text-align:left;padding:6px 12px;border-radius:7px;font-size:12px}
+  .statmenu button:hover{background:var(--panel2)}
+  .statmenu .sdot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px}
+
+  /* quick open */
+  #quick{position:fixed;top:12%;left:50%;transform:translateX(-50%);width:480px;background:var(--panel);border:1px solid var(--edge);border-radius:12px;z-index:80;box-shadow:0 16px 50px #000c;display:none}
+  #quick .qin{width:100%;background:none;border:none;outline:none;color:var(--fg);font-size:14px;padding:12px 16px}
+  #quick .qlist{max-height:280px;overflow:auto;padding:0 8px 8px}
+  .qi{padding:6px 10px;border-radius:7px;font-size:12.5px;cursor:pointer;color:var(--fg-dim);display:flex;justify-content:space-between}
+  .qi.on{background:var(--panel2);color:var(--fg)}
+  .qi .kb{font-family:var(--mono);font-size:10px;color:var(--fg-dim)}
+
+  /* toast */
+  #toasts{position:fixed;right:16px;bottom:44px;display:flex;flex-direction:column;gap:8px;z-index:90}
+  .toast{background:#000d;border:1px solid var(--accent);border-radius:10px;padding:9px 14px;font-size:12px;max-width:340px;animation:tin .2s}
+  .toast.ev{border-color:var(--done)}
+  @keyframes tin{from{transform:translateY(8px);opacity:0}}
+
+  /* ============ 三模式布局(?variant=A|B|C) ============ */
+  /* A=Zed 编辑器优先 · B=Orca 调度驾驶舱 · C=融合双轨 */
+  #orchestration{display:none;flex-direction:column;min-width:0;min-height:0}
+  body.mode-orca #app{grid-template-columns:44px 336px 1fr 252px}
+  body.mode-orca #tabbar,body.mode-orca #editor,body.mode-orca #bottomdock,
+  body.mode-orca #rightdock,body.mode-orca #docktabs{display:none}
+  body.mode-orca #orchestration{display:flex}
+  body.mode-orca #orchright{display:flex;flex-direction:column}
+  #orchright{display:none;background:var(--panel);border-left:1px solid var(--edge);min-height:0}
+  .osum{display:flex;align-items:center;gap:18px;padding:13px 18px;border-bottom:1px solid var(--edge);background:linear-gradient(90deg,#22303c,transparent 55%)}
+  .osum .t{font-size:16px;font-weight:650}
+  .osum .m{color:var(--fg-dim);font-size:11.5px;margin-top:4px}
+  .ometrics{display:flex;gap:14px;margin-left:auto}
+  .ometric{min-width:76px;border-left:1px solid var(--edge);padding-left:12px}
+  .ometric b{display:block;font-size:16px;font-family:var(--mono)}
+  .ometric span{font-size:10px;color:var(--fg-dim);letter-spacing:.5px}
+  #orchmatrix{flex:1;min-height:0;display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:8px;padding:10px}
+  #orchmatrix.zoomed{display:flex}
+  /* 终端放大视图(点击矩阵格 → 完整终端) */
+  #orchzoom{flex:1;display:flex;flex-direction:column;border:1px solid var(--edge);border-radius:8px;background:#14181e;min-height:0;overflow:hidden}
+  .ozhead{display:flex;align-items:center;gap:12px;padding:7px 12px;border-bottom:1px solid var(--edge);background:var(--panel);font-size:12px}
+  .ozhead .ozst{color:var(--fg-dim);font-size:11px}
+  .ozterm{flex:1;overflow:auto;padding:10px 14px;font-family:var(--mono);font-size:12px;line-height:1.6}
+  .ozterm .tl{color:var(--fg-dim);white-space:pre-wrap;word-break:break-all}
+  .ozin{display:flex;gap:8px;align-items:center;padding:8px 12px;border-top:1px solid var(--edge)}
+  .ozin .pr{color:var(--accent);font-family:var(--mono)}
+  .ozin input{flex:1;background:none;border:none;outline:none;color:var(--fg);font-family:var(--mono);font-size:12px}
+  .ocons{border:1px solid var(--edge);border-radius:8px;background:#14181e;display:grid;grid-template-rows:30px 1fr;overflow:hidden;min-height:0;cursor:pointer}
+  .ocons:hover{border-color:var(--accent)}
+  .ocons.sel{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent) inset}
+  .ocons .h{display:flex;align-items:center;gap:8px;padding:0 10px;border-bottom:1px solid var(--edge);background:var(--panel);font-size:11.5px}
+  .ocons .b{padding:8px 10px;font-family:var(--mono);font-size:10.5px;line-height:1.55;color:var(--fg-dim);overflow:hidden}
+  .ocons .b .cmd{color:var(--fg)} .ocons .b .tool{color:var(--accent)} .ocons .b .ok{color:var(--done)} .ocons .b .warn{color:var(--review)}
+  #orchdag{border-top:1px solid var(--edge);background:var(--panel);padding:8px 16px 12px}
+  .odaglabel{font-size:10px;letter-spacing:1.2px;color:var(--fg-dim);text-transform:uppercase;font-weight:700;margin-bottom:8px}
+  .odag{display:flex;align-items:center;gap:26px}
+  .onode{width:170px;padding:8px 11px;border:1px solid var(--edge);border-radius:7px;background:var(--bg);position:relative;font-size:11.5px}
+  .onode:not(:last-child)::after{content:'';position:absolute;right:-27px;top:50%;width:26px;border-top:1px solid #4a5560}
+  .onode .id{color:var(--fg-dim);font-size:10px;font-family:var(--mono)}
+  .onode .nm{margin-top:4px;line-height:1.3}
+  .onode .stt{margin-top:5px;font-size:10px;font-family:var(--mono)}
+  /* Run 队列(Orca 模式左栏) */
+  .qgrp{font-size:10px;letter-spacing:1.2px;text-transform:uppercase;font-weight:700;margin:12px 6px 6px}
+  .qgrp.danger{color:var(--fail)} .qgrp.run{color:var(--prog)} .qgrp.rev{color:var(--review)} .qgrp.rec{color:var(--fg-dim)}
+  .qrow{margin:0 6px 5px;padding:8px 9px;border:1px solid transparent;border-radius:6px;cursor:pointer}
+  .qrow:hover{background:var(--panel2)}
+  .qrow.sel{border-color:#465154;background:var(--panel2);box-shadow:3px 0 0 var(--accent) inset}
+  .qrow .t{display:flex;align-items:center;gap:7px;font-weight:600;font-size:12.5px}
+  .qrow .m{display:flex;gap:6px;margin-top:5px;color:var(--fg-dim);font-size:10px;font-family:var(--mono)}
+  /* Change set(Orca 模式右栏) */
+  .ocshead{font-size:10px;letter-spacing:1.2px;text-transform:uppercase;font-weight:700;color:var(--fg-dim);padding:12px 12px 6px;display:flex;justify-content:space-between}
+  .ocsrow{display:flex;align-items:center;gap:7px;padding:6px 12px;font-size:12px;color:var(--fg-dim);border-bottom:1px solid #00000030}
+  .ocsrow .delta{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--done)}
+  .ocsrow:hover{color:var(--fg);background:var(--panel2);cursor:pointer}
+  /* 权限卡(人在环,吸收双轨方案 Inspector) */
+  .perm{align-self:stretch;background:#241c12;border:1px solid var(--review);border-radius:10px;padding:9px 11px;font-size:12px}
+  .perm .ops{display:flex;gap:6px;margin-top:9px;flex-wrap:wrap}
+  .perm .ops button{border:1px solid var(--review);border-radius:7px;padding:3px 11px;font-size:11.5px;color:var(--review)}
+  .perm .ops button.pri{background:var(--review);color:#0c1117;font-weight:700}
+  .perm .cmd{font-family:var(--mono);color:var(--fg);background:#0007;border-radius:5px;padding:2px 7px;display:inline-block;margin:5px 0}
+
+  /* 模式分段开关(状态栏左):工作方式切换 */
+  #modeseg{display:flex;border:1px solid var(--accent);border-radius:9px;overflow:hidden;flex:none;background:#0004}
+  #modeseg button{padding:3px 12px;font-size:11.5px;color:var(--fg-dim);display:flex;align-items:center;gap:5px}
+  #modeseg button:hover{color:var(--fg);background:var(--panel2)}
+  #modeseg button.on{background:var(--accent);color:#0c1117;font-weight:700}
+  #modeseg button:not(:last-child){border-right:1px solid var(--accent)}
+
+  /* ============ 浅色主题 ============ */
+  html.light{--bg:#f5f6f8;--panel:#ffffff;--panel2:#eef0f4;--edge:#d4d8e0;--fg:#24292f;--fg-dim:#6a737d}
+  html.light .kw{color:#a626a4}html.light .ty{color:#0184bc}html.light .fn{color:#c18401}
+  html.light .st{color:#50a14f}html.light .cm{color:#98a0ab}html.light .pn{color:#4078f2}
+  html.light .ln .no{color:#a0a8b4}html.light .ln.cur{background:#e7ebf0}
+  html.light .tl.dim{color:#6a737d}
+
+  /* ============ 设置弹窗 ============ */
+  .gear{margin-top:auto}
+  .setwrap{display:grid;grid-template-columns:148px 1fr;height:470px}
+  .setnav{border-right:1px solid var(--edge);padding:8px 0}
+  .setnav button{display:block;width:100%;text-align:left;padding:8px 16px 8px 14px;font-size:12.5px;color:var(--fg-dim);border-left:2px solid transparent}
+  .setnav button.on{color:var(--accent);background:var(--panel2);border-left-color:var(--accent)}
+  .setbody{padding:6px 18px 14px;overflow:auto}
+  .setbody h4{font-size:12px;color:var(--fg-dim);margin:14px 0 4px;font-weight:600}
+  .setrow{display:flex;justify-content:space-between;align-items:center;padding:11px 0;border-bottom:1px solid var(--edge);gap:16px}
+  .setrow .lbl{font-size:12.5px}
+  .setrow .sub{font-size:11px;color:var(--fg-dim);margin-top:3px;line-height:1.5}
+  .seg{display:flex;border:1px solid var(--edge);border-radius:8px;overflow:hidden;flex:none}
+  .seg button{padding:4px 13px;font-size:12px;color:var(--fg-dim)}
+  .seg button.on{background:var(--accent);color:#0c1117;font-weight:600}
+  .setwrap input[type=range]{accent-color:var(--accent);width:180px}
+  .setwrap input[type=text],.setwrap input[type=password],.setwrap select{background:var(--panel2);border:1px solid var(--edge);border-radius:8px;color:var(--fg);padding:6px 10px;font-size:12px;outline:none;width:220px}
+  .setwrap select{width:150px}
+  .sw{width:38px;height:21px;border-radius:11px;background:var(--panel2);border:1px solid var(--edge);position:relative;cursor:pointer;flex:none;transition:.15s}
+  .sw::after{content:'';position:absolute;width:13px;height:13px;border-radius:50%;background:var(--fg-dim);top:3px;left:3px;transition:.15s}
+  .sw.on{background:var(--accent);border-color:var(--accent)}
+  .sw.on::after{left:20px;background:#0c1117}
+  .krow{display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid var(--edge);gap:12px}
+  .krow .lbl{font-size:12.5px;flex:1}
+  .krow .lbl .sub{font-size:11px;color:var(--fg-dim);margin-top:2px}
+  .kb{font-family:var(--mono);background:var(--panel2);border:1px solid var(--edge);border-radius:6px;padding:3px 12px;font-size:11px;min-width:96px;text-align:center;flex:none}
+  .kb.fixed{opacity:.45}
+  .kbtn{font-size:11px;border:1px solid var(--edge);border-radius:6px;padding:3px 11px;flex:none}
+  .kbtn:hover{border-color:var(--accent)}
+  .kbtn.cap{color:var(--review);border-color:var(--review);animation:br 1.2s infinite}
+  /* 分级菜单树(Orca 式) */
+  .setgrp{font-size:10.5px;letter-spacing:1px;color:var(--fg-dim);text-transform:uppercase;padding:12px 14px 4px;cursor:pointer;user-select:none}
+  .setgrp::before{content:'▾ ';font-size:9px}
+  .setgrp.fold::before{content:'▸ '}
+  .setsub{display:block;width:100%;text-align:left;padding:7px 14px 7px 26px;font-size:12.5px;color:var(--fg-dim);border-left:2px solid transparent}
+  .setsub:hover{color:var(--fg)}
+  .setsub.on{color:var(--accent);background:var(--panel2);border-left-color:var(--accent)}
+  /* Provider 管理(ZCode 式) */
+  .pnote{font-size:11.5px;color:var(--fg-dim);line-height:1.6;background:var(--panel2);border-radius:8px;padding:8px 12px}
+  .prow{display:flex;align-items:center;gap:10px;padding:10px 4px;border-bottom:1px solid var(--edge);cursor:pointer}
+  .prow:hover{background:var(--panel2);border-radius:8px}
+  .pstat{width:8px;height:8px;border-radius:50%;background:var(--fg-dim);flex:none}
+  .pstat.ok{background:var(--done)}
+  .pbadge{font-size:10px;padding:2px 8px;border-radius:8px;flex:none;font-weight:600}
+  .pbadge.local{background:#1d2c3f;color:var(--prog)}
+  .pbadge.api{background:#12331f;color:var(--done)}
+  .psub{font-size:11px;color:var(--fg-dim);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--mono)}
+  .pdef{font-size:11px;color:var(--fg-dim);flex:none}
+  .pdef.on{color:var(--accent)}
+  .pform{background:var(--panel2);border-radius:10px;padding:4px 14px 12px;margin:6px 0 10px}
+  .pform .setrow{border-bottom:1px solid var(--edge)}
+  .mini.ok2{background:var(--accent);color:#0c1117;border-color:var(--accent);font-weight:700}
+  #provsel{max-width:150px}
+
+  /* ============ 原型切换器（技能要求的浮动底栏）============ */
+  #switcher{position:fixed;bottom:44px;left:50%;transform:translateX(-50%);background:#000d;border:1px solid var(--edge);border-radius:999px;display:flex;align-items:center;gap:4px;padding:5px 8px;z-index:100;box-shadow:0 10px 30px #000b;font-size:12px;pointer-events:none}
+  #switcher button{pointer-events:auto;width:30px;height:30px;border-radius:50%;background:var(--panel2);font-size:14px}
+  #switcher button:hover{background:var(--accent);color:#0c1117}
+  #switcher .vlabel{padding:0 14px;font-weight:600;color:var(--fg)}
+  #switcher .hint{padding-left:10px;border-left:1px solid var(--edge);color:var(--fg-dim);font-size:11px;max-width:430px}
+</style>
+</head>
+<body>
+<div id="app">
+  <!-- 活动栏 -->
+  <aside id="activity">
+    <div class="logo">🐒</div>
+    <button class="act on" data-lt="project" title="项目 Ctrl+Shift+E">📁</button>
+    <button class="act" data-lt="vcs" title="版控 Ctrl+Shift+G">⎇<span class="badge" id="vcsbadge">3</span></button>
+    <button class="act" data-lt="board" title="车间 Ctrl+Shift+W">🗂<span class="badge warn" id="boardbadge" style="display:none">1</span></button>
+    <button class="act" data-lt="search" title="搜索 Ctrl+Shift+F">🔍</button>
+    <button class="act" title="Agent 会话 Ctrl+Shift+/" id="act-agent">✦</button>
+    <button class="act gear" title="设置 Ctrl+," id="act-settings">⚙</button>
+  </aside>
+
+  <!-- 左 dock -->
+  <aside id="leftdock">
+    <div id="docktabs">
+      <button class="dtab on" data-lt="project">项目</button>
+      <button class="dtab" data-lt="vcs">版控</button>
+      <button class="dtab" data-lt="board">车间</button>
+    </div>
+    <div class="pane" id="pane-project">
+      <div class="tree">
+        <div class="row">▾ 📦 MonkeyFence</div>
+        <div class="row" style="padding-left:18px">Cargo.toml</div>
+        <div class="row cur" style="padding-left:18px">▾ crates</div>
+        <div class="row" style="padding-left:34px">workspace.rs</div>
+        <div class="row" style="padding-left:34px">editor.rs<span class="gm M">M</span></div>
+        <div class="row" style="padding-left:34px">term.rs</div>
+        <div class="row" style="padding-left:34px">agent_panel.rs<span class="gm A">A</span></div>
+        <div class="row" style="padding-left:18px">README.md</div>
+        <div class="row" style="padding-left:18px">p4config.txt<span class="gm C">C</span></div>
+      </div>
+    </div>
+    <div class="pane hidden" id="pane-vcs">
+      <div style="font-weight:600;margin-bottom:8px">默认变更列表 <span style="color:var(--fg-dim)">3 文件</span></div>
+      <div class="tree">
+        <div class="row">editor.rs<span class="gm M">M</span></div>
+        <div class="row">agent_panel.rs<span class="gm A">A</span></div>
+        <div class="row">p4config.txt<span class="gm C">C</span></div>
+      </div>
+      <button class="mini" style="margin-top:10px">提交 CL…</button>
+    </div>
+    <div class="pane hidden" id="pane-board">
+      <div id="boardhead">
+        <span class="grp">▾ MonkeyFence</span>
+        <span style="flex:1"></span>
+        <button class="iconbtn" id="btn-boardview" title="切换 列表/泳道视图">⇄</button>
+        <button class="iconbtn" id="btn-newwt" title="新建工作树">＋</button>
+        <button class="iconbtn" id="btn-cmt" title="给选中卡片写检查点">✎</button>
+      </div>
+      <div id="board-list"></div>
+      <div id="board-swim" style="display:none"><div id="swim"></div></div>
+      <div style="color:var(--fg-dim);font-size:11px;margin-top:10px;line-height:1.7">
+        提示：点徽章改状态 · 点卡片切到该工作树终端 · 底部 ←→ 切换列表/泳道
+      </div>
+    </div>
+  </aside>
+
+  <!-- 中央 -->
+  <main id="center">
+    <div id="tabbar">
+      <div class="tab on" data-tab="ws">workspace.rs <span class="x">✕</span></div>
+      <div class="tab" data-tab="ed">editor.rs <span class="x">✕</span><span class="gm M" style="font-size:10px">M</span></div>
+      <div class="tab" data-tab="diff" style="display:none">◆ workspace.rs · 审阅 <span class="rdiff">agent diff</span> <span class="x">✕</span></div>
+      <span style="flex:1"></span>
+      <span style="font-size:11px;color:var(--fg-dim)">Ctrl+\ 分屏(原型略) · Alt+Y/Z 审阅</span>
+    </div>
+    <div id="editor"></div>
+
+    <!-- Orca 模式:调度驾驶舱(?variant=B) -->
+    <div id="orchestration">
+      <div class="osum" id="orchsum"></div>
+      <div id="orchmatrix"></div>
+      <div id="orchdag"><div class="odaglabel">关键路径 Critical Path</div><div class="odag" id="odag"></div></div>
+    </div>
+
+    <div id="bottomdock">
+      <div id="bdocktabs">
+        <button class="btab on" data-bt="terminal">TERMINAL</button>
+        <button class="btab" data-bt="search">SEARCH</button>
+        <button class="btab" data-bt="tasks">TASKS</button>
+        <span style="flex:1"></span>
+        <button class="iconbtn" id="bdock-close" title="收起 Ctrl+`">▼</button>
+      </div>
+      <div class="bpane" id="bp-terminal">
+        <div id="sniff">VT 嗅探：<b id="sniffstate">空闲</b><span id="sniffdetail">› Ask Codex to do anything</span>
+          <span style="flex:1"></span><span style="font-size:10px" id="termowner">mf-main · tab[codex]</span></div>
+        <div id="termwrap"></div>
+        <div id="termin"><span class="pr">›</span><input id="terminput" placeholder="Ask Codex to do anything… (Enter 发送)" autocomplete="off"></div>
+      </div>
+      <div class="bpane hidden" id="bp-search">
+        <div id="searchbar">
+          <input id="searchq" placeholder="搜索…试试 LeftPanel" value="LeftPanel">
+          <button class="tg" id="tg-case" title="大小写">Aa</button>
+          <button class="tg" id="tg-word" title="全字">字</button>
+          <button class="tg on" id="tg-rex" title="正则">.*</button>
+        </div>
+        <div id="searchres"></div>
+      </div>
+      <div class="bpane hidden" id="bp-tasks">
+        <div id="taskshead">
+          <span class="run">RUN: 优化工厂 NPC 渲染性能</span>
+          <div style="display:flex;gap:6px">
+            <button class="mini" id="btn-newtask">＋ 新建任务</button>
+            <button class="mini" id="btn-fuse" title="演示:连败3次触发熔断">⚠ 模拟熔断</button>
+          </div>
+        </div>
+        <div id="taskgrid"></div>
+      </div>
+    </div>
+  </main>
+
+  <!-- 右 dock -->
+  <aside id="rightdock">
+    <div id="agenthead">
+      <span>✦ Agent 会话</span>
+      <div style="display:flex;gap:6px">
+        <select id="provsel" title="Provider / 模型(ZCode 式)" style="background:var(--panel2);border:1px solid var(--edge);border-radius:7px;color:var(--fg);font-size:11px;padding:2px 6px"></select>
+        <select id="wtsel" style="background:var(--panel2);border:1px solid var(--edge);border-radius:7px;color:var(--fg);font-size:11px;padding:2px 6px">
+          <option>worktree: mf-main</option>
+          <option>worktree: opt-npc-culling</option>
+        </select>
+      </div>
+    </div>
+    <div id="msgs"></div>
+    <div id="ctxchips">
+      <span class="chip">📄 <b>workspace.rs</b><span class="x">✕</span></span>
+      <span class="chip" id="selchip" style="display:none">≣ 选区 <b>L35-40</b><span class="x">✕</span></span>
+    </div>
+    <div id="askbar" style="display:none"></div>
+    <div id="agentin">
+      <textarea id="agentinput" placeholder="给 agent 下指令…（包含"优化/修改"会触发 diff 审阅演示）&#10;Enter 发送 · Shift+Enter 换行"></textarea>
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <button class="mini" id="modebtn" title="Write 可改文件 / Ask 只读">Write</button>
+        <button class="send" id="agentsend">➤</button>
+      </div>
+    </div>
+    <div id="agentfoot"><span>● <span class="live" id="agentstate">空闲</span></span><span id="agentsess">glm-5.3 · Write 模式</span></div>
+  </aside>
+
+  <!-- Orca 模式右栏:Change set -->
+  <aside id="orchright">
+    <div class="ocshead">Change set <span style="font-family:var(--mono);color:var(--done)">+84 −21</span></div>
+    <div class="ocsrow"><span style="color:var(--accent)">M</span> types.rs <span class="delta">+18 −2</span></div>
+    <div class="ocsrow"><span style="color:var(--accent)">M</span> db.rs <span class="delta">+34 −8</span></div>
+    <div class="ocsrow"><span style="color:var(--accent)">M</span> engine.rs <span class="delta">+22 −9</span></div>
+    <div class="ocsrow"><span style="color:var(--review)">M</span> db_tests.rs <span class="delta">+10 −2</span></div>
+    <div class="ocshead" style="margin-top:14px">执行上下文</div>
+    <div style="padding:2px 12px 12px;color:var(--fg-dim);font-size:11.5px;line-height:1.8">
+      <span style="font-family:var(--mono)">codex/agent-cancel-flow</span><br>
+      P4 CL 483920<br>2 panes · 2 agents<br>
+      <span style="color:var(--review)">1 个权限待处理</span>
+      <div style="margin-top:10px;display:flex;gap:6px">
+        <button class="mini" onclick="toast('切回融合模式查看 diff(演示)')">查看 diff</button>
+        <button class="mini" onclick="applyMode('C',true)">编辑 →</button>
+      </div>
+    </div>
+  </aside>
+</div>
+
+<!-- 状态栏 -->
+<footer id="status">
+  <div id="modeseg" title="工作方式:Alt+1 手写 · Alt+2 AI 驱动 · Alt+3 双轨">
+    <button data-m="A" title="Alt+1 — 自己写代码,Agent 收起">🧑‍💻 Zed</button>
+    <button data-m="B" title="Alt+2 — AI agent 干活,驾驶舱监控">🤖 Orca</button>
+    <button data-m="C" title="Alt+3 — 人机协同,三面板全开">⚡ 双轨</button>
+  </div>
+  <span>⎇ <b id="st-wt">mf-main</b></span>
+  <span id="st-vcs">P4: <b>3</b> 待提交</span>
+  <span class="mid"><span class="live" id="st-agents">0 agents working</span></span>
+  <span><b id="st-pos">35:1</b></span>
+  <span id="st-sel"></span>
+  <span>Rust</span><span>UTF-8</span>
+</footer>
+
+<!-- 快速打开 -->
+<div id="quick"><input class="qin" id="quickin" placeholder="输入文件名…"><div class="qlist" id="quicklist"></div></div>
+<div id="toasts"></div>
+
+<!-- 原型切换器 -->
+<!-- 模式切换器(浮动,与状态栏分段开关等效) -->
+<div id="switcher">
+  <button id="sw-prev">←</button>
+  <span class="vlabel" id="sw-label">双轨 · 人机协同</span>
+  <button id="sw-next">→</button>
+  <span class="hint">Alt+1/2/3 或 ←→ 切换工作方式</span>
+</div>
+
+<script>
+/* 原型错误显示器:把运行时错误写到标题便于诊断 */
+window.onerror=function(m,s,l){document.title='⚠ '+(m||'')+' @line'+(l||'')};
+/* ================================================================
+   MonkeyFence 交互原型 —— 丢弃式 (throwaway prototype)
+   问题：设计文档里的工作流交互(卡片流转/终端矩阵/DAG/ask-reply/diff审阅)
+        手感是否成立？此页回答它。无持久化，刷新即重置。
+================================================================ */
+const $=s=>document.querySelector(s), $$=s=>document.querySelectorAll(s);
+const STATUS={todo:'todo',progress:'in-progress',review:'in-review',completed:'completed',failed:'failed'};
+const SCOLOR={todo:'var(--todo)','in-progress':'var(--prog)','in-review':'var(--review)',completed:'var(--done)',failed:'var(--fail)'};
+const SNAME={todo:'待办','in-progress':'进行中','in-review':'审阅中',completed:'已完成',failed:'失败'};
+const TSTAT={pending:'待定',ready:'就绪',dispatched:'已派发',completed:'完成',failed:'失败',blocked:'阻塞'};
+
+/* ---------- 状态 ---------- */
+let state={
+  view:'list', curWT:0, selCard:null, agentBusy:false, mode:'write',
+  worktrees:[
+    {name:'mf-main',branch:'main',status:'in-progress',comment:'主开发区:面板键位体系落地中',
+     agents:[{t:'claude',s:'run',d:'12m'}],terms:2,unread:false},
+    {name:'opt-npc-culling',branch:'opt-npc-culling',status:'in-review',comment:'42/42 tests; reviewer 报告 clean',
+     agents:[{t:'codex',s:'done',d:'23m'},{t:'claude',s:'idle',d:''}],terms:3,unread:true},
+    {name:'fix-vt-resize',branch:'fix-vt-resize',status:'todo',comment:'',agents:[],terms:0,unread:false},
+    {name:'docs-ui-kit',branch:'docs/ui-kit',status:'completed',comment:'设计系统文档已合入',agents:[],terms:1,unread:false},
+  ],
+  tasks:[
+    {id:'A',title:'#A 移除 IndexOf O(N×M) 扫描',status:'completed',deps:[],to:'codex@opt-npc-culling'},
+    {id:'B',title:'#B 缓存 (bodyType,tagId) 校验结果',status:'ready',deps:['A'],to:''},
+    {id:'C',title:'#C 生成性能对比报告',status:'pending',deps:['B'],to:''},
+  ],
+};
+
+/* ---------- 设置(P0-E16:改键位后命令面板提示同步) ---------- */
+let SETTINGS={
+  theme:'dark', codeSize:12.5, tabSize:4, autosave:false, wrapGuide:true,
+  keys:{ // 可自定义键位(值统一小写 code 形式)
+    board:'ctrl+shift+w', search:'ctrl+shift+f', agent:'ctrl+shift+slash',
+    terminal:'ctrl+backquote', settings:'ctrl+comma',
+  },
+  providers:[ // ZCode 式:本地 CLI 直连 + 自定义 API 端点
+    {id:'p1',name:'codex',type:'local',cmd:'codex --model gpt-5.6-sol',ok:true},
+    {id:'p2',name:'claude',type:'local',cmd:'claude',ok:true},
+    {id:'p3',name:'智谱 GLM',type:'api',base:'https://open.bigmodel.cn/api/paas/v4',key:'sk-mf-••••••••••••4f2a',models:['glm-5.3','glm-5.3-air','glm-5.2'],ok:true},
+    {id:'p4',name:'DeepSeek',type:'api',base:'https://api.deepseek.com/v1',key:'',models:['deepseek-v4'],ok:false},
+  ],
+  agent:{provider:'p3', model:'glm-5.3', autoReview:false},
+  vcs:{p4port:'ssl:rm42-p4.int.hypergryph.com:1666', baseBranch:'main', p4Default:true, autostash:true},
+};
+const KEYLABEL={board:'车间面板',search:'项目搜索',agent:'Agent 会话',terminal:'终端面板',settings:'打开设置'};
+function normKey(e){ // keydown → 'ctrl+shift+w' 形式
+  if(e.key==='Escape')return 'escape';
+  let s='';if(e.ctrlKey||e.metaKey)s+='ctrl+';if(e.shiftKey)s+='shift+';if(e.altKey)s+='alt+';
+  const c=(e.code||'').replace('Key','').replace('Digit','').toLowerCase();
+  return s+c;
+}
+function keyLabel(k){return k.split('+').map(p=>p==='ctrl'?'Ctrl':p==='shift'?'Shift':p==='alt'?'Alt':p==='slash'?'/':p==='backquote'?'`':p==='comma'?',':p.toUpperCase()).join('+')}
+
+/* ---------- 代码内容（带 diff hunks） ---------- */
+const CODE=[
+  ['cm','#[derive(Clone, Copy, PartialEq)'],
+  ['','pub enum LeftPanel {'],
+  ['','    Explorer,'],
+  ['','    Vcs,'],
+  ['','    Agent,'],
+  ['','}'],
+  ['',''],
+  ['cm','/// 工作树卡片:Orca worktree ps 同构'],
+  ['ty','pub struct',0],
+  ['fn','    pub fn name(&self) -> &str { &self.name }'],
+  ['','    pub fn status(&self) -> WorkspaceStatus { self.status }'],
+  ['','    pub fn comment(&self) -> &str { &self.comment }'],
+];
+const HUNKS=[
+  {id:0,kept:null,lines:[['kw','    pub fn'],['pn',' agents'],['','(&self) -> &[[AgentChip]] {'],['','        &self.agents'],['','    }']]},
+  {id:1,kept:null,lines:[['cm','    // 状态徽章: todo → in-progress → in-review → completed'],['ty','    pub fn'],['',' next_status(&self) -> Option<WorkspaceStatus> {'],['','        match self.status {'],['st','            Todo => Some(InProgress),'],['st','            InReview => Some(Completed),'],['','            _ => None,'],['','        }'],['','    }']]},
+];
+function renderEditor(reviewMode){
+  const ed=$('#editor'); let h='';
+  h+='<div style="padding:10px 0">';
+  CODE.forEach((l,i)=>{
+    h+=`<div class="ln ${i===7?'cur':''}"><span class="no">${i+1}</span><span class="${l[0]}">${esc(l[1])}</span></div>`;
+  });
+  if(reviewMode){
+    HUNKS.forEach(hk=>{
+      const cls=hk.kept===true?'hunk add kept':hk.kept===false?'hunk del rejected':'hunk add';
+      h+=`<div class="${cls}" data-hunk="${hk.id}"><div class="hbtns">
+        <button class="hbtn y" data-act="y">✓ 保留</button><button class="hbtn z" data-act="z">✕ 拒绝</button></div>`;
+      hk.lines.forEach(l=>{h+=`<div class="ln"><span class="no"> </span><span>+ </span><span class="${l[0]}">${esc(l[1])}</span></div>`});
+      h+='</div>';
+    });
+    h+=`</div><div id="reviewbar">
+      <span style="color:var(--fg-dim);font-size:11px">agent 修改了 workspace.rs(+${HUNKS.reduce((a,b)=>a+b.lines.length,0)} 行)</span>
+      <button class="y" data-r="y">全部保留 <span class="k">Shift+Alt+Y</span></button>
+      <button class="z" data-r="z">全部拒绝 <span class="k">Shift+Alt+Z</span></button>
+      <button data-r="done" style="color:var(--accent)">完成审阅</button></div>`;
+  } else h+='</div>';
+  ed.innerHTML=h;
+}
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;')}
+
+/* ---------- 卡片墙 ---------- */
+function agentChip(a){
+  const st=a.s==='run'?'st-run':a.s==='done'?'st-done':a.s==='ask'?'st-ask':a.s==='fail'?'st-fail':'st-idle';
+  const mark=a.s==='run'?'<span class="breath"></span> 运行中':a.s==='done'?'✓'+a.d:a.s==='ask'?'? 等待问句':'空闲';
+  return `<span class="achip">✦<b>${a.t}</b> <span class="${st}">${mark}</span></span>`;
+}
+function renderBoard(){
+  const list=$('#board-list'), swim=$('#board-swim');
+  list.style.display=state.view==='list'?'':'none'; swim.style.display=state.view==='swim'?'':'none';
+  if(state.view==='list'){
+    list.innerHTML=state.worktrees.map((w,i)=>`
+    <div class="card ${i===state.curWT?'sel':''}" data-wt="${i}">
+      <div class="top">${w.unread?'<span class="dot"></span>':''}<span class="name">${w.name}</span>
+        <span class="badge ${w.status}" data-st="${i}">${SNAME[w.status]}</span></div>
+      <div class="meta">⎇ ${w.branch} · ${w.terms} terminals</div>
+      ${w.comment?`<div class="cmt">💬 ${w.comment}</div>`:''}
+      <div class="chips">${w.agents.map(agentChip).join('')||'<span class="achip" style="opacity:.5">无 agent</span>'}</div>
+    </div>`).join('');
+  }else{
+    const cols=[['todo','待办'],['in-progress','进行中'],['in-review','审阅中'],['completed','已完成']];
+    $('#swim').innerHTML=cols.map(([k,n])=>`
+      <div class="swimcol" data-col="${k}"><h4>${n} <span class="cnt" style="color:${SCOLOR[k]}">${state.worktrees.filter(w=>w.status===k).length}</span></h4>
+      ${state.worktrees.filter(w=>w.status===k).map((w,i)=>`
+        <div class="scard" draggable="true" data-wt="${state.worktrees.indexOf(w)}">
+          <div style="display:flex;justify-content:space-between"><b>${w.name}</b>${w.unread?'<span class="dot" style="display:inline-block"></span>':''}</div>
+          <div style="color:${SCOLOR[w.status]};font-size:10px;margin:2px 0">⎇ ${w.branch}</div>
+          <div class="chips">${w.agents.map(agentChip).join('')}</div>
+        </div>`).join('')}</div>`).join('');
+  }
+  const nw=state.worktrees.filter(w=>w.unread).length, b=$('#boardbadge');
+  b.style.display=nw?'':'none'; b.textContent=nw;
+  $('#st-agents').textContent=state.worktrees.reduce((a,w)=>a+w.agents.filter(x=>x.s==='run').length,0)+' agents working';
+  $('#st-wt').textContent=state.worktrees[state.curWT].name;
+}
+
+/* ---------- 任务 DAG ---------- */
+function canReady(t){return t.status==='pending'&&t.deps.every(d=>state.tasks.find(x=>x.id===d)?.status==='completed')}
+function renderTasks(){
+  $('#taskgrid').innerHTML=state.tasks.map(t=>{
+    const c=t.status==='completed'?'var(--done)':t.status==='ready'?'var(--prog)':t.status==='dispatched'?'var(--review)':t.status==='failed'?'var(--fail)':'var(--todo)';
+    const dep=t.deps.length?`依赖 ${t.deps.map(d=>{const dt=state.tasks.find(x=>x.id===d);return `<span style="color:${dt.status==='completed'?'var(--done)':'var(--fg-dim)'}">#${d}${dt.status==='completed'?'✓':''}</span>`}).join(' ')}`:'无依赖';
+    let ops='';
+    if(t.status==='ready')ops=`<button data-op="disp" data-id="${t.id}">派发到终端…</button>`;
+    if(t.status==='dispatched')ops=`<button data-op="done" data-id="${t.id}">模拟 worker_done</button><button data-op="fail" data-id="${t.id}">报告失败</button>`;
+    if(t.status==='pending')ops=`<span style="color:var(--fg-dim);font-size:10px">等待依赖满足</span>`;
+    if(t.status==='failed')ops=`<button data-op="retry" data-id="${t.id}">重试</button><button data-op="manual" data-id="${t.id}">人工接管</button>`;
+    const fused=t.fuse?`<div style="color:var(--fail);font-size:10px;margin-top:4px">⚠ 连续3次失败 → 熔断</div>`:'';
+    return `<div class="tcard"><div class="tt"><span class="tdot" style="background:${c}"></span>${t.title}</div>
+      <div class="dep">${dep}${t.to?` · 指派: <b>${t.to}</b>`:''}</div>
+      <div style="font-size:10px;color:var(--fg-dim)">状态: ${TSTAT[t.status]}</div>${fused}
+      <div class="ops">${ops}</div></div>`;
+  }).join('');
+}
+function settleDeps(){
+  state.tasks.forEach(t=>{if(canReady(t)){if(t.status==='pending'){t.status='ready';toast(`任务 #${t.id} 依赖满足 → ready(自动流转)`,true)}}});
+  renderTasks();
+}
+
+/* ---------- 终端模拟 ---------- */
+const term=$('#termwrap');
+function tline(txt,cls=''){const d=document.createElement('div');d.className='tl '+cls;d.textContent=txt;term.appendChild(d);term.scrollTop=term.scrollHeight;return d}
+function banner(){
+  tline('╭─ OpenAI Codex (模拟) ─────────────────╮','dim');
+  tline('│ model: gpt-5.6-sol · dir: mf-main     │','dim');
+  tline('╰───────────────────────────────────────╯','dim');
+}
+let codexState='idle';
+function setSniff(s,detail){codexState=s;$('#sniffstate').textContent={idle:'空闲',working:'工作中',done:'已完成'}[s];$('#sniffdetail').textContent=detail||'';$('#agentstate').textContent={idle:'空闲',working:'思考中…',done:'完成'}[s]}
+function setCurAgents(mut){const w=state.worktrees[state.curWT];mut(w);renderBoard()}
+banner();setSniff('idle');
+function runCodex(prompt){
+  tline('› '+prompt,'acc');
+  setSniff('working','Working…');setCurAgents(w=>{const a=w.agents[0]||w.agents.push({t:'codex',s:'idle',d:''});a.s='run'});
+  tline('• Reading crates/mf/src/workspace.rs …','dim');
+  setTimeout(()=>{tline('• Grepping "LeftPanel" …','dim');},700);
+  setTimeout(()=>{tline('• 正在分析面板键位体系…','dim');
+    tline('✔ 回答:'+fakeAnswer(prompt),'ok');
+    tline('─ Worked for 23s ─','dim');tline('› Ask Codex to do anything','dim');
+    setSniff('done','Worked for 23s');setCurAgents(w=>{if(w.agents[0])w.agents[0].s='done'});
+    toast('终端嗅探: agent 完成 → 卡片 agent 状态 ✓',true);
+  },1900);
+}
+function fakeAnswer(p){
+  if(/优化|修改|改/.test(p))return '已定位 2 处 hunk,进入编辑器审阅态(Alt+Y 保留 / Alt+Z 拒绝)。';
+  return '收到。面板键位体系建议按 P0-E2 顺序:项目/版控/车间 三键先行。';
+}
+$('#terminput').addEventListener('keydown',e=>{
+  if(e.key==='Enter'&&e.target.value.trim()){runCodex(e.target.value.trim());e.target.value=''}
+});
+
+/* ---------- Agent 会话 ---------- */
+const msgs=$('#msgs');
+function msg(html,who){const d=document.createElement('div');d.className='msg '+who;d.innerHTML=html;msgs.appendChild(d);msgs.scrollTop=msgs.scrollHeight;return d}
+function toolEl(name,arg){
+  const d=document.createElement('div');d.className='tool';d.innerHTML=`▸ 🔧 <span class="sum">${name}</span> <span style="opacity:.6">${arg}</span>`;msgs.appendChild(d);msgs.scrollTop=msgs.scrollHeight;
+  d.onclick=()=>d.innerHTML=d.dataset.open?'▸ 🔧 <span class="sum">'+name+'</span> <span style="opacity:.6">'+arg+'</span>':'▾ 🔧 <b>'+name+'</b><br><span style="font-size:11px;color:var(--fg-dim);white-space:pre-wrap">'+esc('读取 44 行:enum LeftPanel { Explorer, Vcs, Agent }\n发现: 无 Dock 方向字段,无多光标支持')+'</span>';d.dataset.open=d.dataset.open?'':'1';
+}
+/* 权限卡(人在环,吸收双轨方案 Inspector 的 PERMISSION) */
+function permEl(cmd){
+  const d=document.createElement('div');d.className='perm';
+  d.innerHTML=`<b>⚠ 权限请求</b> — agent 想运行:<div class="cmd">${esc(cmd)}</div>
+    <div style="color:var(--fg-dim);font-size:11px">该命令只读取仓库并写入 target/</div>
+    <div class="ops"><button class="pri">允许一次</button><button>本会话始终允许</button><button>拒绝</button></div>`;
+  msgs.appendChild(d);msgs.scrollTop=msgs.scrollHeight;
+  d.querySelectorAll('button').forEach(b=>b.onclick=()=>{
+    const a=b.textContent;
+    d.innerHTML=`<b>权限</b> — ${esc(cmd)} → <span style="color:${a==='拒绝'?'var(--fail)':'var(--done)'}">${a} ✓ 已记录</span>`;
+    msg(a==='拒绝'?'收到,跳过该命令,继续只读分析。':'权限已授予,命令运行中…','a');
+    toast('人在环:权限决定已记录(策略沉淀到 Run)',true);
+  });
+}
+msg('我在。当前绑定 <b>mf-main</b> · 上下文已挂载 workspace.rs。试试让我"优化 LeftPanel"。<br><span style="color:var(--fg-dim);font-size:11px">演示链:消息流 → 工具折叠 → diff 审阅 → ask 问句 → 任务联动</span>','a');
+function sendAgent(txt){
+  msg(esc(txt),'u');
+  state.agentBusy=true;$('#agentstate').textContent='思考中…';
+  toolEl('Read','crates/mf/src/workspace.rs');
+  setTimeout(()=>toolEl('Grep','"LeftPanel"'),500);
+  setTimeout(()=>permEl('cargo test -p mf-agent'),900);
+  setTimeout(()=>{
+    if(/优化|修改|改/.test(txt)&&state.mode==='write'){
+      const fc=document.createElement('div');fc.className='filechg';
+      fc.innerHTML='✎ 修改 <b>workspace.rs</b>(+15 行) <button id="viewdiff">查看 diff →</button>';
+      msgs.appendChild(fc);msgs.scrollTop=msgs.scrollHeight;
+      fc.querySelector('#viewdiff').onclick=()=>openReview();
+      msg('改动已就绪:2 个 hunk 进入审阅态。<b>Alt+Y</b> 逐块保留 / <b>Alt+Z</b> 拒绝。','a');
+      openReview();
+    }else{
+      msg('分析:LeftPanel 目前是 3 值枚举、单 dock 方向。按 P0-E2 应升级为 (PanelId × Dock) 二维,车间面板新增 <b>Ctrl+Shift+W</b>。','a');
+    }
+    state.agentBusy=false;$('#agentstate').textContent='空闲';
+    setTimeout(showAsk,600);
+  },1300);
+}
+function showAsk(){
+  if($('#askbar').style.display==='block')return;
+  const ab=$('#askbar');ab.style.display='block';
+  ab.innerHTML=`<div class="q">❓ 阻塞问句(F5):#B 缓存失效策略选哪种?</div>
+    <div class="ops"><button data-a="项目变更即失效">项目变更失效</button><button data-a="固定 TTL 60s">TTL 60s</button><button data-a="自定义…">自定义…</button></div>`;
+  ab.querySelectorAll('button').forEach(b=>b.onclick=()=>{
+    ab.style.display='none';
+    msg(`已答复:#B 采用「${b.dataset.a}」`,'u');
+    msg('收到,继续执行 #B。该答复已写入 Run 邮箱,后续 resume 不再重复提问。','a');
+    toast('ask/reply 完成 · 问句不丢失(按消息 ID resume)',true);
+  });
+  toast('agent 提出阻塞问句,等待你的决定…');
+}
+$('#agentsend').onclick=()=>{const t=$('#agentinput');if(t.value.trim()){sendAgent(t.value.trim());t.value=''}};
+$('#agentinput').addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();$('#agentsend').click()}});
+$('#modebtn').onclick=e=>{state.mode=state.mode==='write'?'ask':'write';e.target.textContent=state.mode==='write'?'Write':'Ask';syncAgentFoot()};
+$$('#ctxchips .x').forEach(x=>x.onclick=()=>x.parentElement.remove());
+
+/* ---------- diff 审阅 ---------- */
+let reviewing=false;
+function openReview(){
+  reviewing=true;renderEditor(true);
+  $$('.tab').forEach(t=>t.classList.remove('on'));
+  const dt=$('[data-tab="diff"]');dt.style.display='';dt.classList.add('on');
+  toast('进入 diff 审阅态 · Alt+Y 保留 / Alt+Z 拒绝当前块');
+}
+function hunkVerdict(id,kept){
+  const hk=HUNKS.find(h=>h.id===id);if(!hk||hk.kept!==null)return;
+  hk.kept=kept;renderEditor(true);
+  if(HUNKS.every(h=>h.kept!==null))finishReview();
+}
+function finishReview(){
+  const kept=HUNKS.filter(h=>h.kept).length,rej=HUNKS.length-kept;
+  reviewing=false;renderEditor(false);
+  $('[data-tab="diff"]').style.display='none';$('[data-tab="ws"]').classList.add('on');
+  msg(`审阅完成:保留 ${kept} 块 / 拒绝 ${rej} 块,文件已按块合并。`,'a');
+  toast(`审阅完成 ✓${kept} ✕${rej} — hunk 级合并生效`,true);
+}
+$('#editor').addEventListener('click',e=>{
+  const b=e.target.closest('[data-act]');if(b){hunkVerdict(+b.closest('[data-hunk]').dataset.hunk,b.dataset.act==='y')}
+  const r=e.target.closest('[data-r]');
+  if(r){if(r.dataset.r==='y'){HUNKS.forEach(h=>h.kept=true);finishReview()}
+        if(r.dataset.r==='z'){HUNKS.forEach(h=>h.kept=false);finishReview()}
+        if(r.dataset.r==='done'){HUNKS.filter(h=>h.kept===null).forEach(h=>h.kept=true);finishReview()}}
+});
+
+/* ---------- toast ---------- */
+function toast(t,ev){const d=document.createElement('div');d.className='toast'+(ev?' ev':'');d.textContent=t;$('#toasts').appendChild(d);setTimeout(()=>d.remove(),3800)}
+
+/* ---------- 左 dock tab / 活动栏 ---------- */
+function setLeftTab(lt){
+  $$('.dtab').forEach(t=>t.classList.toggle('on',t.dataset.lt===lt));
+  $$('.act[data-lt]').forEach(a=>a.classList.toggle('on',a.dataset.lt===lt));
+  ['project','vcs','board'].forEach(p=>$('#pane-'+p).classList.toggle('hidden',p!==lt));
+  if(lt==='search'){$('#docktabs').querySelector('[data-lt="board"]').classList.add('on');$('#pane-board').classList.remove('hidden');switchBPane('search')}
+}
+$$('.dtab').forEach(t=>t.onclick=()=>setLeftTab(t.dataset.lt));
+$$('.act[data-lt]').forEach(a=>a.onclick=()=>setLeftTab(a.dataset.lt));
+$('#act-agent').onclick=()=>$('#rightdock').classList.toggle('hidden');
+
+/* ---------- 底 dock ---------- */
+function switchBPane(p){$$('.btab').forEach(t=>t.classList.toggle('on',t.dataset.bt===p));['terminal','search','tasks'].forEach(x=>$('#bp-'+x).classList.toggle('hidden',x!==p))}
+$$('.btab').forEach(t=>t.onclick=()=>switchBPane(t.dataset.bt));
+$('#bdock-close').onclick=()=>$('#bottomdock').classList.add('hidden');
+function toggleBottom(){$('#bottomdock').classList.toggle('hidden')}
+
+/* ---------- 搜索 ---------- */
+const FILES={'workspace.rs':['pub enum LeftPanel {','    pub fn set_left_panel(&mut self, p: LeftPanel) {','        self.left_panel = p;'],'editor.rs':['    fn sync_from_left_panel(&mut self, panel: LeftPanel) {','        // TODO: 多光标支持'],'agent_panel.rs':['impl LeftPanel { /* dock 化改造 */ }']};
+function doSearch(){
+  const q=$('#searchq').value;if(!q){$('#searchres').innerHTML='';return}
+  let total=0,h='';
+  for(const[f,lines]of Object.entries(FILES)){
+    const hits=lines.filter(l=>l.includes(q));
+    if(!hits.length)continue;total+=hits.length;
+    h+=`<div class="sfile">📄 ${f} <span style="color:var(--accent)">${hits.length}</span></div>`;
+    hits.forEach(l=>{const i=l.indexOf(q);h+=`<div class="sline">${esc(l.slice(0,i))}<mark>${esc(q)}</mark>${esc(l.slice(i+q.length))}</div>`});
+  }
+  $('#searchres').innerHTML=h+`<div style="color:var(--fg-dim);font-size:11px;margin-top:6px">${total} 处匹配 · 按文件分组(Zed 式)</div>`;
+}
+$('#searchq').addEventListener('input',doSearch);
+['tg-case','tg-word','tg-rex'].forEach(id=>$('#'+id).onclick=e=>e.target.classList.toggle('on'));
+doSearch();
+$('#searchres').addEventListener('click',e=>{if(e.target.classList.contains('sline'))toast('点击结果 → 打开文件并跳转高亮行(演示)')});
+
+/* ---------- 卡片交互 ---------- */
+$('#board-list').addEventListener('click',e=>{
+  const st=e.target.closest('[data-st]');
+  if(st){e.stopPropagation();openStatMenu(+st.dataset.st,st.getBoundingClientRect());return}
+  const c=e.target.closest('[data-wt]');
+  if(c){state.curWT=+c.dataset.wt;const w=state.worktrees[state.curWT];
+    if(w.unread){w.unread=false;toast('已读:unread 圆点清除')}
+    renderBoard();switchBPane('terminal');
+    $('#termowner').textContent=w.name+' · tab[codex]';
+    term.innerHTML='';banner();setSniff('idle');}
+});
+$('#btn-cmt').onclick=()=>{
+  const w=state.worktrees[state.curWT];
+  const v=prompt('写检查点 comment(Orca: worktree set --comment):',w.comment);
+  if(v!==null){w.comment=v;renderBoard();toast('检查点已写入卡片',true)}
+};
+function openStatMenu(i,r){
+  const old=$('.statmenu');if(old)old.remove();
+  const m=document.createElement('div');m.className='statmenu';
+  m.innerHTML=Object.entries(STATUS).map(([k,v])=>`<button data-s="${v}"><span class="sdot" style="background:${SCOLOR[v]}"></span>${SNAME[v]}</button>`).join('');
+  m.style.left=r.left+'px';m.style.top=r.bottom+6+'px';document.body.appendChild(m);
+  m.onclick=e=>{const s=e.target.closest('[data-s]');if(!s)return;
+    state.worktrees[i].status=s.dataset.s;renderBoard();m.remove();
+    toast(`状态流转 → ${SNAME[s.dataset.s]}${s.dataset.s==='in-review'?' · (P2:可自动触发 reviewer)':''}`,true);
+    if(s.dataset.s==='in-review')setTimeout(()=>toast('提示:切泳道视图可直接拖拽改状态'),900)};
+  setTimeout(()=>document.addEventListener('click',function h(ev){if(!m.contains(ev.target)){m.remove();document.removeEventListener('click',h)}}),0);
+}
+
+/* 泳道拖拽 */
+$('#swim').addEventListener('dragstart',e=>{const c=e.target.closest('[data-wt]');if(c){c.classList.add('drag');e.dataTransfer.setData('text',c.dataset.wt)}});
+$('#swim').addEventListener('dragend',e=>$$('.scard').forEach(c=>c.classList.remove('drag')));
+$$('.swimcol').length; // bind on render via delegation:
+$('#board-swim').addEventListener('dragover',e=>{const col=e.target.closest('[data-col]');if(col){e.preventDefault();col.classList.add('over')}});
+$('#board-swim').addEventListener('dragleave',e=>{const col=e.target.closest('[data-col]');if(col)col.classList.remove('over')});
+$('#board-swim').addEventListener('drop',e=>{const col=e.target.closest('[data-col]');if(!col)return;e.preventDefault();col.classList.remove('over');
+  const i=+e.dataTransfer.getData('text');state.worktrees[i].status=col.dataset.col;renderBoard();
+  toast(`拖拽流转 → ${SNAME[col.dataset.col]}`,true)});
+
+/* ---------- 任务交互 ---------- */
+$('#taskgrid').addEventListener('click',e=>{
+  const b=e.target.closest('[data-op]');if(!b)return;
+  const t=state.tasks.find(x=>x.id===b.dataset.id);
+  if(b.dataset.op==='disp'){t.status='dispatched';t.to='codex@'+state.worktrees[state.curWT].name;renderTasks();
+    toast(`任务 #${t.id} 已派发(dispatch --inject 语义:spec+生命周期前导注入)`);
+    setTimeout(()=>{if(t.status==='dispatched'){t.status='completed';renderTasks();settleDeps();toast(`worker_done → #${t.id} completed(自动)`,true)}},2600)}
+  if(b.dataset.op==='done'){t.status='completed';renderTasks();settleDeps();toast('worker_done:任务与派发一并收敛',true)}
+  if(b.dataset.op==='fail'){t.fails=(t.fails||0)+1;t.status='pending';renderTasks();toast(`失败 ${t.fails}/3 …`)}
+  if(b.dataset.op==='retry'){t.fails=0;t.fuse=false;t.status='ready';renderTasks();toast('重试:熔断解除,任务回到 ready')}
+  if(b.dataset.op==='manual'){t.fuse=false;t.status='completed';t.to='人工';renderTasks();settleDeps();toast('人工接管:任务关闭',true)}
+});
+$('#btn-fuse').onclick=()=>{
+  const t=state.tasks.find(x=>x.status!=='completed')||state.tasks[2];
+  t.fails=3;t.fuse=true;t.status='failed';renderTasks();
+  toast('⚠ 连续 3 次失败 → 派发上下文熔断,任务标记 failed',true);
+};
+$('#btn-newtask').onclick=async()=>{
+  const title=prompt('任务标题:');if(!title)return;
+  const deps=prompt('依赖(逗号分隔任务号,可空):','');
+  const id=String.fromCharCode(65+state.tasks.length);
+  state.tasks.push({id,title:'#'+id+' '+title,status:'pending',deps:deps?deps.split(',').map(s=>s.trim().replace('#','')):[],to:''});
+  renderTasks();settleDeps();toast('任务已创建(pending)',true);
+};
+
+/* ---------- 三模式切换(?variant=A|B|C,共享同一实时状态) ---------- */
+const MODES=[
+  {k:'A',cls:'mode-zed',n:'Zed · 专注手写(我写代码)'},
+  {k:'B',cls:'mode-orca',n:'Orca · AI 驱动(agent 干活)'},
+  {k:'C',cls:'mode-fusion',n:'双轨 · 人机协同'},
+];
+let selRun=0;
+function curMode(){return MODES.find(m=>document.body.classList.contains(m.cls))||MODES[2]}
+function applyMode(k,updUrl){
+  const m=MODES.find(x=>x.k===k)||MODES[2];
+  document.body.className=m.cls;
+  if(updUrl){const u=new URL(location.href);u.searchParams.set('variant',k);history.replaceState({},'',u)}
+  $('#sw-label').textContent=m.k+' — '+m.n;
+  $$('#modeseg button').forEach(b=>b.classList.toggle('on',b.dataset.m===m.k));
+  if(m.cls==='mode-zed'){$('#bottomdock').classList.add('hidden');$('#rightdock').classList.add('hidden');setLeftTab('project');
+    toast('Zed 模式 · 专注手写:编辑器最大化,Agent 已收起(Ctrl+Shift+/ 呼出,Ctrl+` 终端)')}
+  if(m.cls==='mode-orca'){$('#rightdock').classList.add('hidden');setLeftTab('board');renderBoard();renderOrca();
+    toast('Orca 模式 · AI 驱动:交给 agent 干活,驾驶舱监控 Run 队列与终端矩阵')}
+  if(m.cls==='mode-fusion'){$('#bottomdock').classList.remove('hidden');$('#rightdock').classList.remove('hidden');setLeftTab('board');renderBoard();
+    toast('双轨模式 · 人机协同:卡片墙 + 编辑器 + Agent 会话三面板全开')}
+}
+$$('#modeseg button').forEach(b=>b.onclick=()=>applyMode(b.dataset.m,true));
+function cycleMode(d){const i=MODES.indexOf(curMode());applyMode(MODES[(i+d+MODES.length)%MODES.length].k,true)}
+$('#sw-prev').onclick=()=>cycleMode(-1);
+$('#sw-next').onclick=()=>cycleMode(1);
+window.addEventListener('popstate',()=>applyMode(new URLSearchParams(location.search).get('variant')||'C'));
+$('#btn-boardview').onclick=()=>{state.view=state.view==='list'?'swim':'list';renderBoard();toast('卡片墙 → '+(state.view==='swim'?'泳道(可拖拽流转)':'列表'))};
+
+/* ---------- Orca 驾驶舱渲染(吸收 Mission Control 变体) ---------- */
+function runGroups(){
+  const w=state.worktrees;
+  return [
+    ['需要关注','danger',w.filter(x=>x.status==='failed'||x.agents.some(a=>a.s==='ask'))],
+    ['进行中','run',w.filter(x=>x.status==='in-progress'&&!x.agents.some(a=>a.s==='ask'))],
+    ['待审阅','rev',w.filter(x=>x.status==='in-review')],
+    ['排队 / 最近','rec',w.filter(x=>x.status==='todo'||x.status==='completed')],
+  ];
+}
+function renderRunQueue(){
+  $('#board-list').style.display='';$('#board-swim').style.display='none';
+  $('#board-list').innerHTML=runGroups().map(([g,c,ws])=>ws.length?`
+    <div class="qgrp ${c}">${g} <span style="font-family:var(--mono)">${ws.length}</span></div>`+
+    ws.map(w=>{const i=state.worktrees.indexOf(w);
+      const st=w.status==='failed'||w.agents.some(a=>a.s==='ask')?'danger':w.status==='in-progress'?'run':w.status==='in-review'?'rev':'';
+      const dotc={danger:'var(--fail)',run:'var(--prog)',rev:'var(--review)'}[st]||'var(--todo)';
+      return `<div class="qrow ${i===selRun?'sel':''}" data-wt="${i}">
+        <div class="t"><span class="dot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${dotc};${st==='run'?'animation:br 1.6s infinite':''}"></span>${w.name}</div>
+        <div class="m"><span>⎇ ${w.branch}</span><span>·</span><span>${w.agents.length} agents</span><span>·</span><span>${w.terms} terms</span></div></div>`}).join('')
+    :'').join('');
+  $$('#board-list .qrow').forEach(r=>r.onclick=()=>{selRun=+r.dataset.wt;state.curWT=selRun;orchZoom=null;orchLines={};renderRunQueue();renderOrca()});
+}
+const CONS_TEMPLATES=[
+  (n,w)=>`<div class="cmd">› ${w.comment||'执行任务中'}</div><span class="tool">read</span> crates/mf-agent/src/db.rs<br><span class="tool">patch</span> + DispatchView { retry_of }<br><span class="warn">waiting for cargo test permission…</span>`,
+  (n,w)=>`<div class="cmd">› Add Engine::cancel_task</div><span class="tool">search</span> active dispatch ownership<br><span class="tool">read</span> crates/mf-agent/src/engine.rs<br>planning cancellation boundary…`,
+  ()=>`<span class="ok">PLAN ACCEPTED</span><br>5 tasks · critical path: #17 → #18 → #20<br>file overlap risk: types.rs`,
+  ()=>`Waiting for tasks #18, #19 and #20.<br>Policy: tests + diff review<br>+ no unresolved gates.`,
+];
+/* 终端放大(F6:矩阵缩略 → 完整终端,Esc/按钮返回) */
+let orchZoom=null; /* null=矩阵视图,数字=放大的 agent 索引 */
+let orchLines={};
+function zoomCons(i){orchZoom=i;renderOrca();toast('终端放大 · Esc 或 ←返回矩阵')}
+function selCons(i,el){
+  $$('#orchmatrix .ocons').forEach(c=>c.classList.toggle('sel',c===el));
+  toast('已选中终端(单击选中 · 双击进入完整终端)');
+}
+function zoomBack(){orchZoom=null;renderOrca()}
+function ozlines(i,w){
+  if(!orchLines[i])orchLines[i]=CONS_TEMPLATES[i%4](i,w).split(/<br>/);
+  return orchLines[i];
+}
+function renderZoomTerm(){
+  const t=$('#ozterm');if(!t)return;
+  t.innerHTML=orchLines[orchZoom].map(l=>`<div class="tl">${l}</div>`).join('');
+  t.scrollTop=t.scrollHeight;
+}
+function renderZoom(a,w){
+  const st=a.s==='run'?'● 运行中':a.s==='done'?'✓ 完成':a.s==='ask'?'? 等待问句':'○ 空闲';
+  ozlines(orchZoom,w);
+  $('#orchmatrix').innerHTML=`<div id="orchzoom">
+    <div class="ozhead">
+      <button class="mini" onclick="zoomBack()">← 返回矩阵</button>
+      <b>✦ ${a.t}</b><span class="ozst">${st} · #${18+orchZoom}</span>
+      <span style="margin-left:auto;color:var(--fg-dim);font-size:11px">${w.name} · ⎇ ${w.branch}</span>
+    </div>
+    <div class="ozterm" id="ozterm"></div>
+    <div class="ozin"><span class="pr">›</span><input id="ozinput" placeholder="Ask ${a.t} to do anything… (Enter 发送 · Esc 返回矩阵)" autocomplete="off"></div>
+  </div>`;
+  renderZoomTerm();
+  const inp=$('#ozinput');
+  inp.addEventListener('keydown',e=>{
+    if(e.key==='Escape'){e.stopPropagation();zoomBack();return}
+    if(e.key==='Enter'&&inp.value.trim()){
+      const v=inp.value.trim();inp.value='';
+      const ls=orchLines[orchZoom];
+      ls.push(`<span style="color:var(--fg)">› ${esc(v)}</span>`);
+      ls.push(`<span class="acc">Working…</span>`);
+      renderZoomTerm();
+      setTimeout(()=>{
+        ls.pop();
+        ls.push(`<span style="color:var(--done)">✔ ${fakeAnswer(v)}</span>`);
+        ls.push(`<span>─ Worked for 12s ─</span>`);
+        renderZoomTerm();
+        setSniff('done','Worked for 12s');
+        toast('终端嗅探:agent 完成 → 联动卡片状态(F7)',true);
+      },1500);
+    }
+  });
+  inp.focus();
+}
+
+function renderOrca(){
+  const w=state.worktrees[selRun]||state.worktrees[0];
+  const done=state.tasks.filter(t=>t.status==='completed').length;
+  $('#orchsum').innerHTML=`<div><div class="t">${w.name}</div>
+    <div class="m">⎇ ${w.branch} · ${w.agents.length} agents · ${w.comment||'—'}</div></div>
+    <div class="ometrics">
+      <div class="ometric"><b>${done}/${state.tasks.length}</b><span>TASKS</span></div>
+      <div class="ometric"><b>04:18</b><span>ELAPSED</span></div>
+      <div class="ometric"><b>${w.agents.filter(a=>a.s==='run').length}</b><span>RUNNING</span></div>
+      <div class="ometric"><b style="color:var(--review)">1</b><span>PENDING</span></div>
+    </div>`;
+  const agents=w.agents.length?w.agents:[{t:'codex',s:'run',d:''},{t:'claude',s:'idle',d:''},{t:'planner',s:'done',d:''},{t:'reviewer',s:'idle',d:''}];
+  if(orchZoom!==null&&agents[orchZoom]){
+    $('#orchmatrix').classList.add('zoomed');
+    renderZoom(agents[orchZoom],w);
+  }else{
+    orchZoom=null;
+    $('#orchmatrix').classList.remove('zoomed');
+    $('#orchmatrix').innerHTML=agents.slice(0,4).map((a,i)=>{
+      const st=a.s==='run'?'<span class="breath st-run"></span> 运行中':a.s==='done'?'<span class="st-done">✓ 完成</span>':a.s==='ask'?'<span class="st-ask">? 等待问句</span>':'空闲';
+      return `<div class="ocons" data-cons="${i}" onclick="selCons(${i},this)" ondblclick="zoomCons(${i})" title="单击选中 · 双击进入完整终端">
+        <div class="h"><span class="dot" style="width:8px;height:8px;border-radius:50%;display:inline-block;background:${a.s==='run'?'var(--prog)':a.s==='done'?'var(--done)':'var(--todo)'}"></span>
+        <b>${a.t}</b><span style="margin-left:auto;color:var(--fg-dim);font-size:10px">#${18+i} · ${st}</span></div>
+        <div class="b">${CONS_TEMPLATES[i%4](i,w)}</div></div>`}).join('');
+  }
+  const nodes=[
+    state.tasks.find(t=>t.status==='completed')||state.tasks[0],
+    state.tasks.find(t=>t.status==='ready'||t.status==='dispatched')||state.tasks[1],
+    state.tasks.find(t=>t.status==='pending')||state.tasks[2],
+  ].filter(Boolean);
+  $('#odag').innerHTML=nodes.map(t=>{
+    const c=t.status==='completed'?'var(--done)':t.status==='dispatched'?'var(--review)':t.status==='ready'?'var(--prog)':'var(--todo)';
+    const label=t.status==='completed'?'✓ COMPLETED':t.status==='dispatched'?'● DISPATCHED':t.status==='ready'?'● READY':'○ WAITING';
+    return `<div class="onode"><span class="id">#${t.id}</span><div class="nm">${t.title.replace(/^#\w+\s/,'')}</div>
+      <div class="stt" style="color:${c}">${label}</div></div>`}).join('');
+}
+/* Orca 模式下卡片墙渲染路由 */
+const _renderBoard=renderBoard;
+renderBoard=function(){if(document.body.classList.contains('mode-orca'))return renderRunQueue();_renderBoard()};
+
+/* ---------- 快速打开 / 命令面板(双模式) ---------- */
+const QFILES=['workspace.rs','editor.rs','term.rs','agent_panel.rs','settings.rs','diff_view.rs','vcs_panel.rs'];
+let qi=0,qmode='file',qitems=[];
+function cmdItems(){return [
+  {n:'设置: 打开设置',k:SETTINGS.keys.settings,run:openSettings},
+  {n:'车间: 卡片墙面板',k:SETTINGS.keys.board,run:()=>setLeftTab('board')},
+  {n:'搜索: 项目搜索',k:SETTINGS.keys.search,run:()=>{$('#bottomdock').classList.remove('hidden');switchBPane('search')}},
+  {n:'Agent: 会话面板 开合',k:SETTINGS.keys.agent,run:()=>$('#rightdock').classList.toggle('hidden')},
+  {n:'终端: 面板开合',k:SETTINGS.keys.terminal,run:toggleBottom},
+  {n:'车间: 新建工作树…',k:'',run:()=>$('#btn-newwt').click()},
+  {n:'任务: 新建任务…',k:'',run:()=>$('#btn-newtask').click()},
+  {n:'车间: 切换列表/泳道',k:'',run:()=>$('#btn-boardview').click()},
+  {n:'模式: Zed · 我写代码(编辑器优先)',k:'Alt+1',run:()=>applyMode('A',true)},
+  {n:'模式: Orca · AI 驱动(驾驶舱)',k:'Alt+2',run:()=>applyMode('B',true)},
+  {n:'模式: 双轨 · 人机协同',k:'Alt+3',run:()=>applyMode('C',true)},
+]}
+function renderQuick(f=''){
+  qitems=qmode==='cmd'?cmdItems():QFILES.filter(x=>x.toLowerCase().includes(f.toLowerCase())).map(x=>({n:x,k:'文件',file:true}));
+  if(qmode==='cmd'&&f)qitems=qitems.filter(c=>c.n.toLowerCase().includes(f.toLowerCase()));
+  $('#quicklist').innerHTML=qitems.map((x,i)=>`<div class="qi ${i===0?'on':''}" data-i="${i}">${x.n}<span class="kb">${x.k?keyLabel(x.k):''}</span></div>`).join('')||'<div class="qi">无匹配</div>';
+  qi=0;
+}
+function openQuick(mode='file'){qmode=mode;$('#quick').style.display='block';
+  $('#quickin').value='';$('#quickin').placeholder=mode==='cmd'?'输入命令名…(键位随设置实时同步)':'输入文件名…';
+  renderQuick();$('#quickin').focus()}
+function closeQuick(){$('#quick').style.display='none'}
+function execQuick(i){const it=qitems[i];if(!it)return;closeQuick();
+  if(it.file)toast('打开 '+it.n+'(演示:实际切换编辑器 tab)');
+  else{it.run();toast('已执行: '+it.n+(it.k?' · '+keyLabel(it.k):''))}}
+$('#quickin').addEventListener('input',e=>renderQuick(e.target.value));
+$('#quickin').addEventListener('keydown',e=>{
+  const items=[...$$('.qi')];
+  if(e.key==='ArrowDown'){qi=Math.min(qi+1,items.length-1)}
+  if(e.key==='ArrowUp'){qi=Math.max(qi-1,0)}
+  if(e.key==='Enter')execQuick(qi);
+  if(e.key==='Escape')closeQuick();
+  items.forEach((x,i)=>x.classList.toggle('on',i===qi));
+});
+$('#quicklist').addEventListener('click',e=>{const q=e.target.closest('[data-i]');if(q)execQuick(+q.dataset.i)});
+
+/* ---------- 编辑器选区 → agent 上下文 chip ---------- */
+let selCount=0;
+$('#editor').addEventListener('mouseup',()=>{
+  const s=window.getSelection().toString();
+  const chip=$('#selchip');
+  if(s.length>2){chip.style.display='';$('#st-sel').textContent=`选区 ${s.split(/\s+/).length} 词`;toast('Ctrl+Shift+. 可把选区附加为 agent 上下文(F1)')}
+  else{$('#st-sel').textContent=''}
+});
+
+/* ---------- 全局键位(P0-E2 体系,面板键位读 SETTINGS 可自定义) ---------- */
+window.keyCapture=null; // 正在录制新键位
+document.addEventListener('keydown',e=>{
+  /* 键位录制模式:优先接管一切 */
+  if(window.keyCapture){
+    e.preventDefault();e.stopPropagation();
+    if(normKey(e)==='escape'){window.keyCapture=null;renderSettings();toast('已取消键位修改');return}
+    const nk=normKey(e);
+    if(!['control','shift','alt'].includes(nk.split('+').pop())&&nk.includes('+')){
+      const act=window.keyCapture;window.keyCapture=null;
+      const old=SETTINGS.keys[act];SETTINGS.keys[act]=nk;renderSettings();
+      toast(`键位已更新:${KEYLABEL[act]} = ${keyLabel(nk)}(命令面板提示已同步)`,true);
+    }
+    return;
+  }
+  const inField=/INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName);
+  /* 快速打开 / 命令面板(固定键) */
+  if((e.ctrlKey||e.metaKey)&&!e.shiftKey&&e.key.toLowerCase()==='p'){e.preventDefault();openQuick('file');return}
+  if((e.ctrlKey||e.metaKey)&&e.shiftKey&&e.key.toLowerCase()==='p'){e.preventDefault();openQuick('cmd');return}
+  if(e.key==='Escape'){closeQuick();$$('.statmenu').forEach(m=>m.remove());if(document.body.classList.contains('mode-orca')&&orchZoom!==null)zoomBack();return}
+  /* 固定面板键位 */
+  if(e.ctrlKey&&e.shiftKey&&!e.altKey){
+    const k=e.key.toLowerCase();
+    if(k==='e'){e.preventDefault();setLeftTab('project');toast('Ctrl+Shift+E → 项目面板')}
+    if(k==='g'){e.preventDefault();setLeftTab('vcs');toast('Ctrl+Shift+G → 版控面板')}
+  }
+  /* 工作方式切换:Alt+1 手写 / Alt+2 AI驱动 / Alt+3 双轨 */
+  if(e.altKey&&!e.ctrlKey&&!e.shiftKey){
+    const mk={digit1:'A',digit2:'B',digit3:'C'}[normKey(e).split('+').pop()];
+    if(mk){e.preventDefault();applyMode(mk,true)}
+  }
+  /* 可自定义键位(设置里改,此处同步生效) */
+  const K=normKey(e);
+  const panelActs={
+    [SETTINGS.keys.board]:()=>{setLeftTab('board');toast(keyLabel(SETTINGS.keys.board)+' → 车间(卡片墙)')},
+    [SETTINGS.keys.search]:()=>{$('#bottomdock').classList.remove('hidden');switchBPane('search');toast(keyLabel(SETTINGS.keys.search)+' → 项目搜索')},
+    [SETTINGS.keys.agent]:()=>{$('#rightdock').classList.remove('hidden');toast(keyLabel(SETTINGS.keys.agent)+' → Agent 会话(右 dock)')},
+    [SETTINGS.keys.terminal]:()=>{toggleBottom();toast(keyLabel(SETTINGS.keys.terminal)+' → 终端面板开合')},
+    [SETTINGS.keys.settings]:()=>{openSettings();toast(keyLabel(SETTINGS.keys.settings)+' → 设置')},
+  };
+  if(panelActs[K]&&K.includes('+')){e.preventDefault();panelActs[K]();return}
+  /* diff 审阅键位 */
+  if(reviewing&&e.altKey){
+    const k=e.key.toLowerCase();
+    const hks=HUNKS.filter(h=>h.kept===null);
+    if(k==='y'){e.preventDefault();
+      if(e.shiftKey){HUNKS.forEach(h=>h.kept=true);finishReview()}
+      else if(hks[0]!==undefined){hunkVerdict(hks[0].id,true);toast('Alt+Y → 保留当前 hunk ✓',true)}}
+    if(k==='z'){e.preventDefault();
+      if(e.shiftKey){HUNKS.forEach(h=>h.kept=false);finishReview()}
+      else if(hks[0]!==undefined){hunkVerdict(hks[0].id,false);toast('Alt+Z → 拒绝当前 hunk ✕')}}
+  }
+  /* 选区附加上下文 */
+  if(e.ctrlKey&&e.shiftKey&&e.key==='.'&&window.getSelection().toString().length>2){
+    e.preventDefault();$('#selchip').style.display='';toast('选区已附加为 agent 上下文 chip(F1)',true);
+  }
+  /* 原型切换 */
+  if(!inField&&e.key==='ArrowLeft')cycleMode(-1);
+  if(!inField&&e.key==='ArrowRight')cycleMode(1);
+});
+
+/* ---------- tab 切换 ---------- */
+$$('#tabbar .tab').forEach(t=>t.addEventListener('click',e=>{
+  if(e.target.classList.contains('x')){t.style.display='none';$('[data-tab="ws"]').style.display='';$('[data-tab="ws"]').classList.add('on');return}
+  if(t.dataset.tab==='diff'){renderEditor(true);reviewing=true}else{renderEditor(false);reviewing=false}
+  $$('.tab').forEach(x=>x.classList.remove('on'));t.classList.add('on');
+}));
+
+/* (旧变体切换器已由三模式系统取代) */
+
+/* ---------- 新建工作树弹窗 ---------- */
+$('#btn-newwt').onclick=()=>{
+  const bg=document.createElement('div');bg.className='modal-bg';
+  bg.innerHTML=`<div class="modal"><h3>新建工作树</h3>
+    <label>名称</label><input type="text" id="nwt-name" value="task-${Math.random().toString(36).slice(2,6)}">
+    <label>基于</label><select id="nwt-base"><option>main</option><option>当前分支</option></select>
+    <label>启动 agent(第一个终端)</label><select id="nwt-agent">${SETTINGS.providers.map(p=>`<option value="${p.id}" ${p.id===SETTINGS.agent.provider?'selected':''}>${esc(p.name)}${p.type==='local'?' (CLI)':''}</option>`).join('')}</select>
+    <div class="row"><button class="mini" id="nwt-cancel">取消</button><button class="mini ok" id="nwt-ok">创建</button></div></div>`;
+  document.body.appendChild(bg);
+  bg.querySelector('#nwt-cancel').onclick=()=>bg.remove();
+  bg.querySelector('#nwt-ok').onclick=()=>{
+    const name=bg.querySelector('#nwt-name').value||'task-x';
+    const prov=provById(bg.querySelector('#nwt-agent').value);
+    const w={name,branch:name,status:'todo',comment:'',agents:[],terms:prov?1:0,unread:false};
+    state.worktrees.unshift(w);state.curWT=0;renderBoard();bg.remove();
+    toast(`工作树已创建:独立 checkout + 分支 ${name}(状态 todo)`,true);
+    if(prov){
+      setTimeout(()=>{w.agents.push({t:prov.name,s:'run',d:'0m'});w.status='in-progress';w.unread=true;renderBoard();
+        toast(`spawn ${prov.name}(${prov.type==='local'?'本地 CLI · PTY 嗅探':'API · '+prov.base}):卡片自动 in-progress + unread`,true);
+        setTimeout(()=>{w.agents[0].s='done';w.agents[0].d='18s';renderBoard();toast('agent 完成 → 卡片状态/耗时更新',true)},3200);
+      },1200);
+    }
+  };
+};
+
+/* ---------- 设置弹窗:分级菜单(Orca 式两级树) + Provider 管理(ZCode 式) ---------- */
+let setBg=null,setCur='appearance',editPid=null,setFold={};
+const SETTREE=[
+ {grp:'通用',pages:[['appearance','外观'],['editor','编辑器'],['keys','快捷键']]},
+ {grp:'Agent 与模型',pages:[['providers','Provider 管理'],['agent','默认行为']]},
+ {grp:'版控',pages:[['p4','Perforce'],['git','Git']]},
+];
+function openSettings(){
+  if(setBg)return;
+  setBg=document.createElement('div');setBg.className='modal-bg';
+  setBg.innerHTML=`<div class="modal" style="width:730px">
+    <h3 style="display:flex;justify-content:space-between;align-items:center">设置 <span style="font-size:11px;color:var(--fg-dim);font-weight:400">改动即时生效 · 键位改动同步命令面板(E9)</span></h3>
+    <div class="setwrap"><nav class="setnav" id="setnav"></nav><div class="setbody" id="setbody"></div></div></div>`;
+  document.body.appendChild(setBg);
+  setBg.addEventListener('click',e=>{if(e.target===setBg)closeSettings()});
+  renderSettings();
+}
+function closeSettings(){if(setBg){setBg.remove();setBg=null}}
+function seg(opts,cur,cb){return `<div class="seg">${opts.map(o=>`<button class="${o===cur?'on':''}" onclick="${cb}('${o}')">${o}</button>`).join('')}</div>`}
+function sw(on,cb){return `<div class="sw ${on?'on':''}" onclick="${cb}(this)"></div>`}
+function capKey(act){window.keyCapture=act;renderSettings();toast('请按下新键位…(Esc 取消)')}
+/* Provider 工具 */
+function provById(id){return SETTINGS.providers.find(p=>p.id===id)}
+function agentLabel(){const p=provById(SETTINGS.agent.provider);return (p?p.name:'—')+' · '+SETTINGS.agent.model}
+function pmOptions(){return SETTINGS.providers.flatMap(p=>(p.type==='api'?p.models:[p.name+' (CLI)']).map(m=>({v:p.id+'|'+m,t:p.name+' / '+m})))}
+function renderProvSel(){const s=$('#provsel');if(!s)return;
+  const cur=SETTINGS.agent.provider+'|'+SETTINGS.agent.model;
+  s.innerHTML=pmOptions().map(o=>`<option value="${esc(o.v)}" ${o.v===cur?'selected':''}>${esc(o.t)}</option>`).join('')}
+function syncAgentFoot(){$('#agentsess').textContent=agentLabel()+' · '+(state.mode==='write'?'Write 模式':'Ask 只读')}
+function setAgentPM(v){const[i,m]=v.split('|');SETTINGS.agent.provider=i;SETTINGS.agent.model=m;syncAgentFoot();renderProvSel()}
+$('#provsel').addEventListener('change',e=>{setAgentPM(e.target.value);toast('会话 Provider → '+agentLabel(),true)});
+
+function renderSettings(){
+  if(!setBg)return;
+  $('#setnav').innerHTML=SETTREE.map(g=>{
+    const folded=setFold[g.grp];
+    return `<div class="setgrp ${folded?'fold':''}" onclick="foldGrp('${g.grp}')">${g.grp}</div>`+
+      (folded?'':g.pages.map(([k,n])=>`<button class="setsub ${k===setCur?'on':''}" data-p="${k}">${n}</button>`).join(''));
+  }).join('');
+  $$('#setnav .setsub').forEach(b=>b.onclick=()=>{setCur=b.dataset.p;editPid=null;renderSettings()});
+  const b=$('#setbody');
+  if(setCur==='appearance')b.innerHTML=`
+    <div class="setrow"><div><div class="lbl">主题</div><div class="sub">深色 One Dark / 浅色(即时切换整页)</div></div>
+      ${seg(['深色','浅色'],SETTINGS.theme==='dark'?'深色':'浅色','setTheme')}</div>
+    <div class="setrow"><div><div class="lbl">编辑器字号 <b id="szlbl">${SETTINGS.codeSize}</b>px</div><div class="sub">拖动即时生效</div></div>
+      <input type="range" min="10" max="18" step="0.5" value="${SETTINGS.codeSize}" oninput="setCodeSize(this.value)"></div>`;
+  if(setCur==='editor')b.innerHTML=`
+    <div class="setrow"><div><div class="lbl">Tab 大小</div></div>${seg([2,4,8],SETTINGS.tabSize,'setTab')}</div>
+    <div class="setrow"><div><div class="lbl">自动保存</div><div class="sub">失焦后 500ms 落盘</div></div>${sw(SETTINGS.autosave,'setAutosave')}</div>
+    <div class="setrow"><div><div class="lbl">缩进参考线</div></div>${sw(SETTINGS.wrapGuide,'setGuide')}</div>`;
+  if(setCur==='keys'){
+    const fixed=[['快速打开文件','Ctrl+P'],['命令面板','Ctrl+Shift+P'],['项目 / 版控面板','Ctrl+Shift+E / G'],['diff 审阅 保留/拒绝','Alt+Y / Alt+Z'],['全部保留 / 拒绝','Shift+Alt+Y / Z']];
+    b.innerHTML=`<h4>可自定义(改后命令面板提示同步)</h4>`+
+      Object.entries(SETTINGS.keys).map(([k,v])=>`
+      <div class="krow"><div class="lbl">${KEYLABEL[k]}<div class="sub">${window.keyCapture===k?'正在录制…':''}</div></div>
+        <span class="kb">${keyLabel(v)}</span>
+        <button class="kbtn ${window.keyCapture===k?'cap':''}" onclick="capKey('${k}')">${window.keyCapture===k?'按新键… (Esc 取消)':'修改'}</button></div>`).join('')+
+      `<h4>固定键位(只读)</h4>`+fixed.map(([n,k])=>`<div class="krow"><div class="lbl">${n}</div><span class="kb fixed">${k}</span></div>`).join('');
+  }
+  if(setCur==='providers')b.innerHTML=`
+    <h4>Agent Provider</h4>
+    <div class="pnote">两类接入:<b>本地 CLI</b> — 直接调用你机器上已装的 TUI agent(codex/claude/…),经 PTY 嗅探感知状态,无需 API Key;<b>API 端点</b> — 自定义 Base URL + API Key + 模型列表,走 mf-agent HTTP 通道(OpenAI 兼容格式)。</div>
+    <div style="padding:10px 0 4px"><button class="mini" onclick="provAdd()">＋ 添加 Provider</button></div>`+
+    SETTINGS.providers.map(p=>{
+      const head=`<div class="prow" onclick="provEdit('${p.id}')">
+        <span class="pstat ${p.ok?'ok':''}" title="${p.ok?'已连接':'未配置'}"></span><b>${esc(p.name)}</b>
+        <span class="pbadge ${p.type}">${p.type==='local'?'本地 CLI':'API'}</span>
+        <span class="psub">${p.type==='local'?esc(p.cmd):p.models.length+' 模型 · '+esc(p.base)}</span>
+        <span class="pdef ${SETTINGS.agent.provider===p.id?'on':''}" title="设为默认" onclick="event.stopPropagation();provDefault('${p.id}')">${SETTINGS.agent.provider===p.id?'◉ 默认':'○'}</span>
+        <button class="kbtn" onclick="event.stopPropagation();provDel('${p.id}')">删除</button></div>`;
+      if(editPid!==p.id)return head;
+      const form=(p.type==='local'
+        ?`<div class="setrow"><div class="lbl">名称</div><input type="text" id="pf-name" value="${esc(p.name)}"></div>
+          <div class="setrow"><div class="lbl">启动命令<div class="sub">在工作树终端 tab 内运行</div></div><input type="text" id="pf-cmd" value="${esc(p.cmd)}" style="width:250px;font-family:var(--mono)"></div>`
+        :`<div class="setrow"><div class="lbl">名称</div><input type="text" id="pf-name" value="${esc(p.name)}"></div>
+          <div class="setrow"><div class="lbl">Base URL</div><input type="text" id="pf-base" value="${esc(p.base)}" style="width:280px;font-family:var(--mono)"></div>
+          <div class="setrow"><div class="lbl">API Key<div class="sub">存本机凭据库,不入库</div></div><input type="password" id="pf-key" value="${esc(p.key)}" style="width:210px"></div>
+          <div class="setrow"><div class="lbl">模型列表<div class="sub">逗号或换行分隔</div></div><input type="text" id="pf-models" value="${esc(p.models.join(', '))}" style="width:250px"></div>
+          <div class="setrow"><div class="lbl">连接测试</div><button class="mini" onclick="provTest('${p.id}')">测试连接</button></div>`)
+        +`<div class="setrow"><div class="lbl">类型</div>${seg(['本地 CLI','API 端点'],p.type==='local'?'本地 CLI':'API 端点','provType')}</div>`;
+      return head+`<div class="pform">${form}
+        <div style="display:flex;gap:8px;justify-content:flex-end;padding-top:10px">
+        <button class="mini" onclick="provCancel()">取消</button>
+        <button class="mini ok2" onclick="provSave('${p.id}')">保存</button></div></div>`;
+    }).join('');
+  if(setCur==='agent')b.innerHTML=`
+    <div class="setrow"><div><div class="lbl">默认 Provider / 模型</div><div class="sub">新会话与工作树 spawn 的预选值</div></div>
+      <select onchange="setAgentPM(this.value)">${pmOptions().map(o=>`<option value="${esc(o.v)}" ${o.v===SETTINGS.agent.provider+'|'+SETTINGS.agent.model?'selected':''}>${esc(o.t)}</option>`).join('')}</select></div>
+    <div class="setrow"><div><div class="lbl">新会话默认模式</div></div>${seg(['Write','Ask'],state.mode==='write'?'Write':'Ask','setDefMode')}</div>
+    <div class="setrow"><div><div class="lbl">进入审阅时自动触发 reviewer</div><div class="sub">P2-F4:只读 reviewer agent 预设</div></div>${sw(SETTINGS.agent.autoReview,'setAutoReview')}</div>`;
+  if(setCur==='p4')b.innerHTML=`
+    <div class="setrow"><div><div class="lbl">默认版控</div><div class="sub">决定 VCS 面板与卡片提交动作</div></div>${seg(['P4','Git'],SETTINGS.vcs.p4Default?'P4':'Git','setVcsDefault')}</div>
+    <div class="setrow"><div><div class="lbl">P4 服务器 (P4PORT)</div></div>
+      <input type="text" value="${esc(SETTINGS.vcs.p4port)}" onchange="setP4(this.value)" style="width:280px;font-family:var(--mono)"></div>
+    <div class="setrow"><div><div class="lbl">变更列表模板</div><div class="sub">agent 产出自动写入 CL 描述</div></div>
+      <input type="text" value="[mf-agent] {task} · {provider}" disabled style="width:220px;opacity:.6"></div>`;
+  if(setCur==='git')b.innerHTML=`
+    <div class="setrow"><div><div class="lbl">工作树默认 base 分支</div></div>
+      <select onchange="setBase(this.value)">${['main','dev','release'].map(x=>`<option ${x===SETTINGS.vcs.baseBranch?'selected':''}>${x}</option>`).join('')}</select></div>
+    <div class="setrow"><div><div class="lbl">切换前自动 stash</div></div>${sw(SETTINGS.vcs.autostash,'setStash')}</div>`;
+}
+/* 分组折叠 */
+function foldGrp(g){setFold[g]=!setFold[g];renderSettings()}
+/* Provider CRUD */
+function provAdd(){const id='p'+Date.now();SETTINGS.providers.push({id,name:'新 Provider',type:'api',base:'https://api.example.com/v1',key:'',models:['model-1'],ok:false});editPid=id;renderSettings();toast('已创建:点「类型」切换 本地CLI/API,再保存')}
+function provEdit(id){editPid=id;renderSettings()}
+function provCancel(){editPid=null;renderSettings()}
+function provType(v){const p=provById(editPid);if(!p)return;p.type=v==='本地 CLI'?'local':'api';if(p.type==='local'&&!p.cmd)p.cmd=p.name;renderSettings()}
+function provSave(id){const p=provById(id);if(!p)return;
+  const g=k=>$('#pf-'+k)?$('#pf-'+k).value:null;
+  const nm=g('name');if(nm)p.name=nm;
+  if(p.type==='local'){p.cmd=g('cmd')||p.name;p.ok=true}
+  else{p.base=g('base')||p.base;p.key=g('key')??p.key;const ms=g('models');if(ms!==null)p.models=ms.split(/[,\n]/).map(s=>s.trim()).filter(Boolean);p.ok=p.key&&p.base.startsWith('http')}
+  editPid=null;renderSettings();renderProvSel();toast('Provider「'+p.name+'」已保存'+(p.ok?' ✓':',请补全配置'),p.ok)}
+function provDel(id){const p=provById(id);SETTINGS.providers=SETTINGS.providers.filter(x=>x.id!==id);
+  if(SETTINGS.agent.provider===id&&SETTINGS.providers[0])provDefault(SETTINGS.providers[0].id);
+  renderSettings();renderProvSel();toast('已删除「'+(p?p.name:id)+'」')}
+function provDefault(id){const p=provById(id);if(!p)return;SETTINGS.agent.provider=id;
+  SETTINGS.agent.model=p.type==='api'?p.models[0]:p.name+' (CLI)';
+  renderSettings();renderProvSel();syncAgentFoot();toast('默认 Provider → '+agentLabel(),true)}
+function provTest(id){toast('GET /models → 200 OK · 3 个模型可用(演示)',true)}
+/* 设置项 setter(全部即时生效) */
+function setTheme(v){SETTINGS.theme=v==='深色'?'dark':'light';document.documentElement.classList.toggle('light',SETTINGS.theme==='light');renderSettings();toast('主题已切换(即时生效)',true)}
+function setCodeSize(v){SETTINGS.codeSize=+v;document.documentElement.style.setProperty('--code-size',v+'px');$('#szlbl').textContent=v}
+function setTab(v){SETTINGS.tabSize=+v;renderSettings();toast('Tab = '+v)}
+function setAutosave(el){SETTINGS.autosave=el.classList.toggle('on');toast('自动保存 '+(SETTINGS.autosave?'开':'关'))}
+function setGuide(el){SETTINGS.wrapGuide=el.classList.toggle('on');toast('缩进参考线 '+(SETTINGS.wrapGuide?'开':'关'))}
+function setDefMode(v){toast('新会话默认 '+(v==='Ask'?'Ask 只读':'Write')+'(演示:即刻生效于当前会话)')}
+function setAutoReview(el){SETTINGS.agent.autoReview=el.classList.toggle('on');toast('自动 reviewer '+(SETTINGS.agent.autoReview?'开:卡片入 in-review 时触发(演示)':'关'))}
+function setVcsDefault(v){SETTINGS.vcs.p4Default=v==='P4';renderSettings();toast('默认版控 → '+v,true)}
+function setP4(v){SETTINGS.vcs.p4port=v;toast('P4PORT 已更新')}
+function setBase(v){SETTINGS.vcs.baseBranch=v;toast('工作树 base → '+v,true)}
+function setStash(el){SETTINGS.vcs.autostash=el.classList.toggle('on');toast('自动 stash '+(SETTINGS.vcs.autostash?'开':'关'))}
+$('#act-settings').onclick=openSettings;
+
+/* ---------- init ---------- */
+renderProvSel();syncAgentFoot();
+renderBoard();renderTasks();renderEditor(false);setLeftTab('board');switchBPane('terminal');
+applyMode(new URLSearchParams(location.search).get('variant')||'C');
+setTimeout(()=>toast('原型已就绪:先点卡片徽章试试状态流转,底部 ←→ 切泳道,⚙ 或 Ctrl+, 打开设置'),600);
+setTimeout(()=>{switchBPane('tasks');toast('演示:DAG 中 #A 已完成 → #B 自动 ready(依赖解锁)',true)},2400);
+</script>
+</body>
+</html>
