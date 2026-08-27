@@ -3289,6 +3289,8 @@ dependencies = [
  "parking_lot",
  "portable-pty",
  "ropey",
+ "serde",
+ "serde_json",
  "toml 0.8.23",
  "unicode-segmentation",
 ]

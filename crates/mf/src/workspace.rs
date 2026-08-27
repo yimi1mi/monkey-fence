@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::agent_panel::AgentPanel;
+use crate::board::Board;
 use crate::cockpit::Cockpit;
 use crate::console::ConsoleDock;
 use crate::diff_view::DiffView;
@@ -40,6 +41,7 @@ pub enum LeftPanel {
     Explorer,
     Vcs,
     Agent,
+    BoardPanel,
 }
 
 /// 工作方式(三模式):Zed=专注手写 / Orca=AI 驾驶舱 / Dual=双轨协同
@@ -98,6 +100,7 @@ pub struct Workspace {
     quick_open: Option<Entity<QuickOpen>>,
     vcs_panel: Option<Entity<VcsPanel>>,
     agent_panel: Option<Entity<AgentPanel>>,
+    board: Option<Entity<Board>>,
     console_dock: Option<Entity<ConsoleDock>>,
     cockpit: Option<Entity<Cockpit>>,
     layout_mode: LayoutMode,
@@ -121,6 +124,7 @@ impl Workspace {
             quick_open: None,
             vcs_panel: None,
             agent_panel: None,
+            board: None,
             console_dock: None,
             cockpit: None,
             layout_mode: LayoutMode::Dual,
@@ -168,6 +172,7 @@ impl Workspace {
             });
         });
         self.vcs_panel = Some(vcs);
+        self.board = Some(cx.new(|cx| Board::new(path.clone(), cx)));
 
         // Agent 面板 + 编排引擎(状态存项目内,git 忽略)
         let agent = cx.new(|cx| AgentPanel::new(cx));
@@ -413,7 +418,8 @@ impl Workspace {
         self.left_panel = match self.left_panel {
             LeftPanel::Explorer => LeftPanel::Vcs,
             LeftPanel::Vcs => LeftPanel::Agent,
-            LeftPanel::Agent => LeftPanel::Explorer,
+            LeftPanel::Agent => LeftPanel::BoardPanel,
+            LeftPanel::BoardPanel => LeftPanel::Explorer,
         };
         cx.notify();
     }
@@ -596,10 +602,11 @@ impl Workspace {
 
     fn render_activity_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let _ = cx;
-        let icons: [(&'static str, &'static str, LeftPanel); 3] = [
+        let icons: [(&'static str, &'static str, LeftPanel); 4] = [
             ("🗂", "资源管理器", LeftPanel::Explorer),
             ("⎇", "版本控制", LeftPanel::Vcs),
             ("🐒", "Agent", LeftPanel::Agent),
+            ("📋", "车间卡片墙", LeftPanel::BoardPanel),
         ];
         // Zed 模式(专注手写)收起 Agent 入口
         let hide_agent = self.layout_mode == LayoutMode::Zed;
@@ -655,6 +662,7 @@ impl Workspace {
             LeftPanel::Explorer => "资源管理器",
             LeftPanel::Vcs => "版本控制",
             LeftPanel::Agent => "AGENT",
+            LeftPanel::BoardPanel => "车间",
         };
         let body = match (&self.left_panel, &self.file_tree) {
             (LeftPanel::Explorer, Some(tree)) => div().size_full().flex().child(tree.clone()),
@@ -679,9 +687,18 @@ impl Workspace {
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child("尚未打开文件夹"),
             },
+            (LeftPanel::BoardPanel, _) => match &self.board {
+                Some(b) => div().size_full().flex().child(b.clone()),
+                None => div()
+                    .p_3()
+                    .text_size(px(12.))
+                    .text_color(rgb(crate::theme::Theme::fg_faint()))
+                    .child("尚未打开文件夹"),
+            },
         };
         let width = match self.left_panel {
             LeftPanel::Agent => px(340.),
+            LeftPanel::BoardPanel => px(286.),
             _ => px(250.),
         };
         div()
