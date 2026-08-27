@@ -8,6 +8,7 @@ mod file_index;
 mod file_tree;
 mod quick_open;
 mod settings;
+mod term;
 mod theme;
 mod vcs_panel;
 mod workspace;
@@ -212,58 +213,58 @@ fn agent_smoke(project: Option<String>) -> i32 {
 /// 的宏展开深度计数有怪癖,放在模块文件里会触发 recursion limit)
 #[cfg(test)]
 mod tests {
-    use crate::console::{TermFilter, MAX_LINES};
+    use crate::term::{palette, Screen};
+
+    fn line(s: &Screen, r: usize) -> String {
+        (0..s.cols).map(|c| s.cell(r, c).ch).collect::<String>().trim_end().to_string()
+    }
 
     #[test]
     fn console_ansi_strip_and_control_chars() {
-        let mut f = TermFilter::new();
-        let mut lines = vec![String::new()];
-        f.feed(&mut lines, b"\x1b[32mOK\x1b[0m\r\n");
-        f.feed(&mut lines, b"50%\r");
-        f.feed(&mut lines, b"100%\r\n");
-        f.feed(&mut lines, b"abc\x08D\n");
-        f.feed(&mut lines, b"a\tb\n");
-        assert_eq!(lines, vec!["OK", "100%", "abD", "a       b", ""]);
+        let mut s = Screen::new(8, 40);
+        s.feed(b"\x1b[32mOK\x1b[0m\r\n");
+        s.feed(b"50%\r");
+        s.feed(b"100%\r\n");
+        s.feed(b"abc\x08D\r\n");
+        s.feed(b"a\tb\n");
+        assert_eq!(line(&s, 0), "OK");
+        assert_eq!(line(&s, 1), "100%");
+        assert_eq!(line(&s, 2), "abD");
+        assert_eq!(line(&s, 3), "a       b");
     }
 
     #[test]
-    fn console_osc_sequences_ignored() {
-        let mut f = TermFilter::new();
-        let mut lines = vec![String::new()];
-        f.feed(&mut lines, b"\x1b]0;title\x07hello\n");
-        assert_eq!(lines, vec!["hello", ""]);
-        f.feed(&mut lines, b"\x1b]8;;http://x\x1b\\link\n");
-        assert_eq!(lines, vec!["hello", "link", ""]);
-    }
-
-    #[test]
-    fn console_ansi_partial_sequence_across_feeds() {
-        let mut f = TermFilter::new();
-        let mut lines = vec![String::new()];
-        f.feed(&mut lines, b"\x1b[");
-        f.feed(&mut lines, b"31mred\n");
-        assert_eq!(lines, vec!["red", ""]);
+    fn console_osc_title_captured_not_printed() {
+        let mut s = Screen::new(4, 40);
+        s.feed(b"\x1b]0;title\x07hello\n");
+        assert_eq!(line(&s, 0), "hello");
+        assert_eq!(s.title, "title");
     }
 
     #[test]
     fn console_carriage_return_overwrites() {
-        // \r 回到行首后重写,不整行清除
-        let mut f = TermFilter::new();
-        let mut lines = vec![String::new()];
-        f.feed(&mut lines, b"downloading 50%\rdownloading 99%\n");
-        assert_eq!(lines, vec!["downloading 99%", ""]);
+        let mut s = Screen::new(4, 40);
+        s.feed(b"downloading 50%\rdownloading 99%\n");
+        assert_eq!(line(&s, 0), "downloading 99%");
     }
 
     #[test]
-    fn console_max_lines_capped() {
-        let mut f = TermFilter::new();
-        let mut lines = vec![String::new()];
-        for i in 0..(MAX_LINES + 100) {
-            f.feed(&mut lines, format!("line{}\n", i).as_bytes());
-        }
-        assert_eq!(lines.len(), MAX_LINES);
-        let last_content = lines.iter().rev().find(|l| !l.is_empty()).unwrap();
-        assert!(last_content.starts_with("line"));
+    fn console_clear_screen_tui() {
+        let mut s = Screen::new(8, 40);
+        s.feed(b"junk everywhere\r\nmore junk");
+        s.feed(b"\x1b[2J\x1b[1;1Hready");
+        assert_eq!(line(&s, 0), "ready");
+        assert_eq!(line(&s, 1), "");
+    }
+
+    #[test]
+    fn console_sgr_persists_per_cell() {
+        let mut s = Screen::new(4, 40);
+        s.feed(b"\x1b[1;34mBLUE\x1b[0m ok");
+        assert_eq!(s.cell(0, 0).fg, palette(4));
+        assert!(s.cell(0, 0).bold);
+        assert!(s.cell(0, 5).fg.default);
+        assert!(!s.cell(0, 5).bold);
     }
 
     #[test]
