@@ -209,6 +209,12 @@ impl Editor {
 
     // ---------- 移动原语 ----------
 
+    /// 跳到指定行(1-based,搜索结果/命令用),并清除选区
+    pub fn goto_line(&mut self, row_1based: usize, cx: &mut Context<Self>) {
+        let offset = self.buf(cx, |b| b.pos_to_offset(row_1based.saturating_sub(1), 0));
+        self.move_to(offset, cx);
+    }
+
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         let len = self.buf(cx, |b| b.len_bytes());
         self.cursor = offset.min(len);

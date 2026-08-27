@@ -9,6 +9,7 @@ mod editor;
 mod file_index;
 mod file_tree;
 mod quick_open;
+mod search;
 mod settings;
 mod term;
 mod theme;
@@ -123,6 +124,7 @@ fn bind_keys(cx: &mut App) {    use editor as ed;
         ("ctrl-shift-e", ws::ShowExplorer),
         ("ctrl-shift-g", ws::ShowVcs),
         ("ctrl-`", ws::ToggleConsole),
+        ("ctrl-shift-f", ws::OpenProjectSearch),
         ("ctrl-,", ws::OpenSettings),
         ("alt-1", ws::SetModeZed),
         ("alt-2", ws::SetModeOrca),

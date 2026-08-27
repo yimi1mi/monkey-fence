@@ -3288,6 +3288,7 @@ dependencies = [
  "nucleo-matcher",
  "parking_lot",
  "portable-pty",
+ "regex",
  "ropey",
  "serde",
  "serde_json",

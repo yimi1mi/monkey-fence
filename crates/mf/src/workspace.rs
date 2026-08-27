@@ -12,6 +12,7 @@ use crate::editor::Editor;
 use crate::file_index::FileIndex;
 use crate::file_tree::FileTree;
 use crate::quick_open::{QuickItem, QuickOpen};
+use crate::search::ProjectSearch;
 use crate::settings::{Dismissed, Saved, SettingsView};
 use crate::vcs_panel::VcsPanel;
 
@@ -29,6 +30,7 @@ actions!(
         ShowVcs,
         ShowAgent,
         ToggleConsole,
+        OpenProjectSearch,
         OpenSettings,
         SetModeZed,
         SetModeOrca,
@@ -98,6 +100,7 @@ pub struct Workspace {
     file_index: Option<Entity<FileIndex>>,
     file_tree: Option<Entity<FileTree>>,
     quick_open: Option<Entity<QuickOpen>>,
+    search_overlay: Option<Entity<ProjectSearch>>,
     vcs_panel: Option<Entity<VcsPanel>>,
     agent_panel: Option<Entity<AgentPanel>>,
     board: Option<Entity<Board>>,
@@ -122,6 +125,7 @@ impl Workspace {
             file_index: None,
             file_tree: None,
             quick_open: None,
+            search_overlay: None,
             vcs_panel: None,
             agent_panel: None,
             board: None,
@@ -314,6 +318,7 @@ impl Workspace {
             ("toggle_vcs".into(), "显示版本控制".into()),
             ("toggle_agent".into(), "显示 Agent 面板".into()),
             ("toggle_console".into(), "切换控制台分屏".into()),
+            ("project_search".into(), "项目搜索…".into()),
             ("open_settings".into(), "打开设置".into()),
             ("close_tab".into(), "关闭当前标签页".into()),
             ("mode_zed".into(), "模式: Zed · 我写代码(编辑器优先) [Alt+1]".into()),
@@ -348,6 +353,7 @@ impl Workspace {
                                 "toggle_vcs" => ws.left_panel = LeftPanel::Vcs,
                                 "toggle_agent" => ws.left_panel = LeftPanel::Agent,
                                 "toggle_console" => ws.toggle_console(cx),
+                                "project_search" => ws.open_project_search(cx),
                                 "open_settings" => ws.open_settings(cx),
                                 "mode_zed" => ws.set_layout_mode(LayoutMode::Zed, cx),
                                 "mode_orca" => ws.set_layout_mode(LayoutMode::Orca, cx),
@@ -436,6 +442,41 @@ impl Workspace {
 
     fn act_show_agent(&mut self, _: &ShowAgent, _: &mut Window, cx: &mut Context<Self>) {
         self.left_panel = LeftPanel::Agent;
+        cx.notify();
+    }
+
+    fn act_open_project_search(&mut self, _: &OpenProjectSearch, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_project_search(cx);
+    }
+
+    fn open_project_search(&mut self, cx: &mut Context<Self>) {
+        if self.search_overlay.is_some() {
+            return;
+        }
+        let Some(root) = self.root.clone() else { return };
+        let s = cx.new(|cx| ProjectSearch::new(root, cx));
+        let weak = cx.weak_entity();
+        s.update(cx, |sv, _| {
+            sv.set_on_open(move |path, row, window, cx| {
+                weak.update(cx, |ws, cx| {
+                    ws.open_path(path, cx);
+                    if let Some(Tab::Editor(ed)) = ws.tabs.get(ws.active) {
+                        ed.update(cx, |e, cx| e.goto_line(row, cx));
+                    }
+                    cx.notify();
+                })
+                .ok();
+                let _ = window;
+            });
+        });
+        cx.subscribe(&s, move |ws, _, _: &crate::search::Dismissed, cx| {
+            ws.search_overlay = None;
+            ws.focus_active(cx);
+            cx.notify();
+        })
+        .detach();
+        self.pending_focus = Some(s.read(cx).focus_handle(cx));
+        self.search_overlay = Some(s);
         cx.notify();
     }
 
@@ -938,6 +979,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::act_show_vcs))
             .on_action(cx.listener(Self::act_show_agent))
             .on_action(cx.listener(Self::act_toggle_console))
+            .on_action(cx.listener(Self::act_open_project_search))
             .on_action(cx.listener(Self::act_open_settings))
             .on_action(cx.listener(Self::act_set_mode_zed))
             .on_action(cx.listener(Self::act_set_mode_orca))
