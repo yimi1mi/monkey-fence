@@ -271,6 +271,28 @@ impl AgentPanel {
     pub fn take_touched(&mut self) -> Vec<String> {
         std::mem::take(&mut self.pending_touched)
     }
+
+    pub fn tasks_snapshot(&self) -> Vec<TaskView> {
+        self.tasks.clone()
+    }
+
+    pub fn run_status_label(&self) -> String {
+        self.run_status.clone()
+    }
+
+    pub fn working_count(&self) -> usize {
+        self.tasks
+            .iter()
+            .filter(|task| matches!(task.status, TaskStatus::Ready | TaskStatus::Dispatched))
+            .count()
+    }
+
+    pub fn reset_task(&mut self, task_id: i64, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine.lock().clone() else { return };
+        let _ = engine.unblock_task(task_id);
+        self.run_status = format!("任务 #{} 已重置,等待重新派发", task_id);
+        cx.notify();
+    }
 }
 
 fn extract_path(summary: &str) -> Option<String> {
@@ -288,8 +310,9 @@ impl Focusable for AgentPanel {
     }
 }
 
-impl Render for AgentPanel {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl AgentPanel {
+    #[allow(dead_code)]
+    fn render_legacy(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut col = div()
             .id("agent-panel")
             .size_full()
@@ -597,5 +620,297 @@ impl Render for AgentPanel {
                 )
                 .flex_1()),
         )
+    }
+}
+
+impl Render for AgentPanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let project = std::path::Path::new(&self.root_label)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "未打开项目".into());
+        let logs: Vec<(String, String)> = self
+            .logs
+            .iter()
+            .map(|line| (line.worker.clone(), line.text.clone()))
+            .collect();
+
+        let messages = div()
+            .id("agent-messages")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .p_2p5()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .when(logs.is_empty(), |d| {
+                d.child(
+                    div()
+                        .max_w(px(268.))
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(crate::theme::Theme::border()))
+                        .bg(rgb(crate::theme::Theme::bg_elevated()))
+                        .p_2p5()
+                        .text_size(px(12.))
+                        .text_color(rgb(crate::theme::Theme::fg_dim()))
+                        .child("把目标交给 agent；工具调用、改动与回答会在这里形成连续会话。"),
+                )
+            })
+            .children(logs.into_iter().enumerate().map(|(index, (worker, text))| {
+                let is_user = worker == "run" && text.starts_with("目标:");
+                let is_tool = text.contains('🔧');
+                let is_error = worker == "engine" || text.starts_with('⚠');
+                div()
+                    .id(("agent-message", index))
+                    .when(is_user, |d| d.ml_8())
+                    .when(!is_user, |d| d.mr_5())
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(if is_error {
+                        crate::theme::Theme::danger()
+                    } else if is_tool {
+                        crate::theme::Theme::border()
+                    } else if is_user {
+                        crate::theme::Theme::accent_dim()
+                    } else {
+                        crate::theme::Theme::border()
+                    }))
+                    .bg(rgb(if is_user {
+                        0x2c3a4d
+                    } else if is_tool {
+                        0x1d232c
+                    } else {
+                        crate::theme::Theme::bg_elevated()
+                    }))
+                    .px_2p5()
+                    .py_2()
+                    .child(
+                        div()
+                            .mb_1()
+                            .text_size(px(9.5))
+                            .text_color(rgb(crate::theme::Theme::fg_faint()))
+                            .child(if is_user { "你".to_string() } else { worker }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .line_height(relative(1.45))
+                            .text_color(rgb(if is_error {
+                                crate::theme::Theme::danger()
+                            } else if is_tool {
+                                crate::theme::Theme::fg_dim()
+                            } else {
+                                crate::theme::Theme::fg()
+                            }))
+                            .child(text),
+                    )
+            }));
+
+        let mut panel = div()
+            .id("agent-panel")
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgb(crate::theme::Theme::bg_panel()))
+            .text_size(px(12.))
+            .child(
+                div()
+                    .h(px(38.))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .border_b_1()
+                    .border_color(rgb(crate::theme::Theme::border()))
+                    .child(div().font_weight(FontWeight::SEMIBOLD).text_color(rgb(crate::theme::Theme::fg())).child("✦ Agent 会话"))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(crate::theme::Theme::border()))
+                            .bg(rgb(crate::theme::Theme::bg_elevated()))
+                            .text_size(px(10.))
+                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .child("glm-5.3"),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(112.))
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(crate::theme::Theme::border()))
+                            .bg(rgb(crate::theme::Theme::bg_elevated()))
+                            .text_size(px(10.))
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .child(format!("⇆ {project}")),
+                    ),
+            )
+            .child(messages);
+
+        if let Some(question) = self.open_question.clone() {
+            panel = panel.child(
+                div()
+                    .id("agent-question")
+                    .mx_3()
+                    .mb_2()
+                    .p_2()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(crate::theme::Theme::warning()))
+                    .bg(rgb(0x2d2612))
+                    .child(div().mb_2().text_color(rgb(crate::theme::Theme::warning())).child(format!("❓ {}", question.question)))
+                    .child(
+                        div()
+                            .id("answer-input")
+                            .min_h(px(28.))
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(crate::theme::Theme::border()))
+                            .bg(rgb(crate::theme::Theme::bg()))
+                            .focusable()
+                            .on_key_down(cx.listener(Self::on_answer_key))
+                            .child(if self.answer.is_empty() {
+                                SharedString::from("输入回答…")
+                            } else {
+                                SharedString::from(self.answer.clone())
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("answer-btn")
+                            .mt_2()
+                            .px_2()
+                            .py_1()
+                            .self_start()
+                            .rounded_sm()
+                            .border_1()
+                            .border_color(rgb(crate::theme::Theme::warning()))
+                            .text_color(rgb(crate::theme::Theme::warning()))
+                            .cursor_pointer()
+                            .child("提交回答")
+                            .on_click(cx.listener(Self::act_answer)),
+                    ),
+            );
+        }
+
+        panel
+            .child(
+                div()
+                    .id("agent-context")
+                    .h(px(28.))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_3()
+                    .child(
+                        div()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(crate::theme::Theme::border()))
+                            .bg(rgb(0x1d232c))
+                            .text_size(px(10.))
+                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .child(format!("📄 {project}  ×")),
+                    ),
+            )
+            .child(
+                div()
+                    .id("agent-composer")
+                    .flex()
+                    .items_end()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(rgb(crate::theme::Theme::border()))
+                    .child(
+                        div()
+                            .id("objective-input")
+                            .flex_1()
+                            .min_h(px(58.))
+                            .px_2()
+                            .py_1p5()
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(if self.input_focus.is_focused(window) {
+                                crate::theme::Theme::accent()
+                            } else {
+                                crate::theme::Theme::border()
+                            }))
+                            .bg(rgb(crate::theme::Theme::bg_elevated()))
+                            .track_focus(&self.input_focus)
+                            .on_key_down(cx.listener(Self::on_objective_key))
+                            .text_color(rgb(if self.objective.is_empty() {
+                                crate::theme::Theme::fg_faint()
+                            } else {
+                                crate::theme::Theme::fg()
+                            }))
+                            .child(if self.objective.is_empty() {
+                                SharedString::from("给 agent 下指令…\nEnter 发送 · Shift+Enter 换行")
+                            } else {
+                                SharedString::from(self.objective.clone())
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(rgb(crate::theme::Theme::border()))
+                                    .text_size(px(10.))
+                                    .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                    .child("Write"),
+                            )
+                            .child(
+                                div()
+                                    .id("start-run-btn")
+                                    .size(px(32.))
+                                    .rounded_lg()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(rgb(crate::theme::Theme::accent()))
+                                    .text_color(rgb(crate::theme::Theme::bg()))
+                                    .font_weight(FontWeight::BOLD)
+                                    .cursor_pointer()
+                                    .child("➤")
+                                    .on_click(cx.listener(Self::act_start)),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .h(px(26.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .border_t_1()
+                    .border_color(rgb(crate::theme::Theme::border()))
+                    .text_size(px(10.))
+                    .text_color(rgb(crate::theme::Theme::fg_dim()))
+                    .child(format!("● {}", self.run_status))
+                    .child("glm-5.3 · Write 模式"),
+            )
     }
 }

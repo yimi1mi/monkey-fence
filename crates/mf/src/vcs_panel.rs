@@ -86,6 +86,13 @@ impl VcsPanel {
         }
     }
 
+    pub fn change_count(&self) -> usize {
+        match self.kind {
+            VcsKind::P4 => self.opened.len(),
+            VcsKind::Git => self.git_status.len(),
+        }
+    }
+
     fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.loading {
             return;

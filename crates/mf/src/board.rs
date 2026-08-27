@@ -82,6 +82,10 @@ impl Board {
         this
     }
 
+    pub fn unread_count(&self) -> usize {
+        self.cards.iter().filter(|card| card.unread).count()
+    }
+
     fn store_path(&self) -> PathBuf {
         self.root.join(".mf-agent").join("workspaces.json")
     }

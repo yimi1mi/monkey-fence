@@ -16,6 +16,7 @@ pub struct ProjectSearch {
     total_hits: usize,
     searching: bool,
     status: SharedString,
+    embedded: bool,
     focus_handle: FocusHandle,
     on_open: Option<Box<dyn Fn(&Path, usize, &mut Window, &mut App)>>,
 }
@@ -59,6 +60,7 @@ impl ProjectSearch {
             total_hits: 0,
             searching: false,
             status: "输入搜索词,Enter 执行".into(),
+            embedded: false,
             focus_handle: cx.focus_handle(),
             on_open: None,
         }
@@ -66,6 +68,10 @@ impl ProjectSearch {
 
     pub fn set_on_open(&mut self, cb: impl Fn(&Path, usize, &mut Window, &mut App) + 'static) {
         self.on_open = Some(Box::new(cb));
+    }
+
+    pub fn set_embedded(&mut self, embedded: bool) {
+        self.embedded = embedded;
     }
 
     fn toggle(&mut self, which: u8, cx: &mut Context<Self>) {
@@ -193,34 +199,41 @@ fn scan_project(root: &Path, query: &str, case: bool, word: bool, regex: bool) -
 impl Render for ProjectSearch {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let results = self.results.clone();
+        let embedded = self.embedded;
         div()
             .id("project-search-root")
             .key_context("ProjectSearch")
             .size_full()
-            .absolute()
-            .top_0()
-            .left_0()
-            .bg(gpui::black().opacity(0.4))
             .flex()
-            .justify_center()
             .track_focus(&self.focus_handle)
-            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
-                cx.emit(Dismissed);
-            }))
+            .when(!embedded, |d| {
+                d.absolute()
+                    .top_0()
+                    .left_0()
+                    .bg(gpui::black().opacity(0.4))
+                    .justify_center()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
+                        cx.emit(Dismissed);
+                    }))
+            })
+            .when(embedded, |d| d.bg(rgb(Theme::bg_panel())))
             .child(
                 div()
                     .id("ps-panel")
-                    .mt(px(70.))
-                    .w(px(680.))
-                    .max_h(px(560.))
                     .flex()
                     .flex_col()
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(Theme::border()))
                     .bg(rgb(Theme::bg_panel()))
-                    .shadow_lg()
-                    .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                    .when(!embedded, |d| {
+                        d.mt(px(70.))
+                            .w(px(680.))
+                            .max_h(px(560.))
+                            .rounded_lg()
+                            .border_1()
+                            .border_color(rgb(Theme::border()))
+                            .shadow_lg()
+                            .on_mouse_down(MouseButton::Left, |_, _, _| {})
+                    })
+                    .when(embedded, |d| d.size_full())
                     .child(
                         // 输入行 + 开关
                         div()
