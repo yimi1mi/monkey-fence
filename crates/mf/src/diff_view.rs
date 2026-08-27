@@ -11,7 +11,7 @@ pub struct DiffView {
     diff_text: String,
     /// hunk 审阅状态:Some(true)=保留 Some(false)=拒绝 None=未决
     hunk_states: Vec<Option<bool>>,
-    scroll_handle: UniformListScrollHandle,
+    scroll_handle: ScrollHandle,
     on_reject: Option<Box<dyn Fn(String, &mut Window, &mut App)>>,
 }
 
@@ -30,7 +30,7 @@ impl DiffView {
             diff,
             diff_text: diff_text.to_string(),
             hunk_states: vec![None; n_hunks],
-            scroll_handle: UniformListScrollHandle::new(),
+            scroll_handle: ScrollHandle::new(),
             on_reject: None,
         }
     }
@@ -181,26 +181,59 @@ impl Render for DiffView {
                                     .child(format!("{} 个 hunk · {} 待审阅", total_hunks, pending)),
                             )
                             .child(
-                                div().text_size(px(10.5)).text_color(rgb(crate::theme::Theme::fg_faint()))
-                                    .child("Alt+Y 保留 / Alt+Z 拒绝 · Shift 全部"),
+                                div()
+                                    .id("dh-all-y")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(rgb(crate::theme::Theme::success()))
+                                    .text_color(rgb(crate::theme::Theme::success()))
+                                    .cursor_pointer()
+                                    .text_size(px(10.5))
+                                    .hover(|h| h.bg(rgb(crate::theme::Theme::bg_hover())))
+                                    .child("✓ 全部保留")
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.key_verdict(true, true, w, cx);
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("dh-all-z")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(rgb(crate::theme::Theme::danger()))
+                                    .text_color(rgb(crate::theme::Theme::danger()))
+                                    .cursor_pointer()
+                                    .text_size(px(10.5))
+                                    .hover(|h| h.bg(rgb(crate::theme::Theme::bg_hover())))
+                                    .child("✕ 全部拒绝")
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        this.key_verdict(false, true, w, cx);
+                                    })),
+                            )
+                            .child(
+                                div().text_size(px(10.)).text_color(rgb(crate::theme::Theme::fg_faint()))
+                                    .child("Alt+Y/Z"),
                             )
                     }),
             )
             .child(
-                uniform_list(
-                    "diff-lines",
-                    rows.len(),
-                    cx.processor(move |this: &mut DiffView, range, _window, _cx| {
-                        let rows = this.build_rows();
-                        let lines = &this.diff.lines;
-                        let states = &this.hunk_states;
-                        let reviewing = this.has_hunks();
-                        let mut out = Vec::new();
-                        for ix in range {
-                            let Some(row) = rows.get(ix) else { continue };
+                div()
+                    .id("diff-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle)
+                    .children({
+                        let mut out: Vec<AnyElement> = Vec::new();
+                        let max_rows = 3000usize;
+                        for (ix, row) in rows.iter().enumerate().take(max_rows) {
                             match row {
                                 Row::HunkBar(h) => {
-                                    let state = states.get(*h).copied().flatten();
+                                    let state = self.hunk_states.get(*h).copied().flatten();
                                     let label = match state {
                                         Some(true) => "✓ 已保留",
                                         Some(false) => "✕ 已拒绝(工作区已还原该段)",
@@ -215,31 +248,54 @@ impl Render for DiffView {
                                     out.push(
                                         div()
                                             .id(("dhb", ix))
-                                            .h(px(22.))
+                                            .h(px(24.))
                                             .flex()
                                             .items_center()
                                             .gap_2()
                                             .pl_2()
+                                            .pr_1()
                                             .border_b_1()
                                             .border_color(rgb(crate::theme::Theme::border()))
                                             .bg(rgb(crate::theme::Theme::bg_elevated()))
                                             .text_size(px(10.5))
                                             .child(div().text_color(rgb(color)).child(format!("HUNK #{} · {}", hi + 1, label)))
+                                            .child(div().flex_1())
                                             .when(reviewing && state.is_none(), |d| {
                                                 d.child(
                                                     div()
-                                                        .text_color(rgb(crate::theme::Theme::fg_faint()))
-                                                        .child("Alt+Y 保留 · Alt+Z 拒绝"),
+                                                        .id(ElementId::Name(format!("dhb-y-{}", hi).into()))
+                                                        .px_1p5()
+                                                        .rounded_sm()
+                                                        .border_1()
+                                                        .border_color(rgb(crate::theme::Theme::success()))
+                                                        .text_color(rgb(crate::theme::Theme::success()))
+                                                        .cursor_pointer()
+                                                        .child("✓ 保留")
+                                                        .on_click(cx.listener(move |this, _, w, cx| {
+                                                            this.verdict(hi, true, w, cx);
+                                                        })),
                                                 )
-                                            }),
+                                                .child(
+                                                    div()
+                                                        .id(ElementId::Name(format!("dhb-z-{}", hi).into()))
+                                                        .px_1p5()
+                                                        .rounded_sm()
+                                                        .border_1()
+                                                        .border_color(rgb(crate::theme::Theme::danger()))
+                                                        .text_color(rgb(crate::theme::Theme::danger()))
+                                                        .cursor_pointer()
+                                                        .child("✕ 拒绝")
+                                                        .on_click(cx.listener(move |this, _, w, cx| {
+                                                            this.verdict(hi, false, w, cx);
+                                                        })),
+                                                )
+                                            })
+                                            .into_any_element(),
                                     );
                                 }
                                 Row::Line(i) => {
-                                    let Some((kind, text, old_no, new_no)) =
-                                        lines.get(*i).map(|l: &DiffLine| (l.kind, l.text.clone(), l.old_no, l.new_no))
-                                    else {
-                                        continue;
-                                    };
+                                    let Some(l) = lines.get(*i) else { continue };
+                                    let (kind, text, old_no, new_no) = (l.0, l.1.clone(), l.2, l.3);
                                     let (fg, prefix) = match kind {
                                         DiffLineKind::Add => (crate::theme::Theme::success(), "+"),
                                         DiffLineKind::Delete => (crate::theme::Theme::danger(), "-"),
@@ -273,16 +329,24 @@ impl Render for DiffView {
                                                     .child(gutter),
                                             )
                                             .child(div().w(px(10.)).text_color(rgb(fg)).child(prefix))
-                                            .child(div().text_color(rgb(fg)).overflow_hidden().child(text)),
+                                            .child(div().text_color(rgb(fg)).overflow_hidden().child(text))
+                                            .into_any_element(),
                                     );
                                 }
                             }
                         }
+                        if rows.len() > max_rows {
+                            out.push(
+                                div()
+                                    .p_2()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(crate::theme::Theme::fg_faint()))
+                                    .child(format!("… 其余 {} 行未渲染(超大 diff)", rows.len() - max_rows))
+                                    .into_any_element(),
+                            );
+                        }
                         out
                     }),
-                )
-                .track_scroll(&self.scroll_handle)
-                .flex_1(),
             )
     }
 }

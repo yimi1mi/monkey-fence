@@ -612,7 +612,11 @@ impl Render for VcsPanel {
                             .cursor_pointer()
                             .on_click({
                                 let path_str = path_str.clone();
-                                cx.listener(move |p: &mut VcsPanel, _, _, cx| {
+                                cx.listener(move |p: &mut VcsPanel, e: &gpui::ClickEvent, window, cx| {
+                                    if e.click_count() == 2 {
+                                        p.open_file_diff(idx, window, cx);
+                                        return;
+                                    }
                                     if p.selected.contains(&path_str) {
                                         p.selected.remove(&path_str);
                                     } else {
