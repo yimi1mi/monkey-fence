@@ -369,14 +369,14 @@ impl Workspace {
         let qo = cx.new(|cx| QuickOpen::commands(cx));
         let has_folder = self.root.is_some();
         let mut cmds = vec![
-            ("open_folder".into(), "打开文件夹…".into()),
-            ("toggle_explorer".into(), "显示资源管理器".into()),
-            ("toggle_vcs".into(), "显示版本控制".into()),
+            ("open_folder".into(), "打开文件夹…  Ctrl+Shift+O".into()),
+            ("toggle_explorer".into(), "显示资源管理器  Ctrl+Shift+E".into()),
+            ("toggle_vcs".into(), "显示版本控制  Ctrl+Shift+G".into()),
             ("toggle_agent".into(), "显示 Agent 面板".into()),
-            ("toggle_console".into(), "切换控制台分屏".into()),
-            ("project_search".into(), "项目搜索…".into()),
-            ("open_settings".into(), "打开设置".into()),
-            ("close_tab".into(), "关闭当前标签页".into()),
+            ("toggle_console".into(), "切换控制台分屏  Ctrl+`".into()),
+            ("project_search".into(), "项目搜索…  Ctrl+Shift+F".into()),
+            ("open_settings".into(), "打开设置  Ctrl+,".into()),
+            ("close_tab".into(), "关闭当前标签页  Ctrl+W".into()),
             ("mode_zed".into(), "模式: Zed · 我写代码(编辑器优先) [Alt+1]".into()),
             ("mode_orca".into(), "模式: Orca · AI 驱动(驾驶舱) [Alt+2]".into()),
             ("mode_dual".into(), "模式: 双轨 · 人机协同 [Alt+3]".into()),

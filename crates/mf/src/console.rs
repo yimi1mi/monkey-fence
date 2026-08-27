@@ -5,6 +5,16 @@ use std::io::{Read, Write};
 
 use crate::term::Screen;
 
+/// VT 嗅探状态(agent CLI 通用横幅识别)
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum SniffState {
+    Idle,
+    Working,
+    Done,
+    Dead,
+    Unknown,
+}
+
 /// 控制台分屏(参考 orca):底部 dock + 可嵌套拆分的窗格树,每格一个 ConPTY 终端。
 /// 渲染走完整 VT 网格(颜色/光标/alt-screen),可运行 TUI 应用。
 
@@ -175,6 +185,25 @@ impl ConsolePane {
     /// 屏幕尾部 n 个非空行(矩阵缩略/状态嗅探)
     pub fn tail_lines(&self, n: usize) -> Vec<String> {
         self.screen.tail_lines(n)
+    }
+
+    /// VT 嗅探:从屏幕尾部推断 CLI agent 状态(P0-E6,识别任意 TUI agent 的通用横幅)
+    pub fn sniff_state(&self) -> SniffState {
+        if self.dead {
+            return SniffState::Dead;
+        }
+        for line in self.screen.tail_lines(4).iter().rev() {
+            if line.contains("anything") || line.contains("›") {
+                return SniffState::Idle; // "Ask ... to do anything" 等待输入
+            }
+            if line.contains("Worked for") || line.contains("tokens used") {
+                return SniffState::Done;
+            }
+            if line.contains("Working") || line.contains("esc to interrupt") {
+                return SniffState::Working;
+            }
+        }
+        SniffState::Unknown
     }
 
     fn send_bytes(&mut self, bytes: &[u8]) {

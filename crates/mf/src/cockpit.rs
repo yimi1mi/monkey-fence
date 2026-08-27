@@ -434,9 +434,9 @@ impl Cockpit {
             div().flex_1().min_h_0().flex().gap_2().children(row.into_iter().map(|i| {
                 let pane = self.panes[i].clone();
                 let is_sel = self.selected == Some(i);
-                let (title, dead, tail) = {
+                let (title, dead, tail, sniff) = {
                     let p = pane.read(cx);
-                    (p.title().to_string(), p.is_dead(), p.tail_lines(6))
+                    (p.title().to_string(), p.is_dead(), p.tail_lines(6), p.sniff_state())
                 };
                 let idx = i;
                 div()
@@ -471,8 +471,25 @@ impl Cockpit {
                             .border_b_1()
                             .border_color(rgb(Theme::border()))
                             .bg(rgb(Theme::bg_panel()))
-                            .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(rgb(if dead { Theme::danger() } else { Theme::success() })))
+                            .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(rgb(match sniff {
+                                crate::console::SniffState::Working => Theme::warning(),
+                                crate::console::SniffState::Idle => Theme::success(),
+                                crate::console::SniffState::Done => Theme::accent(),
+                                crate::console::SniffState::Dead => Theme::danger(),
+                                crate::console::SniffState::Unknown => if dead { Theme::danger() } else { Theme::fg_faint() },
+                            })))
                             .child(div().text_size(px(11.)).text_ellipsis().whitespace_nowrap().overflow_hidden().flex_1().text_color(rgb(Theme::fg_dim())).child(title))
+                            .child(div().text_size(px(9.)).text_color(rgb(match sniff {
+                                crate::console::SniffState::Working => Theme::warning(),
+                                crate::console::SniffState::Idle => Theme::success(),
+                                _ => Theme::fg_faint(),
+                            })).child(match sniff {
+                                crate::console::SniffState::Working => "● 运行",
+                                crate::console::SniffState::Idle => "○ 空闲",
+                                crate::console::SniffState::Done => "✓ 完成",
+                                crate::console::SniffState::Dead => "✕ 退出",
+                                crate::console::SniffState::Unknown => "",
+                            }))
                             .child(
                                 div()
                                     .id(ElementId::Name(format!("ck-cons-close-{idx}").into()))
