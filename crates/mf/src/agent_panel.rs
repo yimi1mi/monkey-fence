@@ -49,18 +49,15 @@ impl AgentPanel {
 
     /// 打开项目时注入引擎
     pub fn attach_engine(&mut self, engine: Arc<Engine>, root: &std::path::Path, cx: &mut Context<Self>) {
-        *self.engine.lock() = Some(engine);
+        *self.engine.lock() = Some(engine.clone());
         self.root_label = root.display().to_string();
-        // 恢复最近一次 run 的任务视图
-        if let Some(run) = self.engine.lock().as_ref().and_then(|e| e.latest_active_run().ok().flatten()) {
+        // 恢复最近一次 run 的任务视图。
+        // 注意:直接用局部 engine 查询,不要经 self.engine.lock() —— if let 条件里的
+        // MutexGuard 临时值会活到整个 if-let 结束,body 内再锁同一把 std Mutex 会同线程死锁。
+        if let Some(run) = engine.latest_active_run().ok().flatten() {
             self.active_run = Some(run.id);
             self.run_status = format!("{}(历史)", run.status);
-            self.tasks = self
-                .engine
-                .lock()
-                .as_ref()
-                .and_then(|e| e.tasks_of_run(run.id).ok())
-                .unwrap_or_default();
+            self.tasks = engine.tasks_of_run(run.id).ok().unwrap_or_default();
         }
         cx.notify();
     }

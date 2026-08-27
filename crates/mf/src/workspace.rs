@@ -156,9 +156,9 @@ impl Workspace {
             config,
             skills,
         ) {
-            let engine = Arc::new(engine);
+                let engine = Arc::new(engine);
             agent.update(cx, |a, cx| a.attach_engine(engine.clone(), &path, cx));
-        }
+            }
         self.agent_panel = Some(agent);
 
         self.status_message = format!("已打开 {}", path.display()).into();
