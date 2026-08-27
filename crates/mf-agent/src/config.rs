@@ -89,6 +89,20 @@ impl Default for EditorConfig {
     }
 }
 
+/// 终端矩阵(驾驶舱)spawn 配置
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TerminalConfig {
+    /// 终端命令(如 "codex" / "powershell");留空 = 平台默认(cmd/COMSPEC)
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self { command: None }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -100,6 +114,8 @@ pub struct Config {
     pub engine: EngineConfig,
     #[serde(default)]
     pub editor: EditorConfig,
+    #[serde(default)]
+    pub terminal: TerminalConfig,
 }
 
 impl Default for Config {
@@ -123,6 +139,7 @@ impl Default for Config {
             roles,
             engine: EngineConfig::default(),
             editor: EditorConfig::default(),
+            terminal: TerminalConfig::default(),
         }
     }
 }

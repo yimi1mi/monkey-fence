@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::agent_panel::AgentPanel;
+use crate::cockpit::Cockpit;
 use crate::console::ConsoleDock;
 use crate::diff_view::DiffView;
 use crate::editor::Editor;
@@ -28,6 +29,9 @@ actions!(
         ShowAgent,
         ToggleConsole,
         OpenSettings,
+        SetModeZed,
+        SetModeOrca,
+        SetModeDual,
     ]
 );
 
@@ -36,6 +40,24 @@ pub enum LeftPanel {
     Explorer,
     Vcs,
     Agent,
+}
+
+/// 工作方式(三模式):Zed=专注手写 / Orca=AI 驾驶舱 / Dual=双轨协同
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LayoutMode {
+    Zed,
+    Orca,
+    Dual,
+}
+
+impl LayoutMode {
+    pub fn label(&self) -> &'static str {
+        match self {
+            LayoutMode::Zed => "🧑‍💻 Zed",
+            LayoutMode::Orca => "🤖 Orca",
+            LayoutMode::Dual => "⚡ 双轨",
+        }
+    }
 }
 
 /// 标签页内容:编辑器或 diff 视图
@@ -77,6 +99,8 @@ pub struct Workspace {
     vcs_panel: Option<Entity<VcsPanel>>,
     agent_panel: Option<Entity<AgentPanel>>,
     console_dock: Option<Entity<ConsoleDock>>,
+    cockpit: Option<Entity<Cockpit>>,
+    layout_mode: LayoutMode,
     settings_open: Option<Entity<SettingsView>>,
     left_panel: LeftPanel,
     status_message: SharedString,
@@ -98,6 +122,8 @@ impl Workspace {
             vcs_panel: None,
             agent_panel: None,
             console_dock: None,
+            cockpit: None,
+            layout_mode: LayoutMode::Dual,
             settings_open: None,
             left_panel: LeftPanel::Explorer,
             status_message: "就绪".into(),
@@ -150,6 +176,11 @@ impl Workspace {
         let skills = mf_skills::load_skills(Some(&path));
         let config = mf_agent::Config::load().unwrap_or_default();
         self.editor_font = config.editor.clone();
+        let term_cmd = config
+            .terminal
+            .command
+            .clone()
+            .filter(|s| !s.trim().is_empty());
         if let Ok(engine) = mf_agent::Engine::start(
             db_dir.join("orchestration.db"),
             path.clone(),
@@ -158,6 +189,8 @@ impl Workspace {
         ) {
                 let engine = Arc::new(engine);
             agent.update(cx, |a, cx| a.attach_engine(engine.clone(), &path, cx));
+            let shell = term_cmd.unwrap_or_else(crate::console::default_shell);
+            self.cockpit = Some(cx.new(|cx| Cockpit::new(engine, path.clone(), shell, cx)));
             }
         self.agent_panel = Some(agent);
 
@@ -278,6 +311,9 @@ impl Workspace {
             ("toggle_console".into(), "切换控制台分屏".into()),
             ("open_settings".into(), "打开设置".into()),
             ("close_tab".into(), "关闭当前标签页".into()),
+            ("mode_zed".into(), "模式: Zed · 我写代码(编辑器优先) [Alt+1]".into()),
+            ("mode_orca".into(), "模式: Orca · AI 驱动(驾驶舱) [Alt+2]".into()),
+            ("mode_dual".into(), "模式: 双轨 · 人机协同 [Alt+3]".into()),
         ];
         if has_folder {
             cmds.push(("refresh_tree".into(), "刷新文件树".into()));
@@ -308,6 +344,9 @@ impl Workspace {
                                 "toggle_agent" => ws.left_panel = LeftPanel::Agent,
                                 "toggle_console" => ws.toggle_console(cx),
                                 "open_settings" => ws.open_settings(cx),
+                                "mode_zed" => ws.set_layout_mode(LayoutMode::Zed, cx),
+                                "mode_orca" => ws.set_layout_mode(LayoutMode::Orca, cx),
+                                "mode_dual" => ws.set_layout_mode(LayoutMode::Dual, cx),
                                 "close_tab" => ws.close_tab(&CloseTab, window, cx),
                                 "refresh_tree" => {
                                     if let Some(t) = &ws.file_tree {
@@ -400,6 +439,33 @@ impl Workspace {
 
     fn act_open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
         self.open_settings(cx);
+    }
+
+    // ---------- 三模式(工作方式) ----------
+
+    fn act_set_mode_zed(&mut self, _: &SetModeZed, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_layout_mode(LayoutMode::Zed, cx);
+    }
+
+    fn act_set_mode_orca(&mut self, _: &SetModeOrca, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_layout_mode(LayoutMode::Orca, cx);
+    }
+
+    fn act_set_mode_dual(&mut self, _: &SetModeDual, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_layout_mode(LayoutMode::Dual, cx);
+    }
+
+    fn set_layout_mode(&mut self, mode: LayoutMode, cx: &mut Context<Self>) {
+        if self.layout_mode == mode {
+            return;
+        }
+        self.layout_mode = mode;
+        if mode == LayoutMode::Zed {
+            // 专注手写:回资源管理器;编辑器区域等 render 分派收起(PTY 保活不销毁)
+            self.left_panel = LeftPanel::Explorer;
+        }
+        self.focus_active(cx);
+        cx.notify();
     }
 
     // ---------- 控制台分屏 ----------
@@ -535,6 +601,8 @@ impl Workspace {
             ("⎇", "版本控制", LeftPanel::Vcs),
             ("🐒", "Agent", LeftPanel::Agent),
         ];
+        // Zed 模式(专注手写)收起 Agent 入口
+        let hide_agent = self.layout_mode == LayoutMode::Zed;
         let mut bar = div()
             .id("activity-bar")
             .w(px(44.))
@@ -547,6 +615,9 @@ impl Workspace {
             .border_r_1()
             .border_color(rgb(crate::theme::Theme::BORDER));
         for (icon, tip, panel) in icons {
+            if hide_agent && panel == LeftPanel::Agent {
+                continue;
+            }
             let is_active = self.left_panel == panel;
             bar = bar.child(
                 div()
@@ -636,6 +707,43 @@ impl Workspace {
             .child(body)
     }
 
+    /// 状态栏最左:工作方式三段开关(Zed 手写 / Orca AI 驾驶舱 / 双轨)
+    fn render_mode_switch(&self, cx: &Context<Self>) -> impl IntoElement {
+        let cur = self.layout_mode;
+        div()
+            .id("mode-switch")
+            .flex()
+            .items_center()
+            .h(px(18.))
+            .rounded_sm()
+            .overflow_hidden()
+            .border_1()
+            .border_color(rgb(crate::theme::Theme::ACCENT_DIM))
+            .children([LayoutMode::Zed, LayoutMode::Orca, LayoutMode::Dual].map(|m| {
+                let active = cur == m;
+                div()
+                    .id(ElementId::Name(format!("mode-{}", m.label()).into()))
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .h_full()
+                    .cursor_pointer()
+                    .text_size(px(11.))
+                    .when(active, |d| {
+                        d.bg(rgb(crate::theme::Theme::ACCENT))
+                            .text_color(rgb(crate::theme::Theme::BG))
+                    })
+                    .when(!active, |d| {
+                        d.text_color(rgb(crate::theme::Theme::FG_DIM))
+                            .hover(|h| h.bg(rgb(crate::theme::Theme::BG_HOVER)))
+                    })
+                    .child(m.label())
+                    .on_click(cx.listener(move |ws: &mut Workspace, _: &ClickEvent, _w, cx| {
+                        ws.set_layout_mode(m, cx);
+                    }))
+            }))
+    }
+
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let files = self
             .file_index
@@ -671,6 +779,7 @@ impl Workspace {
             .border_color(rgb(crate::theme::Theme::BORDER))
             .text_size(px(11.))
             .text_color(rgb(crate::theme::Theme::FG_DIM))
+            .child(self.render_mode_switch(cx))
             .child(div().child(root_name))
             .when_some(vcs_label, |d, v| d.child(div().text_color(rgb(crate::theme::Theme::ACCENT)).child(v)))
             .when(files > 0, |d| {
@@ -813,6 +922,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::act_show_agent))
             .on_action(cx.listener(Self::act_toggle_console))
             .on_action(cx.listener(Self::act_open_settings))
+            .on_action(cx.listener(Self::act_set_mode_zed))
+            .on_action(cx.listener(Self::act_set_mode_orca))
+            .on_action(cx.listener(Self::act_set_mode_dual))
             .child(
                 div()
                     .id("main-row")
@@ -820,25 +932,44 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .child(self.render_activity_bar(cx))
-                    .child(self.render_left_panel(cx))
-                    .child(center),
+                    .when(self.layout_mode == LayoutMode::Orca, |d| {
+                        // Orca 模式:驾驶舱整体替换 左面板+编辑区(队列/矩阵/DAG/Change set)
+                        if let Some(cp) = &self.cockpit {
+                            d.child(cp.clone())
+                        } else {
+                            d.child(
+                                div()
+                                    .flex_1()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                                    .child("驾驶舱不可用(未打开项目或引擎启动失败)"),
+                            )
+                        }
+                    })
+                    .when(self.layout_mode != LayoutMode::Orca, |d| {
+                        d.child(self.render_left_panel(cx)).child(center)
+                    }),
             );
 
-        // 控制台 dock(最后一个窗格关闭时自动收起)
+        // 控制台 dock(最后一个窗格关闭时自动收起);Zed/Orca 模式下不渲染但 PTY 保活
         if let Some(dock) = &self.console_dock {
             if dock.read(cx).close_pending {
                 self.console_dock = None;
             }
         }
         if let Some(dock) = &self.console_dock {
-            root = root.child(
-                div()
-                    .id("console-dock-area")
-                    .h(px(240.))
-                    .min_h_0()
-                    .flex()
-                    .child(dock.clone()),
-            );
+            if self.layout_mode == LayoutMode::Dual {
+                root = root.child(
+                    div()
+                        .id("console-dock-area")
+                        .h(px(240.))
+                        .min_h_0()
+                        .flex()
+                        .child(dock.clone()),
+                );
+            }
         }
         root = root.child(self.render_status_bar(cx));
 

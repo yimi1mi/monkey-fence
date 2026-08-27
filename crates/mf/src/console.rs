@@ -102,7 +102,7 @@ impl ConsolePane {
     }
 
     /// PTY 启动失败时的只读兜底窗格(展示错误,不参与输入)
-    fn failed(id: usize, err: anyhow::Error, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn failed(id: usize, err: anyhow::Error, cx: &mut Context<Self>) -> Self {
         let mut screen = Screen::new(TERM_ROWS, TERM_COLS);
         screen.feed(
             format!(
@@ -165,6 +165,16 @@ impl ConsolePane {
         } else {
             self.fallback_title.clone()
         }
+    }
+
+    /// shell 是否已退出(矩阵缩略格状态点用)
+    pub fn is_dead(&self) -> bool {
+        self.dead
+    }
+
+    /// 屏幕尾部 n 个非空行(矩阵缩略/状态嗅探)
+    pub fn tail_lines(&self, n: usize) -> Vec<String> {
+        self.screen.tail_lines(n)
     }
 
     fn send_bytes(&mut self, bytes: &[u8]) {
@@ -514,7 +524,7 @@ impl ConsoleDock {
     }
 }
 
-fn default_shell() -> String {
+pub(crate) fn default_shell() -> String {
     std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into())
 }
 

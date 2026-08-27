@@ -190,6 +190,34 @@ impl Screen {
         self.cursor
     }
 
+    /// 第 row 行的可见文本(尾部空白裁剪)。用于矩阵缩略/状态嗅探。
+    pub fn line_text(&self, row: usize) -> String {
+        let grid = self.grid();
+        if row >= grid.len() {
+            return String::new();
+        }
+        let mut s: String = grid[row].iter().map(|c| c.ch).collect();
+        s.truncate(s.trim_end().len());
+        s
+    }
+
+    /// 自底向上取 n 个非空行(保持屏幕顺序)。空屏返回空 vec。
+    pub fn tail_lines(&self, n: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        for r in (0..self.rows).rev() {
+            let line = self.line_text(r);
+            if line.is_empty() {
+                continue;
+            }
+            out.push(line);
+            if out.len() >= n {
+                break;
+            }
+        }
+        out.reverse();
+        out
+    }
+
     /// 喂入字节流(UTF-8 + VT 序列,状态跨调用保持)
     pub fn feed(&mut self, bytes: &[u8]) {
         for &b in bytes {

@@ -35,6 +35,7 @@ enum Field {
     MaxFailures,
     FontFamily,
     FontSize,
+    TerminalCommand,
 }
 
 impl SettingsView {
@@ -107,6 +108,7 @@ impl SettingsView {
             Field::MaxFailures => self.max_failures_s.clone(),
             Field::FontFamily => self.draft.editor.font_family.clone(),
             Field::FontSize => self.font_size_s.clone(),
+            Field::TerminalCommand => self.draft.terminal.command.clone().unwrap_or_default(),
         }
     }
 
@@ -356,6 +358,7 @@ impl SettingsView {
             .child(section("编辑器"))
             .child(field_row("字体", self.text_input(Field::FontFamily, window, cx)))
             .child(field_row("字号(px)", self.text_input(Field::FontSize, window, cx)))
+            .child(field_row("终端命令(空=cmd;可填 codex 等 CLI)", self.text_input(Field::TerminalCommand, window, cx)))
             .into_any_element()
     }
 
@@ -443,6 +446,13 @@ impl SettingsView {
             Field::MaxFailures => self.max_failures_s.push_str(text),
             Field::FontFamily => self.draft.editor.font_family.push_str(text),
             Field::FontSize => self.font_size_s.push_str(text),
+            Field::TerminalCommand => {
+                self.draft
+                    .terminal
+                    .command
+                    .get_or_insert_with(String::new)
+                    .push_str(text)
+            }
         }
         cx.notify();
     }
@@ -477,6 +487,11 @@ impl SettingsView {
             }
             Field::FontSize => {
                 self.font_size_s.pop();
+            }
+            Field::TerminalCommand => {
+                if let Some(c) = self.draft.terminal.command.as_mut() {
+                    c.pop();
+                }
             }
         };
         cx.notify();

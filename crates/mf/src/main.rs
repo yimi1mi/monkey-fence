@@ -1,6 +1,7 @@
 #![recursion_limit = "256"]
 
 mod agent_panel;
+mod cockpit;
 mod console;
 mod diff_view;
 mod editor;
@@ -122,6 +123,9 @@ fn bind_keys(cx: &mut App) {    use editor as ed;
         ("ctrl-shift-g", ws::ShowVcs),
         ("ctrl-`", ws::ToggleConsole),
         ("ctrl-,", ws::OpenSettings),
+        ("alt-1", ws::SetModeZed),
+        ("alt-2", ws::SetModeOrca),
+        ("alt-3", ws::SetModeDual),
     );
 
     // 设置弹窗
