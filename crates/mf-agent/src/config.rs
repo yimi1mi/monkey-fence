@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     Mock,
@@ -21,7 +21,7 @@ impl ProviderKind {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProviderConfig {
     pub kind: ProviderKind,
     #[serde(default)]
@@ -32,7 +32,7 @@ pub struct ProviderConfig {
     pub model: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EngineConfig {
     #[serde(default = "default_workers")]
     pub workers: usize,
@@ -64,7 +64,32 @@ impl Default for EngineConfig {
     }
 }
 
-#[derive(Clone, Debug, Deserialize)]
+/// 编辑器外观(全局字体等),设置界面可改
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EditorConfig {
+    #[serde(default = "default_font_family")]
+    pub font_family: String,
+    #[serde(default = "default_font_size")]
+    pub font_size: f32,
+}
+
+fn default_font_family() -> String {
+    "Consolas".into()
+}
+fn default_font_size() -> f32 {
+    13.0
+}
+
+impl Default for EditorConfig {
+    fn default() -> Self {
+        Self {
+            font_family: default_font_family(),
+            font_size: default_font_size(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
@@ -73,6 +98,8 @@ pub struct Config {
     pub roles: HashMap<String, String>,
     #[serde(default)]
     pub engine: EngineConfig,
+    #[serde(default)]
+    pub editor: EditorConfig,
 }
 
 impl Default for Config {
@@ -95,6 +122,7 @@ impl Default for Config {
             providers,
             roles,
             engine: EngineConfig::default(),
+            editor: EditorConfig::default(),
         }
     }
 }
@@ -157,6 +185,15 @@ max_iterations = 24
 max_failures = 3
 "#;
         std::fs::write(Self::config_path(), template)?;
+        Ok(())
+    }
+
+    /// 把当前配置写回 config.toml(设置界面“保存”用)
+    pub fn save(&self) -> Result<()> {
+        std::fs::create_dir_all(Self::config_dir())?;
+        let text = toml::to_string_pretty(self).context("serialize config")?;
+        std::fs::write(Self::config_path(), text)
+            .with_context(|| format!("write {}", Self::config_path().display()))?;
         Ok(())
     }
 

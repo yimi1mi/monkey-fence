@@ -38,12 +38,32 @@ cargo run -p mf -- --agent-smoke .
 | `Ctrl+P` | 快速打开文件(模糊匹配) |
 | `Ctrl+Shift+P` | 命令面板 |
 | `Ctrl+B` | 切换左侧面板 |
+| `Ctrl+`` | 切换控制台分屏(底部终端 dock) |
+| `Ctrl+,` | 打开设置 |
 | `Ctrl+W` / `Ctrl+Tab` | 关闭 / 切换标签页 |
 | `Ctrl+S` / `Ctrl+Z` / `Ctrl+Y` | 保存 / 撤销 / 重做 |
 | `Ctrl+A` / `Ctrl+C` / `Ctrl+V` / `Ctrl+X` | 全选 / 复制 / 粘贴 / 剪切 |
 | `Ctrl+←/→` `Ctrl+Backspace` | 按词移动 / 删词 |
 | `Alt+↑/↓` `Ctrl+D` | 移动行 / 复制行 |
 | `Tab` / `Shift+Tab` | 缩进 / 反缩进(支持选区) |
+
+## 控制台分屏(终端 dock)
+
+`Ctrl+`` 或状态栏「⌨ 终端」打开底部终端 dock,每个窗格是一个真实 shell(ConPTY,默认 `cmd.exe`):
+
+- 工具栏:**新窗格 / 右分屏 / 下分屏 / 关闭窗格**,窗格可任意嵌套拆分(树形布局,单子分叉自动折叠)
+- 每格独立:头部状态点(运行中绿 / 已退出红)、滚动缓冲(5000 行)、悬停 ✕ 单独关闭
+- 点击窗格即激活(顶部高亮边),键盘直接输入;`Ctrl+C` `Ctrl+D` `Ctrl+L`、方向键 / Home / End / PageUp / Delete 等已映射为终端转义序列
+- 输出解析:剥离 ANSI/OSC 转义(支持跨包不完整序列),`\r` 按光标列覆盖写(进度条友好),`\b` / `\t` 语义化处理
+- 关闭最后一个窗格自动收起整个 dock
+
+## 设置
+
+`Ctrl+,` 或状态栏「⚙」打开设置弹窗,修改保存到 `~/.monkeyfence/config.toml`:
+
+- **角色 → 提供方**:planner / worker / reviewer 各自指定提供方名称;点选角色后编辑其提供方的类型(mock / openai 兼容 / anthropic)、base_url、api_key、model(新名称会自动建同名提供方并迁移旧配置)
+- **引擎**:并行 worker 数、工具循环轮数、失败熔断次数(下次打开项目生效)
+- **编辑器**:字体、字号(保存后立即应用到所有打开的编辑器)
 
 ## Agent 编排(核心)
 
@@ -107,15 +127,19 @@ crates/
 ## 测试
 
 ```bash
-cargo test --workspace   # 24 项:buffer/undo 往返、DAG 状态机、熔断、问答、
-                         # 端到端 mock 运行、ztag 解析(真实样本)、diff 解析、git 往返
+cargo test --workspace   # 31 项:buffer/undo 往返、DAG 状态机、熔断、问答、端到端 mock 运行、
+                         # ztag 解析(真实样本)、diff 解析、git 往返、
+                         # 终端 ANSI/OSC 剥离与 \r 覆盖写、配置序列化往返
 ```
+
+> 注:mf-bin 的单元测试集中在 `main.rs`(rustc 对超大 gpui 模块内联 `#[test]` 的宏展开深度有计数怪癖)。
 
 ## 已知限制(v1)
 
-- 多光标、分栏、软换行未实现
+- 多光标、编辑器分栏、软换行未实现(终端 dock 支持任意嵌套分屏)
+- 终端为行缓冲渲染(无全屏 TUI 应用支持;vim/top 等备用 `run_cmd` 工具)
 - 中文输入走系统 IME(基础支持,组合窗口位置未定制)
-- 任务 result 摘要在个别路径下显示为"(无总结)"
+- 任务 result 摘要在个别路径下显示为“(无总结)”
 - Windows 优先(其他平台依赖 GPUI 后端可用性)
 
 ## 许可

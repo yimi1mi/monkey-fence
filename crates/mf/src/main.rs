@@ -1,9 +1,13 @@
+#![recursion_limit = "256"]
+
 mod agent_panel;
+mod console;
 mod diff_view;
 mod editor;
 mod file_index;
 mod file_tree;
 mod quick_open;
+mod settings;
 mod theme;
 mod vcs_panel;
 mod workspace;
@@ -66,6 +70,7 @@ macro_rules! bind_many {
 
 fn bind_keys(cx: &mut App) {    use editor as ed;
     use quick_open as qo;
+    use settings;
     use workspace as ws;
 
     // 编辑器
@@ -114,6 +119,13 @@ fn bind_keys(cx: &mut App) {    use editor as ed;
         ("ctrl-b", ws::ToggleLeftPanel),
         ("ctrl-shift-e", ws::ShowExplorer),
         ("ctrl-shift-g", ws::ShowVcs),
+        ("ctrl-`", ws::ToggleConsole),
+        ("ctrl-,", ws::OpenSettings),
+    );
+
+    // 设置弹窗
+    bind_many!(cx, "Settings";
+        ("escape", settings::Dismiss),
     );
 
     // 快速打开浮层
@@ -194,4 +206,102 @@ fn agent_smoke(project: Option<String>) -> i32 {
     eprintln!("[agent-smoke] 超时未收敛");
     engine.stop();
     1
+}
+
+/// mf-bin 的单元测试集中放在 main.rs(rustc 对超大 gpui 模块内联 #[test]
+/// 的宏展开深度计数有怪癖,放在模块文件里会触发 recursion limit)
+#[cfg(test)]
+mod tests {
+    use crate::console::{TermFilter, MAX_LINES};
+
+    #[test]
+    fn console_ansi_strip_and_control_chars() {
+        let mut f = TermFilter::new();
+        let mut lines = vec![String::new()];
+        f.feed(&mut lines, b"\x1b[32mOK\x1b[0m\r\n");
+        f.feed(&mut lines, b"50%\r");
+        f.feed(&mut lines, b"100%\r\n");
+        f.feed(&mut lines, b"abc\x08D\n");
+        f.feed(&mut lines, b"a\tb\n");
+        assert_eq!(lines, vec!["OK", "100%", "abD", "a       b", ""]);
+    }
+
+    #[test]
+    fn console_osc_sequences_ignored() {
+        let mut f = TermFilter::new();
+        let mut lines = vec![String::new()];
+        f.feed(&mut lines, b"\x1b]0;title\x07hello\n");
+        assert_eq!(lines, vec!["hello", ""]);
+        f.feed(&mut lines, b"\x1b]8;;http://x\x1b\\link\n");
+        assert_eq!(lines, vec!["hello", "link", ""]);
+    }
+
+    #[test]
+    fn console_ansi_partial_sequence_across_feeds() {
+        let mut f = TermFilter::new();
+        let mut lines = vec![String::new()];
+        f.feed(&mut lines, b"\x1b[");
+        f.feed(&mut lines, b"31mred\n");
+        assert_eq!(lines, vec!["red", ""]);
+    }
+
+    #[test]
+    fn console_carriage_return_overwrites() {
+        // \r 回到行首后重写,不整行清除
+        let mut f = TermFilter::new();
+        let mut lines = vec![String::new()];
+        f.feed(&mut lines, b"downloading 50%\rdownloading 99%\n");
+        assert_eq!(lines, vec!["downloading 99%", ""]);
+    }
+
+    #[test]
+    fn console_max_lines_capped() {
+        let mut f = TermFilter::new();
+        let mut lines = vec![String::new()];
+        for i in 0..(MAX_LINES + 100) {
+            f.feed(&mut lines, format!("line{}\n", i).as_bytes());
+        }
+        assert_eq!(lines.len(), MAX_LINES);
+        let last_content = lines.iter().rev().find(|l| !l.is_empty()).unwrap();
+        assert!(last_content.starts_with("line"));
+    }
+
+    #[test]
+    fn settings_config_roundtrip_with_editor_section() {
+        use mf_agent::{Config, ProviderConfig, ProviderKind};
+        let mut cfg = Config::default();
+        cfg.editor.font_family = "JetBrains Mono".into();
+        cfg.editor.font_size = 14.5;
+        cfg.roles.insert("worker".into(), "glm".into());
+        cfg.providers.insert(
+            "glm".into(),
+            ProviderConfig {
+                kind: ProviderKind::Openai,
+                base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
+                api_key: "sk-test".into(),
+                model: "glm-4.6".into(),
+            },
+        );
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.editor.font_family, "JetBrains Mono");
+        assert_eq!(back.editor.font_size, 14.5);
+        assert_eq!(back.provider_for_role("worker").model, "glm-4.6");
+        assert_eq!(back.provider_for_role("worker").api_key, "sk-test");
+    }
+
+    #[test]
+    fn settings_legacy_config_without_editor_section_loads() {
+        let legacy = r#"
+[roles]
+planner = "mock"
+
+[engine]
+workers = 3
+"#;
+        let cfg: mf_agent::Config = toml::from_str(legacy).unwrap();
+        assert_eq!(cfg.engine.workers, 3);
+        assert_eq!(cfg.editor.font_family, "Consolas");
+        assert_eq!(cfg.editor.font_size, 13.0);
+    }
 }

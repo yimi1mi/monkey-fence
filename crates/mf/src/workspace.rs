@@ -4,11 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::agent_panel::AgentPanel;
+use crate::console::ConsoleDock;
 use crate::diff_view::DiffView;
 use crate::editor::Editor;
 use crate::file_index::FileIndex;
 use crate::file_tree::FileTree;
 use crate::quick_open::{QuickItem, QuickOpen};
+use crate::settings::{Dismissed, Saved, SettingsView};
 use crate::vcs_panel::VcsPanel;
 
 actions!(
@@ -24,6 +26,8 @@ actions!(
         ShowExplorer,
         ShowVcs,
         ShowAgent,
+        ToggleConsole,
+        OpenSettings,
     ]
 );
 
@@ -72,11 +76,14 @@ pub struct Workspace {
     quick_open: Option<Entity<QuickOpen>>,
     vcs_panel: Option<Entity<VcsPanel>>,
     agent_panel: Option<Entity<AgentPanel>>,
+    console_dock: Option<Entity<ConsoleDock>>,
+    settings_open: Option<Entity<SettingsView>>,
     left_panel: LeftPanel,
     status_message: SharedString,
     focus_handle: FocusHandle,
     focus_editor_next: bool,
-    pending_focus: Option<Entity<QuickOpen>>,
+    pending_focus: Option<FocusHandle>,
+    editor_font: mf_agent::EditorConfig,
 }
 
 impl Workspace {
@@ -90,11 +97,14 @@ impl Workspace {
             quick_open: None,
             vcs_panel: None,
             agent_panel: None,
+            console_dock: None,
+            settings_open: None,
             left_panel: LeftPanel::Explorer,
             status_message: "就绪".into(),
             focus_handle: cx.focus_handle(),
             focus_editor_next: false,
             pending_focus: None,
+            editor_font: mf_agent::EditorConfig::default(),
         }
     }
 
@@ -139,6 +149,7 @@ impl Workspace {
         let _ = std::fs::create_dir_all(&db_dir);
         let skills = mf_skills::load_skills(Some(&path));
         let config = mf_agent::Config::load().unwrap_or_default();
+        self.editor_font = config.editor.clone();
         if let Ok(engine) = mf_agent::Engine::start(
             db_dir.join("orchestration.db"),
             path.clone(),
@@ -174,6 +185,8 @@ impl Workspace {
             Ok(buf) => {
                 let buffer = cx.new(|_| buf);
                 let editor = cx.new(|cx| Editor::new(buffer, cx));
+                let font = self.editor_font.clone();
+                editor.update(cx, |ed, cx| ed.set_font(&font, cx));
                 self.tabs.push(Tab::Editor(editor));
                 self.active = self.tabs.len() - 1;
                 self.focus_active(cx);
@@ -262,6 +275,8 @@ impl Workspace {
             ("toggle_explorer".into(), "显示资源管理器".into()),
             ("toggle_vcs".into(), "显示版本控制".into()),
             ("toggle_agent".into(), "显示 Agent 面板".into()),
+            ("toggle_console".into(), "切换控制台分屏".into()),
+            ("open_settings".into(), "打开设置".into()),
             ("close_tab".into(), "关闭当前标签页".into()),
         ];
         if has_folder {
@@ -291,6 +306,8 @@ impl Workspace {
                                 "toggle_explorer" => ws.left_panel = LeftPanel::Explorer,
                                 "toggle_vcs" => ws.left_panel = LeftPanel::Vcs,
                                 "toggle_agent" => ws.left_panel = LeftPanel::Agent,
+                                "toggle_console" => ws.toggle_console(cx),
+                                "open_settings" => ws.open_settings(cx),
                                 "close_tab" => ws.close_tab(&CloseTab, window, cx),
                                 "refresh_tree" => {
                                     if let Some(t) = &ws.file_tree {
@@ -308,13 +325,13 @@ impl Workspace {
             });
         });
         // 订阅浮层的Dismissed 事件(点击遮罩关闭)
-        let weak2 = cx.weak_entity();
-        cx.subscribe(&qo, move |_, _, _: &crate::quick_open::Dismissed, cx| {
-            weak2.update(cx, |ws, cx| ws.dismiss_quick_open(cx)).ok();
+        // 注意:subscribe 回调已在 Workspace update 内,直接用回调参数,不可再 weak.update 重入
+        cx.subscribe(&qo, move |ws, _, _: &crate::quick_open::Dismissed, cx| {
+            ws.dismiss_quick_open(cx);
         })
         .detach();
         self.quick_open = Some(qo.clone());
-        self.pending_focus = Some(qo.clone());
+        self.pending_focus = Some(qo.read(cx).focus_handle(cx));
         let _ = window;
         cx.notify();
     }
@@ -375,6 +392,58 @@ impl Workspace {
     fn act_show_agent(&mut self, _: &ShowAgent, _: &mut Window, cx: &mut Context<Self>) {
         self.left_panel = LeftPanel::Agent;
         cx.notify();
+    }
+
+    fn act_toggle_console(&mut self, _: &ToggleConsole, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_console(cx);
+    }
+
+    fn act_open_settings(&mut self, _: &OpenSettings, _: &mut Window, cx: &mut Context<Self>) {
+        self.open_settings(cx);
+    }
+
+    // ---------- 控制台分屏 ----------
+
+    pub fn toggle_console(&mut self, cx: &mut Context<Self>) {
+        if self.console_dock.take().is_none() {
+            self.console_dock = Some(cx.new(|cx| ConsoleDock::new(cx)));
+        }
+        cx.notify();
+    }
+
+    // ---------- 设置 ----------
+
+    pub fn open_settings(&mut self, cx: &mut Context<Self>) {
+        if self.settings_open.is_some() {
+            self.settings_open = None;
+            cx.notify();
+            return;
+        }
+        let s = cx.new(|cx| SettingsView::new(cx));
+        cx.subscribe(&s, move |ws, _, ev: &Saved, cx| {
+            ws.apply_editor_font(&ev.0.editor, cx);
+            ws.editor_font = ev.0.editor.clone();
+            ws.status_message = "设置已保存".into();
+            cx.notify();
+        })
+        .detach();
+        cx.subscribe(&s, move |ws, _, _: &Dismissed, cx| {
+            ws.settings_open = None;
+            ws.focus_active(cx);
+            cx.notify();
+        })
+        .detach();
+        self.pending_focus = Some(s.read(cx).focus_handle(cx));
+        self.settings_open = Some(s);
+        cx.notify();
+    }
+
+    fn apply_editor_font(&mut self, cfg: &mf_agent::EditorConfig, cx: &mut Context<Self>) {
+        for t in &mut self.tabs {
+            if let Tab::Editor(ed) = t {
+                ed.update(cx, |ed, cx| ed.set_font(cfg, cx));
+            }
+        }
     }
 
     // ---------- 渲染 ----------
@@ -607,16 +676,61 @@ impl Workspace {
             .when(files > 0, |d| {
                 d.child(div().child(format!("{} 个文件", files)))
             })
-            .child(div().ml_auto().child(self.status_message.clone()))
+            .child(
+                div()
+                    .id("status-message")
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .whitespace_nowrap()
+                    .child(self.status_message.clone()),
+            )
             .when_some(cursor, |d, c| d.child(div().child(c)))
+            .child(
+                div()
+                    .id("sb-console")
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .ml_2()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_color(rgb(if self.console_dock.is_some() {
+                        crate::theme::Theme::ACCENT
+                    } else {
+                        crate::theme::Theme::FG_DIM
+                    }))
+                    .hover(|d| d.bg(rgb(crate::theme::Theme::BG_HOVER)))
+                    .child("⌨ 终端")
+                    .on_click(cx.listener(|ws: &mut Workspace, _: &ClickEvent, _w, cx| {
+                        ws.toggle_console(cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id("sb-settings")
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_color(rgb(crate::theme::Theme::FG_DIM))
+                    .hover(|d| d.bg(rgb(crate::theme::Theme::BG_HOVER)))
+                    .child("⚙")
+                    .on_click(cx.listener(|ws: &mut Workspace, _: &ClickEvent, _w, cx| {
+                        ws.open_settings(cx);
+                    })),
+            )
     }
 }
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 延迟聚焦处理(需要 window)
-        if let Some(qo) = self.pending_focus.take() {
-            let handle = qo.read(cx).focus_handle(cx);
+        if let Some(handle) = self.pending_focus.take() {
             window.focus(&handle, cx);
         } else if self.focus_editor_next && !self.tabs.is_empty() {
             self.focus_editor_next = false;
@@ -697,6 +811,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::act_show_explorer))
             .on_action(cx.listener(Self::act_show_vcs))
             .on_action(cx.listener(Self::act_show_agent))
+            .on_action(cx.listener(Self::act_toggle_console))
+            .on_action(cx.listener(Self::act_open_settings))
             .child(
                 div()
                     .id("main-row")
@@ -706,11 +822,31 @@ impl Render for Workspace {
                     .child(self.render_activity_bar(cx))
                     .child(self.render_left_panel(cx))
                     .child(center),
-            )
-            .child(self.render_status_bar(cx));
+            );
+
+        // 控制台 dock(最后一个窗格关闭时自动收起)
+        if let Some(dock) = &self.console_dock {
+            if dock.read(cx).close_pending {
+                self.console_dock = None;
+            }
+        }
+        if let Some(dock) = &self.console_dock {
+            root = root.child(
+                div()
+                    .id("console-dock-area")
+                    .h(px(240.))
+                    .min_h_0()
+                    .flex()
+                    .child(dock.clone()),
+            );
+        }
+        root = root.child(self.render_status_bar(cx));
 
         if let Some(qo) = self.quick_open.clone() {
             root = root.child(qo);
+        }
+        if let Some(s) = self.settings_open.clone() {
+            root = root.child(s);
         }
         root
     }

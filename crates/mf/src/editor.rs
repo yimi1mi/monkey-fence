@@ -82,6 +82,10 @@ pub struct Editor {
     is_selecting: bool,
     geometry: Option<Arc<EditorGeometry>>,
     on_saved: Option<Box<dyn Fn(&mut Window, &mut Context<Editor>)>>,
+    /// 外观(设置界面可改)
+    font_family: SharedString,
+    font_size: Pixels,
+    line_h: Pixels,
 }
 
 impl Editor {
@@ -100,9 +104,21 @@ impl Editor {
             is_selecting: false,
             geometry: None,
             on_saved: None,
+            font_family: "Consolas".into(),
+            font_size: px(15.),
+            line_h: px(22.),
         };
         ed.request_highlight(cx);
         ed
+    }
+
+    /// 应用设置里的编辑器字体
+    pub fn set_font(&mut self, cfg: &mf_agent::EditorConfig, cx: &mut Context<Self>) {
+        let size = cfg.font_size.clamp(8.0, 32.0);
+        self.font_family = cfg.font_family.clone().into();
+        self.font_size = px(size);
+        self.line_h = px((size * 1.47).round());
+        cx.notify();
     }
 
     pub fn cursor_pos(&self, cx: &App) -> (usize, usize) {
@@ -830,9 +846,9 @@ impl Render for Editor {
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)
             .bg(rgb(crate::theme::Theme::BG))
-            .font_family("Consolas")
-            .text_size(px(15.))
-            .line_height(px(22.))
+            .font_family(self.font_family.clone())
+            .text_size(self.font_size)
+            .line_height(self.line_h)
             .text_color(rgb(crate::theme::Theme::FG))
             .on_action(cx.listener(Self::act_backspace))
             .on_action(cx.listener(Self::act_delete))

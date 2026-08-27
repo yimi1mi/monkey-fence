@@ -25,4 +25,8 @@ chrono.workspace = true
 unicode-segmentation = "1.11"
 ignore.workspace = true
 crossbeam-channel.workspace = true
+portable-pty = "0.8"
 notify.workspace = true
+
+[dev-dependencies]
+toml.workspace = true
