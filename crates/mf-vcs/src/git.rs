@@ -210,6 +210,60 @@ impl Git {
     pub fn root(&self) -> PathBuf {
         self.repo.workdir().unwrap_or_else(|| Path::new(".")).to_path_buf()
     }
+
+    // ---------- worktree 管理(卡片墙/驾驶舱用) ----------
+
+    /// 列出全部 worktree (name, 绝对路径)
+    pub fn worktree_list(&self) -> Result<Vec<(String, PathBuf)>> {
+        let mut out = Vec::new();
+        for name in self.repo.worktrees()?.iter().flatten() {
+            if let Ok(wt) = self.repo.find_worktree(name) {
+                if let Some(p) = wt.path().to_str() {
+                    out.push((name.to_string(), PathBuf::from(p)));
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 在 `<root>/../.worktrees/<name>` 创建 worktree + 同名新分支(基于当前 HEAD)
+    pub fn worktree_create(&self, name: &str) -> Result<PathBuf> {
+        let parent = self
+            .root()
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("仓库根没有父目录"))?
+            .to_path_buf();
+        let dir = parent.join(".worktrees").join(name);
+        anyhow::ensure!(!dir.exists(), "worktree 目录已存在: {}", dir.display());
+        std::fs::create_dir_all(dir.parent().unwrap_or(&parent))?;
+        let head = self.repo.head()?.peel_to_commit()?;
+        let branch_ref = format!("refs/heads/{}", name);
+        let mut opts = git2::WorktreeAddOptions::new();
+        let reference = self.repo.reference(&branch_ref, head.id(), false, "mf worktree create")
+            .with_context(|| format!("创建分支失败: {}", branch_ref))?;
+        opts.reference(Some(&reference));
+        let wt = self.repo.worktree(name, &dir, Some(&opts))?;
+        let _ = wt;
+        Ok(dir)
+    }
+
+    /// 删除 worktree(prune 元数据 + 移除目录 + 删除同名分支)
+    pub fn worktree_remove(&self, name: &str) -> Result<()> {
+        let wt = self.repo.find_worktree(name).context("worktree 不存在")?;
+        if let Some(p) = wt.path().to_str() {
+            if std::path::Path::new(p).exists() {
+                if let Err(e) = std::fs::remove_dir_all(p) {
+                    // 目录删不掉(可能被占用)时先 lock 再 prune
+                    let _ = wt.lock(Some("removing"));
+                }
+            }
+        }
+        let mut prune = git2::WorktreePruneOptions::new();
+        prune.valid(true).working_tree(true);
+        wt.prune(Some(&mut prune)).context("prune worktree")?;
+        let _ = self.repo.find_reference(&format!("refs/heads/{}", name)).and_then(|mut r| r.delete());
+        Ok(())
+    }
 }
 
 impl GitStatus {
@@ -267,5 +321,22 @@ mod tests {
         // 分支名可能是 master 或 main,不断言具体值
         let b = git.branch().unwrap();
         assert!(b == "master" || b == "main", "branch = {b}");
+    }
+
+    #[test]
+    fn worktree_lifecycle() {
+        let (_tmp, git) = init_repo();
+        std::fs::write(git.root().join("x"), "1").unwrap();
+        git.stage(&[PathBuf::from("x")]).unwrap();
+        git.commit("c").unwrap();
+
+        let path = git.worktree_create("demo-wt").unwrap();
+        assert!(path.join("x").exists(), "worktree 应包含仓库文件");
+        let list = git.worktree_list().unwrap();
+        assert!(list.iter().any(|(n, _)| n == "demo-wt"), "list: {list:?}");
+
+        git.worktree_remove("demo-wt").unwrap();
+        let list = git.worktree_list().unwrap();
+        assert!(!list.iter().any(|(n, _)| n == "demo-wt"), "remove 后不应残留: {list:?}");
     }
 }
