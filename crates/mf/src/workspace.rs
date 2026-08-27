@@ -258,7 +258,7 @@ impl Workspace {
                 }
             }
         };
-        let view = cx.new(|_| DiffView::new(title, &diff_text));
+        let view = cx.new(|cx| DiffView::new(title, &diff_text, cx));
         // hunk 审阅:拒绝 = 后台 git apply -R mini-patch,完成后重开该 diff
         let root = root.clone();
         let rel = local_path.strip_prefix(&root).unwrap_or(local_path).to_path_buf();
@@ -315,8 +315,11 @@ impl Workspace {
                 .detach();
             });
         });
-        self.tabs.push(Tab::Diff(view));
+        self.tabs.push(Tab::Diff(view.clone()));
         self.active = self.tabs.len() - 1;
+        if let Some(Tab::Diff(dv)) = self.tabs.get(self.active) {
+            self.pending_focus = Some(dv.read(cx).focus_handle());
+        }
         cx.notify();
     }
 

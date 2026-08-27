@@ -12,6 +12,7 @@ pub struct DiffView {
     /// hunk 审阅状态:Some(true)=保留 Some(false)=拒绝 None=未决
     hunk_states: Vec<Option<bool>>,
     scroll_handle: ScrollHandle,
+    focus_handle: FocusHandle,
     on_reject: Option<Box<dyn Fn(String, &mut Window, &mut App)>>,
 }
 
@@ -22,7 +23,7 @@ enum Row {
 }
 
 impl DiffView {
-    pub fn new(title: impl Into<SharedString>, diff_text: &str) -> Self {
+    pub fn new(title: impl Into<SharedString>, diff_text: &str, cx: &mut Context<Self>) -> Self {
         let diff = parse_unified_diff(diff_text);
         let n_hunks = diff.lines.iter().filter(|l| l.kind == DiffLineKind::HunkMeta).count();
         Self {
@@ -31,12 +32,17 @@ impl DiffView {
             diff_text: diff_text.to_string(),
             hunk_states: vec![None; n_hunks],
             scroll_handle: ScrollHandle::new(),
+            focus_handle: cx.focus_handle(),
             on_reject: None,
         }
     }
 
     pub fn title(&self) -> SharedString {
         self.title.clone()
+    }
+
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus_handle.clone()
     }
 
     pub fn set_on_reject(&mut self, cb: impl Fn(String, &mut Window, &mut App) + 'static) {
@@ -148,6 +154,7 @@ impl Render for DiffView {
             .flex()
             .flex_col()
             .bg(rgb(crate::theme::Theme::bg()))
+            .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, e: &KeyDownEvent, w, cx| {
                 if e.keystroke.modifiers.alt {
                     let k = e.keystroke.key.as_str();
