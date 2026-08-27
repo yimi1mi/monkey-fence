@@ -2,6 +2,7 @@
 
 mod agent_panel;
 mod board;
+mod change_set;
 mod cockpit;
 mod console;
 mod diff_view;
@@ -15,6 +16,7 @@ mod settings;
 mod term;
 mod theme;
 mod vcs_panel;
+mod work_items;
 mod workspace;
 
 use gpui::prelude::*;

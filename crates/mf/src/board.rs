@@ -1,11 +1,13 @@
 use gpui::prelude::*;
 use gpui::*;
 use mf_vcs::git::Git;
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use parking_lot::Mutex;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::theme::Theme;
+use crate::work_items::{WorkItemPhase, WorkItemSeed, WorkItemStore};
 
 /// 工作区列表:主仓工作区 + Git worktree 工作区。
 /// 状态流转 todo → in-progress → in-review → completed;
@@ -13,8 +15,10 @@ use crate::theme::Theme;
 pub struct Board {
     root: PathBuf,
     active_path: PathBuf,
+    work_items: Arc<Mutex<WorkItemStore>>,
     cards: Vec<WorkspaceCard>,
     on_activate: Option<Box<dyn Fn(WorkspaceCard, &mut Window, &mut App)>>,
+    can_remove: Option<Box<dyn Fn(&Path, &mut Window, &mut App) -> bool>>,
     swim: bool,
     /// 展开状态菜单的卡片下标
     menu_for: Option<usize>,
@@ -26,21 +30,17 @@ pub struct Board {
     focus_handle: FocusHandle,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct WorkspaceCard {
     pub name: String,
     pub path: PathBuf,
     pub branch: String,
     /// todo | in-progress | in-review | completed
     pub status: String,
+    pub phase: WorkItemPhase,
     pub comment: String,
     pub unread: bool,
     pub last_activity: u64,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct BoardFile {
-    cards: Vec<WorkspaceCard>,
 }
 
 const STATUS_ORDER: [&str; 4] = ["todo", "in-progress", "in-review", "completed"];
@@ -63,21 +63,46 @@ fn status_color(s: &str) -> u32 {
     }
 }
 
+fn phase_cn(phase: WorkItemPhase) -> &'static str {
+    match phase {
+        WorkItemPhase::Draft => "草稿",
+        WorkItemPhase::Running => "执行中",
+        WorkItemPhase::NeedsInput => "需要输入",
+        WorkItemPhase::Review => "待审阅",
+        WorkItemPhase::ReadyToDeliver => "待交付",
+        WorkItemPhase::Done => "已完成",
+        WorkItemPhase::Failed => "失败",
+    }
+}
+
+fn phase_color(phase: WorkItemPhase) -> u32 {
+    match phase {
+        WorkItemPhase::Draft => Theme::fg_faint(),
+        WorkItemPhase::Running => Theme::accent(),
+        WorkItemPhase::NeedsInput | WorkItemPhase::Review | WorkItemPhase::ReadyToDeliver => {
+            Theme::warning()
+        }
+        WorkItemPhase::Done => Theme::success(),
+        WorkItemPhase::Failed => Theme::danger(),
+    }
+}
+
 /// 泳道拖拽载荷(卡片名)
 pub struct CardDrag(pub String);
 
 impl Board {
-    pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
-        let cards = std::fs::read_to_string(root.join(".mf-agent").join("workspaces.json"))
-            .ok()
-            .and_then(|text| serde_json::from_str::<BoardFile>(&text).ok())
-            .map(|file| file.cards)
-            .unwrap_or_default();
+    pub fn new(
+        root: PathBuf,
+        work_items: Arc<Mutex<WorkItemStore>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let mut this = Self {
             root: root.clone(),
             active_path: root.clone(),
-            cards,
+            work_items,
+            cards: Vec::new(),
             on_activate: None,
+            can_remove: None,
             swim: false,
             menu_for: None,
             editing_comment: None,
@@ -87,12 +112,39 @@ impl Board {
             status_msg: "就绪".into(),
             focus_handle: cx.focus_handle(),
         };
+        this.sync_from_work_items();
         this.reconcile();
         this
     }
 
+    fn sync_from_work_items(&mut self) {
+        let store = self.work_items.lock();
+        if let Some(active) = store.active() {
+            self.active_path = active.workspace.clone();
+        }
+        self.cards = store
+            .items()
+            .iter()
+            .map(|item| WorkspaceCard {
+                name: if item.id == "main" { String::new() } else { item.title.clone() },
+                path: item.workspace.clone(),
+                branch: item.vcs_ref.clone(),
+                status: item.phase.as_workspace_status().into(),
+                phase: item.phase,
+                comment: item.comment.clone(),
+                unread: item.unread,
+                last_activity: item.updated_at / 1000,
+            })
+            .collect();
+    }
+
     pub fn unread_count(&self) -> usize {
-        self.cards.iter().filter(|card| card.unread).count()
+        self.work_items
+            .lock()
+            .items()
+            .iter()
+            .filter(|item| item.unread)
+            .count()
     }
 
     /// 注册工作区卡片激活回调。回调收到点击时卡片状态的稳定快照。
@@ -101,6 +153,13 @@ impl Board {
         cb: impl Fn(WorkspaceCard, &mut Window, &mut App) + 'static,
     ) {
         self.on_activate = Some(Box::new(cb));
+    }
+
+    pub fn set_can_remove(
+        &mut self,
+        callback: impl Fn(&Path, &mut Window, &mut App) -> bool + 'static,
+    ) {
+        self.can_remove = Some(Box::new(callback));
     }
 
     fn activate_card(
@@ -114,68 +173,87 @@ impl Board {
         };
         card.unread = false;
         let card = card.clone();
-        self.active_path = card.path.clone();
         self.menu_for = None;
-        self.save();
+        self.save_card(idx);
         if let Some(cb) = &self.on_activate {
             cb(card, window, cx);
         }
         cx.notify();
     }
 
-    fn store_path(&self) -> PathBuf {
-        self.root.join(".mf-agent").join("workspaces.json")
-    }
-
-    fn save(&self) {
-        let file = BoardFile { cards: self.cards.iter().filter(|c| !c.name.is_empty()).cloned().collect() };
-        let _ = std::fs::create_dir_all(self.root.join(".mf-agent"));
-        if let Ok(text) = serde_json::to_string_pretty(&file) {
-            let _ = std::fs::write(self.store_path(), text);
-        }
+    fn save_card(&self, idx: usize) {
+        let Some(card) = self.cards.get(idx) else {
+            return;
+        };
+        let mut store = self.work_items.lock();
+        store.set_phase(&card.path, card.phase);
+        store.update_comment(&card.path, card.comment.clone());
+        store.set_unread(&card.path, card.unread);
+        let _ = store.save();
     }
 
     /// 主仓卡 + git worktree 对账:新 worktree 补卡,已删的移除
     pub fn reconcile(&mut self) {
-        let git = match Git::open(&self.root) {
-            Ok(g) => g,
-            Err(_) => {
-                if self.cards.is_empty() {
-                    self.cards.push(main_card(&self.root));
+        let project_name = self
+            .root
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "主工作区".into());
+        let mut seeds = Vec::new();
+        if let Ok(git) = Git::open(&self.root) {
+            let branch = git.branch().unwrap_or_default();
+            seeds.push(WorkItemSeed::new(project_name, &self.root, branch));
+            let worktrees = match git.worktree_list() {
+                Ok(worktrees) => worktrees,
+                Err(error) => {
+                    self.status_msg = format!("工作区对账失败: {error:#}").into();
+                    return;
                 }
-                return;
-            }
-        };
-        let branch = git.branch().unwrap_or_default();
-        let mut cards: Vec<WorkspaceCard> = vec![main_card(&self.root)];
-        cards[0].branch = branch;
-        let wts = git.worktree_list().unwrap_or_default();
-        for (name, path) in wts {
-            if name.is_empty() {
-                continue;
-            }
-            let existing = self.cards.iter().find(|c| c.name == name).cloned();
-            cards.push(existing.unwrap_or(WorkspaceCard {
-                name: name.clone(),
-                branch: name,
-                path,
-                status: "todo".into(),
-                comment: String::new(),
-                unread: false,
-                last_activity: now_secs(),
-            }));
+            };
+            seeds.extend(
+                worktrees
+                    .into_iter()
+                    .filter(|(name, _)| !name.is_empty())
+                    .map(|(name, path)| WorkItemSeed::new(name.clone(), path, name)),
+            );
+        } else {
+            let p4 = mf_vcs::p4::P4::new(&self.root);
+            let vcs_ref = p4
+                .info()
+                .map(|info| {
+                    if info.client_stream.is_empty() {
+                        info.client_name
+                    } else {
+                        info.client_stream
+                    }
+                })
+                .unwrap_or_default();
+            seeds.push(WorkItemSeed::new(project_name, &self.root, vcs_ref));
         }
-        self.cards = cards;
-        self.save();
+        {
+            let mut store = self.work_items.lock();
+            store.reconcile_workspaces(seeds);
+            let _ = store.save();
+        }
+        self.sync_from_work_items();
     }
 
     fn set_status(&mut self, idx: usize, status: &str, cx: &mut Context<Self>) {
+        if self.cards.get(idx).is_some_and(|card| {
+            matches!(card.phase, WorkItemPhase::Running | WorkItemPhase::NeedsInput)
+        }) {
+            self.status_msg = "执行中或等待输入的工作项不能手动改阶段".into();
+            self.menu_for = None;
+            cx.notify();
+            return;
+        }
         if let Some(c) = self.cards.get_mut(idx) {
             c.status = status.to_string();
+            c.phase = WorkItemPhase::from_workspace_status(status);
             c.last_activity = now_secs();
         }
         self.menu_for = None;
-        self.save();
+        self.save_card(idx);
         cx.notify();
     }
 
@@ -222,11 +300,20 @@ impl Board {
         .detach();
     }
 
-    fn remove_worktree(&mut self, idx: usize, cx: &mut Context<Self>) {
-        let name = match self.cards.get(idx) {
-            Some(c) if !c.name.is_empty() => c.name.clone(),
+    fn remove_worktree(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let (name, path) = match self.cards.get(idx) {
+            Some(c) if !c.name.is_empty() => (c.name.clone(), c.path.clone()),
             _ => return,
         };
+        if self
+            .can_remove
+            .as_ref()
+            .is_some_and(|can_remove| !can_remove(&path, window, cx))
+        {
+            self.status_msg = "该工作区仍有未保存标签，不能删除".into();
+            cx.notify();
+            return;
+        }
         self.status_msg = format!("删除 worktree「{name}」…").into();
         cx.notify();
         let root = self.root.clone();
@@ -285,8 +372,8 @@ impl Board {
                     .cursor_pointer()
                     .text_size(px(9.5))
                     .text_color(rgb(Theme::bg()))
-                    .bg(rgb(status_color(&card.status)))
-                    .child(status_cn(&card.status))
+                    .bg(rgb(phase_color(card.phase)))
+                    .child(phase_cn(card.phase))
                     .on_click(cx.listener(move |b: &mut Board, _: &ClickEvent, _w, cx| {
                         cx.stop_propagation();
                         b.menu_for = if b.menu_for == Some(idx) { None } else { Some(idx) };
@@ -390,7 +477,7 @@ impl Board {
                                     cx.notify();
                                 })),
                         )
-                        .when(!card.name.is_empty(), |d| {
+                        .when(!card.name.is_empty() && !is_active, |d| {
                             d.child(
                                 div()
                                     .id(ElementId::Name(format!("bd-rm-{idx}").into()))
@@ -399,10 +486,10 @@ impl Board {
                                     .text_size(px(10.)).text_color(rgb(Theme::danger()))
                                     .cursor_pointer()
                                     .child("🗑 删除")
-                                    .on_click(cx.listener(move |b: &mut Board, _: &ClickEvent, _w, cx| {
+                                    .on_click(cx.listener(move |b: &mut Board, _: &ClickEvent, window, cx| {
                                         cx.stop_propagation();
                                         b.menu_for = None;
-                                        b.remove_worktree(idx, cx);
+                                        b.remove_worktree(idx, window, cx);
                                     })),
                             )
                         }),
@@ -441,7 +528,7 @@ impl Board {
                             c.comment = b.comment_input.clone();
                             c.last_activity = now_secs();
                         }
-                        b.save();
+                        b.save_card(idx);
                     }
                     b.comment_input.clear();
                     cx.notify();
@@ -551,18 +638,6 @@ impl Board {
     }
 }
 
-fn main_card(root: &PathBuf) -> WorkspaceCard {
-    WorkspaceCard {
-        name: String::new(), // 空 name = 主仓卡
-        path: root.clone(),
-        branch: String::new(),
-        status: "in-progress".into(),
-        comment: String::new(),
-        unread: false,
-        last_activity: now_secs(),
-    }
-}
-
 fn display_name(name: &str) -> &str {
     if name.is_empty() { "(主仓库)" } else { name }
 }
@@ -587,6 +662,7 @@ fn rel_time(secs: u64) -> String {
 
 impl Render for Board {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_from_work_items();
         let has_git = Git::is_repo(&self.root);
         div()
             .id("board-root")

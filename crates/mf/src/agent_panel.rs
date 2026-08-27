@@ -5,9 +5,12 @@ use parking_lot::Mutex;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::work_items::{WorkItemPhase, WorkItemStore};
+
 /// Agent 面板:目标输入 → 任务看板 → 运行日志 → 人机问答
 pub struct AgentPanel {
     engine: Arc<Mutex<Option<Arc<Engine>>>>,
+    work_items: Option<Arc<Mutex<WorkItemStore>>>,
     root_label: String,
     objective: String,
     active_run: Option<i64>,
@@ -33,6 +36,7 @@ impl AgentPanel {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let panel = Self {
             engine: Arc::new(Mutex::new(None)),
+            work_items: None,
             root_label: String::new(),
             objective: String::new(),
             active_run: None,
@@ -57,7 +61,21 @@ impl AgentPanel {
         // 注意:直接用局部 engine 查询,不要经 self.engine.lock() —— if let 条件里的
         // MutexGuard 临时值会活到整个 if-let 结束,body 内再锁同一把 std Mutex 会同线程死锁。
         if let Some(run) = engine.latest_active_run().ok().flatten() {
-            self.active_run = Some(run.id);
+            self.update_work_item(|store| {
+                store.bind_run(run.id);
+                let current = store.active().map(|item| item.phase);
+                let phase = match run.status.as_str() {
+                    "active" => WorkItemPhase::Running,
+                    "done" if matches!(current, Some(WorkItemPhase::Done | WorkItemPhase::ReadyToDeliver)) => {
+                        current.unwrap()
+                    }
+                    "done" => WorkItemPhase::Review,
+                    "done-with-failures" | "planner-error" => WorkItemPhase::Failed,
+                    _ => current.unwrap_or(WorkItemPhase::Draft),
+                };
+                store.set_phase_for_active(phase);
+            });
+            self.active_run = (run.status == "active").then_some(run.id);
             self.run_status = format!("{}(历史)", run.status);
             self.tasks = engine.tasks_of_run(run.id).ok().unwrap_or_default();
         }
@@ -66,6 +84,10 @@ impl AgentPanel {
 
     pub fn set_on_files_touched(&mut self, cb: impl Fn(&[String], &mut Window, &mut App) + 'static) {
         self.on_files_touched = Some(Box::new(cb));
+    }
+
+    pub fn attach_work_items(&mut self, work_items: Arc<Mutex<WorkItemStore>>) {
+        self.work_items = Some(work_items);
     }
 
     pub fn stop_engine(&mut self) {
@@ -82,6 +104,9 @@ impl AgentPanel {
                     .timer(std::time::Duration::from_millis(150))
                     .await;
                 let Some(engine_ref) = engine.lock().clone() else {
+                    if this.update(cx, |_, _| {}).is_err() {
+                        break;
+                    }
                     continue;
                 };
                 // 非阻塞抽干事件
@@ -93,11 +118,14 @@ impl AgentPanel {
                     }
                 }
                 if !batch.is_empty() {
-                    this.update(cx, |p, cx| {
+                    if this.update(cx, |p, cx| {
                         p.apply_events(batch, cx);
                         cx.notify();
                     })
-                    .ok();
+                    .is_err()
+                    {
+                        break;
+                    }
                 }
             }
         })
@@ -109,6 +137,13 @@ impl AgentPanel {
         for ev in events {
             match ev {
                 EngineEvent::RunStarted(run) => {
+                    if self.active_run.is_some_and(|active| active != run.id) {
+                        continue;
+                    }
+                    self.update_work_item(|store| {
+                        store.bind_run(run.id);
+                        store.set_phase_for_active(WorkItemPhase::Running);
+                    });
                     self.active_run = Some(run.id);
                     self.run_status = "运行中".into();
                     self.tasks.clear();
@@ -118,9 +153,15 @@ impl AgentPanel {
                     });
                 }
                 EngineEvent::TaskCreated(t) => {
+                    if self.active_run != Some(t.run_id) {
+                        continue;
+                    }
                     self.tasks.push(t);
                 }
                 EngineEvent::TaskStatus(t) => {
+                    if self.active_run != Some(t.run_id) {
+                        continue;
+                    }
                     if let Some(slot) = self.tasks.iter_mut().find(|x| x.id == t.id) {
                         *slot = t;
                     } else {
@@ -128,6 +169,9 @@ impl AgentPanel {
                     }
                 }
                 EngineEvent::WorkerLog { task_id, worker, text } => {
+                    if task_id > 0 && !self.tasks.iter().any(|task| task.id == task_id) {
+                        continue;
+                    }
                     self.logs.push(LogLine {
                         worker,
                         text: if task_id > 0 {
@@ -142,6 +186,9 @@ impl AgentPanel {
                     }
                 }
                 EngineEvent::WorkerTool { task_id, worker, tool, summary } => {
+                    if task_id > 0 && !self.tasks.iter().any(|task| task.id == task_id) {
+                        continue;
+                    }
                     self.logs.push(LogLine {
                         worker,
                         text: format!("[#{}] 🔧 {} {}", task_id, tool, summary),
@@ -154,20 +201,47 @@ impl AgentPanel {
                     }
                 }
                 EngineEvent::QuestionOpened(q) => {
+                    if self.active_run != Some(q.run_id) {
+                        continue;
+                    }
+                    self.update_work_item(|store| {
+                        store.set_phase_for_active(WorkItemPhase::NeedsInput);
+                        store.set_unread_for_active(true);
+                    });
                     self.open_question = Some(q);
                 }
-                EngineEvent::QuestionAnswered(_) => {
+                EngineEvent::QuestionAnswered(question) => {
+                    if self.active_run != Some(question.run_id) {
+                        continue;
+                    }
+                    self.update_work_item(|store| {
+                        store.set_phase_for_active(WorkItemPhase::Running);
+                    });
                     self.open_question = None;
                     self.answer.clear();
                 }
-                EngineEvent::RunFinished(_, msg) => {
+                EngineEvent::RunFinished(run_id, msg) => {
+                    if self.active_run != Some(run_id) {
+                        continue;
+                    }
+                    let phase = if msg.contains("失败") || msg.contains("熔断") {
+                        WorkItemPhase::Failed
+                    } else {
+                        WorkItemPhase::Review
+                    };
+                    self.update_work_item(|store| {
+                        store.set_phase_for_active(phase);
+                        store.set_unread_for_active(true);
+                    });
                     self.run_status = msg.clone();
+                    self.active_run = None;
                     self.logs.push(LogLine {
                         worker: "run".into(),
                         text: format!("🏁 {}", msg),
                     });
                 }
                 EngineEvent::EngineError(e) => {
+                    self.run_status = format!("执行失败: {e}");
                     self.logs.push(LogLine {
                         worker: "engine".into(),
                         text: format!("⚠ {}", e),
@@ -187,6 +261,11 @@ impl AgentPanel {
     }
 
     fn act_start_owned(&mut self, cx: &mut Context<Self>) {
+        if self.active_run.is_some() {
+            self.run_status = "已有执行正在运行；请等待完成或处理待答问题".into();
+            cx.notify();
+            return;
+        }
         let obj = self.objective.trim().to_string();
         if obj.is_empty() {
             self.run_status = "请输入目标".into();
@@ -199,7 +278,12 @@ impl AgentPanel {
             return;
         };
         match engine.start_run(&obj) {
-            Ok(_) => {
+            Ok(run_id) => {
+                self.active_run = Some(run_id);
+                self.update_work_item(|store| {
+                    store.bind_run(run_id);
+                    store.set_phase_for_active(WorkItemPhase::Running);
+                });
                 self.objective.clear();
                 self.logs.clear();
                 self.tasks.clear();
@@ -268,6 +352,14 @@ impl AgentPanel {
             TaskStatus::Completed => crate::theme::Theme::success(),
             TaskStatus::Failed => crate::theme::Theme::danger(),
             TaskStatus::Blocked => crate::theme::Theme::danger(),
+        }
+    }
+
+    fn update_work_item(&self, update: impl FnOnce(&mut WorkItemStore)) {
+        if let Some(work_items) = &self.work_items {
+            let mut store = work_items.lock();
+            update(&mut store);
+            let _ = store.save();
         }
     }
 }

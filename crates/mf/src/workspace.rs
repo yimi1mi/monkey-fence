@@ -1,6 +1,8 @@
 use gpui::*;
 use gpui::prelude::*;
 use mf_agent::TaskStatus;
+use parking_lot::Mutex;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -12,11 +14,15 @@ use crate::diff_view::DiffView;
 use crate::editor::Editor;
 use crate::file_index::FileIndex;
 use crate::file_tree::FileTree;
-use crate::navigation::{BottomPanel, LeftPanel, NavAction, NavigationState, PrimarySurface};
+use crate::navigation::{
+    empty_state_for, BottomPanel, EmptyState, LeftPanel, NavAction, NavigationState,
+    PrimarySurface,
+};
 use crate::quick_open::{QuickItem, QuickOpen};
 use crate::search::ProjectSearch;
 use crate::settings::{Dismissed, Saved, SettingsView};
 use crate::vcs_panel::VcsPanel;
+use crate::work_items::{WorkItemPhase, WorkItemStore};
 
 actions!(
     workspace,
@@ -73,6 +79,7 @@ pub struct Workspace {
     active_workspace: Option<PathBuf>,
     tabs: Vec<Tab>,
     active: usize,
+    tab_sessions: HashMap<PathBuf, (Vec<Tab>, usize)>,
     file_index: Option<Entity<FileIndex>>,
     file_tree: Option<Entity<FileTree>>,
     quick_open: Option<Entity<QuickOpen>>,
@@ -80,6 +87,7 @@ pub struct Workspace {
     vcs_panel: Option<Entity<VcsPanel>>,
     agent_panel: Option<Entity<AgentPanel>>,
     board: Option<Entity<Board>>,
+    work_items: Option<Arc<Mutex<WorkItemStore>>>,
     console_dock: Option<Entity<ConsoleDock>>,
     cockpit: Option<Entity<Cockpit>>,
     navigation: NavigationState,
@@ -98,6 +106,7 @@ impl Workspace {
             active_workspace: None,
             tabs: Vec::new(),
             active: 0,
+            tab_sessions: HashMap::new(),
             file_index: None,
             file_tree: None,
             quick_open: None,
@@ -105,6 +114,7 @@ impl Workspace {
             vcs_panel: None,
             agent_panel: None,
             board: None,
+            work_items: None,
             console_dock: None,
             cockpit: None,
             navigation: NavigationState::default(),
@@ -127,14 +137,34 @@ impl Workspace {
         // 统一为绝对路径,保证 agent 沙箱与索引以同一坐标系工作
         let path = std::path::absolute(&path).unwrap_or(path);
         if self.root.as_ref() == Some(&path) {
-            self.navigation.apply(NavAction::ShowCode);
-            self.status_message = format!("当前工作区 {}", path.display()).into();
-            cx.notify();
+            if self.active_workspace.as_ref() == Some(&path) {
+                self.navigation.apply(NavAction::ShowCode);
+                self.status_message = format!("当前工作区 {}", path.display()).into();
+                cx.notify();
+            } else {
+                self.activate_workspace_context(path, cx);
+            }
             return;
         }
         let switching_project = self.root.as_ref().is_some_and(|root| root != &path);
-        if switching_project && self.tabs.iter().any(|tab| tab.is_dirty(cx)) {
+        let has_dirty_tabs = self.tabs.iter().any(|tab| tab.is_dirty(cx))
+            || self
+                .tab_sessions
+                .values()
+                .any(|(tabs, _)| tabs.iter().any(|tab| tab.is_dirty(cx)));
+        if switching_project && has_dirty_tabs {
             self.status_message = "存在未保存文件；请先保存或关闭后再切换工作区".into();
+            cx.notify();
+            return;
+        }
+        if switching_project
+            && self.work_items.as_ref().is_some_and(|work_items| {
+                work_items.lock().active().is_some_and(|item| {
+                    matches!(item.phase, WorkItemPhase::Running | WorkItemPhase::NeedsInput)
+                })
+            })
+        {
+            self.status_message = "当前工作项仍在执行或等待输入，暂不能切换项目".into();
             cx.notify();
             return;
         }
@@ -148,62 +178,170 @@ impl Workspace {
         self.file_tree = None;
         self.vcs_panel = None;
         self.board = None;
+        self.work_items = None;
         self.console_dock = None;
         self.cockpit = None;
         self.navigation = NavigationState::default();
         self.root = Some(path.clone());
         self.active_workspace = Some(path.clone());
         self.tabs.clear();
+        self.tab_sessions.clear();
         self.active = 0;
+        let work_items = Arc::new(Mutex::new(WorkItemStore::load(path.clone())));
+        self.work_items = Some(work_items.clone());
+        let board_work_items = work_items.clone();
+        let board = cx.new(|cx| Board::new(path.clone(), board_work_items, cx));
+        let weak_activate = cx.weak_entity();
+        let weak_remove = cx.weak_entity();
+        board.update(cx, |board, _| {
+            board.set_on_activate(move |card, _window, cx| {
+                weak_activate.update(cx, |workspace, cx| {
+                    workspace.navigation.apply(NavAction::ShowWorkspaces);
+                    workspace.activate_workspace_context(card.path, cx);
+                })
+                .ok();
+            });
+            board.set_can_remove(move |path, _window, cx| {
+                weak_remove
+                    .update(cx, |workspace, cx| {
+                        let current_dirty = workspace.active_workspace.as_deref() == Some(path)
+                            && workspace.tabs.iter().any(|tab| tab.is_dirty(cx));
+                        let hidden_dirty = workspace
+                            .tab_sessions
+                            .get(path)
+                            .is_some_and(|(tabs, _)| tabs.iter().any(|tab| tab.is_dirty(cx)));
+                        let dirty = current_dirty || hidden_dirty;
+                        if !dirty {
+                            workspace.tab_sessions.remove(path);
+                        }
+                        !dirty
+                    })
+                    .unwrap_or(false)
+            });
+        });
+        self.board = Some(board);
+        let initial_workspace = work_items
+            .lock()
+            .active()
+            .map(|item| item.workspace.clone())
+            .unwrap_or_else(|| path.clone());
+        self.active_workspace = None;
+        self.activate_workspace_context(initial_workspace, cx);
+        self.status_message = format!("已打开 {}", path.display()).into();
+        cx.notify();
+    }
+
+    fn activate_workspace_context(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let path = std::path::absolute(&path).unwrap_or(path);
+        if !path.is_dir() {
+            self.status_message = format!("工作区不存在: {}", path.display()).into();
+            cx.notify();
+            return;
+        }
+        if self.active_workspace.as_ref() == Some(&path) && self.file_index.is_some() {
+            self.navigation.apply(NavAction::ShowWorkspaces);
+            self.status_message = format!("当前工作区 {}", path.display()).into();
+            cx.notify();
+            return;
+        }
+        if let Some(work_items) = &self.work_items {
+            let store = work_items.lock();
+            let switching = store
+                .active()
+                .is_some_and(|item| item.workspace != path);
+            let busy = store.active().is_some_and(|item| {
+                matches!(item.phase, WorkItemPhase::Running | WorkItemPhase::NeedsInput)
+            });
+            if switching && busy {
+                self.status_message = "当前工作项仍在执行或等待输入，暂不能切换工作区".into();
+                cx.notify();
+                return;
+            }
+        }
+
+        if let Some(current_workspace) = self.active_workspace.clone() {
+            let tabs = std::mem::take(&mut self.tabs);
+            self.tab_sessions
+                .insert(current_workspace, (tabs, self.active));
+        }
+        let (mut tabs, active) = self
+            .tab_sessions
+            .remove(&path)
+            .unwrap_or_else(|| (Vec::new(), 0));
+        for tab in &mut tabs {
+            if let Tab::Editor(editor) = tab {
+                if !editor.read(cx).buffer.read(cx).is_dirty() {
+                    editor.update(cx, |editor, cx| {
+                        editor.buffer.update(cx, |buffer, _| {
+                            let _ = buffer.reload_from_disk();
+                        });
+                        cx.notify();
+                    });
+                }
+            }
+        }
+        self.tabs = tabs;
+        self.active = active.min(self.tabs.len().saturating_sub(1));
+
+        let reopen_console = self.navigation.bottom == Some(BottomPanel::Terminal);
+        let reopen_search = self.navigation.bottom == Some(BottomPanel::Search);
+        if let Some(agent) = self.agent_panel.take() {
+            agent.update(cx, |agent, _| agent.stop_engine());
+        }
+        self.quick_open = None;
+        self.search_overlay = None;
+        self.file_index = None;
+        self.file_tree = None;
+        self.vcs_panel = None;
+        self.console_dock = None;
+        self.cockpit = None;
+        self.active_workspace = Some(path.clone());
+        if let Some(work_items) = &self.work_items {
+            let mut store = work_items.lock();
+            store.activate_workspace(&path);
+            let _ = store.save();
+        }
+
         let index = cx.new(|cx| FileIndex::new(path.clone(), cx));
         let tree = cx.new(|cx| FileTree::new(path.clone(), cx));
         let weak = cx.weak_entity();
-        tree.update(cx, |t, _| {
-            t.set_on_open(move |path, _window, cx| {
-                weak.update(cx, |ws, cx| ws.open_path(path, cx)).ok();
+        tree.update(cx, |tree, _| {
+            tree.set_on_open(move |path, _window, cx| {
+                weak.update(cx, |workspace, cx| workspace.open_path(path, cx))
+                    .ok();
             });
         });
         self.file_index = Some(index);
         self.file_tree = Some(tree);
 
-        // 版控面板(P4/Git 自动检测)
         let vcs = cx.new(|cx| VcsPanel::new(path.clone(), cx));
         let weak = cx.weak_entity();
-        vcs.update(cx, |v, _| {
-            v.set_on_open_diff(move |title, local_path, window, cx| {
-                weak.update(cx, |ws, cx| ws.open_diff(&title, &local_path, cx))
-                    .ok();
-                let _ = window;
-            });
-        });
-        self.vcs_panel = Some(vcs);
-        let board = cx.new(|cx| Board::new(path.clone(), cx));
-        let weak = cx.weak_entity();
-        board.update(cx, |board, _| {
-            board.set_on_activate(move |card, _window, cx| {
+        vcs.update(cx, |vcs, _| {
+            vcs.set_on_open_diff(move |title, local_path, _window, cx| {
                 weak.update(cx, |workspace, cx| {
-                    workspace.active_workspace = Some(card.path.clone());
-                    workspace.navigation.apply(NavAction::ShowWorkspaces);
-                    workspace.status_message = format!("当前工作区 {}", card.path.display()).into();
-                    cx.notify();
+                    workspace.open_diff(&title, &local_path, cx)
                 })
                 .ok();
             });
         });
-        self.board = Some(board);
+        self.vcs_panel = Some(vcs);
 
-        // Agent 面板 + 编排引擎(状态存项目内,git 忽略)
         let agent = cx.new(|cx| AgentPanel::new(cx));
+        if let Some(work_items) = &self.work_items {
+            agent.update(cx, |agent, _| agent.attach_work_items(work_items.clone()));
+        }
         let db_dir = path.join(".mf-agent");
         let _ = std::fs::create_dir_all(&db_dir);
         let skills = mf_skills::load_skills(Some(&path));
         let config = mf_agent::Config::load().unwrap_or_default();
         self.editor_font = config.editor.clone();
-        let term_cmd = config
+        self.apply_editor_font(&config.editor, cx);
+        let shell = config
             .terminal
             .command
             .clone()
-            .filter(|s| !s.trim().is_empty());
+            .filter(|command| !command.trim().is_empty())
+            .unwrap_or_else(crate::console::default_shell);
         if let Ok(engine) = mf_agent::Engine::start(
             db_dir.join("orchestration.db"),
             path.clone(),
@@ -211,8 +349,7 @@ impl Workspace {
             skills,
         ) {
             let engine = Arc::new(engine);
-            agent.update(cx, |a, cx| a.attach_engine(engine.clone(), &path, cx));
-            let shell = term_cmd.unwrap_or_else(crate::console::default_shell);
+            agent.update(cx, |agent, cx| agent.attach_engine(engine.clone(), &path, cx));
             let cockpit = cx.new(|cx| Cockpit::new(engine, path.clone(), shell, cx));
             let weak = cx.weak_entity();
             let work_root = path.clone();
@@ -227,17 +364,29 @@ impl Workspace {
                         .file_name()
                         .map(|name| name.to_string_lossy().to_string())
                         .unwrap_or_else(|| "变更".into());
-                    weak.update(cx, |workspace, cx| {
-                        workspace.open_diff(&title, &path, cx);
-                    })
-                    .ok();
+                    weak.update(cx, |workspace, cx| workspace.open_diff(&title, &path, cx))
+                        .ok();
                 });
             });
             self.cockpit = Some(cockpit);
         }
         self.agent_panel = Some(agent);
-        self.status_message = format!("已打开 {}", path.display()).into();
+
+        if reopen_console {
+            self.ensure_console(cx);
+        }
+        if reopen_search {
+            self.open_project_search(cx);
+        }
+        self.status_message = format!("当前工作区 {}", path.display()).into();
         cx.notify();
+    }
+
+    fn active_root(&self) -> PathBuf {
+        self.active_workspace
+            .clone()
+            .or_else(|| self.root.clone())
+            .unwrap_or_default()
     }
 
     pub fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
@@ -278,7 +427,7 @@ impl Workspace {
     /// 打开文件的工作区 diff 标签页(P4 优先,回退 Git)
     pub fn open_diff(&mut self, title: &str, local_path: &Path, cx: &mut Context<Self>) {
         self.navigation.apply(NavAction::ShowCode);
-        let root = self.root.clone().unwrap_or_default();
+        let root = self.active_root();
         let (diff_text, git_review) = {
             let p4 = mf_vcs::p4::P4::new(&root);
             match p4.diff_file(local_path) {
@@ -308,14 +457,16 @@ impl Workspace {
                 let rel = rel.clone();
                 let title = title_owned.clone();
                 let weak = weak.clone();
+                let review_root = root.clone();
                 cx.spawn(async move |cx| {
+                    let command_root = review_root.clone();
                     let applied = cx.background_executor().spawn(async move {
                         use std::io::Write as _;
                         let mut child = std::process::Command::new("git")
                             .arg("apply")
                             .arg("-R")
                             .arg("--recount")
-                            .current_dir(&root)
+                            .current_dir(&command_root)
                             .stdin(std::process::Stdio::piped())
                             .stdout(std::process::Stdio::piped())
                             .stderr(std::process::Stdio::piped())
@@ -337,6 +488,11 @@ impl Workspace {
                     });
                     let r = applied.await;
                     weak.update(cx, move |ws: &mut Workspace, cx| {
+                        if ws.active_root() != review_root {
+                            ws.status_message = "工作区已切换；旧工作区 hunk 已处理，但未重开 Diff".into();
+                            cx.notify();
+                            return;
+                        }
                         match r {
                             Ok(()) => ws.status_message = "hunk 已拒绝(git apply -R),diff 已刷新".into(),
                             Err(e) => ws.status_message = format!("拒绝失败:{e}").into(),
@@ -482,7 +638,8 @@ impl Workspace {
                             let path = if p.is_absolute() {
                                 p
                             } else {
-                                ws.root.as_ref().map(|root| root.join(&p)).unwrap_or(p)
+                                let root = ws.active_root();
+                                if root.as_os_str().is_empty() { p } else { root.join(&p) }
                             };
                             ws.navigation.apply(NavAction::ShowCode);
                             ws.open_path(&path, cx);
@@ -596,7 +753,10 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let Some(root) = self.root.clone() else { return };
+        let root = self.active_root();
+        if root.as_os_str().is_empty() {
+            return;
+        }
         let s = cx.new(|cx| ProjectSearch::new(root, cx));
         let weak = cx.weak_entity();
         s.update(cx, |sv, _| {
@@ -810,6 +970,114 @@ impl Workspace {
                                         ws.show_command_palette(&CommandPalette, window, cx);
                                     })),
                             )
+                    ),
+            )
+    }
+
+    fn render_project_ready(&self, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(336.))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("project-quick-open")
+                            .w_full()
+                            .h(px(52.))
+                            .px_3()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .rounded_lg()
+                            .bg(rgb(crate::theme::Theme::accent()))
+                            .text_color(rgb(crate::theme::Theme::bg()))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgb(0x72b3ff)))
+                            .child(div().w(px(22.)).text_size(px(17.)).child("⌕"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .child(div().text_size(px(12.5)).font_weight(FontWeight::SEMIBOLD).child("快速打开文件"))
+                                    .child(div().text_size(px(9.5)).child("Ctrl+P")),
+                            )
+                            .on_click(cx.listener(|workspace: &mut Workspace, _, window, cx| {
+                                workspace.show_quick_open_files(&QuickOpenFiles, window, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("project-work-overview")
+                                    .w(px(164.))
+                                    .h(px(52.))
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(rgb(crate::theme::Theme::border()))
+                                    .bg(rgb(crate::theme::Theme::bg_elevated()))
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())).border_color(rgb(crate::theme::Theme::accent_dim())))
+                                    .child(div().w(px(18.)).text_size(px(15.)).text_color(rgb(crate::theme::Theme::accent())).child("▦"))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_0p5()
+                                            .child(div().text_size(px(11.5)).text_color(rgb(crate::theme::Theme::fg())).child("工作概览"))
+                                            .child(div().text_size(px(9.5)).text_color(rgb(crate::theme::Theme::fg_faint())).child("Ctrl+Shift+W")),
+                                    )
+                                    .on_click(cx.listener(|workspace: &mut Workspace, _, _, cx| {
+                                        workspace.navigation.apply(NavAction::ShowWorkspaces);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("project-command-palette")
+                                    .w(px(164.))
+                                    .h(px(52.))
+                                    .px_3()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(rgb(crate::theme::Theme::border()))
+                                    .bg(rgb(crate::theme::Theme::bg_elevated()))
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())).border_color(rgb(crate::theme::Theme::accent_dim())))
+                                    .child(div().w(px(18.)).text_size(px(15.)).text_color(rgb(crate::theme::Theme::accent())).child("⌘"))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_0p5()
+                                            .child(div().text_size(px(11.5)).text_color(rgb(crate::theme::Theme::fg())).child("命令面板"))
+                                            .child(div().text_size(px(9.5)).text_color(rgb(crate::theme::Theme::fg_faint())).child("Ctrl+Shift+P")),
+                                    )
+                                    .on_click(cx.listener(|workspace: &mut Workspace, _, window, cx| {
+                                        workspace.show_command_palette(&CommandPalette, window, cx);
+                                    })),
+                            ),
                     ),
             )
     }
@@ -1419,7 +1687,7 @@ impl Render for Workspace {
         if let Some(agent) = &self.agent_panel {
             let touched = agent.update(cx, |a, _| a.take_touched());
             if !touched.is_empty() {
-                let root = self.root.clone().unwrap_or_default();
+                let root = self.active_root();
                 for rel in &touched {
                     let abs = root.join(rel);
                     for t in &mut self.tabs {
@@ -1447,9 +1715,10 @@ impl Render for Workspace {
                 }
             }
         }
-        let center: AnyElement = if self.tabs.is_empty() {
-            self.render_welcome(cx).into_any_element()
-        } else {
+        let center: AnyElement = match empty_state_for(self.root.is_some(), !self.tabs.is_empty()) {
+            Some(EmptyState::FirstLaunch) => self.render_welcome(cx).into_any_element(),
+            Some(EmptyState::ProjectReady) => self.render_project_ready(cx).into_any_element(),
+            None => {
             let active_tab = self.tabs.get(self.active).cloned();
             let mut col = div()
                 .id("editor-col")
@@ -1467,6 +1736,7 @@ impl Render for Workspace {
                 None => {}
             }
             col.into_any_element()
+            }
         };
 
         // 终端最后一个窗格关闭时只收起底 dock，实体其余状态不受影响。

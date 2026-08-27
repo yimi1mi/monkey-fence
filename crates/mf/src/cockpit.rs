@@ -1,10 +1,10 @@
 use gpui::prelude::*;
 use gpui::*;
 use mf_agent::{Engine, QuestionView, RunView, TaskStatus, TaskView};
-use mf_vcs::git::{Git, GitFileEntry};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use crate::change_set::{ChangeEntry, ChangeSetSnapshot};
 use crate::console::ConsolePane;
 use crate::theme::Theme;
 
@@ -25,13 +25,14 @@ pub struct Cockpit {
     run: Option<RunView>,
     tasks: Vec<TaskView>,
     questions: Vec<QuestionView>,
-    git_status: Vec<GitFileEntry>,
+    change_set: ChangeSetSnapshot,
     sig: String,
     on_open_change: Option<Box<dyn Fn(PathBuf, &mut Window, &mut App)>>,
 }
 
 impl Cockpit {
     pub fn new(engine: Arc<Engine>, root: PathBuf, shell: String, cx: &mut Context<Self>) -> Self {
+        let change_set = ChangeSetSnapshot::load(&root);
         let mut this = Self {
             engine,
             root,
@@ -44,7 +45,7 @@ impl Cockpit {
             run: None,
             tasks: Vec::new(),
             questions: Vec::new(),
-            git_status: Vec::new(),
+            change_set,
             sig: String::new(),
             on_open_change: None,
         };
@@ -67,8 +68,9 @@ impl Cockpit {
         let id = self.next_pane_id;
         self.next_pane_id += 1;
         let shell = self.shell.clone();
+        let root = self.root.clone();
         let pane = cx.new(|cx| {
-            ConsolePane::new(id, &shell, cx)
+            ConsolePane::new_in(id, &shell, &root, cx)
                 .unwrap_or_else(|e| ConsolePane::failed(id, e, cx))
         });
         self.panes.push(pane);
@@ -109,13 +111,11 @@ impl Cockpit {
             ),
             None => (Vec::new(), Vec::new()),
         };
-        let git_status = Git::open(&self.root)
-            .and_then(|g| g.status())
-            .unwrap_or_default();
+        let change_set = ChangeSetSnapshot::load(&self.root);
         self.run = run;
         self.tasks = tasks;
         self.questions = questions;
-        self.git_status = git_status;
+        self.change_set = change_set;
     }
 
     fn start_polling(&self, cx: &mut Context<Self>) {
@@ -138,12 +138,10 @@ impl Cockpit {
                         ),
                         None => (Vec::new(), Vec::new()),
                     };
-                    let git_status = Git::open(&root)
-                        .and_then(|g| g.status())
-                        .unwrap_or_default();
-                    (run, tasks, questions, git_status)
+                    let change_set = ChangeSetSnapshot::load(&root);
+                    (run, tasks, questions, change_set)
                 });
-                let (run, tasks, questions, git_status) = snap.await;
+                let (run, tasks, questions, change_set) = snap.await;
                 let mut sig = format!(
                     "run:{:?};q:{};",
                     run.as_ref().map(|r| (r.id, r.status.clone())),
@@ -152,20 +150,24 @@ impl Cockpit {
                 for t in &tasks {
                     sig.push_str(&format!("{}:{:?},", t.id, t.status));
                 }
-                for g in &git_status {
-                    sig.push_str(&format!("{}|{:?};", g.path.display(), g.status));
+                sig.push_str(&format!("backend:{:?};", change_set.backend));
+                for entry in &change_set.entries {
+                    sig.push_str(&format!("{}|{};", entry.path.display(), entry.status));
                 }
-                this.update(cx, |p, cx| {
+                if this.update(cx, |p, cx| {
                     p.run = run;
                     p.tasks = tasks;
                     p.questions = questions;
-                    p.git_status = git_status;
+                    p.change_set = change_set;
                     if p.sig != sig {
                         p.sig = sig;
                         cx.notify();
                     }
                 })
-                .ok();
+                .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
@@ -577,7 +579,7 @@ impl Cockpit {
                     .border_color(rgb(Theme::border()))
                     .text_size(px(10.))
                     .text_color(rgb(Theme::fg_faint()))
-                    .child(format!("CHANGE SET · {} 项", self.git_status.len())),
+                    .child(format!("{} · {} 项", self.change_set.label(), self.change_set.entries.len())),
             )
             .child(
                 div()
@@ -585,15 +587,25 @@ impl Cockpit {
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
-                    .children(if self.git_status.is_empty() {
+                    .children(if self.change_set.entries.is_empty() {
                         vec![div().id("ck-cs-empty").p_2().text_size(px(11.)).text_color(rgb(Theme::fg_faint())).child("工作区干净").into_any_element()]
                     } else {
-                        self.git_status
+                        self.change_set.entries
                             .iter()
                             .take(50)
                             .map(|g| {
-                                let (mark, color) = git_mark(&g);
+                                let (mark, color) = change_mark(&g);
                                 let path = g.path.clone();
+                                let detail = g
+                                    .change
+                                    .as_ref()
+                                    .map(|change| format!("CL {change}"))
+                                    .unwrap_or_else(|| {
+                                        g.path
+                                            .parent()
+                                            .map(|parent| truncate(&parent.display().to_string(), 12))
+                                            .unwrap_or_default()
+                                    });
                                 div()
                                     .id(ElementId::Name(format!("ck-cs-{}", g.path.display()).into()))
                                     .flex()
@@ -625,7 +637,7 @@ impl Cockpit {
                                         div()
                                             .text_size(px(9.))
                                             .text_color(rgb(Theme::fg_faint()))
-                                            .child(g.path.parent().map(|p| truncate(&p.display().to_string(), 12)).unwrap_or_default()),
+                                            .child(detail),
                                     )
                                     .into_any_element()
                             })
@@ -712,14 +724,13 @@ fn status_dot(s: &TaskStatus) -> (u32, &'static str) {
     }
 }
 
-fn git_mark(g: &GitFileEntry) -> (String, u32) {
-    use mf_vcs::git::GitStatus;
-    match g.status {
-        GitStatus::New => ("A".into(), Theme::success()),
-        GitStatus::Modified => ("M".into(), Theme::warning()),
-        GitStatus::Deleted => ("D".into(), Theme::danger()),
-        GitStatus::Renamed => ("R".into(), Theme::warning()),
-        GitStatus::Staged { .. } => ("S".into(), Theme::accent()),
+fn change_mark(entry: &ChangeEntry) -> (String, u32) {
+    match entry.status.as_str() {
+        "add" => ("A".into(), Theme::success()),
+        "delete" => ("D".into(), Theme::danger()),
+        "rename" | "branch" | "move/add" => ("R".into(), Theme::warning()),
+        "staged" => ("S".into(), Theme::accent()),
+        _ => ("M".into(), Theme::warning()),
     }
 }
 

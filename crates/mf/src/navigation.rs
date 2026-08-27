@@ -5,6 +5,22 @@ pub enum PrimarySurface {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EmptyState {
+    FirstLaunch,
+    ProjectReady,
+}
+
+pub fn empty_state_for(has_project: bool, has_tabs: bool) -> Option<EmptyState> {
+    if has_tabs {
+        None
+    } else if has_project {
+        Some(EmptyState::ProjectReady)
+    } else {
+        Some(EmptyState::FirstLaunch)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LeftPanel {
     Explorer,
     Vcs,
@@ -148,5 +164,22 @@ mod tests {
         assert!(nav.agent_open);
         assert_eq!(nav.bottom, None);
         assert_eq!(nav.left, Some(LeftPanel::Explorer));
+    }
+
+    #[test]
+    fn opened_project_without_tabs_uses_project_ready_state() {
+        assert_eq!(
+            empty_state_for(true, false),
+            Some(EmptyState::ProjectReady)
+        );
+    }
+
+    #[test]
+    fn first_launch_and_open_editor_are_distinct() {
+        assert_eq!(
+            empty_state_for(false, false),
+            Some(EmptyState::FirstLaunch)
+        );
+        assert_eq!(empty_state_for(true, true), None);
     }
 }
