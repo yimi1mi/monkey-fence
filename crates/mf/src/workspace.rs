@@ -259,6 +259,62 @@ impl Workspace {
             }
         };
         let view = cx.new(|_| DiffView::new(title, &diff_text));
+        // hunk 审阅:拒绝 = 后台 git apply -R mini-patch,完成后重开该 diff
+        let root = root.clone();
+        let rel = local_path.strip_prefix(&root).unwrap_or(local_path).to_path_buf();
+        let title_owned = title.to_string();
+        let weak = cx.weak_entity();
+        view.update(cx, |dv, _| {
+            dv.set_on_reject(move |patch, _window, cx| {
+                let root = root.clone();
+                let rel = rel.clone();
+                let title = title_owned.clone();
+                let weak = weak.clone();
+                cx.spawn(async move |cx| {
+                    let applied = cx.background_executor().spawn(async move {
+                        use std::io::Write as _;
+                        let mut child = std::process::Command::new("git")
+                            .arg("apply")
+                            .arg("-R")
+                            .arg("--recount")
+                            .current_dir(&root)
+                            .stdin(std::process::Stdio::piped())
+                            .stdout(std::process::Stdio::piped())
+                            .stderr(std::process::Stdio::piped())
+                            .spawn();
+                        match child {
+                            Ok(mut c) => {
+                                if let Some(mut sin) = c.stdin.take() {
+                                    let _ = sin.write_all(patch.as_bytes());
+                                }
+                                let out = c.wait_with_output();
+                                out.map(|o| {
+                                    if o.status.success() { Ok(()) } else {
+                                        Err(String::from_utf8_lossy(&o.stderr).chars().take(200).collect())
+                                    }
+                                }).unwrap_or_else(|e| Err(e.to_string()))
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    });
+                    let r = applied.await;
+                    weak.update(cx, move |ws: &mut Workspace, cx| {
+                        match r {
+                            Ok(()) => ws.status_message = "hunk 已拒绝(git apply -R),diff 已刷新".into(),
+                            Err(e) => ws.status_message = format!("拒绝失败:{e}").into(),
+                        }
+                        // 重开同文件 diff 刷新视图(复用当前 Diff tab 位置)
+                        if let Some(idx) = ws.tabs.iter().rposition(|t| matches!(t, Tab::Diff(_))) {
+                            ws.tabs.remove(idx);
+                        }
+                        ws.open_diff(&title, &rel, cx);
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .detach();
+            });
+        });
         self.tabs.push(Tab::Diff(view));
         self.active = self.tabs.len() - 1;
         cx.notify();
