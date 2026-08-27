@@ -180,9 +180,9 @@ impl Render for FileTree {
                                 .map(|s| *s == entry.path)
                                 .unwrap_or(false);
                             let name_color = if entry.is_dir {
-                                crate::theme::Theme::FG
+                                crate::theme::Theme::fg()
                             } else {
-                                crate::theme::Theme::FG_DIM
+                                crate::theme::Theme::fg_dim()
                             };
                             let arrow = if entry.is_dir {
                                 if this.expanded.contains(&entry.path) {
@@ -204,15 +204,15 @@ impl Render for FileTree {
                                     .pl(px((depth as f32 * 12.0 + 8.0) as f32))
                                     .pr_2()
                                     .when(is_selected, |d| {
-                                        d.bg(rgb(crate::theme::Theme::BG_ACTIVE))
+                                        d.bg(rgb(crate::theme::Theme::bg_active()))
                                     })
-                                    .hover(|d| d.bg(rgb(crate::theme::Theme::BG_HOVER)))
+                                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                                     .cursor_pointer()
                                     .text_size(px(13.))
                                     .child(
                                         div()
                                             .w(px(14.))
-                                            .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                                            .text_color(rgb(crate::theme::Theme::fg_faint()))
                                             .child(arrow),
                                     )
                                     .child(

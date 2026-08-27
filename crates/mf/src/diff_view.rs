@@ -39,7 +39,7 @@ impl Render for DiffView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(crate::theme::Theme::BG))
+            .bg(rgb(crate::theme::Theme::bg()))
             .child(
                 div()
                     .h(px(28.))
@@ -48,22 +48,22 @@ impl Render for DiffView {
                     .gap_3()
                     .px_3()
                     .border_b_1()
-                    .border_color(rgb(crate::theme::Theme::BORDER))
-                    .bg(rgb(crate::theme::Theme::BG_PANEL))
+                    .border_color(rgb(crate::theme::Theme::border()))
+                    .bg(rgb(crate::theme::Theme::bg_panel()))
                     .text_size(px(12.))
                     .child(
                         div()
-                            .text_color(rgb(crate::theme::Theme::FG))
+                            .text_color(rgb(crate::theme::Theme::fg()))
                             .child(self.title.clone()),
                     )
                     .child(
                         div()
-                            .text_color(rgb(crate::theme::Theme::SUCCESS))
+                            .text_color(rgb(crate::theme::Theme::success()))
                             .child(format!("+{}", added)),
                     )
                     .child(
                         div()
-                            .text_color(rgb(crate::theme::Theme::DANGER))
+                            .text_color(rgb(crate::theme::Theme::danger()))
                             .child(format!("-{}", deleted)),
                     ),
             )
@@ -83,28 +83,28 @@ impl Render for DiffView {
                         };
                         let (bg, fg, prefix) = match kind {
                             DiffLineKind::Add => (
-                                crate::theme::Theme::SUCCESS,
-                                crate::theme::Theme::SUCCESS,
+                                crate::theme::Theme::success(),
+                                crate::theme::Theme::success(),
                                 "+",
                             ),
                             DiffLineKind::Delete => (
-                                crate::theme::Theme::DANGER,
-                                crate::theme::Theme::DANGER,
+                                crate::theme::Theme::danger(),
+                                crate::theme::Theme::danger(),
                                 "-",
                             ),
                             DiffLineKind::HunkMeta => (
-                                crate::theme::Theme::BG_PANEL,
-                                crate::theme::Theme::ACCENT,
+                                crate::theme::Theme::bg_panel(),
+                                crate::theme::Theme::accent(),
                                 "@",
                             ),
                             DiffLineKind::Header => (
-                                crate::theme::Theme::BG_PANEL,
-                                crate::theme::Theme::FG_DIM,
+                                crate::theme::Theme::bg_panel(),
+                                crate::theme::Theme::fg_dim(),
                                 " ",
                             ),
                             DiffLineKind::Context => (
-                                crate::theme::Theme::BG,
-                                crate::theme::Theme::FG_DIM,
+                                crate::theme::Theme::bg(),
+                                crate::theme::Theme::fg_dim(),
                                 " ",
                             ),
                         };
@@ -131,7 +131,7 @@ impl Render for DiffView {
                                 .text_size(px(12.))
                                 .child(
                                     div()
-                                        .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                                        .text_color(rgb(crate::theme::Theme::fg_faint()))
                                         .child(gutter),
                                 )
                                 .child(

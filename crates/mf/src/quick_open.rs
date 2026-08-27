@@ -223,9 +223,9 @@ impl Render for QuickOpen {
                     .flex()
                     .flex_col()
                     .rounded_md()
-                    .bg(rgb(crate::theme::Theme::BG_ELEVATED))
+                    .bg(rgb(crate::theme::Theme::bg_elevated()))
                     .border_1()
-                    .border_color(rgb(crate::theme::Theme::BORDER))
+                    .border_color(rgb(crate::theme::Theme::border()))
                     .shadow_lg()
                     .on_mouse_down(MouseButton::Left, |_, _, _| {
                         // 阻止冒泡关闭
@@ -239,17 +239,17 @@ impl Render for QuickOpen {
                             .items_center()
                             .gap_2()
                             .border_b_1()
-                            .border_color(rgb(crate::theme::Theme::BORDER))
+                            .border_color(rgb(crate::theme::Theme::border()))
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                                    .text_color(rgb(crate::theme::Theme::fg_faint()))
                                     .child(mode_label),
                             )
                             .child(
                                 div()
                                     .text_size(px(15.))
-                                    .text_color(rgb(crate::theme::Theme::FG))
+                                    .text_color(rgb(crate::theme::Theme::fg()))
                                     .child(format!("{}{}", query, caret)),
                             ),
                     )
@@ -289,20 +289,20 @@ impl Render for QuickOpen {
                                             .items_center()
                                             .gap_2()
                                             .when(is_sel, |d| {
-                                                d.bg(rgb(crate::theme::Theme::ACCENT_DIM))
+                                                d.bg(rgb(crate::theme::Theme::accent_dim()))
                                             })
-                                            .hover(|d| d.bg(rgb(crate::theme::Theme::BG_HOVER)))
+                                            .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                                             .cursor_pointer()
                                             .child(
                                                 div()
                                                     .text_size(px(12.))
-                                                    .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                                                    .text_color(rgb(crate::theme::Theme::fg_faint()))
                                                     .child(icon),
                                             )
                                             .child(
                                                 div()
                                                     .text_size(px(13.))
-                                                    .text_color(rgb(crate::theme::Theme::FG))
+                                                    .text_color(rgb(crate::theme::Theme::fg()))
                                                     .child(label),
                                             )
                                             .when(!dir_hint.is_empty(), |d| {
@@ -311,7 +311,7 @@ impl Render for QuickOpen {
                                                         .ml_auto()
                                                         .text_size(px(11.))
                                                         .text_color(rgb(
-                                                            crate::theme::Theme::FG_FAINT,
+                                                            crate::theme::Theme::fg_faint(),
                                                         ))
                                                         .overflow_hidden()
                                                         .child(dir_hint),

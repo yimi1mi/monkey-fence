@@ -414,9 +414,9 @@ fn load_vcs(root: &PathBuf, with_history: bool) -> anyhow::Result<LoadedData> {
 
 fn action_color(action: &str) -> u32 {
     match action {
-        "add" | "branch" => crate::theme::Theme::SUCCESS,
-        "delete" | "move/delete" => crate::theme::Theme::DANGER,
-        _ => crate::theme::Theme::WARNING,
+        "add" | "branch" => crate::theme::Theme::success(),
+        "delete" | "move/delete" => crate::theme::Theme::danger(),
+        _ => crate::theme::Theme::warning(),
     }
 }
 
@@ -444,7 +444,7 @@ impl Render for VcsPanel {
                 .gap_1()
                 .px_2()
                 .border_b_1()
-                .border_color(rgb(crate::theme::Theme::BORDER))
+                .border_color(rgb(crate::theme::Theme::border()))
                 .child(tool_btn("刷新", cx.listener(|p: &mut VcsPanel, _, _, cx| p.refresh(cx))))
                 .child(tool_btn(
                     "同步",
@@ -461,13 +461,13 @@ impl Render for VcsPanel {
 
         // 状态行
         if let Some(err) = &self.error {
-            col = col.child(banner(crate::theme::Theme::DANGER, format!("⚠ {}", err)));
+            col = col.child(banner(crate::theme::Theme::danger(), format!("⚠ {}", err)));
         }
         if let Some(n) = &self.notice {
-            col = col.child(banner(crate::theme::Theme::FG_DIM, n.clone()));
+            col = col.child(banner(crate::theme::Theme::fg_dim(), n.clone()));
         }
         if self.loading {
-            col = col.child(banner(crate::theme::Theme::ACCENT, "加载中…".into()));
+            col = col.child(banner(crate::theme::Theme::accent(), "加载中…".into()));
         }
 
         // 文件列表区
@@ -497,7 +497,7 @@ impl Render for VcsPanel {
                             .pt_1()
                             .pb_1()
                             .border_b_1()
-                            .border_color(rgb(crate::theme::Theme::BORDER))
+                            .border_color(rgb(crate::theme::Theme::border()))
                             .flex()
                             .flex_col()
                             .gap_1()
@@ -508,20 +508,20 @@ impl Render for VcsPanel {
                                     .gap_2()
                                     .child(
                                         div()
-                                            .text_color(rgb(crate::theme::Theme::ACCENT))
+                                            .text_color(rgb(crate::theme::Theme::accent()))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .child(format!("CL {}", ch.id)),
                                     )
                                     .child(
                                         div()
-                                            .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                                            .text_color(rgb(crate::theme::Theme::fg_faint()))
                                             .overflow_hidden()
                                             .child(ch.short_desc()),
                                     )
                                     .when(ch.shelved, |d| {
                                         d.child(
                                             div()
-                                                .text_color(rgb(crate::theme::Theme::WARNING))
+                                                .text_color(rgb(crate::theme::Theme::warning()))
                                                 .child("[搁置]"),
                                         )
                                     }),
@@ -541,24 +541,24 @@ impl Render for VcsPanel {
                                 .flex()
                                 .flex_col()
                                 .border_b_1()
-                                .border_color(rgb(crate::theme::Theme::BORDER))
+                                .border_color(rgb(crate::theme::Theme::border()))
                                 .child(
                                     div()
                                         .flex()
                                         .gap_2()
                                         .child(
                                             div()
-                                                .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                                                .text_color(rgb(crate::theme::Theme::fg_faint()))
                                                 .child(format!("#{}", h.id)),
                                         )
                                         .child(
                                             div()
-                                                .text_color(rgb(crate::theme::Theme::FG_DIM))
+                                                .text_color(rgb(crate::theme::Theme::fg_dim()))
                                                 .child(h.user.clone()),
                                         )
                                         .child(
                                             div()
-                                                .text_color(rgb(crate::theme::Theme::FG))
+                                                .text_color(rgb(crate::theme::Theme::fg()))
                                                 .overflow_hidden()
                                                 .child(h.short_desc()),
                                         ),
@@ -591,12 +591,12 @@ impl Render for VcsPanel {
                     let staged = g.status.is_staged();
                     let label = g.status.label();
                     let color = if staged {
-                        crate::theme::Theme::SUCCESS
+                        crate::theme::Theme::success()
                     } else {
                         match g.status {
-                            mf_vcs::git::GitStatus::New => crate::theme::Theme::SUCCESS,
-                            mf_vcs::git::GitStatus::Deleted => crate::theme::Theme::DANGER,
-                            _ => crate::theme::Theme::WARNING,
+                            mf_vcs::git::GitStatus::New => crate::theme::Theme::success(),
+                            mf_vcs::git::GitStatus::Deleted => crate::theme::Theme::danger(),
+                            _ => crate::theme::Theme::warning(),
                         }
                     };
                     list = list.child(
@@ -608,7 +608,7 @@ impl Render for VcsPanel {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .hover(|d| d.bg(rgb(crate::theme::Theme::BG_HOVER)))
+                            .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                             .cursor_pointer()
                             .on_click({
                                 let path_str = path_str.clone();
@@ -623,11 +623,11 @@ impl Render for VcsPanel {
                             })
                             .child(div().w(px(12.)).child(if checked { "☑" } else { "☐" }))
                             .child(div().w(px(28.)).text_color(rgb(color)).child(label))
-                            .child(div().text_color(rgb(crate::theme::Theme::FG)).child(name))
+                            .child(div().text_color(rgb(crate::theme::Theme::fg())).child(name))
                             .child(
                                 div()
                                     .ml_auto()
-                                    .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                                    .text_color(rgb(crate::theme::Theme::fg_faint()))
                                     .overflow_hidden()
                                     .child(dir),
                             ),
@@ -646,20 +646,20 @@ impl Render for VcsPanel {
                                 .flex()
                                 .gap_2()
                                 .border_b_1()
-                                .border_color(rgb(crate::theme::Theme::BORDER))
+                                .border_color(rgb(crate::theme::Theme::border()))
                                 .child(
                                     div()
-                                        .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                                        .text_color(rgb(crate::theme::Theme::fg_faint()))
                                         .child(h.id.clone()),
                                 )
                                 .child(
                                     div()
-                                        .text_color(rgb(crate::theme::Theme::FG_DIM))
+                                        .text_color(rgb(crate::theme::Theme::fg_dim()))
                                         .child(h.author.clone()),
                                 )
                                 .child(
                                     div()
-                                        .text_color(rgb(crate::theme::Theme::FG))
+                                        .text_color(rgb(crate::theme::Theme::fg()))
                                         .overflow_hidden()
                                         .child(h.summary.clone()),
                                 ),
@@ -674,7 +674,7 @@ impl Render for VcsPanel {
         col.child(
             div()
                 .border_t_1()
-                .border_color(rgb(crate::theme::Theme::BORDER))
+                .border_color(rgb(crate::theme::Theme::border()))
                 .p_2()
                 .flex()
                 .flex_col()
@@ -686,15 +686,15 @@ impl Render for VcsPanel {
                         .p_1()
                         .rounded_sm()
                         .border_1()
-                        .border_color(rgb(crate::theme::Theme::BORDER))
-                        .bg(rgb(crate::theme::Theme::BG))
+                        .border_color(rgb(crate::theme::Theme::border()))
+                        .bg(rgb(crate::theme::Theme::bg()))
                         .track_focus(&self.desc_focus)
                         .when(self.desc_focus.is_focused(window), |d| {
-                            d.border_color(rgb(crate::theme::Theme::ACCENT))
+                            d.border_color(rgb(crate::theme::Theme::accent()))
                         })
                         .on_key_down(cx.listener(Self::on_desc_key))
                         .text_size(px(12.))
-                        .text_color(rgb(crate::theme::Theme::FG))
+                        .text_color(rgb(crate::theme::Theme::fg()))
                         .child(if self.submit_desc.is_empty() {
                             SharedString::from("提交描述(点击后输入)")
                         } else {
@@ -740,7 +740,7 @@ impl VcsPanel {
             .flex()
             .items_center()
             .gap_2()
-            .hover(|d| d.bg(rgb(crate::theme::Theme::BG_HOVER)))
+            .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
             .cursor_pointer()
             .on_click({
                 let depot = depot.clone();
@@ -768,11 +768,11 @@ impl VcsPanel {
                     .text_color(rgb(color))
                     .child(action),
             )
-            .child(div().text_color(rgb(crate::theme::Theme::FG)).child(name))
+            .child(div().text_color(rgb(crate::theme::Theme::fg())).child(name))
             .child(
                 div()
                     .ml_auto()
-                    .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                    .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .overflow_hidden()
                     .child(dir),
             )
@@ -785,10 +785,10 @@ fn section_header(text: String) -> impl IntoElement {
         .flex()
         .items_center()
         .px_2()
-        .bg(rgb(crate::theme::Theme::BG_ELEVATED))
+        .bg(rgb(crate::theme::Theme::bg_elevated()))
         .text_size(px(11.))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(crate::theme::Theme::FG_DIM))
+        .text_color(rgb(crate::theme::Theme::fg_dim()))
         .child(text)
 }
 
@@ -798,7 +798,7 @@ fn banner(color: u32, text: String) -> impl IntoElement {
         .py_1()
         .text_size(px(11.))
         .text_color(rgb(color))
-        .bg(rgb(crate::theme::Theme::BG_ELEVATED))
+        .bg(rgb(crate::theme::Theme::bg_elevated()))
         .child(text)
 }
 
@@ -811,14 +811,14 @@ fn tool_btn(
         .px_2()
         .py_1()
         .rounded_sm()
-        .bg(rgb(crate::theme::Theme::BG_ELEVATED))
+        .bg(rgb(crate::theme::Theme::bg_elevated()))
         .border_1()
-        .border_color(rgb(crate::theme::Theme::BORDER))
+        .border_color(rgb(crate::theme::Theme::border()))
         .text_size(px(11.))
-        .text_color(rgb(crate::theme::Theme::FG_DIM))
+        .text_color(rgb(crate::theme::Theme::fg_dim()))
         .hover(|d| {
-            d.bg(rgb(crate::theme::Theme::BG_HOVER))
-                .text_color(rgb(crate::theme::Theme::FG))
+            d.bg(rgb(crate::theme::Theme::bg_hover()))
+                .text_color(rgb(crate::theme::Theme::fg()))
         })
         .cursor_pointer()
         .child(label.to_string())

@@ -256,12 +256,12 @@ impl AgentPanel {
 
     fn status_color(s: TaskStatus) -> u32 {
         match s {
-            TaskStatus::Pending => crate::theme::Theme::FG_FAINT,
-            TaskStatus::Ready => crate::theme::Theme::ACCENT,
-            TaskStatus::Dispatched => crate::theme::Theme::WARNING,
-            TaskStatus::Completed => crate::theme::Theme::SUCCESS,
-            TaskStatus::Failed => crate::theme::Theme::DANGER,
-            TaskStatus::Blocked => crate::theme::Theme::DANGER,
+            TaskStatus::Pending => crate::theme::Theme::fg_faint(),
+            TaskStatus::Ready => crate::theme::Theme::accent(),
+            TaskStatus::Dispatched => crate::theme::Theme::warning(),
+            TaskStatus::Completed => crate::theme::Theme::success(),
+            TaskStatus::Failed => crate::theme::Theme::danger(),
+            TaskStatus::Blocked => crate::theme::Theme::danger(),
         }
     }
 }
@@ -312,20 +312,20 @@ impl Render for AgentPanel {
                 .gap_2()
                 .px_3()
                 .border_b_1()
-                .border_color(rgb(crate::theme::Theme::BORDER))
+                .border_color(rgb(crate::theme::Theme::border()))
                 .child(
                     div()
                         .text_size(px(11.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                        .text_color(rgb(crate::theme::Theme::fg_faint()))
                         .child("AGENT"),
                 )
                 .child(
                     div()
-                        .text_color(rgb(crate::theme::Theme::ACCENT))
+                        .text_color(rgb(crate::theme::Theme::accent()))
                         .child(self.run_status.clone()),
                 )
-                .child(div().ml_auto().text_color(rgb(crate::theme::Theme::FG_FAINT)).child(
+                .child(div().ml_auto().text_color(rgb(crate::theme::Theme::fg_faint())).child(
                     if self.root_label.is_empty() { "未打开项目".to_string() } else { "mock/GLM".to_string() },
                 )),
         );
@@ -338,7 +338,7 @@ impl Render for AgentPanel {
                 .flex_col()
                 .gap_2()
                 .border_b_1()
-                .border_color(rgb(crate::theme::Theme::BORDER))
+                .border_color(rgb(crate::theme::Theme::border()))
                 .child(
                     div()
                         .id("objective-input")
@@ -346,14 +346,14 @@ impl Render for AgentPanel {
                         .p_1()
                         .rounded_sm()
                         .border_1()
-                        .border_color(rgb(crate::theme::Theme::BORDER))
-                        .bg(rgb(crate::theme::Theme::BG))
+                        .border_color(rgb(crate::theme::Theme::border()))
+                        .bg(rgb(crate::theme::Theme::bg()))
                         .track_focus(&self.input_focus)
                         .on_key_down(cx.listener(Self::on_objective_key))
                         .when(self.input_focus.is_focused(window), |d| {
-                            d.border_color(rgb(crate::theme::Theme::ACCENT))
+                            d.border_color(rgb(crate::theme::Theme::accent()))
                         })
-                        .text_color(rgb(crate::theme::Theme::FG))
+                        .text_color(rgb(crate::theme::Theme::fg()))
                         .child(if self.objective.is_empty() {
                             SharedString::from("输入目标,例如:给 utils 加单元测试并跑通")
                         } else {
@@ -367,12 +367,12 @@ impl Render for AgentPanel {
                         .py_1()
                         .self_start()
                         .rounded_sm()
-                        .bg(rgb(crate::theme::Theme::ACCENT_DIM))
+                        .bg(rgb(crate::theme::Theme::accent_dim()))
                         .border_1()
-                        .border_color(rgb(crate::theme::Theme::ACCENT))
-                        .text_color(rgb(crate::theme::Theme::FG))
+                        .border_color(rgb(crate::theme::Theme::accent()))
+                        .text_color(rgb(crate::theme::Theme::fg()))
                         .cursor_pointer()
-                        .hover(|d| d.bg(rgb(crate::theme::Theme::BG_ACTIVE)))
+                        .hover(|d| d.bg(rgb(crate::theme::Theme::bg_active())))
                         .child("▶ 启动运行")
                         .on_click(cx.listener(Self::act_start)),
                 ),
@@ -387,14 +387,14 @@ impl Render for AgentPanel {
                     .p_2()
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(crate::theme::Theme::WARNING))
-                    .bg(rgb(crate::theme::Theme::BG_ELEVATED))
+                    .border_color(rgb(crate::theme::Theme::warning()))
+                    .bg(rgb(crate::theme::Theme::bg_elevated()))
                     .flex()
                     .flex_col()
                     .gap_2()
                     .child(
                         div()
-                            .text_color(rgb(crate::theme::Theme::WARNING))
+                            .text_color(rgb(crate::theme::Theme::warning()))
                             .child(format!("❓ {}", q.question)),
                     )
                     .child(
@@ -404,8 +404,8 @@ impl Render for AgentPanel {
                             .p_1()
                             .rounded_sm()
                             .border_1()
-                            .border_color(rgb(crate::theme::Theme::BORDER))
-                            .bg(rgb(crate::theme::Theme::BG))
+                            .border_color(rgb(crate::theme::Theme::border()))
+                            .bg(rgb(crate::theme::Theme::bg()))
                             .focusable()
                             .on_key_down(cx.listener(Self::on_answer_key))
                             .child(if self.answer.is_empty() {
@@ -421,7 +421,7 @@ impl Render for AgentPanel {
                             .py_1()
                             .self_start()
                             .rounded_sm()
-                            .bg(rgb(crate::theme::Theme::ACCENT_DIM))
+                            .bg(rgb(crate::theme::Theme::accent_dim()))
                             .cursor_pointer()
                             .child("提交回答")
                             .on_click(cx.listener(Self::act_answer)),
@@ -441,7 +441,7 @@ impl Render for AgentPanel {
             .flex()
             .flex_col()
             .border_b_1()
-            .border_color(rgb(crate::theme::Theme::BORDER));
+            .border_color(rgb(crate::theme::Theme::border()));
         for (_i, t) in tasks {
             let color = Self::status_color(t.status);
             let deps = if t.deps.is_empty() {
@@ -459,7 +459,7 @@ impl Render for AgentPanel {
                     .pt_1()
                     .pb_1()
                     .border_b_1()
-                    .border_color(rgb(crate::theme::Theme::BORDER))
+                    .border_color(rgb(crate::theme::Theme::border()))
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -470,7 +470,7 @@ impl Render for AgentPanel {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                                    .text_color(rgb(crate::theme::Theme::fg_faint()))
                                     .child(format!("#{}", t.id)),
                             )
                             .child(
@@ -482,7 +482,7 @@ impl Render for AgentPanel {
                             )
                             .child(
                                 div()
-                                    .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                                    .text_color(rgb(crate::theme::Theme::fg_faint()))
                                     .text_size(px(10.))
                                     .child(deps),
                             )
@@ -494,8 +494,8 @@ impl Render for AgentPanel {
                                         .px_1()
                                         .rounded_sm()
                                         .border_1()
-                                        .border_color(rgb(crate::theme::Theme::DANGER))
-                                        .text_color(rgb(crate::theme::Theme::DANGER))
+                                        .border_color(rgb(crate::theme::Theme::danger()))
+                                        .text_color(rgb(crate::theme::Theme::danger()))
                                         .cursor_pointer()
                                         .child("重置")
                                         .on_click({
@@ -508,7 +508,7 @@ impl Render for AgentPanel {
                     )
                     .child(
                         div()
-                            .text_color(rgb(crate::theme::Theme::FG))
+                            .text_color(rgb(crate::theme::Theme::fg()))
                             .child(
                                 t.spec
                                     .lines()
@@ -523,7 +523,7 @@ impl Render for AgentPanel {
                         d.child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                                .text_color(rgb(crate::theme::Theme::fg_faint()))
                                 .child(format!("✓ {}", r.lines().next().unwrap_or("").chars().take(80).collect::<String>())),
                         )
                     }),
@@ -550,10 +550,10 @@ impl Render for AgentPanel {
                         .flex()
                         .items_center()
                         .px_2()
-                        .bg(rgb(crate::theme::Theme::BG_ELEVATED))
+                        .bg(rgb(crate::theme::Theme::bg_elevated()))
                         .text_size(px(10.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                        .text_color(rgb(crate::theme::Theme::fg_faint()))
                         .child("运行日志"),
                 )
                 .child(uniform_list(
@@ -580,13 +580,13 @@ impl Render for AgentPanel {
                                     .child(
                                         div()
                                             .w(px(56.))
-                                            .text_color(rgb(crate::theme::Theme::ACCENT))
+                                            .text_color(rgb(crate::theme::Theme::accent()))
                                             .overflow_hidden()
                                             .child(worker.clone()),
                                     )
                                     .child(
                                         div()
-                                            .text_color(rgb(crate::theme::Theme::FG_DIM))
+                                            .text_color(rgb(crate::theme::Theme::fg_dim()))
                                             .overflow_hidden()
                                             .child(text.clone()),
                                     ),

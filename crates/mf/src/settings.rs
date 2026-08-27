@@ -203,7 +203,7 @@ impl SettingsView {
             .items_center()
             .px_4()
             .border_b_1()
-            .border_color(rgb(crate::theme::Theme::BORDER))
+            .border_color(rgb(crate::theme::Theme::border()))
             .text_size(px(13.))
             .font_weight(FontWeight::SEMIBOLD)
             .child("设置");
@@ -217,8 +217,8 @@ impl SettingsView {
             .flex_col()
             .rounded_md()
             .border_1()
-            .border_color(rgb(crate::theme::Theme::BORDER))
-            .bg(rgb(crate::theme::Theme::BG_PANEL))
+            .border_color(rgb(crate::theme::Theme::border()))
+            .bg(rgb(crate::theme::Theme::bg_panel()))
             .shadow_lg()
             .overflow_hidden()
             .child(title_bar)
@@ -245,7 +245,7 @@ impl SettingsView {
                 div()
                     .id("settings-hint")
                     .text_size(px(11.))
-                    .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                    .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child("引擎/提供方改动在下次打开项目或新建运行时生效;字体立即应用到所有编辑器。"),
             )
             .into_any_element()
@@ -277,8 +277,8 @@ impl SettingsView {
                     .py(px(4.))
                     .rounded_sm()
                     .cursor_pointer()
-                    .when(selected, |d| d.bg(rgb(crate::theme::Theme::BG_ACTIVE)))
-                    .hover(|d| d.bg(rgb(crate::theme::Theme::BG_HOVER)))
+                    .when(selected, |d| d.bg(rgb(crate::theme::Theme::bg_active())))
+                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                     .on_click(cx.listener(move |s, _, _, cx| {
                         s.select_role(role, cx);
                     }))
@@ -297,9 +297,9 @@ impl SettingsView {
             .text_size(px(12.))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(rgb(if selected {
-                crate::theme::Theme::ACCENT
+                crate::theme::Theme::accent()
             } else {
-                crate::theme::Theme::FG_DIM
+                crate::theme::Theme::fg_dim()
             }))
             .child(role.to_string())
     }
@@ -308,7 +308,7 @@ impl SettingsView {
         div()
             .flex_1()
             .text_size(px(12.))
-            .text_color(rgb(crate::theme::Theme::FG))
+            .text_color(rgb(crate::theme::Theme::fg()))
             .child(prov_name.to_string())
     }
 
@@ -371,13 +371,13 @@ impl SettingsView {
             .gap_2()
             .px_4()
             .border_t_1()
-            .border_color(rgb(crate::theme::Theme::BORDER))
+            .border_color(rgb(crate::theme::Theme::border()))
             .child(
                 div()
                     .id("settings-status")
                     .flex_1()
                     .text_size(px(11.))
-                    .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                    .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child(self.status.clone()),
             )
             .child(primary_btn("保存", cx.listener(Self::do_save)))
@@ -398,14 +398,14 @@ impl SettingsView {
             .px_2()
             .rounded_sm()
             .border_1()
-            .border_color(rgb(crate::theme::Theme::BORDER))
-            .bg(rgb(crate::theme::Theme::BG))
+            .border_color(rgb(crate::theme::Theme::border()))
+            .bg(rgb(crate::theme::Theme::bg()))
             .track_focus(&self.focus_handle)
             .when(self.focus_handle.is_focused(window), |d| {
-                d.border_color(rgb(crate::theme::Theme::ACCENT))
+                d.border_color(rgb(crate::theme::Theme::accent()))
             })
             .text_size(px(12.))
-            .text_color(rgb(crate::theme::Theme::FG))
+            .text_color(rgb(crate::theme::Theme::fg()))
             .overflow_hidden()
             .on_key_down(cx.listener(move |s, e: &KeyDownEvent, _w, cx| {
                 if let Some(chars) = e.keystroke.key_char.clone() {
@@ -502,7 +502,7 @@ fn section(title: impl Into<SharedString>) -> Div {
     div()
         .text_size(px(11.))
         .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(crate::theme::Theme::ACCENT))
+        .text_color(rgb(crate::theme::Theme::accent()))
         .child(title.into())
 }
 
@@ -511,7 +511,7 @@ fn field_row(label: &str, input: impl IntoElement) -> Div {
         .flex()
         .items_center()
         .gap_2()
-        .child(div().w(px(110.)).text_size(px(12.)).text_color(rgb(crate::theme::Theme::FG_DIM)).child(label.to_string()))
+        .child(div().w(px(110.)).text_size(px(12.)).text_color(rgb(crate::theme::Theme::fg_dim())).child(label.to_string()))
         .child(input)
 }
 
@@ -520,7 +520,7 @@ fn field_row_kind(label: &str, current: ProviderKind, cx: &Context<SettingsView>
         .flex()
         .items_center()
         .gap_2()
-        .child(div().w(px(110.)).text_size(px(12.)).text_color(rgb(crate::theme::Theme::FG_DIM)).child(label.to_string()))
+        .child(div().w(px(110.)).text_size(px(12.)).text_color(rgb(crate::theme::Theme::fg_dim())).child(label.to_string()))
         .child(kind_btn("mock", current == ProviderKind::Mock, ProviderKind::Mock, cx))
         .child(kind_btn("openai", current == ProviderKind::Openai, ProviderKind::Openai, cx))
         .child(kind_btn("anthropic", current == ProviderKind::Anthropic, ProviderKind::Anthropic, cx))
@@ -539,19 +539,19 @@ fn kind_btn(
         .rounded_sm()
         .border_1()
         .border_color(rgb(if active {
-            crate::theme::Theme::ACCENT
+            crate::theme::Theme::accent()
         } else {
-            crate::theme::Theme::BORDER
+            crate::theme::Theme::border()
         }))
         .text_size(px(11.))
         .text_color(rgb(if active {
-            crate::theme::Theme::ACCENT
+            crate::theme::Theme::accent()
         } else {
-            crate::theme::Theme::FG_DIM
+            crate::theme::Theme::fg_dim()
         }))
-        .when(active, |d| d.bg(rgb(crate::theme::Theme::BG_ACTIVE)))
+        .when(active, |d| d.bg(rgb(crate::theme::Theme::bg_active())))
         .cursor_pointer()
-        .hover(|d| d.bg(rgb(crate::theme::Theme::BG_HOVER)))
+        .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
         .child(label.to_string())
         .on_click(cx.listener(move |s, _, _, cx| {
             s.set_kind(kind, cx);
@@ -564,12 +564,12 @@ fn primary_btn(label: &str, listener: impl Fn(&ClickEvent, &mut Window, &mut App
         .px_3()
         .py(px(4.))
         .rounded_sm()
-        .bg(rgb(crate::theme::Theme::ACCENT))
+        .bg(rgb(crate::theme::Theme::accent()))
         .text_size(px(12.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(0xffffff))
         .cursor_pointer()
-        .hover(|d| d.bg(rgb(crate::theme::Theme::ACCENT_DIM)))
+        .hover(|d| d.bg(rgb(crate::theme::Theme::accent_dim())))
         .child(label.to_string())
         .on_click(move |e, w, cx| listener(e, w, cx))
 }
@@ -581,12 +581,12 @@ fn secondary_btn(label: &str, listener: impl Fn(&ClickEvent, &mut Window, &mut A
         .py(px(4.))
         .rounded_sm()
         .border_1()
-        .border_color(rgb(crate::theme::Theme::BORDER))
-        .bg(rgb(crate::theme::Theme::BG_ELEVATED))
+        .border_color(rgb(crate::theme::Theme::border()))
+        .bg(rgb(crate::theme::Theme::bg_elevated()))
         .text_size(px(12.))
-        .text_color(rgb(crate::theme::Theme::FG_DIM))
+        .text_color(rgb(crate::theme::Theme::fg_dim()))
         .cursor_pointer()
-        .hover(|d| d.bg(rgb(crate::theme::Theme::BG_HOVER)))
+        .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
         .child(label.to_string())
         .on_click(move |e, w, cx| listener(e, w, cx))
 }

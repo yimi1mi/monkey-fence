@@ -526,19 +526,19 @@ impl Workspace {
                 div()
                     .text_size(px(42.))
                     .font_weight(FontWeight::BOLD)
-                    .text_color(rgb(crate::theme::Theme::FG))
+                    .text_color(rgb(crate::theme::Theme::fg()))
                     .child("MonkeyFence"),
             )
             .child(
                 div()
                     .text_size(px(14.))
-                    .text_color(rgb(crate::theme::Theme::FG_DIM))
+                    .text_color(rgb(crate::theme::Theme::fg_dim()))
                     .child("AI 编辑器 · 任务流转 · P4 版控"),
             )
             .child(
                 div()
                     .text_size(px(13.))
-                    .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                    .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child("Ctrl+Shift+O 打开文件夹 · Ctrl+P 快速打开 · Ctrl+Shift+P 命令面板"),
             )
     }
@@ -556,8 +556,8 @@ impl Workspace {
             .flex_row()
             .h(px(36.))
             .border_b_1()
-            .border_color(rgb(crate::theme::Theme::BORDER))
-            .bg(rgb(crate::theme::Theme::BG_PANEL));
+            .border_color(rgb(crate::theme::Theme::border()))
+            .bg(rgb(crate::theme::Theme::bg_panel()));
         for (name, is_active, dirty) in tabs {
             el = el.child(
                 div()
@@ -571,14 +571,14 @@ impl Workspace {
                     .text_size(px(12.))
                     .cursor_pointer()
                     .when(is_active, |d| {
-                        d.bg(rgb(crate::theme::Theme::BG))
+                        d.bg(rgb(crate::theme::Theme::bg()))
                             .border_b_2()
-                            .border_color(rgb(crate::theme::Theme::ACCENT))
-                            .text_color(rgb(crate::theme::Theme::FG))
+                            .border_color(rgb(crate::theme::Theme::accent()))
+                            .text_color(rgb(crate::theme::Theme::fg()))
                     })
                     .when(!is_active, |d| {
-                        d.text_color(rgb(crate::theme::Theme::FG_DIM))
-                            .hover(|h| h.bg(rgb(crate::theme::Theme::BG_HOVER)))
+                        d.text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .hover(|h| h.bg(rgb(crate::theme::Theme::bg_hover())))
                     })
                     .child(name)
                     .when(dirty, |d| {
@@ -586,7 +586,7 @@ impl Workspace {
                             div()
                                 .size(px(7.))
                                 .rounded_full()
-                                .bg(rgb(crate::theme::Theme::WARNING)),
+                                .bg(rgb(crate::theme::Theme::warning())),
                         )
                     }),
             );
@@ -611,9 +611,9 @@ impl Workspace {
             .items_center()
             .py_2()
             .gap_1()
-            .bg(rgb(crate::theme::Theme::BG_PANEL))
+            .bg(rgb(crate::theme::Theme::bg_panel()))
             .border_r_1()
-            .border_color(rgb(crate::theme::Theme::BORDER));
+            .border_color(rgb(crate::theme::Theme::border()));
         for (icon, tip, panel) in icons {
             if hide_agent && panel == LeftPanel::Agent {
                 continue;
@@ -630,12 +630,12 @@ impl Workspace {
                     .text_size(px(17.))
                     .cursor_pointer()
                     .when(is_active, |d| {
-                        d.bg(rgb(crate::theme::Theme::BG_ACTIVE))
-                            .text_color(rgb(crate::theme::Theme::ACCENT))
+                        d.bg(rgb(crate::theme::Theme::bg_active()))
+                            .text_color(rgb(crate::theme::Theme::accent()))
                     })
                     .when(!is_active, |d| {
-                        d.text_color(rgb(crate::theme::Theme::FG_DIM))
-                            .hover(|h| h.bg(rgb(crate::theme::Theme::BG_HOVER)))
+                        d.text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .hover(|h| h.bg(rgb(crate::theme::Theme::bg_hover())))
                     })
                     .child(icon)
                     .on_click({
@@ -661,14 +661,14 @@ impl Workspace {
             (LeftPanel::Explorer, None) => div()
                 .p_3()
                 .text_size(px(12.))
-                .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                .text_color(rgb(crate::theme::Theme::fg_faint()))
                 .child("尚未打开文件夹"),
             (LeftPanel::Vcs, _) => match &self.vcs_panel {
                 Some(v) => div().size_full().flex().child(v.clone()),
                 None => div()
                     .p_3()
                     .text_size(px(12.))
-                    .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                    .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child("尚未打开文件夹"),
             },
             (LeftPanel::Agent, _) => match &self.agent_panel {
@@ -676,7 +676,7 @@ impl Workspace {
                 None => div()
                     .p_3()
                     .text_size(px(12.))
-                    .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                    .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child("尚未打开文件夹"),
             },
         };
@@ -689,9 +689,9 @@ impl Workspace {
             .w(width)
             .flex()
             .flex_col()
-            .bg(rgb(crate::theme::Theme::BG_PANEL))
+            .bg(rgb(crate::theme::Theme::bg_panel()))
             .border_r_1()
-            .border_color(rgb(crate::theme::Theme::BORDER))
+            .border_color(rgb(crate::theme::Theme::border()))
             .overflow_hidden()
             .child(
                 div()
@@ -701,7 +701,7 @@ impl Workspace {
                     .px_3()
                     .text_size(px(11.))
                     .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                    .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child(title),
             )
             .child(body)
@@ -718,7 +718,7 @@ impl Workspace {
             .rounded_sm()
             .overflow_hidden()
             .border_1()
-            .border_color(rgb(crate::theme::Theme::ACCENT_DIM))
+            .border_color(rgb(crate::theme::Theme::accent_dim()))
             .children([LayoutMode::Zed, LayoutMode::Orca, LayoutMode::Dual].map(|m| {
                 let active = cur == m;
                 div()
@@ -730,12 +730,12 @@ impl Workspace {
                     .cursor_pointer()
                     .text_size(px(11.))
                     .when(active, |d| {
-                        d.bg(rgb(crate::theme::Theme::ACCENT))
-                            .text_color(rgb(crate::theme::Theme::BG))
+                        d.bg(rgb(crate::theme::Theme::accent()))
+                            .text_color(rgb(crate::theme::Theme::bg()))
                     })
                     .when(!active, |d| {
-                        d.text_color(rgb(crate::theme::Theme::FG_DIM))
-                            .hover(|h| h.bg(rgb(crate::theme::Theme::BG_HOVER)))
+                        d.text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .hover(|h| h.bg(rgb(crate::theme::Theme::bg_hover())))
                     })
                     .child(m.label())
                     .on_click(cx.listener(move |ws: &mut Workspace, _: &ClickEvent, _w, cx| {
@@ -774,14 +774,14 @@ impl Workspace {
             .items_center()
             .px_3()
             .gap_4()
-            .bg(rgb(crate::theme::Theme::BG_PANEL))
+            .bg(rgb(crate::theme::Theme::bg_panel()))
             .border_t_1()
-            .border_color(rgb(crate::theme::Theme::BORDER))
+            .border_color(rgb(crate::theme::Theme::border()))
             .text_size(px(11.))
-            .text_color(rgb(crate::theme::Theme::FG_DIM))
+            .text_color(rgb(crate::theme::Theme::fg_dim()))
             .child(self.render_mode_switch(cx))
             .child(div().child(root_name))
-            .when_some(vcs_label, |d, v| d.child(div().text_color(rgb(crate::theme::Theme::ACCENT)).child(v)))
+            .when_some(vcs_label, |d, v| d.child(div().text_color(rgb(crate::theme::Theme::accent())).child(v)))
             .when(files > 0, |d| {
                 d.child(div().child(format!("{} 个文件", files)))
             })
@@ -807,11 +807,11 @@ impl Workspace {
                     .rounded_sm()
                     .cursor_pointer()
                     .text_color(rgb(if self.console_dock.is_some() {
-                        crate::theme::Theme::ACCENT
+                        crate::theme::Theme::accent()
                     } else {
-                        crate::theme::Theme::FG_DIM
+                        crate::theme::Theme::fg_dim()
                     }))
-                    .hover(|d| d.bg(rgb(crate::theme::Theme::BG_HOVER)))
+                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                     .child("⌨ 终端")
                     .on_click(cx.listener(|ws: &mut Workspace, _: &ClickEvent, _w, cx| {
                         ws.toggle_console(cx);
@@ -826,8 +826,8 @@ impl Workspace {
                     .px_2()
                     .rounded_sm()
                     .cursor_pointer()
-                    .text_color(rgb(crate::theme::Theme::FG_DIM))
-                    .hover(|d| d.bg(rgb(crate::theme::Theme::BG_HOVER)))
+                    .text_color(rgb(crate::theme::Theme::fg_dim()))
+                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                     .child("⚙")
                     .on_click(cx.listener(|ws: &mut Workspace, _: &ClickEvent, _w, cx| {
                         ws.open_settings(cx);
@@ -908,8 +908,8 @@ impl Render for Workspace {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(crate::theme::Theme::BG))
-            .text_color(rgb(crate::theme::Theme::FG))
+            .bg(rgb(crate::theme::Theme::bg()))
+            .text_color(rgb(crate::theme::Theme::fg()))
             .on_action(cx.listener(Self::act_open_folder))
             .on_action(cx.listener(Self::show_quick_open_files))
             .on_action(cx.listener(Self::show_command_palette))
@@ -943,7 +943,7 @@ impl Render for Workspace {
                                     .flex()
                                     .items_center()
                                     .justify_center()
-                                    .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                                    .text_color(rgb(crate::theme::Theme::fg_faint()))
                                     .child("驾驶舱不可用(未打开项目或引擎启动失败)"),
                             )
                         }

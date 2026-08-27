@@ -845,11 +845,11 @@ impl Render for Editor {
             .overflow_hidden()
             .track_focus(&self.focus_handle)
             .cursor(CursorStyle::IBeam)
-            .bg(rgb(crate::theme::Theme::BG))
+            .bg(rgb(crate::theme::Theme::bg()))
             .font_family(self.font_family.clone())
             .text_size(self.font_size)
             .line_height(self.line_h)
-            .text_color(rgb(crate::theme::Theme::FG))
+            .text_color(rgb(crate::theme::Theme::fg()))
             .on_action(cx.listener(Self::act_backspace))
             .on_action(cx.listener(Self::act_delete))
             .on_action(cx.listener(Self::act_left))
@@ -963,7 +963,7 @@ impl Element for EditorElement {
         let gutter_run = TextRun {
             len: gutter_text.len(),
             font: style.font(),
-            color: rgb(crate::theme::Theme::GUTTER_FG).into(),
+            color: rgb(crate::theme::Theme::gutter_fg()).into(),
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -1088,7 +1088,7 @@ impl Element for EditorElement {
                         point(bounds.left() + gutter_width + x0, y),
                         point(bounds.left() + gutter_width + x1.max(x0), y + line_height),
                     ),
-                    crate::theme::Theme::SELECTION,
+                    crate::theme::Theme::selection(),
                 ));
             }
 
@@ -1104,7 +1104,7 @@ impl Element for EditorElement {
                         point(bounds.left() + gutter_width + x, y),
                         size(px(2.), line_height),
                     ),
-                    rgb(crate::theme::Theme::CURSOR),
+                    rgb(crate::theme::Theme::cursor()),
                 ));
             }
 
@@ -1150,7 +1150,7 @@ impl Element for EditorElement {
         // 文本区背景分色:行号区稍暗
         window.paint_quad(fill(
             Bounds::new(bounds.origin, size(gutter_width, bounds.size.height)),
-            rgb(crate::theme::Theme::BG_PANEL),
+            rgb(crate::theme::Theme::bg_panel()),
         ));
 
         for quad in prepaint.selection.drain(..) {
@@ -1166,7 +1166,7 @@ impl Element for EditorElement {
             let num_run = TextRun {
                 len: num.len(),
                 font: style.font(),
-                color: rgb(crate::theme::Theme::GUTTER_FG).into(),
+                color: rgb(crate::theme::Theme::gutter_fg()).into(),
                 background_color: None,
                 underline: None,
                 strikethrough: None,

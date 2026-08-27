@@ -193,10 +193,10 @@ impl Cockpit {
             }
         }
         vec![
-            (if attention.is_empty() { "需要关注" } else { "需要关注 ⚠" }, Theme::DANGER, attention),
-            ("进行中", Theme::ACCENT, doing),
-            ("就绪 / 排队", Theme::FG_DIM, ready),
-            ("已完成", Theme::SUCCESS, done),
+            (if attention.is_empty() { "需要关注" } else { "需要关注 ⚠" }, Theme::danger(), attention),
+            ("进行中", Theme::accent(), doing),
+            ("就绪 / 排队", Theme::fg_dim(), ready),
+            ("已完成", Theme::success(), done),
         ]
     }
 
@@ -210,8 +210,8 @@ impl Cockpit {
             .flex()
             .flex_col()
             .border_r_1()
-            .border_color(rgb(Theme::BORDER))
-            .bg(rgb(Theme::BG_PANEL))
+            .border_color(rgb(Theme::border()))
+            .bg(rgb(Theme::bg_panel()))
             .child(
                 div()
                     .flex()
@@ -220,8 +220,8 @@ impl Cockpit {
                     .px_2()
                     .h(px(34.))
                     .border_b_1()
-                    .border_color(rgb(Theme::BORDER))
-                    .child(div().text_size(px(12.)).text_color(rgb(Theme::FG_DIM)).child("RUN 队列"))
+                    .border_color(rgb(Theme::border()))
+                    .child(div().text_size(px(12.)).text_color(rgb(Theme::fg_dim())).child("RUN 队列"))
                     .child(div().flex_1())
                     .child(
                         div()
@@ -231,8 +231,8 @@ impl Cockpit {
                             .rounded_sm()
                             .cursor_pointer()
                             .text_size(px(11.))
-                            .text_color(rgb(if run_active { Theme::FG_DIM } else { Theme::ACCENT }))
-                            .hover(|d| d.bg(rgb(Theme::BG_HOVER)))
+                            .text_color(rgb(if run_active { Theme::fg_dim() } else { Theme::accent() }))
+                            .hover(|d| d.bg(rgb(Theme::bg_hover())))
                             .child(if run_active { "● 运行中" } else { "▶ 启动 Run" })
                             .on_click(cx.listener(|p: &mut Self, _: &ClickEvent, _w, cx| {
                                 p.start_run(cx);
@@ -246,8 +246,8 @@ impl Cockpit {
                             .rounded_sm()
                             .cursor_pointer()
                             .text_size(px(11.))
-                            .text_color(rgb(Theme::FG_DIM))
-                            .hover(|d| d.bg(rgb(Theme::BG_HOVER)))
+                            .text_color(rgb(Theme::fg_dim()))
+                            .hover(|d| d.bg(rgb(Theme::bg_hover())))
                             .child("⊕ 终端")
                             .on_click(cx.listener(|p: &mut Self, _: &ClickEvent, _w, cx| {
                                 p.spawn_pane(cx);
@@ -265,7 +265,7 @@ impl Cockpit {
                         vec![div()
                             .p_2()
                             .text_size(px(11.5))
-                            .text_color(rgb(Theme::FG_FAINT))
+                            .text_color(rgb(Theme::fg_faint()))
                             .child("暂无任务。点「▶ 启动 Run」让引擎规划并派发(mock provider 可无 key 演示)。")
                             .into_any_element()]
                     } else {
@@ -292,11 +292,11 @@ impl Cockpit {
                                         .rounded_sm()
                                         .cursor_pointer()
                                         .when(sel, |d| {
-                                            d.bg(rgb(Theme::BG_ACTIVE))
+                                            d.bg(rgb(Theme::bg_active()))
                                                 .border_l_2()
-                                                .border_color(rgb(Theme::ACCENT))
+                                                .border_color(rgb(Theme::accent()))
                                         })
-                                        .hover(|d| d.bg(rgb(Theme::BG_HOVER)))
+                                        .hover(|d| d.bg(rgb(Theme::bg_hover())))
                                         .on_click(cx.listener(move |p: &mut Self, _: &ClickEvent, _w, cx| {
                                             p.selected_task = Some(tid);
                                             cx.notify();
@@ -304,12 +304,12 @@ impl Cockpit {
                                         .child(
                                             div().flex().items_center().gap_1()
                                                 .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(rgb(dot_color)))
-                                                .child(div().text_size(px(12.)).text_color(rgb(Theme::FG)).child(truncate(&t.spec, 26)))
+                                                .child(div().text_size(px(12.)).text_color(rgb(Theme::fg())).child(truncate(&t.spec, 26)))
                                                 .child(div().flex_1())
-                                                .child(div().text_size(px(10.)).text_color(rgb(Theme::FG_FAINT)).child(format!("#{tid}"))),
+                                                .child(div().text_size(px(10.)).text_color(rgb(Theme::fg_faint())).child(format!("#{tid}"))),
                                         )
                                         .when(t.failure_count > 0 && t.status != TaskStatus::Completed, |d| {
-                                            d.child(div().text_size(px(10.)).text_color(rgb(Theme::DANGER)).child(format!("失败 {} 次", t.failure_count)))
+                                            d.child(div().text_size(px(10.)).text_color(rgb(Theme::danger())).child(format!("失败 {} 次", t.failure_count)))
                                         })
                                         .into_any_element()
                                 });
@@ -326,12 +326,12 @@ impl Cockpit {
         let failed: i32 = self.tasks.iter().map(|t| t.failure_count).sum();
         let open_q = self.questions.iter().filter(|q| q.answer.is_none()).count();
         let (status_label, status_color) = match self.run.as_ref().map(|r| r.status.as_str()) {
-            Some("active") => ("● RUNNING", Theme::ACCENT),
-            Some("done") => ("✓ 已收敛", Theme::SUCCESS),
-            Some("done-with-failures") => ("✓ 收敛(有失败)", Theme::WARNING),
-            Some("planner-error") => ("✕ 规划失败", Theme::DANGER),
-            Some(_) => ("终态", Theme::FG_DIM),
-            None => ("未启动", Theme::FG_FAINT),
+            Some("active") => ("● RUNNING", Theme::accent()),
+            Some("done") => ("✓ 已收敛", Theme::success()),
+            Some("done-with-failures") => ("✓ 收敛(有失败)", Theme::warning()),
+            Some("planner-error") => ("✕ 规划失败", Theme::danger()),
+            Some(_) => ("终态", Theme::fg_dim()),
+            None => ("未启动", Theme::fg_faint()),
         };
         let objective = self
             .run
@@ -346,16 +346,16 @@ impl Cockpit {
             .gap_4()
             .px_4()
             .border_b_1()
-            .border_color(rgb(Theme::BORDER))
+            .border_color(rgb(Theme::border()))
             .child(
                 div()
-                    .child(div().text_size(px(14.)).text_color(rgb(Theme::FG)).child(truncate(&objective, 40)))
-                    .child(div().text_size(px(11.)).text_color(rgb(Theme::FG_DIM)).child(format!("mf-agent 引擎 · {}", self.root.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()))),
+                    .child(div().text_size(px(14.)).text_color(rgb(Theme::fg())).child(truncate(&objective, 40)))
+                    .child(div().text_size(px(11.)).text_color(rgb(Theme::fg_dim())).child(format!("mf-agent 引擎 · {}", self.root.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()))),
             )
             .child(div().flex_1())
-            .child(metric(done, total, "TASKS", Theme::FG))
-            .child(metric(open_q, open_q, "待答问句", if open_q > 0 { Theme::WARNING } else { Theme::FG_DIM }))
-            .child(metric(failed.max(0) as usize, failed.max(0) as usize, "累计失败", if failed > 0 { Theme::DANGER } else { Theme::FG_DIM }))
+            .child(metric(done, total, "TASKS", Theme::fg()))
+            .child(metric(open_q, open_q, "待答问句", if open_q > 0 { Theme::warning() } else { Theme::fg_dim() }))
+            .child(metric(failed.max(0) as usize, failed.max(0) as usize, "累计失败", if failed > 0 { Theme::danger() } else { Theme::fg_dim() }))
             .child(
                 div()
                     .px_3()
@@ -378,7 +378,7 @@ impl Cockpit {
                     .flex()
                     .flex_col()
                     .border_1()
-                    .border_color(rgb(Theme::ACCENT))
+                    .border_color(rgb(Theme::accent()))
                     .rounded_sm()
                     .overflow_hidden()
                     .child(
@@ -390,9 +390,9 @@ impl Cockpit {
                             .px_2()
                             .h(px(26.))
                             .border_b_1()
-                            .border_color(rgb(Theme::BORDER))
-                            .bg(rgb(Theme::BG_PANEL))
-                            .child(div().text_size(px(11.)).text_color(rgb(Theme::FG_DIM)).child(format!("终端 #{}", pane.read(cx).id)))
+                            .border_color(rgb(Theme::border()))
+                            .bg(rgb(Theme::bg_panel()))
+                            .child(div().text_size(px(11.)).text_color(rgb(Theme::fg_dim())).child(format!("终端 #{}", pane.read(cx).id)))
                             .child(div().flex_1())
                             .child(
                                 div()
@@ -401,8 +401,8 @@ impl Cockpit {
                                     .rounded_sm()
                                     .cursor_pointer()
                                     .text_size(px(11.))
-                                    .text_color(rgb(Theme::ACCENT))
-                                    .hover(|d| d.bg(rgb(Theme::BG_HOVER)))
+                                    .text_color(rgb(Theme::accent()))
+                                    .hover(|d| d.bg(rgb(Theme::bg_hover())))
                                     .child("⬜ 还原矩阵")
                                     .on_click(cx.listener(|p: &mut Self, _: &ClickEvent, _w, cx| {
                                         p.zoomed = None;
@@ -422,10 +422,10 @@ impl Cockpit {
                     .justify_center()
                     .border_1()
                     .border_dashed()
-                    .border_color(rgb(Theme::BORDER))
+                    .border_color(rgb(Theme::border()))
                     .rounded_sm()
                     .text_size(px(12.))
-                    .text_color(rgb(Theme::FG_FAINT))
+                    .text_color(rgb(Theme::fg_faint()))
                     .child("⊕ 启动第一个终端(上方「⊕ 终端」)"),
             );
         }
@@ -449,9 +449,9 @@ impl Cockpit {
                     .border_1()
                     .rounded_sm()
                     .overflow_hidden()
-                    .border_color(rgb(if is_sel { Theme::ACCENT } else { Theme::BORDER }))
+                    .border_color(rgb(if is_sel { Theme::accent() } else { Theme::border() }))
                     .cursor_pointer()
-                    .bg(rgb(Theme::BG))
+                    .bg(rgb(Theme::bg()))
                     .on_mouse_down(MouseButton::Left, cx.listener(move |p: &mut Self, event: &MouseDownEvent, _w, cx| {
                         if event.click_count == 2 {
                             p.zoomed = Some(idx);
@@ -469,17 +469,17 @@ impl Cockpit {
                             .px_2()
                             .h(px(24.))
                             .border_b_1()
-                            .border_color(rgb(Theme::BORDER))
-                            .bg(rgb(Theme::BG_PANEL))
-                            .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(rgb(if dead { Theme::DANGER } else { Theme::SUCCESS })))
-                            .child(div().text_size(px(11.)).text_ellipsis().whitespace_nowrap().overflow_hidden().flex_1().text_color(rgb(Theme::FG_DIM)).child(title))
+                            .border_color(rgb(Theme::border()))
+                            .bg(rgb(Theme::bg_panel()))
+                            .child(div().w(px(7.)).h(px(7.)).rounded_full().bg(rgb(if dead { Theme::danger() } else { Theme::success() })))
+                            .child(div().text_size(px(11.)).text_ellipsis().whitespace_nowrap().overflow_hidden().flex_1().text_color(rgb(Theme::fg_dim())).child(title))
                             .child(
                                 div()
                                     .id(ElementId::Name(format!("ck-cons-close-{idx}").into()))
                                     .px_1()
                                     .text_size(px(11.))
-                                    .text_color(rgb(Theme::FG_FAINT))
-                                    .hover(|d| d.text_color(rgb(Theme::DANGER)))
+                                    .text_color(rgb(Theme::fg_faint()))
+                                    .hover(|d| d.text_color(rgb(Theme::danger())))
                                     .child("✕")
                                     .on_click(cx.listener(move |p: &mut Self, _: &ClickEvent, _w, cx| {
                                         p.close_pane(idx, cx);
@@ -494,7 +494,7 @@ impl Cockpit {
                             .p_1()
                             .font_family("Consolas")
                             .text_size(px(10.5))
-                            .text_color(rgb(Theme::FG_DIM))
+                            .text_color(rgb(Theme::fg_dim()))
                             .child(if tail.is_empty() {
                                 "…".to_string()
                             } else {
@@ -515,25 +515,25 @@ impl Cockpit {
             .id("ck-dag")
             .h(px(96.))
             .border_t_1()
-            .border_color(rgb(Theme::BORDER))
-            .bg(rgb(Theme::BG_PANEL))
+            .border_color(rgb(Theme::border()))
+            .bg(rgb(Theme::bg_panel()))
             .px_4()
             .py_1()
             .child(
                 div()
                     .text_size(px(10.))
-                    .text_color(rgb(Theme::FG_FAINT))
+                    .text_color(rgb(Theme::fg_faint()))
                     .child("关键路径 CRITICAL PATH"),
             )
             .child(
                 div().flex().items_center().gap_1().pt_1().children(if self.tasks.is_empty() {
-                    vec![div().text_size(px(11.)).text_color(rgb(Theme::FG_FAINT)).child("—").into_any_element()]
+                    vec![div().text_size(px(11.)).text_color(rgb(Theme::fg_faint())).child("—").into_any_element()]
                 } else {
                     let mut out: Vec<Div> = Vec::new();
                     for (i, n) in nodes.iter().enumerate() {
                         if i > 0 {
                             out.push(
-                                div().w(px(26.)).h(px(1.)).bg(rgb(Theme::BORDER)),
+                                div().w(px(26.)).h(px(1.)).bg(rgb(Theme::border())),
                             );
                         }
                         let node = div()
@@ -541,20 +541,20 @@ impl Cockpit {
                             .px_2()
                             .py_1()
                             .border_1()
-                            .border_color(rgb(Theme::BORDER))
+                            .border_color(rgb(Theme::border()))
                             .rounded_sm()
-                            .bg(rgb(Theme::BG));
+                            .bg(rgb(Theme::bg()));
                         let node = match n {
                             Some(t) => {
                                 let (c, label) = status_dot(&t.status);
                                 node.child(
-                                    div().text_size(px(10.)).font_family("Consolas").text_color(rgb(Theme::FG_FAINT)).child(format!("#{}", t.id)),
+                                    div().text_size(px(10.)).font_family("Consolas").text_color(rgb(Theme::fg_faint())).child(format!("#{}", t.id)),
                                 )
-                                .child(div().text_size(px(11.)).text_color(rgb(Theme::FG)).child(truncate(&t.spec, 16)))
+                                .child(div().text_size(px(11.)).text_color(rgb(Theme::fg())).child(truncate(&t.spec, 16)))
                                 .child(div().text_size(px(10.)).font_family("Consolas").text_color(rgb(c)).child(label))
                             }
                             None => node.child(
-                                div().py_1().text_size(px(11.)).text_color(rgb(Theme::FG_FAINT)).child("—"),
+                                div().py_1().text_size(px(11.)).text_color(rgb(Theme::fg_faint())).child("—"),
                             ),
                         };
                         out.push(node);
@@ -573,8 +573,8 @@ impl Cockpit {
             .flex()
             .flex_col()
             .border_l_1()
-            .border_color(rgb(Theme::BORDER))
-            .bg(rgb(Theme::BG_PANEL))
+            .border_color(rgb(Theme::border()))
+            .bg(rgb(Theme::bg_panel()))
             .child(
                 div()
                     .flex()
@@ -582,9 +582,9 @@ impl Cockpit {
                     .px_2()
                     .h(px(30.))
                     .border_b_1()
-                    .border_color(rgb(Theme::BORDER))
+                    .border_color(rgb(Theme::border()))
                     .text_size(px(10.))
-                    .text_color(rgb(Theme::FG_FAINT))
+                    .text_color(rgb(Theme::fg_faint()))
                     .child(format!("CHANGE SET · {} 项", self.git_status.len())),
             )
             .child(
@@ -594,7 +594,7 @@ impl Cockpit {
                     .min_h_0()
                     .overflow_y_scroll()
                     .children(if self.git_status.is_empty() {
-                        vec![div().id("ck-cs-empty").p_2().text_size(px(11.)).text_color(rgb(Theme::FG_FAINT)).child("工作区干净").into_any_element()]
+                        vec![div().id("ck-cs-empty").p_2().text_size(px(11.)).text_color(rgb(Theme::fg_faint())).child("工作区干净").into_any_element()]
                     } else {
                         self.git_status
                             .iter()
@@ -609,7 +609,7 @@ impl Cockpit {
                                     .px_2()
                                     .py_1()
                                     .border_b_1()
-                                    .border_color(rgb(Theme::BG_ELEVATED))
+                                    .border_color(rgb(Theme::bg_elevated()))
                                     .child(div().text_size(px(10.)).font_family("Consolas").text_color(rgb(color)).child(mark))
                                     .child(
                                         div()
@@ -617,14 +617,14 @@ impl Cockpit {
                                             .text_ellipsis()
                                             .whitespace_nowrap()
                                             .overflow_hidden()
-                                            .text_color(rgb(Theme::FG_DIM))
+                                            .text_color(rgb(Theme::fg_dim()))
                                             .child(g.path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()),
                                     )
                                     .child(div().flex_1())
                                     .child(
                                         div()
                                             .text_size(px(9.))
-                                            .text_color(rgb(Theme::FG_FAINT))
+                                            .text_color(rgb(Theme::fg_faint()))
                                             .child(g.path.parent().map(|p| truncate(&p.display().to_string(), 12)).unwrap_or_default()),
                                     )
                                     .into_any_element()
@@ -637,9 +637,9 @@ impl Cockpit {
                     .px_2()
                     .py_1()
                     .border_t_1()
-                    .border_color(rgb(Theme::BORDER))
+                    .border_color(rgb(Theme::border()))
                     .text_size(px(10.))
-                    .text_color(rgb(Theme::FG_FAINT))
+                    .text_color(rgb(Theme::fg_faint()))
                     .child("执行上下文:主仓库 · 终端矩阵 ConPTY"),
             )
     }
@@ -653,8 +653,8 @@ impl Render for Cockpit {
             .size_full()
             .flex()
             .min_h_0()
-            .bg(rgb(Theme::BG))
-            .text_color(rgb(Theme::FG))
+            .bg(rgb(Theme::bg()))
+            .text_color(rgb(Theme::fg()))
             .on_key_down(cx.listener(|p: &mut Self, event: &KeyDownEvent, _w, cx| {
                 if event.keystroke.key == "escape" && p.zoomed.is_some() {
                     p.zoomed = None;
@@ -704,23 +704,23 @@ fn matrix_rows(n: usize) -> Vec<Vec<usize>> {
 
 fn status_dot(s: &TaskStatus) -> (u32, &'static str) {
     match s {
-        TaskStatus::Completed => (Theme::SUCCESS, "✓ 完成"),
-        TaskStatus::Dispatched => (Theme::ACCENT, "● 执行中"),
-        TaskStatus::Ready => (Theme::ACCENT, "● 就绪"),
-        TaskStatus::Pending => (Theme::FG_DIM, "○ 等待"),
-        TaskStatus::Failed => (Theme::DANGER, "✕ 失败"),
-        TaskStatus::Blocked => (Theme::DANGER, "⚠ 熔断"),
+        TaskStatus::Completed => (Theme::success(), "✓ 完成"),
+        TaskStatus::Dispatched => (Theme::accent(), "● 执行中"),
+        TaskStatus::Ready => (Theme::accent(), "● 就绪"),
+        TaskStatus::Pending => (Theme::fg_dim(), "○ 等待"),
+        TaskStatus::Failed => (Theme::danger(), "✕ 失败"),
+        TaskStatus::Blocked => (Theme::danger(), "⚠ 熔断"),
     }
 }
 
 fn git_mark(g: &GitFileEntry) -> (String, u32) {
     use mf_vcs::git::GitStatus;
     match g.status {
-        GitStatus::New => ("A".into(), Theme::SUCCESS),
-        GitStatus::Modified => ("M".into(), Theme::WARNING),
-        GitStatus::Deleted => ("D".into(), Theme::DANGER),
-        GitStatus::Renamed => ("R".into(), Theme::WARNING),
-        GitStatus::Staged { .. } => ("S".into(), Theme::ACCENT),
+        GitStatus::New => ("A".into(), Theme::success()),
+        GitStatus::Modified => ("M".into(), Theme::warning()),
+        GitStatus::Deleted => ("D".into(), Theme::danger()),
+        GitStatus::Renamed => ("R".into(), Theme::warning()),
+        GitStatus::Staged { .. } => ("S".into(), Theme::accent()),
     }
 }
 
@@ -728,9 +728,9 @@ fn metric(value: usize, _alt: usize, label: &str, color: u32) -> Div {
     div()
         .pl_3()
         .border_l_1()
-        .border_color(rgb(Theme::BORDER))
+        .border_color(rgb(Theme::border()))
         .child(div().text_size(px(15.)).font_family("Consolas").text_color(rgb(color)).child(value.to_string()))
-        .child(div().text_size(px(9.)).text_color(rgb(Theme::FG_FAINT)).child(label.to_string()))
+        .child(div().text_size(px(9.)).text_color(rgb(Theme::fg_faint())).child(label.to_string()))
 }
 
 fn truncate(s: &str, max: usize) -> String {

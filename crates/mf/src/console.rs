@@ -370,7 +370,7 @@ impl Render for ConsolePane {
             .min_w_0()
             .min_h_0()
             .track_focus(&self.focus_handle)
-            .bg(rgb(crate::theme::Theme::BG))
+            .bg(rgb(crate::theme::Theme::bg()))
             .on_key_down(cx.listener(Self::on_key))
             // orca 式窗格 tab 头:状态点 + 标题(OSC 0/2)+ 网格尺寸
             .child(
@@ -381,16 +381,16 @@ impl Render for ConsolePane {
                     .items_center()
                     .gap_2()
                     .px_2()
-                    .bg(rgb(crate::theme::Theme::BG_ELEVATED))
+                    .bg(rgb(crate::theme::Theme::bg_elevated()))
                     .border_b_1()
-                    .border_color(rgb(crate::theme::Theme::BORDER))
+                    .border_color(rgb(crate::theme::Theme::border()))
                     .text_size(px(11.))
                     .child(
                         div()
                             .text_color(rgb(if is_dead {
-                                crate::theme::Theme::DANGER
+                                crate::theme::Theme::danger()
                             } else {
-                                crate::theme::Theme::SUCCESS
+                                crate::theme::Theme::success()
                             }))
                             .child("●"),
                     )
@@ -402,9 +402,9 @@ impl Render for ConsolePane {
                             .text_ellipsis()
                             .whitespace_nowrap()
                             .text_color(rgb(if is_dead {
-                                crate::theme::Theme::FG_FAINT
+                                crate::theme::Theme::fg_faint()
                             } else {
-                                crate::theme::Theme::FG_DIM
+                                crate::theme::Theme::fg_dim()
                             }))
                             .child(if is_dead {
                                 SharedString::from(format!("{} (已退出)", title))
@@ -415,7 +415,7 @@ impl Render for ConsolePane {
                     .child(
                         div()
                             .text_size(px(10.))
-                            .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                            .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .child(format!("{}×{}", cols, rows)),
                     ),
             )
@@ -623,9 +623,9 @@ impl Render for ConsoleDock {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(crate::theme::Theme::BG_PANEL))
+            .bg(rgb(crate::theme::Theme::bg_panel()))
             .border_t_1()
-            .border_color(rgb(crate::theme::Theme::BORDER));
+            .border_color(rgb(crate::theme::Theme::border()));
 
         el = el.child(
             div()
@@ -636,12 +636,12 @@ impl Render for ConsoleDock {
                 .gap_1()
                 .px_2()
                 .border_b_1()
-                .border_color(rgb(crate::theme::Theme::BORDER))
+                .border_color(rgb(crate::theme::Theme::border()))
                 .child(
                     div()
                         .text_size(px(11.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                        .text_color(rgb(crate::theme::Theme::fg_faint()))
                         .child("终端"),
                 )
                 .child(dock_btn("＋ 新窗格", cx.listener(|d: &mut ConsoleDock, _, _, cx| {
@@ -679,10 +679,10 @@ impl Render for ConsoleDock {
                 .gap_4()
                 .px_3()
                 .border_t_1()
-                .border_color(rgb(crate::theme::Theme::BORDER))
-                .bg(rgb(crate::theme::Theme::BG_ELEVATED))
+                .border_color(rgb(crate::theme::Theme::border()))
+                .bg(rgb(crate::theme::Theme::bg_elevated()))
                 .text_size(px(10.))
-                .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                .text_color(rgb(crate::theme::Theme::fg_faint()))
                 .child(div().child(format!("{} panes", pane_count)))
                 .child(
                     div()
@@ -706,15 +706,15 @@ fn dock_btn(
         .px_2()
         .py(px(2.))
         .rounded_sm()
-        .bg(rgb(crate::theme::Theme::BG_ELEVATED))
+        .bg(rgb(crate::theme::Theme::bg_elevated()))
         .border_1()
-        .border_color(rgb(crate::theme::Theme::BORDER))
+        .border_color(rgb(crate::theme::Theme::border()))
         .text_size(px(11.))
-        .text_color(rgb(crate::theme::Theme::FG_DIM))
+        .text_color(rgb(crate::theme::Theme::fg_dim()))
         .cursor_pointer()
         .hover(|d| {
-            d.bg(rgb(crate::theme::Theme::BG_HOVER))
-                .text_color(rgb(crate::theme::Theme::FG))
+            d.bg(rgb(crate::theme::Theme::bg_hover()))
+                .text_color(rgb(crate::theme::Theme::fg()))
         })
         .child(label.to_string())
         .on_click(move |e, window, cx| (listener)(e, window, cx))
@@ -750,7 +750,7 @@ fn render_node(node: &SplitNode, active_id: usize, weak: &gpui::WeakEntity<Conso
                 })
                 // orca 风格:激活窗格顶部亮边
                 .when(is_active, |d| {
-                    d.border_t_2().border_color(rgb(crate::theme::Theme::ACCENT))
+                    d.border_t_2().border_color(rgb(crate::theme::Theme::accent()))
                 })
                 .child(div().flex_1().min_h_0().child(leaf.pane.clone()))
                 // 悬浮关闭按钮(每格独立关闭)
@@ -767,9 +767,9 @@ fn render_node(node: &SplitNode, active_id: usize, weak: &gpui::WeakEntity<Conso
                         .justify_center()
                         .rounded_sm()
                         .text_size(px(11.))
-                        .text_color(rgb(crate::theme::Theme::FG_FAINT))
+                        .text_color(rgb(crate::theme::Theme::fg_faint()))
                         .hover(|d| {
-                            d.bg(rgb(crate::theme::Theme::DANGER))
+                            d.bg(rgb(crate::theme::Theme::danger()))
                                 .text_color(rgb(0xffffff))
                         })
                         .child("✕")
@@ -800,9 +800,9 @@ fn render_node(node: &SplitNode, active_id: usize, weak: &gpui::WeakEntity<Conso
                         .min_h_0()
                         .when(i > 0, |d| {
                             if *vertical {
-                                d.border_t_1().border_color(rgb(crate::theme::Theme::BORDER))
+                                d.border_t_1().border_color(rgb(crate::theme::Theme::border()))
                             } else {
-                                d.border_l_1().border_color(rgb(crate::theme::Theme::BORDER))
+                                d.border_l_1().border_color(rgb(crate::theme::Theme::border()))
                             }
                         })
                         .child(child_el),
