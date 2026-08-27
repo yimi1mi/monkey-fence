@@ -303,6 +303,31 @@ fn anthropic_complete(
 
 // ---------- HTTP ----------
 
+/// 连接测试:GET {base_url}/models,返回模型数(设置页"测试连接"用)
+pub fn test_connection(base_url: &str, api_key: &str) -> Result<usize> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let mut req = ureq::get(&url)
+        .timeout(Duration::from_secs(10))
+        .set("Content-Type", "application/json");
+    if !api_key.is_empty() {
+        req = req.set("Authorization", &format!("Bearer {}", api_key));
+    }
+    let resp = req.call().map_err(|e| anyhow!("http: {}", e))?;
+    let status = resp.status();
+    let text = resp.into_string().unwrap_or_default();
+    if !(200..300).contains(&status) {
+        let cut = &text[..text.len().min(160)];
+        anyhow::bail!("HTTP {}: {}", status, cut);
+    }
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+    let n = v
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    Ok(n)
+}
+
 fn http_post_json(url: &str, api_key: &str, body: &impl Serialize) -> Result<serde_json::Value> {
     let mut req = ureq::post(url)
         .timeout(Duration::from_secs(300))

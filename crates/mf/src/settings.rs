@@ -7,8 +7,22 @@ pub struct Saved(pub Config);
 pub struct Dismissed;
 
 /// 设置界面(模态):提供方/角色/引擎/编辑器字体,保存到 ~/.monkeyfence/config.toml
+/// 设置页(两级导航)
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Page {
+    Appearance,
+    EditorTerm,
+    Providers,
+    Roles,
+    Engine,
+}
+
 pub struct SettingsView {
     draft: Config,
+    page: Page,
+    /// Provider 管理页当前选中的提供方名
+    selected_provider_name: String,
+    test_status: SharedString,
     /// 当前编辑其提供方的角色
     selected_role: SharedString,
     /// 数值字段以字符串编辑,保存时解析
@@ -45,8 +59,17 @@ impl SettingsView {
         let max_iters_s = draft.engine.max_iterations.to_string();
         let max_failures_s = draft.engine.max_failures.to_string();
         let font_size_s = format!("{:.1}", draft.editor.font_size);
+        let selected_provider_name = draft
+            .roles
+            .get("planner")
+            .cloned()
+            .or_else(|| draft.providers.keys().next().cloned())
+            .unwrap_or_else(|| "mock".into());
         Self {
             draft,
+            page: Page::Appearance,
+            selected_provider_name,
+            test_status: "".into(),
             selected_role: "planner".into(),
             workers_s,
             max_iters_s,
@@ -100,9 +123,9 @@ impl SettingsView {
                 .get(self.selected_role.as_ref())
                 .cloned()
                 .unwrap_or_default(),
-            Field::BaseUrl => self.selected_provider().base_url.clone(),
-            Field::ApiKey => self.selected_provider().api_key.clone(),
-            Field::Model => self.selected_provider().model.clone(),
+            Field::BaseUrl => self.cur_provider().base_url.clone(),
+            Field::ApiKey => self.cur_provider().api_key.clone(),
+            Field::Model => self.cur_provider().model.clone(),
             Field::Workers => self.workers_s.clone(),
             Field::MaxIters => self.max_iters_s.clone(),
             Field::MaxFailures => self.max_failures_s.clone(),
@@ -156,7 +179,94 @@ impl SettingsView {
     }
 
     fn set_kind(&mut self, kind: ProviderKind, cx: &mut Context<Self>) {
-        self.selected_provider_mut().kind = kind;
+        self.cur_provider_mut().kind = kind;
+        cx.notify();
+    }
+
+    // ---------- Provider 管理页 ----------
+    fn cur_provider(&self) -> ProviderConfig {
+        self.draft
+            .providers
+            .get(&self.selected_provider_name)
+            .cloned()
+            .unwrap_or_else(|| ProviderConfig {
+                kind: ProviderKind::Mock,
+                base_url: String::new(),
+                api_key: String::new(),
+                model: String::new(),
+            })
+    }
+    fn cur_provider_mut(&mut self) -> &mut ProviderConfig {
+        self.draft
+            .providers
+            .entry(self.selected_provider_name.clone())
+            .or_insert_with(|| ProviderConfig {
+                kind: ProviderKind::Mock,
+                base_url: String::new(),
+                api_key: String::new(),
+                model: String::new(),
+            })
+    }
+    fn select_provider(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.selected_provider_name = name.to_string();
+        self.test_status = "".into();
+        cx.notify();
+    }
+    fn new_provider(&mut self, cx: &mut Context<Self>) {
+        let mut i = 1;
+        while self.draft.providers.contains_key(&format!("provider-{i}")) {
+            i += 1;
+        }
+        let name = format!("provider-{i}");
+        self.draft.providers.insert(
+            name.clone(),
+            ProviderConfig { kind: ProviderKind::Openai, base_url: String::new(), api_key: String::new(), model: String::new() },
+        );
+        self.selected_provider_name = name;
+        self.test_status = "".into();
+        cx.notify();
+    }
+    fn delete_provider(&mut self, cx: &mut Context<Self>) {
+        let name = self.selected_provider_name.clone();
+        self.draft.providers.remove(&name);
+        for (_, v) in self.draft.roles.iter_mut() {
+            if *v == name {
+                *v = "mock".into();
+            }
+        }
+        self.selected_provider_name = self
+            .draft
+            .providers
+            .keys()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "mock".into());
+        self.test_status = format!("已删除 {name}").into();
+        cx.notify();
+    }
+    fn test_conn(&mut self, cx: &mut Context<Self>) {
+        let prov = self.cur_provider();
+        self.test_status = "测试中…".into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = cx.background_executor().spawn(async move {
+                mf_agent::provider::test_connection(&prov.base_url, &prov.api_key)
+            });
+            let r = res.await;
+            this.update(cx, |s, cx| {
+                s.test_status = match r {
+                    Ok(n) => format!("✓ 连接成功,{} 个模型", n).into(),
+                    Err(e) => format!("✕ {e:#}").into(),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+    fn apply_theme(&mut self, light: bool, cx: &mut Context<Self>) {
+        crate::theme::set_theme(light);
+        self.status = if light { "已切换浅色主题(即时生效)" } else { "已切换深色主题(即时生效)" }.into();
         cx.notify();
     }
 }
@@ -211,7 +321,7 @@ impl SettingsView {
         div()
             .id("settings-card")
             .on_mouse_down(MouseButton::Left, |_, _, _| {})
-            .w(px(620.))
+            .w(px(760.))
             .max_h(px(640.))
             .flex()
             .flex_col()
@@ -232,21 +342,211 @@ impl SettingsView {
             .id("settings-body")
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .p_4()
             .flex()
-            .flex_col()
-            .gap_4()
-            .child(self.render_roles_section(cx))
-            .child(self.render_provider_section(window, cx))
-            .child(self.render_engine_section(window, cx))
-            .child(self.render_editor_section(window, cx))
+            .child(self.render_nav(cx))
             .child(
                 div()
-                    .id("settings-hint")
-                    .text_size(px(11.))
-                    .text_color(rgb(crate::theme::Theme::fg_faint()))
-                    .child("引擎/提供方改动在下次打开项目或新建运行时生效;字体立即应用到所有编辑器。"),
+                    .id("settings-content")
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(self.render_page(window, cx))
+                    .child(
+                        div()
+                            .id("settings-hint")
+                            .text_size(px(11.))
+                            .text_color(rgb(crate::theme::Theme::fg_faint()))
+                            .child("引擎/提供方改动在下次打开项目或新建运行时生效;主题与字体立即应用。"),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// 左侧两级导航:通用[外观/编辑器与终端] · Agent 与模型[Provider 管理/角色绑定] · 引擎
+    fn render_nav(&self, cx: &Context<Self>) -> AnyElement {
+        let general = [Page::Appearance, Page::EditorTerm];
+        let agent = [Page::Providers, Page::Roles];
+        let engine = [Page::Engine];
+        let groups: Vec<(&str, &[Page])> = vec![
+            ("通用", &general),
+            ("Agent 与模型", &agent),
+            ("", &engine),
+        ];
+        let page_name = |p: Page| match p {
+            Page::Appearance => "外观",
+            Page::EditorTerm => "编辑器与终端",
+            Page::Providers => "Provider 管理",
+            Page::Roles => "角色绑定",
+            Page::Engine => "引擎",
+        };
+        let mut items: Vec<AnyElement> = Vec::new();
+        for (gname, pages) in &groups {
+            if !gname.is_empty() {
+                items.push(
+                    div()
+                        .id(ElementId::Name(format!("nav-g-{}", gname).into()))
+                        .px_2()
+                        .pt_3()
+                        .pb_1()
+                        .text_size(px(9.5))
+                        .text_color(rgb(crate::theme::Theme::fg_faint()))
+                        .child(gname.to_string())
+                        .into_any_element(),
+                );
+            }
+            for &pg in *pages {
+                let cur = self.page == pg;
+                items.push(
+                    div()
+                        .id(ElementId::Name(format!("nav-{:?}", pg).into()))
+                        .px_2()
+                        .py(px(4.))
+                        .pl_3()
+                        .rounded_sm()
+                        .cursor_pointer()
+                        .text_size(px(12.))
+                        .when(cur, |d| {
+                            d.bg(rgb(crate::theme::Theme::accent_dim()))
+                                .text_color(rgb(crate::theme::Theme::fg()))
+                        })
+                        .when(!cur, |d| {
+                            d.text_color(rgb(crate::theme::Theme::fg_dim()))
+                                .hover(|h| h.bg(rgb(crate::theme::Theme::bg_hover())))
+                        })
+                        .child(page_name(pg))
+                        .on_click(cx.listener(move |s, _, _, cx| {
+                            s.page = pg;
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
+        }
+        div()
+            .id("settings-nav")
+            .w(px(150.))
+            .min_h_0()
+            .overflow_y_scroll()
+            .border_r_1()
+            .border_color(rgb(crate::theme::Theme::border()))
+            .bg(rgb(crate::theme::Theme::bg_elevated()))
+            .p_1()
+            .flex()
+            .flex_col()
+            .children(items)
+            .into_any_element()
+    }
+
+    fn render_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        match self.page {
+            Page::Appearance => self.render_appearance_section(window, cx),
+            Page::EditorTerm => self.render_editor_section(window, cx),
+            Page::Providers => self.render_providers_page(window, cx),
+            Page::Roles => self.render_roles_page(window, cx),
+            Page::Engine => self.render_engine_section(window, cx),
+        }
+    }
+
+    fn render_appearance_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let light = crate::theme::is_light();
+        div()
+            .id("appearance-fields")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(section("外观"))
+            .child(
+                div().flex().items_center().gap_2()
+                    .child(div().text_size(px(12.)).text_color(rgb(crate::theme::Theme::fg_dim())).child("主题"))
+                    .child(theme_btn("深色", !light, false, cx))
+                    .child(theme_btn("浅色", light, true, cx)),
+            )
+            .child(field_row("字号(px)", self.text_input(Field::FontSize, window, cx)))
+            .into_any_element()
+    }
+
+    /// 角色绑定页 = 角色列表 + 选中角色的 provider 名编辑
+    fn render_roles_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("roles-page")
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.render_roles_section(cx))
+            .child(
+                div().flex().flex_col().gap_2()
+                    .child(section("绑定提供方(输入名字,新名字会自动创建)"))
+                    .child(field_row("提供方名称", self.text_input(Field::RoleProvider, window, cx))),
+            )
+            .into_any_element()
+    }
+
+    /// Provider 管理页:列表 + 行内编辑 + 新建/删除/测试连接
+    fn render_providers_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let mut names: Vec<String> = self.draft.providers.keys().cloned().collect();
+        names.sort();
+        let sel = self.selected_provider_name.clone();
+        let mut list_rows: Vec<AnyElement> = vec![section("Provider 列表").into_any_element()];
+        for name in &names {
+            let p = &self.draft.providers[name];
+            let selected = *name == sel;
+            list_rows.push(
+                div()
+                    .id(ElementId::Name(format!("prov-{}", name).into()))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py(px(4.))
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(selected, |d| {
+                        d.bg(rgb(crate::theme::Theme::bg_active()))
+                            .border_l_2()
+                            .border_color(rgb(crate::theme::Theme::accent()))
+                    })
+                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                    .on_click({
+                        let nm = name.clone();
+                        cx.listener(move |s, _, _, cx| {
+                            s.select_provider(&nm, cx);
+                        })
+                    })
+                    .child(div().text_size(px(12.)).text_color(rgb(crate::theme::Theme::fg())).child(name.clone()))
+                    .child(kind_badge(p.kind.kind_str()))
+                    .child(div().flex_1())
+                    .child(div().text_size(px(10.5)).text_color(rgb(crate::theme::Theme::fg_faint())).child(p.model.clone()))
+                    .into_any_element(),
+            );
+        }
+        div()
+            .id("providers-page")
+            .flex()
+            .flex_col()
+            .gap_3()
+            .children(list_rows)
+            .child(
+                div().flex().gap_2()
+                    .child(small_btn("＋ 新建", "prov-new", cx, cx.listener(|s, _, _, cx| { s.new_provider(cx); })))
+                    .child(small_btn("🗑 删除", "prov-del", cx, cx.listener(|s, _, _, cx| { s.delete_provider(cx); })))
+                    .child(small_btn("⚡ 测试连接", "prov-test", cx, cx.listener(|s, _, _, cx| { s.test_conn(cx); })))
+                    .child(div().flex_1())
+                    .when(!self.test_status.is_empty(), |d| {
+                        d.child(div().text_size(px(11.)).text_color(rgb(if self.test_status.starts_with('✓') { crate::theme::Theme::success() } else { crate::theme::Theme::danger() })).child(self.test_status.clone()))
+                    }),
+            )
+            .child(
+                div().flex().flex_col().gap_2()
+                    .child(section(format!("编辑 [{}]", sel)))
+                    .child(field_row_kind("类型", self.cur_provider().kind, cx))
+                    .child(field_row("base_url", self.text_input(Field::BaseUrl, window, cx)))
+                    .child(field_row("api_key", self.text_input(Field::ApiKey, window, cx)))
+                    .child(field_row("model", self.text_input(Field::Model, window, cx))),
             )
             .into_any_element()
     }
@@ -310,30 +610,6 @@ impl SettingsView {
             .text_size(px(12.))
             .text_color(rgb(crate::theme::Theme::fg()))
             .child(prov_name.to_string())
-    }
-
-    fn render_provider_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let prov = self.selected_provider();
-        let name = self
-            .draft
-            .roles
-            .get(self.selected_role.as_ref())
-            .cloned()
-            .unwrap_or_default();
-        let header = section(format!("提供方 [{}]({})", self.selected_role, name));
-        let kind_row = field_row_kind("类型", prov.kind, cx);
-        div()
-            .id("provider-fields")
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(header)
-            .child(field_row("名称", self.text_input(Field::RoleProvider, window, cx)))
-            .child(kind_row)
-            .child(field_row("base_url", self.text_input(Field::BaseUrl, window, cx)))
-            .child(field_row("api_key", self.text_input(Field::ApiKey, window, cx)))
-            .child(field_row("model", self.text_input(Field::Model, window, cx)))
-            .into_any_element()
     }
 
     fn render_engine_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -438,9 +714,9 @@ impl SettingsView {
                 }
                 self.draft.roles.insert(role, new);
             }
-            Field::BaseUrl => self.selected_provider_mut().base_url.push_str(text),
-            Field::ApiKey => self.selected_provider_mut().api_key.push_str(text),
-            Field::Model => self.selected_provider_mut().model.push_str(text),
+            Field::BaseUrl => self.cur_provider_mut().base_url.push_str(text),
+            Field::ApiKey => self.cur_provider_mut().api_key.push_str(text),
+            Field::Model => self.cur_provider_mut().model.push_str(text),
             Field::Workers => self.workers_s.push_str(text),
             Field::MaxIters => self.max_iters_s.push_str(text),
             Field::MaxFailures => self.max_failures_s.push_str(text),
@@ -465,13 +741,13 @@ impl SettingsView {
                 }
             }
             Field::BaseUrl => {
-                self.selected_provider_mut().base_url.pop();
+                self.cur_provider_mut().base_url.pop();
             }
             Field::ApiKey => {
-                self.selected_provider_mut().api_key.pop();
+                self.cur_provider_mut().api_key.pop();
             }
             Field::Model => {
-                self.selected_provider_mut().model.pop();
+                self.cur_provider_mut().model.pop();
             }
             Field::Workers => {
                 self.workers_s.pop();
@@ -593,4 +869,40 @@ fn secondary_btn(label: &str, listener: impl Fn(&ClickEvent, &mut Window, &mut A
 
 fn kind_badge(kind: &str) -> SharedString {
     format!("[{}]", kind).into()
+}
+
+fn small_btn(label: &str, id: &str, _cx: &Context<SettingsView>, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> impl IntoElement {
+    let _ = _cx;
+    div()
+        .id(ElementId::Name(id.into()))
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(crate::theme::Theme::border()))
+        .cursor_pointer()
+        .text_size(px(11.))
+        .text_color(rgb(crate::theme::Theme::fg_dim()))
+        .hover(|d| d.border_color(rgb(crate::theme::Theme::accent())))
+        .child(label.to_string())
+        .on_click(move |e, w, cx| on_click(e, w, cx))
+}
+
+fn theme_btn(label: &str, active: bool, light: bool, cx: &Context<SettingsView>) -> impl IntoElement {
+    let label = label.to_string();
+    div()
+        .id(ElementId::Name(format!("theme-{}", label).into()))
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .border_1()
+        .cursor_pointer()
+        .text_size(px(11.))
+        .border_color(rgb(if active { crate::theme::Theme::accent() } else { crate::theme::Theme::border() }))
+        .text_color(rgb(if active { crate::theme::Theme::accent() } else { crate::theme::Theme::fg_dim() }))
+        .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+        .child(label)
+        .on_click(cx.listener(move |s, _, _, cx| {
+            s.apply_theme(light, cx);
+        }))
 }
