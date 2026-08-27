@@ -325,7 +325,9 @@ impl Render for ProjectSearch {
                                                 if let Some(cb) = &s.on_open {
                                                     cb(&path, row, w, cx);
                                                 }
-                                                cx.emit(Dismissed);
+                                                if !s.embedded {
+                                                    cx.emit(Dismissed);
+                                                }
                                             }))
                                             .child(
                                                 div()

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::console::ConsolePane;
 use crate::theme::Theme;
 
-/// Orca 模式驾驶舱(AI 驱动):左侧任务 Run 队列 + 中央 agent 终端矩阵 + DAG 关键路径 + 右侧 Change set。
+/// 工作项执行概览:执行步骤、关键路径与当前 Change Set。
 /// 数据来自 mf-agent 引擎(DB 轮询快照)与 git status;终端为真实 ConPTY。
 ///
 /// 交互:矩阵格 单击=选中 / 双击=放大为完整终端;放大态可输入,⬜ 还原矩阵。
@@ -27,6 +27,7 @@ pub struct Cockpit {
     questions: Vec<QuestionView>,
     git_status: Vec<GitFileEntry>,
     sig: String,
+    on_open_change: Option<Box<dyn Fn(PathBuf, &mut Window, &mut App)>>,
 }
 
 impl Cockpit {
@@ -45,12 +46,18 @@ impl Cockpit {
             questions: Vec::new(),
             git_status: Vec::new(),
             sig: String::new(),
+            on_open_change: None,
         };
         this.refresh_snapshot();
-        this.spawn_pane(cx);
-        this.spawn_pane(cx);
         this.start_polling(cx);
         this
+    }
+
+    pub fn set_on_open_change(
+        &mut self,
+        callback: impl Fn(PathBuf, &mut Window, &mut App) + 'static,
+    ) {
+        self.on_open_change = Some(Box::new(callback));
     }
 
     fn spawn_pane(&mut self, cx: &mut Context<Self>) {
@@ -87,16 +94,6 @@ impl Cockpit {
                 self.selected = Some(s - 1);
             }
         }
-        cx.notify();
-    }
-
-    /// 启动一个新的 Run(无 API key 时 mock provider 即刻演示完整流转)
-    fn start_run(&mut self, cx: &mut Context<Self>) {
-        if self.run.as_ref().is_some_and(|r| r.status == "active") {
-            return;
-        }
-        let _ = self.engine.start_run("cockpit: 驾驶舱演示 Run(规划→派发→收敛)");
-        self.refresh_snapshot();
         cx.notify();
     }
 
@@ -204,13 +201,11 @@ impl Cockpit {
         let run_active = self.run.as_ref().is_some_and(|r| r.status == "active");
         div()
             .id("cockpit-queue")
-            .w(px(330.))
-            .min_w(px(330.))
+            .w_full()
+            .min_w_0()
             .h_full()
             .flex()
             .flex_col()
-            .border_r_1()
-            .border_color(rgb(Theme::border()))
             .bg(rgb(Theme::bg_panel()))
             .child(
                 div()
@@ -221,7 +216,7 @@ impl Cockpit {
                     .h(px(34.))
                     .border_b_1()
                     .border_color(rgb(Theme::border()))
-                    .child(div().text_size(px(12.)).text_color(rgb(Theme::fg_dim())).child("RUN 队列"))
+                    .child(div().text_size(px(12.)).text_color(rgb(Theme::fg_dim())).child("执行概览"))
                     .child(div().flex_1())
                     .child(
                         div()
@@ -229,29 +224,9 @@ impl Cockpit {
                             .px_2()
                             .py_1()
                             .rounded_sm()
-                            .cursor_pointer()
                             .text_size(px(11.))
                             .text_color(rgb(if run_active { Theme::fg_dim() } else { Theme::accent() }))
-                            .hover(|d| d.bg(rgb(Theme::bg_hover())))
-                            .child(if run_active { "● 运行中" } else { "▶ 启动 Run" })
-                            .on_click(cx.listener(|p: &mut Self, _: &ClickEvent, _w, cx| {
-                                p.start_run(cx);
-                            })),
-                    )
-                    .child(
-                        div()
-                            .id("ck-new-pane")
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .text_size(px(11.))
-                            .text_color(rgb(Theme::fg_dim()))
-                            .hover(|d| d.bg(rgb(Theme::bg_hover())))
-                            .child("⊕ 终端")
-                            .on_click(cx.listener(|p: &mut Self, _: &ClickEvent, _w, cx| {
-                                p.spawn_pane(cx);
-                            })),
+                            .child(if run_active { "● 执行中" } else { "从 Agent 创建执行" }),
                     ),
             )
             .child(
@@ -581,7 +556,7 @@ impl Cockpit {
             )
     }
 
-    fn render_changeset(&self) -> impl IntoElement {
+    fn render_changeset(&self, cx: &Context<Self>) -> impl IntoElement {
         div()
             .id("ck-changeset")
             .w(px(250.))
@@ -618,6 +593,7 @@ impl Cockpit {
                             .take(50)
                             .map(|g| {
                                 let (mark, color) = git_mark(&g);
+                                let path = g.path.clone();
                                 div()
                                     .id(ElementId::Name(format!("ck-cs-{}", g.path.display()).into()))
                                     .flex()
@@ -627,6 +603,13 @@ impl Cockpit {
                                     .py_1()
                                     .border_b_1()
                                     .border_color(rgb(Theme::bg_elevated()))
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(rgb(Theme::bg_hover())))
+                                    .on_click(cx.listener(move |cockpit: &mut Cockpit, _, window, cx| {
+                                        if let Some(callback) = &cockpit.on_open_change {
+                                            callback(path.clone(), window, cx);
+                                        }
+                                    }))
                                     .child(div().text_size(px(10.)).font_family("Consolas").text_color(rgb(color)).child(mark))
                                     .child(
                                         div()
@@ -678,7 +661,6 @@ impl Render for Cockpit {
                     cx.notify();
                 }
             }))
-            .child(self.render_queue(cx))
             .child(
                 div()
                     .id("ck-center")
@@ -687,10 +669,10 @@ impl Render for Cockpit {
                     .flex()
                     .flex_col()
                     .child(self.render_summary())
-                    .child(self.render_matrix(cx))
+                    .child(self.render_queue(cx))
                     .child(self.render_dag()),
             )
-            .child(self.render_changeset())
+            .child(self.render_changeset(cx))
     }
 }
 

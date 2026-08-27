@@ -7,12 +7,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::theme::Theme;
 
-/// 车间卡片墙(P0-E5):主仓卡 + git worktree 卡。
+/// 工作区列表:主仓工作区 + Git worktree 工作区。
 /// 状态流转 todo → in-progress → in-review → completed;
 /// comment 为检查点;泳道视图可拖拽跨列改状态。
 pub struct Board {
     root: PathBuf,
+    active_path: PathBuf,
     cards: Vec<WorkspaceCard>,
+    on_activate: Option<Box<dyn Fn(WorkspaceCard, &mut Window, &mut App)>>,
     swim: bool,
     /// 展开状态菜单的卡片下标
     menu_for: Option<usize>,
@@ -66,9 +68,16 @@ pub struct CardDrag(pub String);
 
 impl Board {
     pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
+        let cards = std::fs::read_to_string(root.join(".mf-agent").join("workspaces.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str::<BoardFile>(&text).ok())
+            .map(|file| file.cards)
+            .unwrap_or_default();
         let mut this = Self {
             root: root.clone(),
-            cards: Vec::new(),
+            active_path: root.clone(),
+            cards,
+            on_activate: None,
             swim: false,
             menu_for: None,
             editing_comment: None,
@@ -84,6 +93,34 @@ impl Board {
 
     pub fn unread_count(&self) -> usize {
         self.cards.iter().filter(|card| card.unread).count()
+    }
+
+    /// 注册工作区卡片激活回调。回调收到点击时卡片状态的稳定快照。
+    pub fn set_on_activate(
+        &mut self,
+        cb: impl Fn(WorkspaceCard, &mut Window, &mut App) + 'static,
+    ) {
+        self.on_activate = Some(Box::new(cb));
+    }
+
+    fn activate_card(
+        &mut self,
+        idx: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(card) = self.cards.get_mut(idx) else {
+            return;
+        };
+        card.unread = false;
+        let card = card.clone();
+        self.active_path = card.path.clone();
+        self.menu_for = None;
+        self.save();
+        if let Some(cb) = &self.on_activate {
+            cb(card, window, cx);
+        }
+        cx.notify();
     }
 
     fn store_path(&self) -> PathBuf {
@@ -251,6 +288,7 @@ impl Board {
                     .bg(rgb(status_color(&card.status)))
                     .child(status_cn(&card.status))
                     .on_click(cx.listener(move |b: &mut Board, _: &ClickEvent, _w, cx| {
+                        cx.stop_propagation();
                         b.menu_for = if b.menu_for == Some(idx) { None } else { Some(idx) };
                         cx.notify();
                     })),
@@ -261,24 +299,19 @@ impl Board {
         let card = &self.cards[idx];
         let is_menu = self.menu_for == Some(idx);
         let is_edit = self.editing_comment == Some(idx);
+        let is_active = card.path == self.active_path;
         let mut d = div()
             .id(ElementId::Name(format!("bd-card-{idx}").into()))
             .bg(rgb(Theme::bg_elevated()))
             .border_1()
-            .border_color(rgb(if self.menu_for == Some(idx) { Theme::accent() } else { Theme::border() }))
+            .border_color(rgb(if is_menu || is_active { Theme::accent() } else { Theme::border() }))
             .rounded_sm()
             .p_2()
             .mb_1p5()
             .cursor_pointer()
             .hover(|h| h.border_color(rgb(Theme::accent_dim())))
-            .on_click(cx.listener(move |b: &mut Board, _: &ClickEvent, _w, cx| {
-                if let Some(c) = b.cards.get_mut(idx) {
-                    if c.unread {
-                        c.unread = false;
-                    }
-                }
-                b.menu_for = None;
-                cx.notify();
+            .on_click(cx.listener(move |b: &mut Board, _: &ClickEvent, window, cx| {
+                b.activate_card(idx, window, cx);
             }))
             .child(self.card_head(idx, cx))
             .child(
@@ -303,7 +336,10 @@ impl Board {
             .when(is_menu, |d| {
                 // 行内展开的状态菜单(四态) + 操作行
                 d.child(
-                    div().pt_1p5().flex().flex_wrap().gap_1()
+                    div()
+                        .id(ElementId::Name(format!("bd-menu-{idx}").into()))
+                        .pt_1p5().flex().flex_wrap().gap_1()
+                        .on_click(|_: &ClickEvent, _w, cx| cx.stop_propagation())
                         .children(STATUS_ORDER.iter().map(|s| {
                             div()
                                 .id(ElementId::Name(format!("bd-st-{idx}-{s}").into()))
@@ -318,6 +354,7 @@ impl Board {
                                 .text_color(rgb(status_color(s)))
                                 .child(status_cn(s))
                                 .on_click(cx.listener(move |b: &mut Board, _: &ClickEvent, _w, cx| {
+                                    cx.stop_propagation();
                                     b.set_status(idx, s, cx);
                                 }))
                         }))
@@ -331,6 +368,7 @@ impl Board {
                                 .cursor_pointer()
                                 .child("✎ 检查点")
                                 .on_click(cx.listener(move |b: &mut Board, _: &ClickEvent, _w, cx| {
+                                    cx.stop_propagation();
                                     b.editing_comment = Some(idx);
                                     b.comment_input = b.cards.get(idx).map(|c| c.comment.clone()).unwrap_or_default();
                                     b.menu_for = None;
@@ -346,6 +384,7 @@ impl Board {
                                 .cursor_pointer()
                                 .child("📂 目录")
                                 .on_click(cx.listener(move |b: &mut Board, _: &ClickEvent, _w, cx| {
+                                    cx.stop_propagation();
                                     b.open_worktree_dir(idx);
                                     b.menu_for = None;
                                     cx.notify();
@@ -361,6 +400,7 @@ impl Board {
                                     .cursor_pointer()
                                     .child("🗑 删除")
                                     .on_click(cx.listener(move |b: &mut Board, _: &ClickEvent, _w, cx| {
+                                        cx.stop_propagation();
                                         b.menu_for = None;
                                         b.remove_worktree(idx, cx);
                                     })),
@@ -387,6 +427,7 @@ impl Board {
             } else {
                 self.comment_input.clone()
             })
+            .on_click(|_: &ClickEvent, _w, cx| cx.stop_propagation())
             .on_key_down(cx.listener(|b: &mut Board, e: &KeyDownEvent, _w, cx| {
                 if let Some(ch) = e.keystroke.key_char.clone() {
                     b.comment_input.push_str(&ch);
@@ -485,11 +526,12 @@ impl Board {
             .children(col_idx.iter().map(|&i| {
                 let name = self.cards[i].name.clone();
                 let card = &self.cards[i];
+                let is_active = card.path == self.active_path;
                 div()
                     .id(ElementId::Name(format!("bd-swim-{i}").into()))
                     .bg(rgb(Theme::bg_elevated()))
                     .border_1()
-                    .border_color(rgb(Theme::border()))
+                    .border_color(rgb(if is_active { Theme::accent() } else { Theme::border() }))
                     .rounded_sm()
                     .p_1p5()
                     .mb_1()
@@ -500,6 +542,9 @@ impl Board {
                             cx.new(|_| DragGhost(card_drag.0.clone().into()))
                         },
                     )
+                    .on_click(cx.listener(move |b: &mut Board, _: &ClickEvent, window, cx| {
+                        b.activate_card(i, window, cx);
+                    }))
                     .child(div().text_size(px(11.)).text_color(rgb(Theme::fg())).text_ellipsis().whitespace_nowrap().overflow_hidden().child(display_name(&card.name).to_string()))
                     .child(div().text_size(px(9.5)).text_color(rgb(Theme::fg_faint())).child(format!("⎇ {}", card.branch)))
             }))
@@ -568,7 +613,7 @@ impl Render for Board {
                     .h(px(30.))
                     .border_b_1()
                     .border_color(rgb(Theme::border()))
-                    .child(div().text_size(px(11.)).text_color(rgb(Theme::fg_dim())).child(format!("车间 · {} 张卡", self.cards.len())))
+                    .child(div().text_size(px(11.)).text_color(rgb(Theme::fg_dim())).child(format!("工作区 · {}", self.cards.len())))
                     .child(div().flex_1())
                     .child(
                         div()

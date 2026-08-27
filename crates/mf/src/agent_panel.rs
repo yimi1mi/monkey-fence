@@ -68,6 +68,12 @@ impl AgentPanel {
         self.on_files_touched = Some(Box::new(cb));
     }
 
+    pub fn stop_engine(&mut self) {
+        if let Some(engine) = self.engine.lock().take() {
+            engine.stop();
+        }
+    }
+
     fn start_event_pump(&self, cx: &mut Context<Self>) {
         let engine = self.engine.clone();
         cx.spawn(async move |this, cx| {

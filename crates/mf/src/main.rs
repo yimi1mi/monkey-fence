@@ -8,6 +8,7 @@ mod diff_view;
 mod editor;
 mod file_index;
 mod file_tree;
+mod navigation;
 mod quick_open;
 mod search;
 mod settings;
@@ -129,9 +130,6 @@ fn bind_keys(cx: &mut App) {    use editor as ed;
         ("ctrl-shift-f", ws::OpenProjectSearch),
         ("ctrl-shift-m", ws::ShowTasks),
         ("ctrl-,", ws::OpenSettings),
-        ("alt-1", ws::SetModeZed),
-        ("alt-2", ws::SetModeOrca),
-        ("alt-3", ws::SetModeDual),
     );
 
     // 设置弹窗

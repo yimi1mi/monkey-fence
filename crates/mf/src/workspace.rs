@@ -12,6 +12,7 @@ use crate::diff_view::DiffView;
 use crate::editor::Editor;
 use crate::file_index::FileIndex;
 use crate::file_tree::FileTree;
+use crate::navigation::{BottomPanel, LeftPanel, NavAction, NavigationState, PrimarySurface};
 use crate::quick_open::{QuickItem, QuickOpen};
 use crate::search::ProjectSearch;
 use crate::settings::{Dismissed, Saved, SettingsView};
@@ -35,43 +36,8 @@ actions!(
         OpenProjectSearch,
         ShowTasks,
         OpenSettings,
-        SetModeZed,
-        SetModeOrca,
-        SetModeDual,
     ]
 );
-
-#[derive(Clone, Copy, PartialEq)]
-pub enum LeftPanel {
-    Explorer,
-    Vcs,
-    BoardPanel,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum BottomPanel {
-    Terminal,
-    Search,
-    Tasks,
-}
-
-/// 工作方式(三模式):Zed=专注手写 / Orca=AI 驾驶舱 / Dual=双轨协同
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum LayoutMode {
-    Zed,
-    Orca,
-    Dual,
-}
-
-impl LayoutMode {
-    pub fn label(&self) -> &'static str {
-        match self {
-            LayoutMode::Zed => "🧑‍💻 Zed",
-            LayoutMode::Orca => "🤖 Orca",
-            LayoutMode::Dual => "⚡ 双轨",
-        }
-    }
-}
 
 /// 标签页内容:编辑器或 diff 视图
 #[derive(Clone)]
@@ -104,6 +70,7 @@ impl Tab {
 
 pub struct Workspace {
     pub root: Option<PathBuf>,
+    active_workspace: Option<PathBuf>,
     tabs: Vec<Tab>,
     active: usize,
     file_index: Option<Entity<FileIndex>>,
@@ -115,13 +82,8 @@ pub struct Workspace {
     board: Option<Entity<Board>>,
     console_dock: Option<Entity<ConsoleDock>>,
     cockpit: Option<Entity<Cockpit>>,
-    layout_mode: LayoutMode,
+    navigation: NavigationState,
     settings_open: Option<Entity<SettingsView>>,
-    left_panel: LeftPanel,
-    left_dock_open: bool,
-    right_dock_open: bool,
-    bottom_dock_open: bool,
-    bottom_panel: BottomPanel,
     status_message: SharedString,
     focus_handle: FocusHandle,
     focus_editor_next: bool,
@@ -133,6 +95,7 @@ impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
         Self {
             root: None,
+            active_workspace: None,
             tabs: Vec::new(),
             active: 0,
             file_index: None,
@@ -144,13 +107,8 @@ impl Workspace {
             board: None,
             console_dock: None,
             cockpit: None,
-            layout_mode: LayoutMode::Dual,
+            navigation: NavigationState::default(),
             settings_open: None,
-            left_panel: LeftPanel::BoardPanel,
-            left_dock_open: true,
-            right_dock_open: true,
-            bottom_dock_open: true,
-            bottom_panel: BottomPanel::Terminal,
             status_message: "就绪".into(),
             focus_handle: cx.focus_handle(),
             focus_editor_next: false,
@@ -168,7 +126,33 @@ impl Workspace {
     pub fn open_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         // 统一为绝对路径,保证 agent 沙箱与索引以同一坐标系工作
         let path = std::path::absolute(&path).unwrap_or(path);
+        if self.root.as_ref() == Some(&path) {
+            self.navigation.apply(NavAction::ShowCode);
+            self.status_message = format!("当前工作区 {}", path.display()).into();
+            cx.notify();
+            return;
+        }
+        let switching_project = self.root.as_ref().is_some_and(|root| root != &path);
+        if switching_project && self.tabs.iter().any(|tab| tab.is_dirty(cx)) {
+            self.status_message = "存在未保存文件；请先保存或关闭后再切换工作区".into();
+            cx.notify();
+            return;
+        }
+
+        if let Some(agent) = self.agent_panel.take() {
+            agent.update(cx, |agent, _| agent.stop_engine());
+        }
+        self.quick_open = None;
+        self.search_overlay = None;
+        self.file_index = None;
+        self.file_tree = None;
+        self.vcs_panel = None;
+        self.board = None;
+        self.console_dock = None;
+        self.cockpit = None;
+        self.navigation = NavigationState::default();
         self.root = Some(path.clone());
+        self.active_workspace = Some(path.clone());
         self.tabs.clear();
         self.active = 0;
         let index = cx.new(|cx| FileIndex::new(path.clone(), cx));
@@ -193,7 +177,20 @@ impl Workspace {
             });
         });
         self.vcs_panel = Some(vcs);
-        self.board = Some(cx.new(|cx| Board::new(path.clone(), cx)));
+        let board = cx.new(|cx| Board::new(path.clone(), cx));
+        let weak = cx.weak_entity();
+        board.update(cx, |board, _| {
+            board.set_on_activate(move |card, _window, cx| {
+                weak.update(cx, |workspace, cx| {
+                    workspace.active_workspace = Some(card.path.clone());
+                    workspace.navigation.apply(NavAction::ShowWorkspaces);
+                    workspace.status_message = format!("当前工作区 {}", card.path.display()).into();
+                    cx.notify();
+                })
+                .ok();
+            });
+        });
+        self.board = Some(board);
 
         // Agent 面板 + 编排引擎(状态存项目内,git 忽略)
         let agent = cx.new(|cx| AgentPanel::new(cx));
@@ -213,21 +210,38 @@ impl Workspace {
             config,
             skills,
         ) {
-                let engine = Arc::new(engine);
+            let engine = Arc::new(engine);
             agent.update(cx, |a, cx| a.attach_engine(engine.clone(), &path, cx));
             let shell = term_cmd.unwrap_or_else(crate::console::default_shell);
-            self.cockpit = Some(cx.new(|cx| Cockpit::new(engine, path.clone(), shell, cx)));
-            }
-        self.agent_panel = Some(agent);
-        if self.console_dock.is_none() {
-            self.console_dock = Some(cx.new(|cx| ConsoleDock::new(cx)));
+            let cockpit = cx.new(|cx| Cockpit::new(engine, path.clone(), shell, cx));
+            let weak = cx.weak_entity();
+            let work_root = path.clone();
+            cockpit.update(cx, |cockpit, _| {
+                cockpit.set_on_open_change(move |change_path, _window, cx| {
+                    let path = if change_path.is_absolute() {
+                        change_path
+                    } else {
+                        work_root.join(change_path)
+                    };
+                    let title = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "变更".into());
+                    weak.update(cx, |workspace, cx| {
+                        workspace.open_diff(&title, &path, cx);
+                    })
+                    .ok();
+                });
+            });
+            self.cockpit = Some(cockpit);
         }
-
+        self.agent_panel = Some(agent);
         self.status_message = format!("已打开 {}", path.display()).into();
         cx.notify();
     }
 
     pub fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
+        self.navigation.apply(NavAction::ShowCode);
         if let Some(pos) = self.tabs.iter().position(|t| match t {
             Tab::Editor(ed) => ed
                 .read(cx)
@@ -263,29 +277,33 @@ impl Workspace {
 
     /// 打开文件的工作区 diff 标签页(P4 优先,回退 Git)
     pub fn open_diff(&mut self, title: &str, local_path: &Path, cx: &mut Context<Self>) {
+        self.navigation.apply(NavAction::ShowCode);
         let root = self.root.clone().unwrap_or_default();
-        let diff_text = {
+        let (diff_text, git_review) = {
             let p4 = mf_vcs::p4::P4::new(&root);
             match p4.diff_file(local_path) {
-                Ok(t) if !t.trim().is_empty() => t,
-                Ok(_) => "(无差异)".to_string(),
+                Ok(t) if !t.trim().is_empty() => (t, false),
+                Ok(_) => ("(无差异)".to_string(), false),
                 Err(_) => {
                     // 回退 git
                     let rel = local_path.strip_prefix(&root).unwrap_or(local_path);
-                    mf_vcs::git::Git::open(&root)
+                    let diff = mf_vcs::git::Git::open(&root)
                         .and_then(|g| g.diff_file(rel))
-                        .unwrap_or_else(|e| format!("获取 diff 失败: {e}"))
+                        .unwrap_or_else(|e| format!("获取 diff 失败: {e}"));
+                    (diff, true)
                 }
             }
         };
         let view = cx.new(|cx| DiffView::new(title, &diff_text, cx));
+        let view_id = view.entity_id();
         // hunk 审阅:拒绝 = 后台 git apply -R mini-patch,完成后重开该 diff
         let root = root.clone();
         let rel = local_path.strip_prefix(&root).unwrap_or(local_path).to_path_buf();
         let title_owned = title.to_string();
         let weak = cx.weak_entity();
-        view.update(cx, |dv, _| {
-            dv.set_on_reject(move |patch, _window, cx| {
+        if git_review {
+            view.update(cx, |dv, _| {
+                dv.set_on_reject(move |patch, _window, cx| {
                 let root = root.clone();
                 let rel = rel.clone();
                 let title = title_owned.clone();
@@ -323,18 +341,28 @@ impl Workspace {
                             Ok(()) => ws.status_message = "hunk 已拒绝(git apply -R),diff 已刷新".into(),
                             Err(e) => ws.status_message = format!("拒绝失败:{e}").into(),
                         }
-                        // 重开同文件 diff 刷新视图(复用当前 Diff tab 位置)
-                        if let Some(idx) = ws.tabs.iter().rposition(|t| matches!(t, Tab::Diff(_))) {
+                        // 只替换触发回调的 Diff 标签，避免误删另一个已打开的 Diff。
+                        if let Some(idx) = ws.tabs.iter().position(|tab| {
+                            matches!(tab, Tab::Diff(diff) if diff.entity_id() == view_id)
+                        }) {
                             ws.tabs.remove(idx);
+                            ws.open_diff(&title, &rel, cx);
+                            if let Some(refreshed) = ws.tabs.pop() {
+                                let idx = idx.min(ws.tabs.len());
+                                ws.tabs.insert(idx, refreshed);
+                                ws.activate_tab(idx, cx);
+                            }
+                        } else {
+                            ws.status_message = "原 Diff 标签已关闭，未自动重开".into();
                         }
-                        ws.open_diff(&title, &rel, cx);
                         cx.notify();
                     })
                     .ok();
                 })
                 .detach();
+                });
             });
-        });
+        }
         self.tabs.push(Tab::Diff(view.clone()));
         self.active = self.tabs.len() - 1;
         if let Some(Tab::Diff(dv)) = self.tabs.get(self.active) {
@@ -351,34 +379,63 @@ impl Workspace {
     }
 
     fn close_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
-        if self.tabs.is_empty() {
+        self.close_tab_at(self.active, cx);
+    }
+
+    fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
             return;
         }
-        self.tabs.remove(self.active);
-        self.active = self.active.min(self.tabs.len().saturating_sub(1));
-        self.focus_active(cx);
+        self.active = index;
+        match self.tabs.get(index) {
+            Some(Tab::Editor(_)) => self.focus_active(cx),
+            Some(Tab::Diff(diff)) => {
+                self.pending_focus = Some(diff.read(cx).focus_handle());
+            }
+            None => {}
+        }
         cx.notify();
+    }
+
+    fn close_tab_at(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if tab.is_dirty(cx) {
+            self.status_message = "文件尚未保存；保存后才能关闭标签".into();
+            cx.notify();
+            return;
+        }
+        self.tabs.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        }
+        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        if self.tabs.is_empty() {
+            cx.notify();
+        } else {
+            self.activate_tab(self.active, cx);
+        }
     }
 
     fn next_tab(&mut self, _: &NextTab, _: &mut Window, cx: &mut Context<Self>) {
         if !self.tabs.is_empty() {
-            self.active = (self.active + 1) % self.tabs.len();
-            self.focus_active(cx);
-            cx.notify();
+            let next = (self.active + 1) % self.tabs.len();
+            self.activate_tab(next, cx);
         }
     }
 
     fn prev_tab(&mut self, _: &PrevTab, _: &mut Window, cx: &mut Context<Self>) {
         if !self.tabs.is_empty() {
-            self.active = (self.active + self.tabs.len() - 1) % self.tabs.len();
-            self.focus_active(cx);
-            cx.notify();
+            let previous = (self.active + self.tabs.len() - 1) % self.tabs.len();
+            self.activate_tab(previous, cx);
         }
     }
 
     // ---------- 快速打开 / 命令面板 ----------
 
     fn show_quick_open_files(&mut self, _: &QuickOpenFiles, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = None;
         let Some(index) = self.file_index.clone() else {
             self.status_message = "先打开一个文件夹 (Ctrl+Shift+O)".into();
             cx.notify();
@@ -389,22 +446,20 @@ impl Workspace {
     }
 
     fn show_command_palette(&mut self, _: &CommandPalette, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings_open = None;
         let qo = cx.new(|cx| QuickOpen::commands(cx));
         let has_folder = self.root.is_some();
         let mut cmds = vec![
             ("open_folder".into(), "打开文件夹…  Ctrl+Shift+O".into()),
             ("toggle_explorer".into(), "显示资源管理器  Ctrl+Shift+E".into()),
             ("toggle_vcs".into(), "显示版本控制  Ctrl+Shift+G".into()),
-            ("toggle_board".into(), "显示车间卡片墙  Ctrl+Shift+W".into()),
+            ("toggle_board".into(), "显示工作区  Ctrl+Shift+W".into()),
             ("toggle_agent".into(), "切换右侧 Agent 会话  Ctrl+Shift+/".into()),
             ("toggle_console".into(), "切换底部终端  Ctrl+`".into()),
             ("project_search".into(), "项目搜索…  Ctrl+Shift+F".into()),
-            ("show_tasks".into(), "显示任务 DAG  Ctrl+Shift+M".into()),
+            ("show_tasks".into(), "显示执行步骤  Ctrl+Shift+M".into()),
             ("open_settings".into(), "打开设置  Ctrl+,".into()),
             ("close_tab".into(), "关闭当前标签页  Ctrl+W".into()),
-            ("mode_zed".into(), "模式: Zed · 我写代码(编辑器优先) [Alt+1]".into()),
-            ("mode_orca".into(), "模式: Orca · AI 驱动(驾驶舱) [Alt+2]".into()),
-            ("mode_dual".into(), "模式: 双轨 · 人机协同 [Alt+3]".into()),
         ];
         if has_folder {
             cmds.push(("refresh_tree".into(), "刷新文件树".into()));
@@ -423,33 +478,28 @@ impl Workspace {
                     // 命令/文件处理后关闭浮层
                     match item {
                         QuickItem::File(p) => {
-                            ws.open_path(&p, cx);
+                            let p = p.clone();
+                            let path = if p.is_absolute() {
+                                p
+                            } else {
+                                ws.root.as_ref().map(|root| root.join(&p)).unwrap_or(p)
+                            };
+                            ws.navigation.apply(NavAction::ShowCode);
+                            ws.open_path(&path, cx);
                             ws.quick_open = None;
                         }
                         QuickItem::Command { id, .. } => {
                             ws.quick_open = None;
                             match id.as_ref() {
                                 "open_folder" => ws.prompt_open_folder(window, cx),
-                                "toggle_explorer" => {
-                                    ws.left_panel = LeftPanel::Explorer;
-                                    ws.left_dock_open = true;
-                                }
-                                "toggle_vcs" => {
-                                    ws.left_panel = LeftPanel::Vcs;
-                                    ws.left_dock_open = true;
-                                }
-                                "toggle_board" => {
-                                    ws.left_panel = LeftPanel::BoardPanel;
-                                    ws.left_dock_open = true;
-                                }
+                                "toggle_explorer" => ws.navigation.apply(NavAction::ShowExplorer),
+                                "toggle_vcs" => ws.navigation.apply(NavAction::ShowVcs),
+                                "toggle_board" => ws.navigation.apply(NavAction::ShowWorkspaces),
                                 "toggle_agent" => ws.toggle_agent_dock(cx),
                                 "toggle_console" => ws.toggle_console(cx),
                                 "project_search" => ws.open_project_search(cx),
                                 "show_tasks" => ws.show_tasks(cx),
                                 "open_settings" => ws.open_settings(cx),
-                                "mode_zed" => ws.set_layout_mode(LayoutMode::Zed, cx),
-                                "mode_orca" => ws.set_layout_mode(LayoutMode::Orca, cx),
-                                "mode_dual" => ws.set_layout_mode(LayoutMode::Dual, cx),
                                 "close_tab" => ws.close_tab(&CloseTab, window, cx),
                                 "refresh_tree" => {
                                     if let Some(t) = &ws.file_tree {
@@ -460,7 +510,6 @@ impl Workspace {
                             }
                         }
                     }
-                    ws.focus_active(cx);
                     cx.notify();
                 })
                 .ok();
@@ -513,25 +562,22 @@ impl Workspace {
     }
 
     fn act_toggle_left(&mut self, _: &ToggleLeftPanel, _: &mut Window, cx: &mut Context<Self>) {
-        self.left_dock_open = !self.left_dock_open;
+        self.navigation.apply(NavAction::ToggleLeft);
         cx.notify();
     }
 
     fn act_show_explorer(&mut self, _: &ShowExplorer, _: &mut Window, cx: &mut Context<Self>) {
-        self.left_panel = LeftPanel::Explorer;
-        self.left_dock_open = true;
+        self.navigation.apply(NavAction::ShowExplorer);
         cx.notify();
     }
 
     fn act_show_vcs(&mut self, _: &ShowVcs, _: &mut Window, cx: &mut Context<Self>) {
-        self.left_panel = LeftPanel::Vcs;
-        self.left_dock_open = true;
+        self.navigation.apply(NavAction::ShowVcs);
         cx.notify();
     }
 
     fn act_show_board(&mut self, _: &ShowBoard, _: &mut Window, cx: &mut Context<Self>) {
-        self.left_panel = LeftPanel::BoardPanel;
-        self.left_dock_open = true;
+        self.navigation.apply(NavAction::ShowWorkspaces);
         cx.notify();
     }
 
@@ -545,11 +591,7 @@ impl Workspace {
 
     fn open_project_search(&mut self, cx: &mut Context<Self>) {
         if let Some(search) = self.search_overlay.clone() {
-            if self.layout_mode == LayoutMode::Orca {
-                self.layout_mode = LayoutMode::Dual;
-            }
-            self.bottom_panel = BottomPanel::Search;
-            self.bottom_dock_open = true;
+            self.navigation.apply(NavAction::ShowSearch);
             self.pending_focus = Some(search.read(cx).focus_handle(cx));
             cx.notify();
             return;
@@ -572,18 +614,16 @@ impl Workspace {
             });
         });
         cx.subscribe(&s, move |ws, _, _: &crate::search::Dismissed, cx| {
-            ws.bottom_dock_open = false;
+            if ws.navigation.bottom == Some(BottomPanel::Search) {
+                ws.navigation.apply(NavAction::CloseBottom);
+            }
             ws.focus_active(cx);
             cx.notify();
         })
         .detach();
         self.pending_focus = Some(s.read(cx).focus_handle(cx));
         self.search_overlay = Some(s);
-        if self.layout_mode == LayoutMode::Orca {
-            self.layout_mode = LayoutMode::Dual;
-        }
-        self.bottom_panel = BottomPanel::Search;
-        self.bottom_dock_open = true;
+        self.navigation.apply(NavAction::ShowSearch);
         cx.notify();
     }
 
@@ -599,78 +639,33 @@ impl Workspace {
         self.open_settings(cx);
     }
 
-    // ---------- 三模式(工作方式) ----------
-
-    fn act_set_mode_zed(&mut self, _: &SetModeZed, _: &mut Window, cx: &mut Context<Self>) {
-        self.set_layout_mode(LayoutMode::Zed, cx);
-    }
-
-    fn act_set_mode_orca(&mut self, _: &SetModeOrca, _: &mut Window, cx: &mut Context<Self>) {
-        self.set_layout_mode(LayoutMode::Orca, cx);
-    }
-
-    fn act_set_mode_dual(&mut self, _: &SetModeDual, _: &mut Window, cx: &mut Context<Self>) {
-        self.set_layout_mode(LayoutMode::Dual, cx);
-    }
-
-    fn set_layout_mode(&mut self, mode: LayoutMode, cx: &mut Context<Self>) {
-        self.layout_mode = mode;
-        match mode {
-            LayoutMode::Zed => {
-                self.left_panel = LeftPanel::Explorer;
-                self.left_dock_open = true;
-                self.right_dock_open = false;
-                self.bottom_dock_open = false;
-            }
-            LayoutMode::Orca => {
-                self.right_dock_open = false;
-                self.bottom_dock_open = false;
-            }
-            LayoutMode::Dual => {
-                self.left_panel = LeftPanel::BoardPanel;
-                self.left_dock_open = true;
-                self.right_dock_open = true;
-                self.bottom_dock_open = true;
-            }
-        }
-        self.focus_active(cx);
-        cx.notify();
-    }
-
     // ---------- 控制台分屏 ----------
 
-    pub fn toggle_console(&mut self, cx: &mut Context<Self>) {
+    fn ensure_console(&mut self, cx: &mut Context<Self>) {
         if self.console_dock.is_none() {
-            self.console_dock = Some(cx.new(|cx| ConsoleDock::new(cx)));
+            let cwd = self
+                .active_workspace
+                .clone()
+                .or_else(|| self.root.clone())
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("."));
+            self.console_dock = Some(cx.new(|cx| ConsoleDock::new_in(cwd, cx)));
         }
-        if self.bottom_dock_open && self.bottom_panel == BottomPanel::Terminal {
-            self.bottom_dock_open = false;
-        } else {
-            if self.layout_mode == LayoutMode::Orca {
-                self.layout_mode = LayoutMode::Dual;
-            }
-            self.bottom_panel = BottomPanel::Terminal;
-            self.bottom_dock_open = true;
-        }
+    }
+
+    pub fn toggle_console(&mut self, cx: &mut Context<Self>) {
+        self.ensure_console(cx);
+        self.navigation.apply(NavAction::ToggleTerminal);
         cx.notify();
     }
 
     fn toggle_agent_dock(&mut self, cx: &mut Context<Self>) {
-        if self.layout_mode == LayoutMode::Orca {
-            self.layout_mode = LayoutMode::Dual;
-            self.right_dock_open = true;
-        } else {
-            self.right_dock_open = !self.right_dock_open;
-        }
+        self.navigation.apply(NavAction::ToggleAgent);
         cx.notify();
     }
 
     fn show_tasks(&mut self, cx: &mut Context<Self>) {
-        if self.layout_mode == LayoutMode::Orca {
-            self.layout_mode = LayoutMode::Dual;
-        }
-        self.bottom_panel = BottomPanel::Tasks;
-        self.bottom_dock_open = true;
+        self.navigation.apply(NavAction::ShowSteps);
         cx.notify();
     }
 
@@ -682,6 +677,7 @@ impl Workspace {
             cx.notify();
             return;
         }
+        self.quick_open = None;
         let s = cx.new(|cx| SettingsView::new(cx));
         cx.subscribe(&s, move |ws, _, ev: &Saved, cx| {
             ws.apply_editor_font(&ev.0.editor, cx);
@@ -819,11 +815,11 @@ impl Workspace {
     }
 
     fn render_tabs(&self, cx: &Context<Self>) -> impl IntoElement {
-        let tabs: Vec<(String, bool, bool)> = self
+        let tabs: Vec<(usize, String, bool, bool)> = self
             .tabs
             .iter()
             .enumerate()
-            .map(|(i, t)| (t.title(cx), i == self.active, t.is_dirty(cx)))
+            .map(|(i, t)| (i, t.title(cx), i == self.active, t.is_dirty(cx)))
             .collect();
         let mut el = div()
             .id("tab-strip")
@@ -836,10 +832,15 @@ impl Workspace {
             .border_b_1()
             .border_color(rgb(crate::theme::Theme::border()))
             .bg(rgb(crate::theme::Theme::bg_panel()));
-        for (name, is_active, dirty) in tabs {
+        for (index, name, is_active, dirty) in tabs {
+            let label = if name.ends_with("(diff)") {
+                format!("◆ {name}")
+            } else {
+                name.clone()
+            };
             el = el.child(
                 div()
-                    .id(ElementId::Name(format!("tab-{}", name).into()))
+                    .id(("tab", index))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -860,11 +861,11 @@ impl Workspace {
                         d.text_color(rgb(crate::theme::Theme::fg_dim()))
                             .hover(|h| h.bg(rgb(crate::theme::Theme::bg_hover())))
                     })
-                    .child(if name.ends_with("(diff)") {
-                        format!("◆ {name}")
-                    } else {
-                        name
-                    })
+                    .on_click(cx.listener(move |workspace: &mut Workspace, _, _, cx| {
+                        workspace.navigation.apply(NavAction::ShowCode);
+                        workspace.activate_tab(index, cx);
+                    }))
+                    .child(label)
                     .when(dirty, |d| {
                         d.child(
                             div()
@@ -875,9 +876,18 @@ impl Workspace {
                     })
                     .child(
                         div()
+                            .id(("close-tab", index))
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_pointer()
                             .text_size(px(10.))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
-                            .child("×"),
+                            .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())).text_color(rgb(crate::theme::Theme::fg())))
+                            .child("×")
+                            .on_click(cx.listener(move |workspace: &mut Workspace, _, _, cx| {
+                                cx.stop_propagation();
+                                workspace.close_tab_at(index, cx);
+                            })),
                     ),
             );
         }
@@ -887,8 +897,8 @@ impl Workspace {
     fn render_activity_bar(&self, cx: &Context<Self>) -> impl IntoElement {
         let icons: [(&'static str, &'static str, LeftPanel); 3] = [
             ("▱", "项目 Ctrl+Shift+E", LeftPanel::Explorer),
+            ("▦", "工作 Ctrl+Shift+W", LeftPanel::Workspaces),
             ("⎇", "版控 Ctrl+Shift+G", LeftPanel::Vcs),
-            ("▦", "车间 Ctrl+Shift+W", LeftPanel::BoardPanel),
         ];
         let vcs_count = self.vcs_panel.as_ref().map(|v| v.read(cx).change_count()).unwrap_or(0);
         let unread = self.board.as_ref().map(|b| b.read(cx).unread_count()).unwrap_or(0);
@@ -905,8 +915,8 @@ impl Workspace {
             .border_color(rgb(crate::theme::Theme::border()))
             .child(div().h(px(30.)).flex().items_center().justify_center().text_size(px(18.)).child("🐒"));
         for (icon, tip, panel) in icons {
-            let is_active = self.left_dock_open && self.left_panel == panel;
-            let badge = if panel == LeftPanel::Vcs { vcs_count } else if panel == LeftPanel::BoardPanel { unread } else { 0 };
+            let is_active = self.navigation.left == Some(panel);
+            let badge = if panel == LeftPanel::Vcs { vcs_count } else if panel == LeftPanel::Workspaces { unread } else { 0 };
             bar = bar.child(
                 div()
                     .id(ElementId::Name(format!("act-{}", tip).into()))
@@ -940,7 +950,7 @@ impl Workspace {
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .bg(rgb(if panel == LeftPanel::BoardPanel { crate::theme::Theme::warning() } else { crate::theme::Theme::accent() }))
+                                .bg(rgb(if panel == LeftPanel::Workspaces { crate::theme::Theme::warning() } else { crate::theme::Theme::accent() }))
                                 .text_color(rgb(crate::theme::Theme::bg()))
                                 .text_size(px(9.))
                                 .child(badge.to_string()),
@@ -949,21 +959,45 @@ impl Workspace {
                     .on_click({
                         let panel = panel;
                         cx.listener(move |this: &mut Workspace, _, _, cx| {
-                            this.left_panel = panel;
-                            this.left_dock_open = true;
+                            if this.navigation.left == Some(panel) {
+                                this.navigation.apply(NavAction::ToggleLeft);
+                            } else {
+                                this.navigation.apply(match panel {
+                                    LeftPanel::Explorer => NavAction::ShowExplorer,
+                                    LeftPanel::Vcs => NavAction::ShowVcs,
+                                    LeftPanel::Workspaces => NavAction::ShowWorkspaces,
+                                });
+                            }
                             cx.notify();
                         })
                     }),
             );
         }
-        let search_active = self.bottom_dock_open && self.bottom_panel == BottomPanel::Search;
-        let agent_active = self.right_dock_open && self.layout_mode != LayoutMode::Orca;
-        bar.child(
+        let terminal_active = self.navigation.bottom == Some(BottomPanel::Terminal);
+        let search_active = self.navigation.bottom == Some(BottomPanel::Search);
+        let agent_active = self.navigation.agent_open;
+        bar.child(div().flex_1())
+        .child(
             activity_button(
                 "⌕",
                 "搜索 Ctrl+Shift+F",
                 search_active,
-                cx.listener(|this: &mut Workspace, _, _, cx| this.open_project_search(cx)),
+                cx.listener(|this: &mut Workspace, _, _, cx| {
+                    if this.navigation.bottom == Some(BottomPanel::Search) {
+                        this.navigation.apply(NavAction::CloseBottom);
+                        cx.notify();
+                    } else {
+                        this.open_project_search(cx);
+                    }
+                }),
+            ),
+        )
+        .child(
+            activity_button(
+                "⌨",
+                "终端 Ctrl+`",
+                terminal_active,
+                cx.listener(|this: &mut Workspace, _, _, cx| this.toggle_console(cx)),
             ),
         )
         .child(
@@ -974,7 +1008,6 @@ impl Workspace {
                 cx.listener(|this: &mut Workspace, _, _, cx| this.toggle_agent_dock(cx)),
             ),
         )
-        .child(div().flex_1())
         .child(
             activity_button(
                 "⚙",
@@ -985,8 +1018,14 @@ impl Workspace {
         )
     }
 
-    fn render_left_panel(&self, cx: &Context<Self>) -> impl IntoElement {
-        let body = match (&self.left_panel, &self.file_tree) {
+    fn render_left_panel(&self, _cx: &Context<Self>) -> impl IntoElement {
+        let selected = self.navigation.left.unwrap_or(LeftPanel::Explorer);
+        let title = match selected {
+            LeftPanel::Explorer => "项目",
+            LeftPanel::Workspaces => "工作区",
+            LeftPanel::Vcs => "版控",
+        };
+        let body = match (selected, &self.file_tree) {
             (LeftPanel::Explorer, Some(tree)) => div().size_full().flex().child(tree.clone()),
             (LeftPanel::Explorer, None) => div()
                 .p_3()
@@ -1001,7 +1040,7 @@ impl Workspace {
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child("尚未打开文件夹"),
             },
-            (LeftPanel::BoardPanel, _) => match &self.board {
+            (LeftPanel::Workspaces, _) => match &self.board {
                 Some(b) => div().size_full().flex().child(b.clone()),
                 None => div()
                     .p_3()
@@ -1028,31 +1067,14 @@ impl Workspace {
                     .px_1p5()
                     .border_b_1()
                     .border_color(rgb(crate::theme::Theme::border()))
-                    .children([
-                        ("项目", LeftPanel::Explorer),
-                        ("版控", LeftPanel::Vcs),
-                        ("车间", LeftPanel::BoardPanel),
-                    ].map(|(label, panel)| {
-                        let active = self.left_panel == panel;
+                    .child(
                         div()
-                            .id(ElementId::Name(format!("dock-tab-{label}").into()))
-                            .h(px(26.))
-                            .px_2p5()
-                            .flex()
-                            .items_center()
-                            .rounded_t_md()
-                            .cursor_pointer()
-                            .text_size(px(11.5))
-                            .text_color(rgb(if active { crate::theme::Theme::fg() } else { crate::theme::Theme::fg_dim() }))
-                            .when(active, |d| d.bg(rgb(crate::theme::Theme::bg_elevated())))
-                            .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
-                            .child(label)
-                            .on_click(cx.listener(move |ws: &mut Workspace, _, _, cx| {
-                                ws.left_panel = panel;
-                                ws.left_dock_open = true;
-                                cx.notify();
-                            }))
-                    })),
+                            .px_2()
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .child(title),
+                    ),
             )
             .child(body)
     }
@@ -1080,7 +1102,7 @@ impl Workspace {
             })
     }
 
-    fn render_tasks_dock(&self, cx: &Context<Self>) -> AnyElement {
+    fn render_steps_dock(&self, cx: &Context<Self>) -> AnyElement {
         let (run_status, tasks) = self
             .agent_panel
             .as_ref()
@@ -1091,7 +1113,7 @@ impl Workspace {
             .unwrap_or_else(|| ("未启动".into(), Vec::new()));
 
         div()
-            .id("bottom-tasks")
+            .id("bottom-steps")
             .size_full()
             .flex()
             .flex_col()
@@ -1105,19 +1127,7 @@ impl Workspace {
                     .px_3()
                     .border_b_1()
                     .border_color(rgb(crate::theme::Theme::border()))
-                    .child(div().font_weight(FontWeight::SEMIBOLD).text_size(px(11.5)).child(format!("RUN · {run_status}")))
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .rounded_sm()
-                            .border_1()
-                            .border_color(rgb(crate::theme::Theme::border()))
-                            .text_size(px(10.))
-                            .text_color(rgb(crate::theme::Theme::fg_dim()))
-                            .child("＋ 新建任务"),
-                    ),
+                    .child(div().font_weight(FontWeight::SEMIBOLD).text_size(px(11.5)).child(format!("执行步骤 · {run_status}"))),
             )
             .child(
                 div()
@@ -1137,7 +1147,7 @@ impl Workspace {
                                 .p_3()
                                 .text_size(px(11.))
                                 .text_color(rgb(crate::theme::Theme::fg_faint()))
-                                .child("暂无任务；从右侧 Agent 会话输入目标后，DAG 会实时显示在这里。"),
+                                .child("暂无执行步骤；从右侧 Agent 会话创建工作项执行后，这里会显示计划。"),
                         )
                     })
                     .children(tasks.into_iter().map(|task| {
@@ -1210,7 +1220,8 @@ impl Workspace {
     }
 
     fn render_bottom_dock(&self, cx: &Context<Self>) -> impl IntoElement {
-        let panel: AnyElement = match self.bottom_panel {
+        let selected = self.navigation.bottom.unwrap_or(BottomPanel::Terminal);
+        let panel: AnyElement = match selected {
             BottomPanel::Terminal => match &self.console_dock {
                 Some(console) => div().size_full().flex().child(console.clone()).into_any_element(),
                 None => div().size_full().flex().items_center().justify_center().text_color(rgb(crate::theme::Theme::fg_faint())).child("终端尚未启动").into_any_element(),
@@ -1219,7 +1230,7 @@ impl Workspace {
                 Some(search) => div().size_full().flex().child(search.clone()).into_any_element(),
                 None => div().size_full().flex().items_center().justify_center().text_color(rgb(crate::theme::Theme::fg_faint())).child("Ctrl+Shift+F 开始项目搜索").into_any_element(),
             },
-            BottomPanel::Tasks => self.render_tasks_dock(cx),
+            BottomPanel::Steps => self.render_steps_dock(cx),
         };
 
         div()
@@ -1244,9 +1255,9 @@ impl Workspace {
                     .children([
                         ("TERMINAL", BottomPanel::Terminal),
                         ("SEARCH", BottomPanel::Search),
-                        ("TASKS", BottomPanel::Tasks),
+                        ("STEPS", BottomPanel::Steps),
                     ].map(|(label, target)| {
-                        let active = self.bottom_panel == target;
+                        let active = selected == target;
                         div()
                             .id(ElementId::Name(format!("bottom-tab-{label}").into()))
                             .h(px(25.))
@@ -1263,14 +1274,13 @@ impl Workspace {
                             .on_click(cx.listener(move |ws: &mut Workspace, _, _, cx| {
                                 match target {
                                     BottomPanel::Terminal => {
-                                        if ws.console_dock.is_none() {
-                                            ws.console_dock = Some(cx.new(|cx| ConsoleDock::new(cx)));
+                                        ws.ensure_console(cx);
+                                        if ws.navigation.bottom != Some(BottomPanel::Terminal) {
+                                            ws.navigation.apply(NavAction::ToggleTerminal);
                                         }
-                                        ws.bottom_panel = BottomPanel::Terminal;
-                                        ws.bottom_dock_open = true;
                                     }
                                     BottomPanel::Search => ws.open_project_search(cx),
-                                    BottomPanel::Tasks => ws.show_tasks(cx),
+                                    BottomPanel::Steps => ws.show_tasks(cx),
                                 }
                                 cx.notify();
                             }))
@@ -1288,49 +1298,12 @@ impl Workspace {
                             .hover(|d| d.text_color(rgb(crate::theme::Theme::fg())))
                             .child("⌄")
                             .on_click(cx.listener(|ws: &mut Workspace, _, _, cx| {
-                                ws.bottom_dock_open = false;
+                                ws.navigation.apply(NavAction::CloseBottom);
                                 cx.notify();
                             })),
                     ),
             )
             .child(div().flex_1().min_h_0().child(panel))
-    }
-
-    /// 状态栏最左:工作方式三段开关(Zed 手写 / Orca AI 驾驶舱 / 双轨)
-    fn render_mode_switch(&self, cx: &Context<Self>) -> impl IntoElement {
-        let cur = self.layout_mode;
-        div()
-            .id("mode-switch")
-            .flex()
-            .items_center()
-            .h(px(18.))
-            .rounded_sm()
-            .overflow_hidden()
-            .border_1()
-            .border_color(rgb(crate::theme::Theme::accent_dim()))
-            .children([LayoutMode::Zed, LayoutMode::Orca, LayoutMode::Dual].map(|m| {
-                let active = cur == m;
-                div()
-                    .id(ElementId::Name(format!("mode-{}", m.label()).into()))
-                    .flex()
-                    .items_center()
-                    .px_2()
-                    .h_full()
-                    .cursor_pointer()
-                    .text_size(px(11.))
-                    .when(active, |d| {
-                        d.bg(rgb(crate::theme::Theme::accent()))
-                            .text_color(rgb(crate::theme::Theme::bg()))
-                    })
-                    .when(!active, |d| {
-                        d.text_color(rgb(crate::theme::Theme::fg_dim()))
-                            .hover(|h| h.bg(rgb(crate::theme::Theme::bg_hover())))
-                    })
-                    .child(m.label())
-                    .on_click(cx.listener(move |ws: &mut Workspace, _: &ClickEvent, _w, cx| {
-                        ws.set_layout_mode(m, cx);
-                    }))
-            }))
     }
 
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1353,6 +1326,12 @@ impl Workspace {
             .and_then(|r| r.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "未打开项目".into());
+        let workspace_name = self
+            .active_workspace
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| root_name.clone());
         div()
             .id("status-bar")
             .h(px(26.))
@@ -1365,8 +1344,7 @@ impl Workspace {
             .border_color(rgb(crate::theme::Theme::border()))
             .text_size(px(11.))
             .text_color(rgb(crate::theme::Theme::fg_dim()))
-            .child(self.render_mode_switch(cx))
-            .child(div().child(format!("⎇ {root_name}")))
+            .child(div().child(format!("{} · ⎇ {}", root_name, workspace_name)))
             .child(
                 div()
                     .text_color(rgb(if vcs_count > 0 { crate::theme::Theme::accent() } else { crate::theme::Theme::fg_dim() }))
@@ -1495,14 +1473,15 @@ impl Render for Workspace {
         if let Some(dock) = &self.console_dock {
             if dock.read(cx).close_pending {
                 self.console_dock = None;
-                if self.bottom_panel == BottomPanel::Terminal {
-                    self.bottom_dock_open = false;
+                if self.navigation.bottom == Some(BottomPanel::Terminal) {
+                    self.navigation.apply(NavAction::CloseBottom);
                 }
             }
         }
 
-        let content: AnyElement = if self.layout_mode == LayoutMode::Orca {
-            match &self.cockpit {
+        let primary: AnyElement = match self.navigation.surface {
+            PrimarySurface::Code => center,
+            PrimarySurface::Work => match &self.cockpit {
                 Some(cockpit) => div().flex_1().min_w_0().flex().child(cockpit.clone()).into_any_element(),
                 None => div()
                     .flex_1()
@@ -1510,32 +1489,31 @@ impl Render for Workspace {
                     .items_center()
                     .justify_center()
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
-                    .child("驾驶舱不可用(未打开项目或引擎启动失败)")
+                    .child("执行概览不可用；请先打开项目并配置 Agent")
                     .into_any_element(),
-            }
-        } else {
-            let mut center_stack = div()
-                .id("center-stack")
-                .flex_1()
-                .min_w_0()
-                .min_h_0()
-                .flex()
-                .flex_col()
-                .child(div().flex_1().min_h_0().flex().child(center));
-            if self.bottom_dock_open {
-                center_stack = center_stack.child(self.render_bottom_dock(cx));
-            }
-
-            let mut normal = div().flex_1().min_w_0().min_h_0().flex();
-            if self.left_dock_open {
-                normal = normal.child(self.render_left_panel(cx));
-            }
-            normal = normal.child(center_stack);
-            if self.right_dock_open {
-                normal = normal.child(self.render_right_dock());
-            }
-            normal.into_any_element()
+            },
         };
+
+        let mut center_stack = div()
+            .id("center-stack")
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(div().flex_1().min_h_0().flex().child(primary));
+        if self.navigation.bottom.is_some() {
+            center_stack = center_stack.child(self.render_bottom_dock(cx));
+        }
+
+        let mut content = div().flex_1().min_w_0().min_h_0().flex();
+        if self.navigation.left.is_some() {
+            content = content.child(self.render_left_panel(cx));
+        }
+        content = content.child(center_stack);
+        if self.navigation.agent_open {
+            content = content.child(self.render_right_dock());
+        }
 
         let mut root = div()
             .id("workspace-root")
@@ -1560,9 +1538,6 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::act_open_project_search))
             .on_action(cx.listener(Self::act_show_tasks))
             .on_action(cx.listener(Self::act_open_settings))
-            .on_action(cx.listener(Self::act_set_mode_zed))
-            .on_action(cx.listener(Self::act_set_mode_orca))
-            .on_action(cx.listener(Self::act_set_mode_dual))
             .child(
                 div()
                     .id("main-row")

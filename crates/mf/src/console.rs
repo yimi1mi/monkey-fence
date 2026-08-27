@@ -2,6 +2,7 @@ use gpui::prelude::*;
 use gpui::*;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use crate::term::Screen;
 
@@ -57,6 +58,16 @@ impl ConsolePane {
         shell: &str,
         cx: &mut Context<Self>,
     ) -> Result<Self, anyhow::Error> {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        Self::new_in(id, shell, &cwd, cx)
+    }
+
+    pub fn new_in(
+        id: usize,
+        shell: &str,
+        cwd: &Path,
+        cx: &mut Context<Self>,
+    ) -> Result<Self, anyhow::Error> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(PtySize {
             rows: TERM_ROWS as u16,
@@ -65,7 +76,7 @@ impl ConsolePane {
             pixel_height: 0,
         })?;
         let mut cmd = CommandBuilder::new(shell);
-        cmd.cwd(std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        cmd.cwd(cwd);
         let child = pair.slave.spawn_command(cmd)?;
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader()?;
@@ -473,10 +484,16 @@ pub struct ConsoleDock {
     /// 最后一个窗格被关闭 → 外层应在 render 时关闭整个 dock
     pub close_pending: bool,
     shell: String,
+    cwd: PathBuf,
 }
 
 impl ConsoleDock {
     pub fn new(cx: &mut Context<Self>) -> Self {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        Self::new_in(cwd, cx)
+    }
+
+    pub fn new_in(cwd: PathBuf, cx: &mut Context<Self>) -> Self {
         let mut dock = Self {
             tree: empty_tree(),
             next_id: 1,
@@ -484,6 +501,7 @@ impl ConsoleDock {
             focus_pending: None,
             close_pending: false,
             shell: default_shell(),
+            cwd,
         };
         let leaf = dock.new_leaf(cx);
         dock.tree = SplitNode::Split {
@@ -523,8 +541,10 @@ impl ConsoleDock {
         let id = self.next_id;
         self.next_id += 1;
         let shell = self.shell.clone();
+        let cwd = self.cwd.clone();
         let pane = cx.new(|cx| {
-            ConsolePane::new(id, &shell, cx).unwrap_or_else(|e| ConsolePane::failed(id, e, cx))
+            ConsolePane::new_in(id, &shell, &cwd, cx)
+                .unwrap_or_else(|e| ConsolePane::failed(id, e, cx))
         });
         LeafPane { id, pane }
     }

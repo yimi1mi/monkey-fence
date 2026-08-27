@@ -108,9 +108,18 @@ impl QuickOpen {
     }
 
     fn act_confirm(&mut self, _: &ConfirmItem, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.results.get(self.selected).cloned() else {
+        self.pick(self.selected, window, cx);
+    }
+
+    fn act_dismiss(&mut self, _: &Dismiss, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(Dismissed);
+    }
+
+    fn pick(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.results.get(index).cloned() else {
             return;
         };
+        self.selected = index;
         if let Some(cb) = &self.on_pick {
             cb(&item, window, cx);
         }
@@ -205,6 +214,7 @@ impl Render for QuickOpen {
             .justify_center()
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::act_confirm))
+            .on_action(cx.listener(Self::act_dismiss))
             .on_action(cx.listener(Self::act_prev))
             .on_action(cx.listener(Self::act_next))
             .on_key_down(cx.listener(Self::on_key))
@@ -227,8 +237,8 @@ impl Render for QuickOpen {
                     .border_1()
                     .border_color(rgb(crate::theme::Theme::border()))
                     .shadow_lg()
-                    .on_mouse_down(MouseButton::Left, |_, _, _| {
-                        // 阻止冒泡关闭
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
                     })
                     .child(
                         div()
@@ -257,7 +267,7 @@ impl Render for QuickOpen {
                         uniform_list(
                             "quick-open-list",
                             results.len(),
-                            cx.processor(move |_this, range, _window, _cx| {
+                            cx.processor(move |_this, range, _window, cx| {
                                 let mut out = Vec::new();
                                 for ix in range {
                                     let Some(item) = results.get(ix) else {
@@ -293,6 +303,9 @@ impl Render for QuickOpen {
                                             })
                                             .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                                             .cursor_pointer()
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.pick(ix, window, cx);
+                                            }))
                                             .child(
                                                 div()
                                                     .text_size(px(12.))
