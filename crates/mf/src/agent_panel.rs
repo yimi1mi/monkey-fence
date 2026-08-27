@@ -20,6 +20,7 @@ pub struct AgentPanel {
     pending_touched: Vec<String>,
     on_files_touched:
         Option<Box<dyn Fn(&[String], &mut Window, &mut App)>>,
+    input_focus: FocusHandle,
 }
 
 #[derive(Clone)]
@@ -42,6 +43,7 @@ impl AgentPanel {
             answer: String::new(),
             pending_touched: Vec::new(),
             on_files_touched: None,
+            input_focus: cx.focus_handle(),
         };
         panel.start_event_pump(cx);
         panel
@@ -175,6 +177,10 @@ impl AgentPanel {
     }
 
     fn act_start(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.act_start_owned(cx);
+    }
+
+    fn act_start_owned(&mut self, cx: &mut Context<Self>) {
         let obj = self.objective.trim().to_string();
         if obj.is_empty() {
             self.run_status = "请输入目标".into();
@@ -219,6 +225,10 @@ impl AgentPanel {
     }
 
     fn on_objective_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.key == "enter" {
+            self.act_start_owned(cx);
+            return;
+        }
         if let Some(chars) = event.keystroke.key_char.clone() {
             let printable: String = chars.chars().filter(|c| !c.is_control()).collect();
             if !printable.is_empty() {
@@ -272,8 +282,14 @@ fn extract_path(summary: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
+impl Focusable for AgentPanel {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.input_focus.clone()
+    }
+}
+
 impl Render for AgentPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut col = div()
             .id("agent-panel")
             .size_full()
@@ -332,8 +348,11 @@ impl Render for AgentPanel {
                         .border_1()
                         .border_color(rgb(crate::theme::Theme::BORDER))
                         .bg(rgb(crate::theme::Theme::BG))
-                        .focusable()
+                        .track_focus(&self.input_focus)
                         .on_key_down(cx.listener(Self::on_objective_key))
+                        .when(self.input_focus.is_focused(window), |d| {
+                            d.border_color(rgb(crate::theme::Theme::ACCENT))
+                        })
                         .text_color(rgb(crate::theme::Theme::FG))
                         .child(if self.objective.is_empty() {
                             SharedString::from("输入目标,例如:给 utils 加单元测试并跑通")

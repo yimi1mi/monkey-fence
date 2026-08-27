@@ -169,7 +169,7 @@ impl Focusable for SettingsView {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // 遮罩:点击空白关闭
         div()
             .id("settings-overlay")
@@ -188,12 +188,12 @@ impl Render for SettingsView {
                 cx.emit(Dismissed);
             }))
             .on_action(cx.listener(Self::act_dismiss))
-            .child(self.render_card(cx))
+            .child(self.render_card(window, cx))
     }
 }
 
 impl SettingsView {
-    fn render_card(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_card(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let title_bar = div()
             .id("settings-title")
             .h(px(36.))
@@ -220,12 +220,12 @@ impl SettingsView {
             .shadow_lg()
             .overflow_hidden()
             .child(title_bar)
-            .child(self.render_body(cx))
+            .child(self.render_body(window, cx))
             .child(self.render_footer(cx))
             .into_any_element()
     }
 
-    fn render_body(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("settings-body")
             .flex_1()
@@ -236,9 +236,9 @@ impl SettingsView {
             .flex_col()
             .gap_4()
             .child(self.render_roles_section(cx))
-            .child(self.render_provider_section(cx))
-            .child(self.render_engine_section(cx))
-            .child(self.render_editor_section(cx))
+            .child(self.render_provider_section(window, cx))
+            .child(self.render_engine_section(window, cx))
+            .child(self.render_editor_section(window, cx))
             .child(
                 div()
                     .id("settings-hint")
@@ -310,7 +310,7 @@ impl SettingsView {
             .child(prov_name.to_string())
     }
 
-    fn render_provider_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_provider_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let prov = self.selected_provider();
         let name = self
             .draft
@@ -326,36 +326,36 @@ impl SettingsView {
             .flex_col()
             .gap_2()
             .child(header)
-            .child(field_row("名称", self.text_input(Field::RoleProvider, cx)))
+            .child(field_row("名称", self.text_input(Field::RoleProvider, window, cx)))
             .child(kind_row)
-            .child(field_row("base_url", self.text_input(Field::BaseUrl, cx)))
-            .child(field_row("api_key", self.text_input(Field::ApiKey, cx)))
-            .child(field_row("model", self.text_input(Field::Model, cx)))
+            .child(field_row("base_url", self.text_input(Field::BaseUrl, window, cx)))
+            .child(field_row("api_key", self.text_input(Field::ApiKey, window, cx)))
+            .child(field_row("model", self.text_input(Field::Model, window, cx)))
             .into_any_element()
     }
 
-    fn render_engine_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_engine_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("engine-fields")
             .flex()
             .flex_col()
             .gap_2()
             .child(section("引擎"))
-            .child(field_row("并行 worker 数", self.text_input(Field::Workers, cx)))
-            .child(field_row("工具循环轮数", self.text_input(Field::MaxIters, cx)))
-            .child(field_row("失败熔断次数", self.text_input(Field::MaxFailures, cx)))
+            .child(field_row("并行 worker 数", self.text_input(Field::Workers, window, cx)))
+            .child(field_row("工具循环轮数", self.text_input(Field::MaxIters, window, cx)))
+            .child(field_row("失败熔断次数", self.text_input(Field::MaxFailures, window, cx)))
             .into_any_element()
     }
 
-    fn render_editor_section(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_editor_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("editor-fields")
             .flex()
             .flex_col()
             .gap_2()
             .child(section("编辑器"))
-            .child(field_row("字体", self.text_input(Field::FontFamily, cx)))
-            .child(field_row("字号(px)", self.text_input(Field::FontSize, cx)))
+            .child(field_row("字体", self.text_input(Field::FontFamily, window, cx)))
+            .child(field_row("字号(px)", self.text_input(Field::FontSize, window, cx)))
             .into_any_element()
     }
 
@@ -386,7 +386,7 @@ impl SettingsView {
 
 impl SettingsView {
     /// 单行文本输入(点击聚焦后直接键入,与 VCS 提交描述一致的轻量输入)
-    fn text_input(&self, field: Field, cx: &Context<Self>) -> impl IntoElement {
+    fn text_input(&self, field: Field, window: &mut Window, cx: &Context<Self>) -> impl IntoElement {
         let text = self.field_text(field);
         div()
             .id(ElementId::Name(format!("settings-input-{:?}", field).into()))
@@ -397,7 +397,10 @@ impl SettingsView {
             .border_1()
             .border_color(rgb(crate::theme::Theme::BORDER))
             .bg(rgb(crate::theme::Theme::BG))
-            .focusable()
+            .track_focus(&self.focus_handle)
+            .when(self.focus_handle.is_focused(window), |d| {
+                d.border_color(rgb(crate::theme::Theme::ACCENT))
+            })
             .text_size(px(12.))
             .text_color(rgb(crate::theme::Theme::FG))
             .overflow_hidden()

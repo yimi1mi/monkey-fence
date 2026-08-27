@@ -23,6 +23,7 @@ pub struct VcsPanel {
     notice: Option<String>,
     show_history: bool,
     on_open_diff: Option<Box<dyn Fn(String, PathBuf, &mut Window, &mut App)>>,
+    desc_focus: FocusHandle,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -56,6 +57,7 @@ impl VcsPanel {
             git_branch: String::new(),
             selected: HashSet::new(),
             submit_desc: String::new(),
+            desc_focus: cx.focus_handle(),
             loading: false,
             error: None,
             notice: None,
@@ -418,8 +420,14 @@ fn action_color(action: &str) -> u32 {
     }
 }
 
+impl Focusable for VcsPanel {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.desc_focus.clone()
+    }
+}
+
 impl Render for VcsPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut col = div()
             .id("vcs-panel")
             .size_full()
@@ -680,7 +688,10 @@ impl Render for VcsPanel {
                         .border_1()
                         .border_color(rgb(crate::theme::Theme::BORDER))
                         .bg(rgb(crate::theme::Theme::BG))
-                        .focusable()
+                        .track_focus(&self.desc_focus)
+                        .when(self.desc_focus.is_focused(window), |d| {
+                            d.border_color(rgb(crate::theme::Theme::ACCENT))
+                        })
                         .on_key_down(cx.listener(Self::on_desc_key))
                         .text_size(px(12.))
                         .text_color(rgb(crate::theme::Theme::FG))
