@@ -159,6 +159,7 @@ CREATE TABLE IF NOT EXISTS ad_hoc_sessions (
     status TEXT NOT NULL DEFAULT 'starting',
     snapshot_json TEXT NOT NULL,
     handoff_json TEXT,
+    display_session_id INTEGER,
     created_at TEXT NOT NULL,
     launched_at TEXT,
     ended_at TEXT

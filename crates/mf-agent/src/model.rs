@@ -240,6 +240,8 @@ pub struct AdHocSessionView {
     pub snapshot: crate::agent_instance::AgentInstanceSnapshot,
     /// 用户显式提交的 Handoff(JSON),未提交为 None。
     pub handoff: Option<String>,
+    /// 展示会话行(agent_sessions):卡片/终端交互通道。
+    pub display_session_id: Option<i64>,
     pub created_at: String,
     pub launched_at: Option<String>,
     pub ended_at: Option<String>,

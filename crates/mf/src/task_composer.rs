@@ -26,6 +26,17 @@ pub struct TaskComposerState {
     goal: String,
     /// goal 是否仍跟随 title(用户未手工编辑)
     goal_follows_title: bool,
+    /// 工作流分配选择(模板键或任务本地新建;设计 §11.3)。
+    workflow_choice: WorkflowChoice,
+}
+
+/// 任务创建的工作流分配。
+#[derive(Debug, Clone, PartialEq)]
+pub enum WorkflowChoice {
+    /// 任务本地工作流(默认;私有,可另存为模板)。
+    TaskLocal,
+    /// 分配已有全局模板(template_key)。
+    Template(String),
 }
 
 impl TaskComposerState {
@@ -38,6 +49,7 @@ impl TaskComposerState {
             title: String::new(),
             goal: String::new(),
             goal_follows_title: true,
+            workflow_choice: WorkflowChoice::TaskLocal,
         }
     }
 
@@ -85,6 +97,28 @@ impl TaskComposerState {
     }
 
     /// 提交校验:Project 必选、Title/Goal 必填(无当前 Project 时不能提交)。
+    pub fn workflow_choice(&self) -> &WorkflowChoice {
+        &self.workflow_choice
+    }
+
+    /// 选择工作流:模板键空串 = 任务本地。
+    pub fn select_workflow(&mut self, template_key: &str) {
+        self.workflow_choice = if template_key.is_empty() {
+            WorkflowChoice::TaskLocal
+        } else {
+            WorkflowChoice::Template(template_key.to_string())
+        };
+    }
+
+    /// 分配选项列表(供渲染)。
+    pub fn workflow_options(templates: &[(String, bool)]) -> Vec<String> {
+        templates
+            .iter()
+            .filter(|(_, local)| !local)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
     pub fn can_submit(&self) -> bool {
         self.selected_project.is_some()
             && !self.title.trim().is_empty()

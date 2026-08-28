@@ -2,7 +2,7 @@
 //! 独立文件:task_composer 模块的 GPUI 宏链很深,内联 #[test] 展开超递归预算。
 
 use crate::project_context::ActivationTarget;
-use crate::task_composer::TaskComposerState;
+use crate::task_composer::{TaskComposerState, WorkflowChoice};
 use mf_agent::config::Config;
 use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
 use mf_agent::runtime::{AdHocLaunchSpec, LaunchSpec, RuntimeEvent, RuntimeHost};
@@ -189,4 +189,29 @@ fn mark_session_read_is_idempotent() {
     ));
     orch.mark_session_read(s.id).unwrap();
     assert!(!orch.sessions().unwrap()[0].unread, "重复调用幂等");
+}
+
+// ---------- 工作流分配(UI Task 3)----------
+
+#[test]
+fn composer_defaults_to_task_local_workflow() {
+    let mut state = TaskComposerState::new(vec![(PathBuf::from("/p"), "P".into())], None);
+    assert_eq!(state.workflow_choice(), &WorkflowChoice::TaskLocal);
+    state.select_workflow("review-template");
+    assert_eq!(
+        state.workflow_choice(),
+        &WorkflowChoice::Template("review-template".into())
+    );
+    state.select_workflow("");
+    assert_eq!(state.workflow_choice(), &WorkflowChoice::TaskLocal);
+}
+
+#[test]
+fn workflow_options_list_global_templates_only() {
+    let options = TaskComposerState::workflow_options(&[
+        ("全局A".into(), false),
+        ("task-1 草稿".into(), true),
+        ("全局B".into(), false),
+    ]);
+    assert_eq!(options, vec!["全局A".to_string(), "全局B".to_string()]);
 }

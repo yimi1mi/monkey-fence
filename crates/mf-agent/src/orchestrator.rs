@@ -929,9 +929,22 @@ impl Orchestrator {
         let view = self
             .store
             .insert_ad_hoc_session(task_id, instance_snapshot)?;
+        // 展示会话行(Agents 卡片/终端交互的既有通道);离散会话
+        // 不建 Step / Agent Run,不参与任务成功判定(设计 §4.7)
+        let display = self.store.create_session(
+            None,
+            "pty",
+            &instance_snapshot.agent_type,
+            &view.title,
+        )?;
+        let view = self
+            .store
+            .attach_display_session(view.id, display.id)?
+            .unwrap_or(view);
         let launch = self.host.launch_ad_hoc(crate::runtime::AdHocLaunchSpec {
             task_id,
             session_id: view.id,
+            display_session_id: display.id,
             title: view.title.clone(),
             run_mode: launch_mode,
             plan,
@@ -942,6 +955,11 @@ impl Orchestrator {
         if let Err(error) = launch {
             if let Some(dead) = self.store.set_ad_hoc_status(view.id, SessionStatus::Dead)? {
                 self.emit(SchedulerEvent::AdHocSessionUpdated(dead));
+            }
+            if let Some(dead_session) =
+                self.store.update_session(display.id, Some(SessionStatus::Dead), None, None)?
+            {
+                self.emit(SchedulerEvent::SessionUpdated(dead_session));
             }
             return Err(anyhow::anyhow!("离散会话 {} 启动失败: {error:#}", view.id));
         }
@@ -960,6 +978,11 @@ impl Orchestrator {
                 )));
             }
         };
+        if let Some(working) =
+            self.store.update_session(display.id, Some(SessionStatus::Working), None, None)?
+        {
+            self.emit(SchedulerEvent::SessionUpdated(working));
+        }
         self.emit(SchedulerEvent::AdHocSessionUpdated(launched.clone()));
         // 显式不触碰 Task 状态:离散会话不参与成功判定
         Ok(launched)
@@ -1038,6 +1061,14 @@ impl Orchestrator {
             }
         };
         if let Some(final_view) = self.store.set_ad_hoc_status(session_id, status)? {
+            // 同步展示会话状态(卡片与终端视图)
+            if let Some(display_id) = final_view.display_session_id {
+                if let Some(updated) =
+                    self.store.update_session(display_id, Some(status), None, None)?
+                {
+                    self.emit(SchedulerEvent::SessionUpdated(updated));
+                }
+            }
             self.emit(SchedulerEvent::AdHocSessionUpdated(final_view));
         }
         Ok(())

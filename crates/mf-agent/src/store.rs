@@ -89,6 +89,20 @@ impl Store {
             }
         }
         {
+            let mut stmt = conn.prepare("PRAGMA table_info(ad_hoc_sessions)")?;
+            let has_display = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .any(|c| c.map(|c| c == "display_session_id").unwrap_or(false));
+            drop(stmt);
+            if !has_display {
+                conn.execute(
+                    "ALTER TABLE ad_hoc_sessions ADD COLUMN display_session_id INTEGER",
+                    [],
+                )
+                .context("补齐 ad_hoc_sessions.display_session_id 列失败")?;
+            }
+        }
+        {
             let mut stmt = conn.prepare("PRAGMA table_info(pipeline_revisions)")?;
             let has_snapshot = stmt
                 .query_map([], |r| r.get::<_, String>(1))?
@@ -1433,6 +1447,7 @@ impl Store {
             task_id: r.get(1)?,
             title: r.get(2)?,
             status: SessionStatus::parse(&r.get::<_, String>(3)?).unwrap_or(SessionStatus::Idle),
+            display_session_id: r.get(6)?,
             snapshot: serde_json::from_str(&snapshot_json).map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
                     4,
@@ -1444,13 +1459,13 @@ impl Store {
                 )
             })?,
             handoff: r.get(5)?,
-            created_at: r.get(6)?,
-            launched_at: r.get(7)?,
-            ended_at: r.get(8)?,
+            created_at: r.get(7)?,
+            launched_at: r.get(8)?,
+            ended_at: r.get(9)?,
         })
     }
 
-    const AD_HOC_COLS: &'static str = "id, task_id, title, status, snapshot_json, handoff_json, created_at, launched_at, ended_at";
+    const AD_HOC_COLS: &'static str = "id, task_id, title, status, snapshot_json, handoff_json, display_session_id, created_at, launched_at, ended_at";
 
     /// 插入离散会话行(状态 starting;启动后由 mark_ad_hoc_launched 推进)。
     pub fn insert_ad_hoc_session(
@@ -1497,6 +1512,21 @@ impl Store {
                 .query_map(params![task_id], Self::ad_hoc_view_row)?
                 .collect::<std::result::Result<_, _>>()?;
             Ok(rows)
+        })
+    }
+
+    /// 绑定展示会话行(agent_sessions)。
+    pub fn attach_display_session(
+        &self,
+        ad_hoc_id: i64,
+        display_session_id: i64,
+    ) -> Result<Option<AdHocSessionView>> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE ad_hoc_sessions SET display_session_id = ?2 WHERE id = ?1",
+                params![ad_hoc_id, display_session_id],
+            )?;
+            Self::ad_hoc_view_by_id(c, ad_hoc_id)
         })
     }
 

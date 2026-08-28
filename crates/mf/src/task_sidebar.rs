@@ -34,6 +34,8 @@ pub struct TaskSidebar {
     foreground: Option<PathBuf>,
     /// 显式新建任务 Composer(打开时存在;Project 必选,无隐式归属)。
     composer: Option<Entity<TaskComposer>>,
+    /// `+` 菜单:当前打开的任务 (root, task_id)。
+    cli_menu_task: Option<(PathBuf, i64)>,
     /// Composer 提交失败的用户可见提示。
     composer_error: Option<String>,
     focus_handle: FocusHandle,
@@ -47,6 +49,7 @@ impl TaskSidebar {
             selected: None,
             foreground: None,
             composer: None,
+            cli_menu_task: None,
             composer_error: None,
             focus_handle: cx.focus_handle(),
         }
@@ -166,6 +169,8 @@ impl TaskSidebar {
         let unread = row.task.unread;
         let agents = row.active_runs;
         let questions = row.open_questions;
+        let root2 = root.clone();
+        let _ = &root2;
         div()
             .id(("task-row", id as u64))
             .ml_2()
@@ -226,7 +231,30 @@ impl TaskSidebar {
                                 .text_color(rgb(crate::theme::Theme::success()))
                                 .child(format!("●{agents}")),
                         )
-                    }),
+                    })
+                    .child(
+                        div()
+                            .id(("task-plus", id as u64))
+                            .size(px(16.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(crate::theme::Theme::border()))
+                            .text_size(px(11.))
+                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .cursor_pointer()
+                            .hover(|d| {
+                                d.bg(rgb(crate::theme::Theme::bg_hover()))
+                                    .text_color(rgb(crate::theme::Theme::fg()))
+                            })
+                            .child("＋")
+                            .on_click(cx.listener(move |s: &mut TaskSidebar, _ev, _w, cx| {
+                                s.cli_menu_task = Some((root2.clone(), id));
+                                cx.notify();
+                            })),
+                    ),
             )
             .child(
                 div()
@@ -273,6 +301,201 @@ fn task_color(status: TaskStatus) -> u32 {
         TaskStatus::Failed => crate::theme::Theme::danger(),
         TaskStatus::Cancelled => 0x8a8a8a,
         TaskStatus::Archived => 0x8a8a8a,
+    }
+}
+
+impl TaskSidebar {
+    /// 构建 `+` 菜单条目(插件类型 + 目录实例;设计 §10)。
+    fn build_menu(&self) -> Vec<crate::task_cli_menu::MenuEntry> {
+        let contributions = self.app.plugins.contributions();
+        let types: Vec<crate::agent_instance_editor::AgentTypeInfo> = contributions
+            .agent_types()
+            .into_iter()
+            .map(|(src, a)| crate::agent_instance_editor::AgentTypeInfo {
+                id: a.id.clone(),
+                name: a.name.clone(),
+                plugin_name: src.plugin_full_id.clone(),
+                detected: mf_plugins::builtin::detect_on_path(&a.command).is_some(),
+                supports_isolated_config: a.supports_isolated_config,
+                default_command: a.command.clone(),
+                adapter: a.adapter.clone(),
+                modes: a
+                    .modes
+                    .iter()
+                    .filter_map(|m| mf_agent::RunMode::parse(m))
+                    .collect(),
+            })
+            .collect();
+        let instances = self
+            .app
+            .catalog_store
+            .list_agent_instances(None)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| crate::agent_instances_view::InstanceListInstance {
+                        id: row.id.clone(),
+                        name: row.name.clone(),
+                        agent_type: row.agent_type.clone(),
+                        type_name: row.name.clone(),
+                        enabled: row.enabled,
+                        current_version: row.current_version,
+                        scope: row.scope,
+                        executable: String::new(),
+                        run_mode: mf_agent::RunMode::Interactive,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        crate::task_cli_menu::build_task_cli_menu(&types, &instances)
+    }
+
+    /// 启动 `+` 菜单条目(终端/默认 CLI/实例)。
+    fn launch_menu_entry(
+        &mut self,
+        entry: &crate::task_cli_menu::MenuEntry,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::task_cli_menu::MenuKind;
+        let Some((root, task_id)) = self.cli_menu_task.clone() else {
+            return;
+        };
+        let launch = |snapshot: mf_agent::AgentInstanceSnapshot,
+                      mode: mf_agent::RunMode,
+                      slf: &mut TaskSidebar,
+                      cx: &mut Context<TaskSidebar>| {
+            match slf
+                .app
+                .create_ad_hoc_session(&root, task_id, &snapshot, mode)
+            {
+                Ok(view) => log::info!("离散会话已启动: {}", view.title),
+                Err(e) => log::warn!("离散会话启动失败: {e:#}"),
+            }
+            slf.cli_menu_task = None;
+            cx.notify();
+        };
+        match entry.kind {
+            MenuKind::Terminal => {
+                let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+                let snapshot = ad_hoc_snapshot_for("terminal", "任务终端", &shell);
+                launch(snapshot, mf_agent::RunMode::Interactive, self, cx);
+            }
+            MenuKind::DefaultCli | MenuKind::TemporaryInstance => {
+                let Some(agent_ref) = entry.agent_ref.clone() else {
+                    self.cli_menu_task = None;
+                    cx.notify();
+                    return;
+                };
+                let command = default_command_of(&self.app, &agent_ref);
+                let snapshot = ad_hoc_snapshot_for(&agent_ref, &entry.label, &command);
+                launch(snapshot, mf_agent::RunMode::Interactive, self, cx);
+            }
+            MenuKind::AgentInstance => {
+                let Some(instance_id) = entry.agent_ref.clone() else {
+                    self.cli_menu_task = None;
+                    cx.notify();
+                    return;
+                };
+                match self
+                    .app
+                    .catalog_store
+                    .snapshot_agent_instance(&instance_id, None)
+                {
+                    Ok(snapshot) => {
+                        let mode = snapshot.run_mode;
+                        launch(snapshot, mode, self, cx);
+                    }
+                    Err(e) => {
+                        log::warn!("读取实例失败: {e:#}");
+                        self.cli_menu_task = None;
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+
+    fn render_cli_menu(&self, cx: &Context<Self>) -> AnyElement {
+        let Some((_root, task_id)) = &self.cli_menu_task else {
+            return div().into_any_element();
+        };
+        let entries = self.build_menu();
+        let mut list = div().flex().flex_col().gap_1();
+        for (idx, entry) in entries.iter().enumerate() {
+            let owned = entry.clone();
+            list = list.child(
+                div()
+                    .id(("cli-menu-entry", idx as u64))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(crate::theme::Theme::border()))
+                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                    .cursor_pointer()
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(crate::theme::Theme::fg()))
+                                    .child(entry.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(8.))
+                                    .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                    .child(entry.note.clone()),
+                            ),
+                    )
+                    .on_click(cx.listener(move |s: &mut TaskSidebar, _ev, _w, cx| {
+                        s.launch_menu_entry(&owned, cx);
+                    })),
+            );
+        }
+        div()
+            .id("cli-menu-popover")
+            .absolute()
+            .left(px(56.))
+            .top(px(120.))
+            .w(px(320.))
+            .max_h(px(420.))
+            .overflow_y_scroll()
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(crate::theme::Theme::border()))
+            .bg(rgb(crate::theme::Theme::bg_elevated()))
+            .shadow_md()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .child(format!("任务 {task_id} · 添加 CLI")),
+                    )
+                    .child(
+                        div()
+                            .id("cli-menu-close")
+                            .text_size(px(9.))
+                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .cursor_pointer()
+                            .child("关闭")
+                            .on_click(cx.listener(|s: &mut TaskSidebar, _ev, _w, cx| {
+                                s.cli_menu_task = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(list)
+            .into_any_element()
     }
 }
 
@@ -453,5 +676,41 @@ impl Render for TaskSidebar {
                 )
             })
             .child(list)
+            .when(self.cli_menu_task.is_some(), |d| {
+                d.child(self.render_cli_menu(cx))
+            })
     }
+}
+
+/// 构造离散会话用的最小实例快照(默认 CLI / 终端入口)。
+fn ad_hoc_snapshot_for(
+    agent_type: &str,
+    name: &str,
+    executable: &str,
+) -> mf_agent::AgentInstanceSnapshot {
+    mf_agent::AgentInstanceSnapshot {
+        id: format!("adhoc-{agent_type}"),
+        name: name.to_string(),
+        agent_type: agent_type.to_string(),
+        version: 0,
+        enabled: true,
+        run_mode: mf_agent::RunMode::Interactive,
+        executable: executable.to_string(),
+        argv: vec![],
+        env: vec![],
+        config: serde_json::json!({}),
+        execution_contract: serde_json::json!({ "completion": "manual" }),
+        sealed_secret_ids: vec![],
+    }
+}
+
+/// agent type 的默认命令(贡献声明)。
+fn default_command_of(app: &std::sync::Arc<crate::app_ctx::AppCtx>, agent_type: &str) -> String {
+    app.plugins
+        .contributions()
+        .agent_types()
+        .into_iter()
+        .find(|(_, a)| a.id == agent_type)
+        .map(|(_, a)| a.command)
+        .unwrap_or_default()
 }

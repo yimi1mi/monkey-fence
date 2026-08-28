@@ -26,6 +26,9 @@ mod search;
 #[cfg(test)]
 mod session_restore_tests;
 mod settings;
+mod task_cli_menu;
+#[cfg(test)]
+mod task_cli_menu_tests;
 mod task_composer;
 #[cfg(test)]
 mod task_composer_tests;

@@ -120,6 +120,9 @@ pub struct AdHocLaunchSpec {
     pub run_temp: PathBuf,
     /// 项目路由键;真正的进程 cwd 取自 plan.cwd。
     pub workdir: PathBuf,
+    /// 展示会话行号(agent_sessions):进程注册、卡片与终端交互用;
+    /// 与 session_id(ad_hoc_sessions 行)分属两个表,互不挤占命名空间。
+    pub display_session_id: i64,
     /// 退出事件通道(tag 为 session_id):进程结束时宿主上报
     /// `RuntimeEvent::AdHocExited`,由 Orchestrator 做完成分类。
     pub events: crossbeam_channel::Sender<TaggedRuntimeEvent>,
