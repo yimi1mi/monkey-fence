@@ -2423,6 +2423,12 @@ impl Render for Workspace {
                 window.focus(&handle, cx);
             }
         }
+        // 焦点兜底:窗口内没有任何焦点时(欢迎页、会话恢复无标签、关掉
+        // 最后一个标签、浮层关闭后),按键会退化到 dispatch 树根,匹配不到
+        // "Workspace" 上下文的绑定。把焦点收回工作区根,快捷键保持可达。
+        if !self.focus_handle.contains_focused(window, cx) {
+            window.focus(&self.focus_handle, cx);
+        }
         let has_tabs = self
             .current_surface()
             .map(|s| !s.tabs.is_empty())
@@ -2516,6 +2522,7 @@ impl Render for Workspace {
 
         let mut root = div()
             .id("workspace-root")
+            .track_focus(&self.focus_handle)
             .key_context("Workspace")
             .size_full()
             .flex()
