@@ -176,12 +176,17 @@ struct CloseConfirm {
 enum PanelDrag {
     Left { start_x: f32, start_w: f32 },
     Bottom { start_y: f32, start_h: f32 },
+    Activity { start_x: f32, start_w: f32 },
 }
 
 const LEFT_PANEL_MIN: f32 = 180.;
 const LEFT_PANEL_MAX: f32 = 640.;
 const BOTTOM_DOCK_MIN: f32 = 150.;
 const BOTTOM_DOCK_MAX: f32 = 720.;
+const ACTIVITY_BAR_MIN: f32 = 44.;
+const ACTIVITY_BAR_MAX: f32 = 220.;
+/// 活动栏拉到这个宽度以上时显示「图标 + 中文名」。
+const ACTIVITY_BAR_EXPANDED: f32 = 72.;
 
 pub struct Workspace {
     app: Arc<AppCtx>,
@@ -210,6 +215,7 @@ pub struct Workspace {
     editor_font: mf_agent::EditorConfig,
     left_panel_width: Pixels,
     bottom_panel_height: Pixels,
+    activity_bar_width: Pixels,
     panel_drag: Option<PanelDrag>,
 }
 
@@ -240,6 +246,8 @@ impl Workspace {
             editor_font: mf_agent::EditorConfig::default(),
             left_panel_width: px(284.),
             bottom_panel_height: px(228.),
+            // 默认即展开形态:图标 + 中文名;拖窄到 72px 以下退回纯图标
+            activity_bar_width: px(96.),
             panel_drag: None,
         };
         // 唯一的轻量 snapshot 监听:revision 变化时把同一份快照推给
@@ -1735,11 +1743,12 @@ impl Workspace {
     }
 
     fn render_activity_bar(&self, cx: &Context<Self>) -> impl IntoElement {
-        let icons: [(&'static str, &'static str, LeftPanel); 3] = [
-            ("▱", "项目 Ctrl+Shift+E", LeftPanel::Explorer),
-            ("▦", "任务 Ctrl+Shift+W", LeftPanel::Tasks),
-            ("⎇", "版控 Ctrl+Shift+G", LeftPanel::Vcs),
+        let icons: [(&'static str, &'static str, &'static str, LeftPanel); 3] = [
+            ("▱", "项目 Ctrl+Shift+E", "项目", LeftPanel::Explorer),
+            ("▦", "任务 Ctrl+Shift+W", "任务", LeftPanel::Tasks),
+            ("⎇", "版控 Ctrl+Shift+G", "版控", LeftPanel::Vcs),
         ];
+        let expanded = self.activity_bar_width.as_f32() >= ACTIVITY_BAR_EXPANDED;
         let vcs_count = self
             .vcs_panel
             .as_ref()
@@ -1752,18 +1761,21 @@ impl Workspace {
             .unwrap_or(0);
         let mut bar = div()
             .id("activity-bar")
-            .w(px(44.))
+            .w(self.activity_bar_width)
             .flex()
             .flex_col()
             .items_center()
             .py_2()
             .gap_1()
+            .when(expanded, |d| d.items_stretch().px_1())
             .bg(rgb(crate::theme::Theme::bg_panel()))
             .border_r_1()
             .border_color(rgb(crate::theme::Theme::border()));
         bar = bar.child(activity_button(
             "⋮",
             "所有操作 Ctrl+Shift+P",
+            "所有操作",
+            expanded,
             self.quick_open.is_some(),
             cx.listener(|this: &mut Workspace, _, window, cx| {
                 if this.quick_open.is_some() {
@@ -1773,7 +1785,7 @@ impl Workspace {
                 }
             }),
         ));
-        for (icon, tip, panel) in icons {
+        for (icon, tip, text, panel) in icons {
             let is_active = self.navigation.left == Some(panel);
             let badge = if panel == LeftPanel::Vcs {
                 vcs_count
@@ -1786,13 +1798,20 @@ impl Workspace {
                 div()
                     .id(ElementId::Name(format!("act-{tip}").into()))
                     .relative()
-                    .size(px(36.))
                     .flex()
                     .items_center()
-                    .justify_center()
                     .rounded_md()
                     .text_size(px(17.))
                     .cursor_pointer()
+                    .when(expanded, |d| {
+                        d.w_full()
+                            .h(px(36.))
+                            .px_2()
+                            .gap_2()
+                    })
+                    .when(!expanded, |d| {
+                        d.size(px(36.)).justify_center()
+                    })
                     .when(is_active, |d| {
                         d.bg(rgb(crate::theme::Theme::bg_active()))
                             .text_color(rgb(crate::theme::Theme::accent()))
@@ -1802,6 +1821,15 @@ impl Workspace {
                             .hover(|h| h.bg(rgb(crate::theme::Theme::bg_hover())))
                     })
                     .child(icon)
+                    .when(expanded, |d| {
+                        d.child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .text_size(px(12.))
+                                .child(text),
+                        )
+                    })
                     .when(badge > 0, |d| {
                         d.child(
                             div()
@@ -1849,6 +1877,8 @@ impl Workspace {
             .child(activity_button(
                 "⌕",
                 "搜索 Ctrl+Shift+F",
+                "搜索",
+                expanded,
                 search_active,
                 cx.listener(|this: &mut Workspace, _, _, cx| {
                     if this.navigation.bottom == Some(BottomPanel::Search) {
@@ -1862,12 +1892,16 @@ impl Workspace {
             .child(activity_button(
                 "⌨",
                 "终端 Ctrl+`",
+                "终端",
+                expanded,
                 terminal_active,
                 cx.listener(|this: &mut Workspace, _, _, cx| this.toggle_console(cx)),
             ))
             .child(activity_button(
                 "✦",
                 "Agent 工作区 Ctrl+Shift+/",
+                "Agent",
+                expanded,
                 agent_active,
                 cx.listener(|this: &mut Workspace, _, _, cx| {
                     this.show_agent_workspace(AgentTab::Agents, cx)
@@ -1876,6 +1910,8 @@ impl Workspace {
             .child(activity_button(
                 "⚙",
                 "设置 Ctrl+,",
+                "设置",
+                expanded,
                 self.settings_open.is_some(),
                 cx.listener(|this: &mut Workspace, _, _, cx| this.open_settings(cx)),
             ))
@@ -2265,6 +2301,28 @@ impl Workspace {
             )
     }
 
+    /// 活动栏右缘竖向拖拽条:拉宽后图标显示中文名称。
+    fn render_activity_divider(&self, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .id("activity-bar-resize")
+            .w(px(5.))
+            .h_full()
+            .flex_none()
+            .cursor_col_resize()
+            .hover(|d| d.bg(rgb(crate::theme::Theme::accent_dim())))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|ws, e: &MouseDownEvent, window, cx| {
+                    ws.panel_drag = Some(PanelDrag::Activity {
+                        start_x: e.position.x.as_f32(),
+                        start_w: ws.activity_bar_width.as_f32(),
+                    });
+                    window.prevent_default();
+                    cx.notify();
+                }),
+            )
+    }
+
     /// 底部 dock 上缘横向拖拽条:拖动调高度。
     fn render_bottom_divider(&self, cx: &Context<Self>) -> impl IntoElement {
         div()
@@ -2316,6 +2374,14 @@ impl Workspace {
                     .clamp(BOTTOM_DOCK_MIN, BOTTOM_DOCK_MAX);
                 if (h - self.bottom_panel_height.as_f32()).abs() > 0.5 {
                     self.bottom_panel_height = px(h);
+                    cx.notify();
+                }
+            }
+            PanelDrag::Activity { start_x, start_w } => {
+                let w = (start_w + e.position.x.as_f32() - start_x)
+                    .clamp(ACTIVITY_BAR_MIN, ACTIVITY_BAR_MAX);
+                if (w - self.activity_bar_width.as_f32()).abs() > 0.5 {
+                    self.activity_bar_width = px(w);
                     cx.notify();
                 }
             }
@@ -2503,20 +2569,26 @@ impl Workspace {
 }
 
 fn activity_button(
-    label: &str,
+    icon: &str,
     tip: &str,
+    text: &str,
+    expanded: bool,
     active: bool,
     listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
         .id(ElementId::Name(format!("activity-{tip}").into()))
-        .size(px(36.))
+        .relative()
         .flex()
         .items_center()
-        .justify_center()
         .rounded_md()
         .cursor_pointer()
-        .text_size(px(16.))
+        .when(expanded, |d| {
+            d.w_full().h(px(36.)).px_2().gap_2()
+        })
+        .when(!expanded, |d| {
+            d.size(px(36.)).justify_center()
+        })
         .text_color(rgb(if active {
             crate::theme::Theme::accent()
         } else {
@@ -2527,7 +2599,16 @@ fn activity_button(
             d.bg(rgb(crate::theme::Theme::bg_hover()))
                 .text_color(rgb(crate::theme::Theme::fg()))
         })
-        .child(label.to_string())
+        .child(div().text_size(px(16.)).child(icon.to_string()))
+        .when(expanded, |d| {
+            d.child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .text_size(px(12.))
+                    .child(text.to_string()),
+            )
+        })
         .on_click(move |event, window, cx| listener(event, window, cx))
 }
 
@@ -2666,7 +2747,10 @@ impl Render for Workspace {
             .bg(rgb(crate::theme::Theme::bg()))
             .text_color(rgb(crate::theme::Theme::fg()))
             .when(
-                matches!(self.panel_drag, Some(PanelDrag::Left { .. })),
+                matches!(
+                    self.panel_drag,
+                    Some(PanelDrag::Left { .. }) | Some(PanelDrag::Activity { .. })
+                ),
                 |d| d.cursor_col_resize(),
             )
             .when(
@@ -2698,6 +2782,7 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .child(self.render_activity_bar(cx))
+                    .child(self.render_activity_divider(cx))
                     .child(content),
             );
         root = root.child(self.render_status_bar(cx));
