@@ -123,6 +123,7 @@ impl Fixture {
             mock_profiles(),
             GlobalLimiter::new(8),
             "test-pipe".into(),
+            Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
         )
         .unwrap();
         let task = orch.create_task("t", "goal").unwrap();

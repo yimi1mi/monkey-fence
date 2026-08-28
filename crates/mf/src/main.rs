@@ -236,6 +236,7 @@ fn agent_smoke(project: Option<String>) -> i32 {
         catalog,
         limiter,
         "\\\\.\\pipe\\monkeyfence-smoke".into(),
+        std::sync::Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
     ) {
         Ok(o) => o,
         Err(e) => {

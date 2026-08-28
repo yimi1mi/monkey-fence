@@ -142,6 +142,7 @@ fn start_orch(dir: &std::path::Path, host: Arc<MockHost>) -> Arc<Orchestrator> {
         mock_profiles(),
         GlobalLimiter::new(4),
         r"\\.\pipe\review-test".into(),
+        Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
     )
     .unwrap()
 }

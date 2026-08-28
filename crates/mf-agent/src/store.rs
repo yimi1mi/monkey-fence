@@ -1568,6 +1568,80 @@ impl Store {
         })
     }
 
+    // ---------- Execution Lease ----------
+
+    /// 派发前持久化租约(崩溃后仍可审计/清理)。
+    pub fn insert_execution_lease(
+        &self,
+        lease: &crate::execution_directory::ExecutionLease,
+        run_id: Option<i64>,
+        step_id: i64,
+        task_id: i64,
+    ) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO execution_leases
+                    (lease_key, run_id, step_id, task_id, provider, path, isolated, metadata_json, status, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'held', ?9)
+                 ON CONFLICT(lease_key) DO UPDATE SET
+                    run_id = excluded.run_id, status = 'held', released_at = NULL",
+                params![
+                    lease.id,
+                    run_id,
+                    step_id,
+                    task_id,
+                    lease.provider,
+                    lease.path.to_string_lossy(),
+                    lease.isolated as i64,
+                    lease.metadata.to_string(),
+                    now()
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// 释放租约(终态结算/取消后)。
+    pub fn release_execution_lease(&self, lease_key: &str) -> Result<bool> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE execution_leases SET status = 'released', released_at = ?2
+                 WHERE lease_key = ?1 AND status = 'held'",
+                params![lease_key, now()],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// 任务的租约列表(升序)。
+    pub fn list_execution_leases(&self, task_id: i64) -> Result<Vec<ExecutionLeaseRow>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT lease_key, run_id, step_id, task_id, provider, path, isolated,
+                        metadata_json, status, created_at, released_at
+                 FROM execution_leases WHERE task_id = ?1 ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map(params![task_id], |r| {
+                    Ok(ExecutionLeaseRow {
+                        lease_key: r.get(0)?,
+                        run_id: r.get(1)?,
+                        step_id: r.get(2)?,
+                        task_id: r.get(3)?,
+                        provider: r.get(4)?,
+                        path: r.get(5)?,
+                        isolated: r.get::<_, i64>(6)? != 0,
+                        metadata_json: r.get(7)?,
+                        status: r.get(8)?,
+                        created_at: r.get(9)?,
+                        released_at: r.get(10)?,
+                    })
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(rows)
+        })
+    }
+
     /// 记录 Handoff(与结算同事务的写入由 Run Coordinator 组合)。
     /// 返回 handoff 行 id。
     pub fn insert_handoff(

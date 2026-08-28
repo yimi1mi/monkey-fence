@@ -44,6 +44,7 @@ fn start_orch(dir: &std::path::Path) -> Arc<Orchestrator> {
         Arc::new(RwLock::new(ProfileCatalog::default())),
         GlobalLimiter::new(4),
         "test-pipe".into(),
+        Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
     )
     .unwrap()
 }

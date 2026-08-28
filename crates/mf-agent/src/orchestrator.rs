@@ -4,6 +4,9 @@
 //! 生命周期规则见 `CONTEXT.md`;与 Runtime 的边界见 `runtime.rs`。
 
 use crate::config::Config;
+use crate::execution_directory::{
+    ExecutionDirectoryProvider, ExecutionLease, LeaseContext, ProjectDirectoryProvider,
+};
 use crate::model::*;
 use crate::pipeline::{PipelineDraft, ProfileIndex, SessionPolicy};
 use crate::runtime::{AgentProfileSpec, LaunchSpec, RuntimeEvent, RuntimeHost};
@@ -96,6 +99,12 @@ pub struct Orchestrator {
     active_dispatches: Mutex<HashSet<i64>>,
     /// 手动"继续会话"重试:step → 存活会话 id(一次性,dispatch 消费)。
     continue_sessions: Mutex<HashMap<i64, i64>>,
+    /// 执行目录提供器(默认项目目录;worktree 等由宿主注入插件实现)。
+    directory: Arc<dyn ExecutionDirectoryProvider>,
+    /// run → 持有中的租约(终态释放;未知状态保持)。
+    held_leases: Mutex<HashMap<i64, ExecutionLease>>,
+    /// step → 租约(自动重试复用同一目录,保留文件修改)。
+    step_leases: Mutex<HashMap<i64, ExecutionLease>>,
 }
 
 impl Orchestrator {
@@ -108,6 +117,7 @@ impl Orchestrator {
         profiles: Arc<RwLock<ProfileCatalog>>,
         global: Arc<GlobalLimiter>,
         pipe_name: String,
+        directory: Arc<dyn ExecutionDirectoryProvider>,
     ) -> Result<Arc<Orchestrator>> {
         // 异常退出恢复:未结算 Agent Run → interrupted,Task → needs-you
         let recovered = store.recover_interrupted()?;
@@ -138,6 +148,9 @@ impl Orchestrator {
             stop: stop.clone(),
             active_dispatches: Mutex::new(HashSet::new()),
             continue_sessions: Mutex::new(HashMap::new()),
+            directory,
+            held_leases: Mutex::new(HashMap::new()),
+            step_leases: Mutex::new(HashMap::new()),
         });
         for run in &recovered {
             if let Some(t) = orch.store.task_view(run.task_id)? {
@@ -263,6 +276,22 @@ impl Orchestrator {
         self.store.task_has_active_runs(task_id)
     }
 
+    /// 释放 run 持有的执行租约(终态结算/取消;未知状态不调用)。
+    fn release_lease_of_run(&self, run_id: i64) {
+        if let Some(lease) = self.held_leases.lock().remove(&run_id) {
+            if let Err(e) = self.directory.release(&lease) {
+                log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
+            }
+            let _ = self.store.release_execution_lease(&lease.id);
+            self.step_leases.lock().retain(|_, l| l.id != lease.id);
+        }
+    }
+
+    /// 注入 Runtime 事件(测试与外部管道用;与宿主事件同队列)。
+    pub fn push_runtime_event(&self, run_id: i64, ev: RuntimeEvent) {
+        let _ = self.runtime_tx.send((run_id, ev));
+    }
+
     /// Step 最近一次 run 关联的存活会话(继续会话重试的前提)。
     fn live_session_of_step(&self, step_id: i64) -> Result<Option<SessionView>> {
         let session_id = self
@@ -313,6 +342,7 @@ impl Orchestrator {
             self.host.stop_run(&self.root_str, run.id);
             if let Some(r) = self.store.set_run_status(run.id, RunStatus::Cancelled)? {
                 self.release_slot(run.id);
+                self.release_lease_of_run(run.id);
                 self.emit(SchedulerEvent::RunUpdated(r));
             }
         }
@@ -621,6 +651,10 @@ impl Orchestrator {
 
     fn after_settlement(&self, run: &RunView, settlement: &Settlement) {
         self.release_slot(run.id);
+        // 成功结算释放租约;失败结算的释放延迟到自动重试判定之后
+        if settlement.kind_str() == "complete" {
+            self.release_lease_of_run(run.id);
+        }
         // needs-you 的任务在「需要你」的诱因全部消除后回到 running,下游继续自动派发
         if let Some(t) = self.store.task_view(run.task_id).ok().flatten() {
             if t.status == TaskStatus::NeedsYou && self.task_attention_cleared(run.task_id) {
@@ -689,9 +723,10 @@ impl Orchestrator {
                             step.map(|s| s.attempts).unwrap_or(0)
                         ),
                     });
-                    // 自动重试路径不检查收敛(节点回到 ready)
+                    // 自动重试路径:保留租约与文件修改,不检查收敛(节点回到 ready)
                     return;
                 }
+                self.release_lease_of_run(run.id);
                 if let Ok(blocked) = self.store.block_descendants(run.step_id) {
                     for s in blocked {
                         self.emit(SchedulerEvent::StepUpdated(s));
@@ -1150,6 +1185,28 @@ impl Orchestrator {
         let run = self
             .store
             .dispatch_run(task.id, step.id, step.revision_id, session.id)?;
+        // 执行位置租约:同 step 复用(自动重试保留文件修改),新 step acquire;
+        // 派发进程前先持久化
+        let lease = {
+            let mut step_leases = self.step_leases.lock();
+            if let Some(existing) = step_leases.get(&step.id) {
+                existing.clone()
+            } else {
+                let ctx = LeaseContext {
+                    task_id: task.id,
+                    step_id: step.id,
+                    attempt: (step.attempts as u32) + 1,
+                    project_root: self.root.clone(),
+                    step_key: step.step_key.clone(),
+                };
+                let lease = self.directory.acquire(&ctx)?;
+                step_leases.insert(step.id, lease.clone());
+                lease
+            }
+        };
+        self.store
+            .insert_execution_lease(&lease, Some(run.id), step.id, task.id)?;
+        self.held_leases.lock().insert(run.id, lease.clone());
         self.emit(SchedulerEvent::StepUpdated(StepView {
             status: StepStatus::Running,
             ..step.clone()
@@ -1173,7 +1230,7 @@ impl Orchestrator {
             mfctl_hint: Some(format!(
                 "mfctl step complete --summary \"...\" / mfctl step fail --reason \"...\""
             )),
-            workdir: self.root.clone(),
+            workdir: lease.path.clone(),
         };
         let tx = self.runtime_tx.clone();
         self.host.launch(spec, tx);

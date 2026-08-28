@@ -121,6 +121,7 @@ impl Fixture {
             Arc::new(parking_lot::RwLock::new(ProfileCatalog::default())),
             GlobalLimiter::new(4),
             "test-pipe".into(),
+            Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
         )
         .unwrap();
         Fixture { orch, host }

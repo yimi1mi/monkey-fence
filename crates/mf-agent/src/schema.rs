@@ -174,6 +174,22 @@ CREATE TABLE IF NOT EXISTS handoffs (
 );
 CREATE INDEX IF NOT EXISTS idx_handoffs_task ON handoffs(task_id);
 CREATE INDEX IF NOT EXISTS idx_handoffs_run ON handoffs(run_id);
+CREATE TABLE IF NOT EXISTS execution_leases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lease_key TEXT NOT NULL UNIQUE,
+    run_id INTEGER,
+    step_id INTEGER NOT NULL,
+    task_id INTEGER NOT NULL,
+    provider TEXT NOT NULL,
+    path TEXT NOT NULL,
+    isolated INTEGER NOT NULL DEFAULT 0,
+    metadata_json TEXT,
+    status TEXT NOT NULL DEFAULT 'held',
+    created_at TEXT NOT NULL,
+    released_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_execution_leases_task ON execution_leases(task_id);
+CREATE INDEX IF NOT EXISTS idx_execution_leases_run ON execution_leases(run_id);
 ";
 
 /// 目录库 v1 DDL:仅空表地基(字段随后续里程碑补全);

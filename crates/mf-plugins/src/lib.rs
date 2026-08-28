@@ -18,6 +18,7 @@ pub mod hooks;
 pub mod host;
 pub mod install;
 pub mod manifest;
+pub mod project_directory_provider;
 pub mod worker;
 pub mod worker_protocol;
 

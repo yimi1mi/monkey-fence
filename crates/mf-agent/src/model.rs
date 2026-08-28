@@ -245,6 +245,22 @@ pub struct AdHocSessionView {
     pub ended_at: Option<String>,
 }
 
+/// execution_leases 行(审计/恢复投影)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionLeaseRow {
+    pub lease_key: String,
+    pub run_id: Option<i64>,
+    pub step_id: i64,
+    pub task_id: i64,
+    pub provider: String,
+    pub path: String,
+    pub isolated: bool,
+    pub metadata_json: Option<String>,
+    pub status: String,
+    pub created_at: String,
+    pub released_at: Option<String>,
+}
+
 /// 手动重试模式(设计 §9.6):继续仍存活的交互式会话,或创建新会话。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryMode {

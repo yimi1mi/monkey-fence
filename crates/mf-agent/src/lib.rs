@@ -14,6 +14,7 @@ pub mod agent_adapter;
 pub mod agent_instance;
 pub mod catalog_store;
 pub mod config;
+pub mod execution_directory;
 pub mod handoff;
 pub mod model;
 pub mod orchestrator;

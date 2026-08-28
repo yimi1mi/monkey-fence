@@ -162,6 +162,7 @@ fn start_orch(dir: &std::path::Path, host: Arc<MockHost>) -> (Arc<Orchestrator>,
         mock_profiles(),
         GlobalLimiter::new(4),
         "\\\\.\\pipe\\test".into(),
+        Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
     )
     .unwrap();
     (orch, db)
@@ -799,6 +800,7 @@ fn two_projects_end_to_end() {
             profiles.clone(),
             limiter.clone(),
             r"\.\pipe	est-e2e".into(),
+            Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
         )
         .unwrap();
         orchs.push(orch);

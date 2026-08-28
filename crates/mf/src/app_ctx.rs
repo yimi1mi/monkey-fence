@@ -253,6 +253,7 @@ impl AppCtx {
             self.catalog.clone(),
             self.limiter.clone(),
             pipe_name_for_current_process(),
+            Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
         )?;
         self.projects.lock().push(ProjectHandle {
             root: root.clone(),
