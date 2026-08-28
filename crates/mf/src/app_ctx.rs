@@ -8,8 +8,7 @@ use crate::project_overview::{HubCtx, ProjectOverviewHub};
 use crate::runtime_host::{KeepAwake, RuntimeHostImpl, SessionRegistry};
 use anyhow::{Context as _, Result};
 use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
-use mf_agent::Store;
-use mf_agent::TaskStatus;
+use mf_agent::{CatalogStore, Store, TaskStatus};
 use mf_plugins::PluginRegistry;
 use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
@@ -111,6 +110,8 @@ fn session_path() -> PathBuf {
 pub struct AppCtx {
     pub registry: Arc<SessionRegistry>,
     pub plugins: Arc<PluginRegistry>,
+    /// 用户级目录库(Agent Instance、模板、Secret、插件包;~/.monkeyfence/catalog-v1.db)。
+    pub catalog_store: Arc<CatalogStore>,
     pub limiter: Arc<GlobalLimiter>,
     pub catalog: Arc<RwLock<ProfileCatalog>>,
     pub config: Arc<Mutex<mf_agent::Config>>,
@@ -128,6 +129,12 @@ impl AppCtx {
         let config = mf_agent::Config::load().unwrap_or_default();
         let skills = mf_skills::load_skills(None);
         let plugins = PluginRegistry::load(&config, &skills);
+        let catalog_store = CatalogStore::open_default().unwrap_or_else(|e| {
+            // 目录库打不开不阻塞启动(插件页/实例页后续访问时再暴露错误),
+            // 但必须留下日志,不允许静默降级到无提示状态。
+            log::error!("目录库打开失败: {e:#}");
+            CatalogStore::memory().expect("内存目录库初始化不可能失败")
+        });
         let registry = SessionRegistry::new(config.clone());
         let limiter = GlobalLimiter::new(config.engine.global_concurrency.max(1));
         let keep_awake = Arc::new(KeepAwake::new());
@@ -140,6 +147,7 @@ impl AppCtx {
         let ctx = Arc::new(AppCtx {
             registry: registry.clone(),
             plugins: plugins.clone(),
+            catalog_store,
             limiter: limiter.clone(),
             catalog: catalog.clone(),
             config: Arc::new(Mutex::new(config)),
@@ -196,7 +204,8 @@ impl AppCtx {
         self.overview.request_refresh();
     }
 
-    /// 打开(或复用)一个项目:Store 迁移 + Orchestrator 启动 + work-items.json 一次性导入。
+    /// 打开(或复用)一个项目:Store 初始化 + Orchestrator 启动。
+    /// 使用全新 `workflow-v1.db` 命名空间,不读取旧 `orchestration.db`。
     pub fn open_project(&self, root: PathBuf) -> Result<Arc<Orchestrator>> {
         {
             let projects = self.projects.lock();
@@ -204,10 +213,12 @@ impl AppCtx {
                 return Ok(p.orchestrator.clone());
             }
         }
-        let db_dir = root.join(".mf-agent");
-        std::fs::create_dir_all(&db_dir)
-            .with_context(|| format!("创建 {} 失败", db_dir.display()))?;
-        let store = Store::open(&db_dir.join("orchestration.db"))?;
+        let db_path = mf_agent::project_db_path(&root);
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建 {} 失败", parent.display()))?;
+        }
+        let store = Store::open(&db_path)?;
         let config = self.config.lock().clone();
         let host = RuntimeHostImpl::new(self.registry.clone());
         let orch = Orchestrator::start(
@@ -219,7 +230,6 @@ impl AppCtx {
             self.limiter.clone(),
             pipe_name_for_current_process(),
         )?;
-        import_legacy_work_items(&orch, &root);
         self.projects.lock().push(ProjectHandle {
             root: root.clone(),
             orchestrator: orch.clone(),
@@ -344,54 +354,4 @@ impl AppCtx {
             }
         }
     }
-}
-
-/// 旧 work-items.json 兼容导入(仅一次,忽略 vcs_ref;JSON 原文件保留不写)。
-pub(crate) fn import_legacy_work_items(orch: &Arc<Orchestrator>, root: &PathBuf) {
-    if orch.store.has_import("work-items").unwrap_or(false) {
-        return;
-    }
-    let json = root.join(".mf-agent").join("work-items.json");
-    if !json.is_file() {
-        let _ = orch.store.mark_import("work-items");
-        return;
-    }
-    let Ok(text) = std::fs::read_to_string(&json) else {
-        return;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        return;
-    };
-    let Some(items) = value.get("items").and_then(|i| i.as_array()) else {
-        return;
-    };
-    for item in items {
-        let title = item
-            .get("title")
-            .and_then(|t| t.as_str())
-            .unwrap_or("(未命名工作项)")
-            .to_string();
-        let phase = item
-            .get("phase")
-            .and_then(|p| p.as_str())
-            .unwrap_or("draft");
-        let status = match phase {
-            "done" | "review" | "ready-to-deliver" => TaskStatus::Succeeded,
-            "failed" => TaskStatus::Failed,
-            "running" | "needs-input" => TaskStatus::NeedsYou,
-            _ => TaskStatus::Draft,
-        };
-        if let Ok(task) = orch.store.create_task(
-            &title,
-            &format!("(迁移自 work-items.json,忽略 vcs_ref) {title}"),
-        ) {
-            if status != TaskStatus::Draft {
-                let _ = orch.store.set_task_status(task.id, status);
-            }
-            if status == TaskStatus::NeedsYou {
-                let _ = orch.store.set_task_unread(task.id, true);
-            }
-        }
-    }
-    let _ = orch.store.mark_import("work-items");
 }

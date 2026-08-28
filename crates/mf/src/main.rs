@@ -219,7 +219,7 @@ fn agent_smoke(project: Option<String>) -> i32 {
     };
     let mock_spec = catalog.read().specs.get("mock").cloned().unwrap();
     let _ = mock_spec;
-    let db_path = root.join(".mf-agent").join("orchestration.db");
+    let db_path = mf_agent::project_db_path(&root);
     let store = match Store::open(&db_path) {
         Ok(s) => s,
         Err(e) => {
@@ -504,7 +504,6 @@ workers = 3
 
 #[cfg(test)]
 mod v2_tests {
-    use crate::app_ctx::import_legacy_work_items;
     use crate::pipe_server::{pipe_name_for_current_process, PipeServer};
     use crate::runtime_host::{RuntimeHostImpl, SessionRegistry};
     use mf_agent::model::*;
@@ -651,48 +650,6 @@ mod v2_tests {
         assert!(resp.get("ok").is_some(), "协议响应缺失: {resp}");
 
         server.stop();
-        orch.stop();
-    }
-
-    /// work-items.json 兼容导入一次(忽略 vcs_ref;不删除原文件)。
-    #[test]
-    fn work_items_import_once() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mf_dir = tmp.path().join(".mf-agent");
-        std::fs::create_dir_all(&mf_dir).unwrap();
-        std::fs::write(
-            mf_dir.join("work-items.json"),
-            r#"{
-              "version": 1,
-              "active_id": "main",
-              "items": [
-                { "id": "main", "title": "旧工作项A", "workspace": "C:/x", "vcs_ref": "main",
-                  "phase": "running", "run_id": null, "comment": "", "unread": false,
-                  "created_at": "2026-01-01", "updated_at": "2026-01-02" },
-                { "id": "wt-1", "title": "旧工作项B", "workspace": "C:/y", "vcs_ref": "feat",
-                  "phase": "done", "run_id": null, "comment": "", "unread": false,
-                  "created_at": "2026-01-01", "updated_at": "2026-01-02" }
-              ]
-            }"#,
-        )
-        .unwrap();
-        let orch = start_orch(tmp.path());
-        import_legacy_work_items(&orch, &tmp.path().to_path_buf());
-        let tasks = orch.tasks().unwrap();
-        assert_eq!(tasks.len(), 2, "两个旧工作项导入为 Task");
-        assert!(tasks
-            .iter()
-            .any(|t| t.title == "旧工作项A" && t.status == TaskStatus::NeedsYou));
-        assert!(tasks
-            .iter()
-            .any(|t| t.title == "旧工作项B" && t.status == TaskStatus::Succeeded));
-        let a = tasks.iter().find(|t| t.title == "旧工作项A").unwrap();
-        assert!(a.goal.contains("忽略 vcs_ref"), "vcs_ref 应被忽略并注明");
-        // 只导入一次
-        import_legacy_work_items(&orch, &tmp.path().to_path_buf());
-        assert_eq!(orch.tasks().unwrap().len(), 2);
-        // 原 JSON 保留未删除
-        assert!(mf_dir.join("work-items.json").is_file());
         orch.stop();
     }
 
