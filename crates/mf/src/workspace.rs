@@ -1313,16 +1313,7 @@ impl Workspace {
             .gap_1()
             .bg(rgb(crate::theme::Theme::bg_panel()))
             .border_r_1()
-            .border_color(rgb(crate::theme::Theme::border()))
-            .child(
-                div()
-                    .h(px(30.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(18.))
-                    .child("🐒"),
-            );
+            .border_color(rgb(crate::theme::Theme::border()));
         for (icon, tip, panel) in icons {
             let is_active = self.navigation.left == Some(panel);
             let badge = if panel == LeftPanel::Vcs {

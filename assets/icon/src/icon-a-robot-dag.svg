@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>MonkeyFence — 机器人操控流水线</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#252d3a"/>
+      <stop offset="1" stop-color="#141a22"/>
+    </linearGradient>
+    <radialGradient id="bgGlow" cx="0.5" cy="0.42" r="0.55">
+      <stop offset="0" stop-color="#4d9fff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#4d9fff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="topLight" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="metal" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f0f4f9"/>
+      <stop offset="1" stop-color="#aeb9c6"/>
+    </linearGradient>
+    <linearGradient id="visor" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0c1118"/>
+      <stop offset="1" stop-color="#1d2733"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7ec3ff"/>
+      <stop offset="1" stop-color="#3383ec"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#66da92"/>
+      <stop offset="1" stop-color="#2e9c5b"/>
+    </linearGradient>
+    <filter id="blurBig" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="22"/>
+    </filter>
+    <filter id="blurMid" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="14"/>
+    </filter>
+    <filter id="blurSm" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="10"/>
+    </filter>
+    <clipPath id="bgClip">
+      <rect x="0" y="0" width="1024" height="1024" rx="230"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#bgClip)">
+    <!-- 底色 + 光晕 + 顶部受光 -->
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#bg)"/>
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#bgGlow)"/>
+    <rect x="0" y="0" width="1024" height="460" fill="url(#topLight)"/>
+  </g>
+  <rect x="3" y="3" width="1018" height="1018" rx="227" fill="none" stroke="#ffffff" stroke-opacity="0.07" stroke-width="6"/>
+
+  <!-- 投影 -->
+  <rect x="292" y="226" width="440" height="350" rx="118" fill="#000000" opacity="0.32" filter="url(#blurBig)"/>
+  <rect x="150" y="700" width="724" height="118" rx="56" fill="#000000" opacity="0.30" filter="url(#blurMid)"/>
+
+  <!-- 流水线轨道 -->
+  <line x1="168" y1="740" x2="856" y2="740" stroke="#3d4753" stroke-width="16" stroke-linecap="round"/>
+
+  <!-- 机械臂：机器人双手扶住流水线 -->
+  <path d="M 372 542 C 352 612, 298 652, 244 684" fill="none" stroke="#c3cdd8" stroke-width="20" stroke-linecap="round"/>
+  <path d="M 652 542 C 672 612, 726 652, 780 684" fill="none" stroke="#c3cdd8" stroke-width="20" stroke-linecap="round"/>
+
+  <!-- 节点 1：已完成 -->
+  <g>
+    <rect x="180" y="680" width="120" height="120" rx="30" fill="url(#green)"/>
+    <rect x="180" y="680" width="120" height="120" rx="30" fill="none" stroke="#ffffff" stroke-opacity="0.25" stroke-width="4"/>
+    <polyline points="212,744 234,766 270,714" fill="none" stroke="#ffffff" stroke-width="20" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <!-- 节点 2：运行中 -->
+  <g>
+    <rect x="446" y="674" width="132" height="132" rx="34" fill="#4d9fff" opacity="0.45" filter="url(#blurSm)"/>
+    <rect x="446" y="674" width="132" height="132" rx="34" fill="url(#blue)"/>
+    <rect x="446" y="674" width="132" height="132" rx="34" fill="none" stroke="#ffffff" stroke-opacity="0.3" stroke-width="4"/>
+    <path d="M 538.9 713.1 A 38 38 0 1 1 485.1 766.9" fill="none" stroke="#ffffff" stroke-width="22" stroke-linecap="round"/>
+  </g>
+
+  <!-- 节点 3：待办 -->
+  <g>
+    <rect x="724" y="680" width="120" height="120" rx="30" fill="#2c3540" stroke="#5f6b7a" stroke-width="8"/>
+    <circle cx="784" cy="740" r="34" fill="none" stroke="#98a4b2" stroke-width="16"/>
+  </g>
+
+  <!-- 机械手 -->
+  <circle cx="242" cy="688" r="22" fill="#d3dce5"/>
+  <circle cx="782" cy="688" r="22" fill="#d3dce5"/>
+
+  <!-- 机器人头部 -->
+  <g>
+    <!-- 天线 -->
+    <line x1="512" y1="212" x2="512" y2="140" stroke="#9aa6b4" stroke-width="18" stroke-linecap="round"/>
+    <circle cx="512" cy="118" r="40" fill="#4d9fff" opacity="0.55" filter="url(#blurSm)"/>
+    <circle cx="512" cy="118" r="32" fill="url(#blue)"/>
+    <!-- 侧耳 -->
+    <rect x="224" y="320" width="72" height="130" rx="36" fill="url(#metal)"/>
+    <rect x="728" y="320" width="72" height="130" rx="36" fill="url(#metal)"/>
+    <!-- 头壳 -->
+    <rect x="292" y="210" width="440" height="350" rx="118" fill="url(#metal)"/>
+    <rect x="292" y="210" width="440" height="350" rx="118" fill="none" stroke="#ffffff" stroke-opacity="0.35" stroke-width="4"/>
+    <!-- 面罩 -->
+    <rect x="352" y="282" width="320" height="186" rx="88" fill="url(#visor)"/>
+    <!-- 发光眼 -->
+    <rect x="412" y="351" width="76" height="48" rx="24" fill="#7ec3ff" opacity="0.7" filter="url(#blurSm)"/>
+    <rect x="536" y="351" width="76" height="48" rx="24" fill="#7ec3ff" opacity="0.7" filter="url(#blurSm)"/>
+    <rect x="412" y="351" width="76" height="48" rx="24" fill="url(#blue)"/>
+    <rect x="536" y="351" width="76" height="48" rx="24" fill="url(#blue)"/>
+    <!-- 微笑 -->
+    <path d="M 474 508 Q 512 532 550 508" fill="none" stroke="#93a0ae" stroke-width="14" stroke-linecap="round"/>
+  </g>
+</svg>

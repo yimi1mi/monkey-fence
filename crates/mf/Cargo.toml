@@ -30,9 +30,13 @@ ignore.workspace = true
 regex.workspace = true
 crossbeam-channel.workspace = true
 portable-pty = "0.8"
+dirs.workspace = true
 windows-sys = { version = "0.59", features = ["Win32_System_Power", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Foundation", "Win32_System_IO"] }
 notify.workspace = true
 
 [dev-dependencies]
 toml.workspace = true
 tempfile = "3"
+
+[build-dependencies]
+embed-resource = "3"

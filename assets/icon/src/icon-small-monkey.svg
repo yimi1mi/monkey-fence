@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <title>MonkeyFence — 小尺寸简化版（16–32px · 猴耳）</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#252d3a"/>
+      <stop offset="1" stop-color="#141a22"/>
+    </linearGradient>
+    <radialGradient id="bgGlow" cx="0.5" cy="0.42" r="0.55">
+      <stop offset="0" stop-color="#4d9fff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#4d9fff" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="metal" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f0f4f9"/>
+      <stop offset="1" stop-color="#aeb9c6"/>
+    </linearGradient>
+    <linearGradient id="visor" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0c1118"/>
+      <stop offset="1" stop-color="#1d2733"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#7ec3ff"/>
+      <stop offset="1" stop-color="#3383ec"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#66da92"/>
+      <stop offset="1" stop-color="#2e9c5b"/>
+    </linearGradient>
+    <filter id="blurSm" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="10"/>
+    </filter>
+    <clipPath id="bgClip">
+      <rect x="0" y="0" width="1024" height="1024" rx="230"/>
+    </clipPath>
+  </defs>
+
+  <g clip-path="url(#bgClip)">
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#bg)"/>
+    <rect x="0" y="0" width="1024" height="1024" fill="url(#bgGlow)"/>
+  </g>
+
+  <!-- 流水线三状态圆点：完成 / 运行 / 待办 -->
+  <circle cx="356" cy="744" r="46" fill="url(#green)"/>
+  <circle cx="512" cy="744" r="56" fill="#4d9fff" opacity="0.5" filter="url(#blurSm)"/>
+  <circle cx="512" cy="744" r="52" fill="url(#blue)"/>
+  <circle cx="668" cy="744" r="46" fill="#5a6572"/>
+  <circle cx="668" cy="744" r="46" fill="none" stroke="#b6c0cc" stroke-width="12"/>
+
+  <!-- 放大的机器人头部 -->
+  <g transform="translate(512 420) scale(1.15) translate(-512 -420)">
+    <line x1="512" y1="212" x2="512" y2="140" stroke="#9aa6b4" stroke-width="18" stroke-linecap="round"/>
+    <circle cx="512" cy="118" r="40" fill="#4d9fff" opacity="0.55" filter="url(#blurSm)"/>
+    <circle cx="512" cy="118" r="32" fill="url(#blue)"/>
+    <circle cx="248" cy="338" r="92" fill="url(#metal)"/>
+    <circle cx="248" cy="338" r="50" fill="#2b333e"/>
+    <circle cx="776" cy="338" r="92" fill="url(#metal)"/>
+    <circle cx="776" cy="338" r="50" fill="#2b333e"/>
+    <rect x="292" y="210" width="440" height="350" rx="118" fill="url(#metal)"/>
+    <rect x="292" y="210" width="440" height="350" rx="118" fill="none" stroke="#ffffff" stroke-opacity="0.35" stroke-width="4"/>
+    <rect x="352" y="282" width="320" height="186" rx="88" fill="url(#visor)"/>
+    <rect x="412" y="351" width="76" height="48" rx="24" fill="url(#blue)"/>
+    <rect x="536" y="351" width="76" height="48" rx="24" fill="url(#blue)"/>
+  </g>
+</svg>
