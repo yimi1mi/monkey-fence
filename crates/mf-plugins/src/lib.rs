@@ -15,6 +15,7 @@ pub mod host;
 pub mod install;
 pub mod manifest;
 pub mod worker;
+pub mod worker_protocol;
 
 pub use host::{PluginHost, PluginPin, ResolvedPlugin};
 

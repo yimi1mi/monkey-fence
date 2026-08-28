@@ -1,8 +1,13 @@
-//! 插件后台 worker:独立进程 + NDJSON 请求协议(stdio)。
+//! 插件后台 worker:独立进程 + 版本化 NDJSON 请求协议(stdio,协议版本 1)。
 //!
-//! 权限模型:worker 是否允许运行由插件的 enabled/授权状态决定(注册表把门);
+//! 权限模型:worker 是否允许运行由插件的 enabled/授权状态决定(宿主把门);
 //! 权限只约束 MonkeyFence 宿主接口 —— worker 进程本身仍以当前用户权限运行。
+//! 诊断文本(stderr、未匹配的 stdout 行)入库前按敏感 key 脱敏,上限 500 行。
 
+use crate::worker_protocol::{
+    ensure_matches, redact_text, WorkerRequest, WorkerResponse, WorkerHealth,
+    STDERR_LOG_LIMIT, WORKER_PROTOCOL_VERSION,
+};
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
@@ -17,6 +22,7 @@ pub struct WorkerClient {
     reader: BufReader<std::process::ChildStdout>,
     next_id: AtomicI64,
     logs: Arc<parking_lot::Mutex<Vec<String>>>,
+    capability_token: parking_lot::Mutex<String>,
 }
 
 impl WorkerClient {
@@ -46,18 +52,14 @@ impl WorkerClient {
             .with_context(|| format!("启动 worker 失败: {}", exe.display()))?;
         let stdin = child.stdin.take().context("worker stdin 不可用")?;
         let stdout = child.stdout.take().context("worker stdout 不可用")?;
-        // stderr → 日志缓冲
+        // stderr → 日志缓冲(脱敏 + 有界)
         let logs = Arc::new(parking_lot::Mutex::new(Vec::new()));
         if let Some(stderr) = child.stderr.take() {
             let logs = logs.clone();
             std::thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 for line in reader.lines().map_while(Result::ok) {
-                    let mut l = logs.lock();
-                    if l.len() >= 500 {
-                        l.remove(0);
-                    }
-                    l.push(line);
+                    push_bounded(&logs, redact_text(&line));
                 }
             });
         }
@@ -67,20 +69,32 @@ impl WorkerClient {
             reader: BufReader::new(stdout),
             next_id: AtomicI64::new(1),
             logs,
+            capability_token: parking_lot::Mutex::new(String::new()),
         })
     }
 
-    /// NDJSON 请求/响应:{"id":N,"method":"...","params":{...}} → {"id":N,"ok":true,"result":...}
+    /// 设置一次性能力令牌(仅对当前 Agent Run 有效)。
+    pub fn set_capability_token(&self, token: &str) {
+        *self.capability_token.lock() = token.to_string();
+    }
+
+    /// NDJSON 版本化请求:`{"protocol":1,"id":N,"method":"...","capability_token":"...","params":{...}}`
+    /// → `{"protocol":1,"id":N,"result":...}` / `{"protocol":1,"id":N,"error":"..."}`。
+    /// 协议版本或响应 id 与请求不符 → 拒绝;其余行进入(脱敏后的)诊断日志。
     pub fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let req = json!({ "id": id, "method": method, "params": params });
-        let line = serde_json::to_string(&req)?;
+        let req = WorkerRequest::new(
+            id,
+            method,
+            &self.capability_token.lock(),
+            params,
+        );
+        let line = req.to_line()?;
         self.stdin
             .write_all(line.as_bytes())
-            .and_then(|_| self.stdin.write_all(b"\n"))
             .and_then(|_| self.stdin.flush())
             .context("向 worker 写入失败(进程已退出?)")?;
-        // 逐行读,直到拿到对应 id 的响应
+        // 逐行读,直到拿到协议版本与 id 都匹配的响应
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         loop {
             if std::time::Instant::now() > deadline {
@@ -98,29 +112,34 @@ impl WorkerClient {
             if line.is_empty() {
                 continue;
             }
-            let Ok(v) = serde_json::from_str::<Value>(line) else {
-                self.push_log(line);
-                continue;
-            };
-            if v.get("id").and_then(|i| i.as_i64()) == Some(id) {
-                if v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
-                    return Ok(v.get("result").cloned().unwrap_or(Value::Null));
+            let resp = match WorkerResponse::parse_for(WORKER_PROTOCOL_VERSION, line) {
+                Ok(r) => r,
+                Err(e) => {
+                    // 合法 JSON 但协议不匹配必须立刻暴露,不允许静默降级
+                    if serde_json::from_str::<Value>(line).is_ok() {
+                        bail!("worker 协议不兼容: {e}");
+                    }
+                    push_bounded(&self.logs, redact_text(line));
+                    continue;
                 }
-                bail!(
-                    "worker 错误: {}",
-                    v.get("error").and_then(|e| e.as_str()).unwrap_or("未知")
-                );
+            };
+            if let Err(e) = ensure_matches(WORKER_PROTOCOL_VERSION, id, &resp) {
+                bail!("worker 响应与请求不匹配: {e}");
             }
-            self.push_log(line);
+            if resp.is_ok() {
+                return Ok(resp.result);
+            }
+            bail!(
+                "worker 错误: {}",
+                resp.error.as_deref().unwrap_or("未知")
+            );
         }
     }
 
-    fn push_log(&self, line: &str) {
-        let mut l = self.logs.lock();
-        if l.len() >= 500 {
-            l.remove(0);
-        }
-        l.push(line.to_string());
+    /// 心跳:探测 worker 存活(方法 `heartbeat`)。
+    pub fn heartbeat(&mut self) -> Result<WorkerHealth> {
+        self.request("heartbeat", json!({}))?;
+        Ok(WorkerHealth { alive: true })
     }
 
     pub fn logs(&self) -> Vec<String> {
@@ -135,6 +154,14 @@ impl WorkerClient {
     pub fn is_alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
+}
+
+fn push_bounded(logs: &Arc<parking_lot::Mutex<Vec<String>>>, line: String) {
+    let mut l = logs.lock();
+    if l.len() >= STDERR_LOG_LIMIT {
+        l.remove(0);
+    }
+    l.push(line);
 }
 
 impl Drop for WorkerClient {
@@ -153,12 +180,17 @@ mod tests {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();
-        // 用 PowerShell 模拟 NDJSON worker:读一行、回一个 ok 响应
+        // 用 PowerShell 模拟协议版本 1 的 NDJSON worker:读一行、回一个匹配响应
         let script = r#"
 while ($line = [Console]::In.ReadLine()) {
   if ($null -eq $line) { break }
   $req = $line | ConvertFrom-Json
-  $resp = @{ id = $req.id; ok = $true; result = @{ echo = $req.params.msg } } | ConvertTo-Json -Compress
+  if ($req.method -eq 'heartbeat') {
+    $result = @{ alive = $true }
+  } else {
+    $result = @{ echo = $req.params.msg }
+  }
+  $resp = @{ protocol = 1; id = $req.id; result = $result } | ConvertTo-Json -Compress
   [Console]::Out.WriteLine($resp)
 }
 "#;
@@ -175,10 +207,13 @@ while ($line = [Console]::In.ReadLine()) {
         let mut client =
             WorkerClient::start(&std::path::PathBuf::from("powershell.exe"), &args, None)
                 .expect("powershell 可用");
+        client.set_capability_token("mft_test");
         let result = client
             .request("echo", json!({ "msg": "hello" }))
             .expect("NDJSON 往返");
         assert_eq!(result["echo"], "hello");
+        let health = client.heartbeat().expect("心跳");
+        assert!(health.alive);
         client.kill();
     }
 
