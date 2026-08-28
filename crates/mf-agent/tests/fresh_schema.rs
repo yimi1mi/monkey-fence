@@ -18,5 +18,6 @@ fn catalog_schema_is_independent() {
     assert_eq!(catalog.schema_version().unwrap(), 1);
     let tables = catalog.table_names().unwrap();
     assert!(tables.contains(&"plugin_packages".to_string()));
+    assert!(tables.contains(&"plugin_pins".to_string()));
     assert!(!tables.contains(&"agent_tasks".to_string()));
 }

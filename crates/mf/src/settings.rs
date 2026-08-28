@@ -1917,11 +1917,17 @@ impl SettingsView {
                                     "删除",
                                     crate::theme::Theme::danger(),
                                     move |s2: &mut SettingsView, _, _, cx| {
-                                        s2.plugin_status =
-                                            match mf_plugins::install::uninstall(&fid) {
+                                        let app = s2.app.clone();
+                                        s2.plugin_status = match app {
+                                            Some(app) => match app.plugins.uninstall(&fid) {
                                                 Ok(()) => "已删除(重载后生效)".into(),
                                                 Err(e) => format!("{e:#}").into(),
-                                            };
+                                            },
+                                            None => "应用上下文不可用".into(),
+                                        };
+                                        if let Some(app) = s2.app.clone() {
+                                            app.refresh_catalog();
+                                        }
                                         cx.notify();
                                     },
                                 ))

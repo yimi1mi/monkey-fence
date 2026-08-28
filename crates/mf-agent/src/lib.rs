@@ -20,7 +20,7 @@ pub mod runtime;
 pub mod schema;
 pub mod store;
 
-pub use catalog_store::CatalogStore;
+pub use catalog_store::{CatalogStore, PluginPinRecord};
 pub use config::{
     Config, EditorConfig, EngineConfig, ProviderConfig, ProviderKind, TerminalConfig,
 };

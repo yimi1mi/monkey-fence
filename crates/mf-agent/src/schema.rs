@@ -206,4 +206,13 @@ CREATE TABLE IF NOT EXISTS plugin_packages (
     installed_at TEXT NOT NULL,
     UNIQUE(full_id, version)
 );
+CREATE TABLE IF NOT EXISTS plugin_pins (
+    run_key TEXT NOT NULL,
+    full_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (run_key, full_id, version, content_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_plugin_pins_hash ON plugin_pins(content_hash);
 ";

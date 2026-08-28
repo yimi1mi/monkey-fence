@@ -10,12 +10,21 @@ use crate::schema::{
 };
 use anyhow::{Context as _, Result};
 use parking_lot::Mutex;
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::Arc;
 
 pub struct CatalogStore {
     conn: Mutex<Connection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginPinRecord {
+    pub run_key: String,
+    pub full_id: String,
+    pub version: String,
+    pub content_hash: String,
+    pub created_at: String,
 }
 
 impl CatalogStore {
@@ -61,5 +70,86 @@ impl CatalogStore {
     pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = self.conn.lock();
         f(&conn)
+    }
+
+    pub fn record_plugin_pin(&self, pin: &PluginPinRecord) -> Result<bool> {
+        self.with_conn(|conn| {
+            let changed = conn.execute(
+                "INSERT OR IGNORE INTO plugin_pins
+                 (run_key, full_id, version, content_hash, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    pin.run_key,
+                    pin.full_id,
+                    pin.version,
+                    pin.content_hash,
+                    pin.created_at,
+                ],
+            )?;
+            Ok(changed == 1)
+        })
+    }
+
+    pub fn list_plugin_pins(&self) -> Result<Vec<PluginPinRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT run_key, full_id, version, content_hash, created_at
+                 FROM plugin_pins
+                 ORDER BY run_key, full_id, version, content_hash",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(PluginPinRecord {
+                        run_key: row.get(0)?,
+                        full_id: row.get(1)?,
+                        version: row.get(2)?,
+                        content_hash: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    pub fn remove_plugin_pins_for_run(&self, run_key: &str) -> Result<Vec<PluginPinRecord>> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let rows = {
+            let mut stmt = tx.prepare(
+                "SELECT run_key, full_id, version, content_hash, created_at
+                 FROM plugin_pins WHERE run_key = ?1
+                 ORDER BY full_id, version, content_hash",
+            )?;
+            let records = stmt
+                .query_map(params![run_key], |row| {
+                    Ok(PluginPinRecord {
+                        run_key: row.get(0)?,
+                        full_id: row.get(1)?,
+                        version: row.get(2)?,
+                        content_hash: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            records
+        };
+        tx.execute(
+            "DELETE FROM plugin_pins WHERE run_key = ?1",
+            params![run_key],
+        )?;
+        tx.commit()?;
+        Ok(rows)
+    }
+
+    pub fn plugin_pin_count(&self, content_hash: &str) -> Result<usize> {
+        self.with_conn(|conn| {
+            let count = conn.query_row(
+                "SELECT COUNT(*) FROM plugin_pins WHERE content_hash = ?1",
+                params![content_hash],
+                |row| row.get::<_, i64>(0),
+            )?;
+            Ok(count.max(0) as usize)
+        })
     }
 }

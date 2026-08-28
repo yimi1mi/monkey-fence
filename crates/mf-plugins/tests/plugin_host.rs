@@ -1,5 +1,6 @@
 //! Plugin Host 验收:内容寻址安装、按哈希解析、活动 pin 不被插件更新替换。
 
+use mf_agent::CatalogStore;
 use mf_plugins::host::{PluginHost, ResolvedPlugin};
 use mf_plugins::install::InstallSource;
 use std::path::{Path, PathBuf};
@@ -149,4 +150,46 @@ fn contribution_lookup_by_full_id() {
     assert_eq!(src.content_hash, v1.content_hash);
     assert_eq!(agent.adapter, "generic-command");
     assert!(reg.find_agent_type("test.demo.missing").is_none());
+}
+
+#[test]
+fn persisted_pin_survives_host_rebuild_and_blocks_uninstall() {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = CatalogStore::memory().unwrap();
+
+    let first = PluginHost::empty_at_with_catalog(tmp.path().to_path_buf(), catalog.clone());
+    let package = first
+        .install_package(
+            &fixtures_dir().join("demo-v1"),
+            InstallSource::Local {
+                path: "demo-v1".into(),
+            },
+        )
+        .unwrap();
+    first.enable(&package.full_id, true).unwrap();
+    first.pin_for_run("run-persisted", &package).unwrap();
+    drop(first);
+
+    let rebuilt = PluginHost::load_at_with_catalog(
+        tmp.path().to_path_buf(),
+        catalog,
+        &mf_agent::Config::default(),
+        &[],
+    );
+    assert_eq!(rebuilt.active_pin_count(&package.content_hash), 1);
+    assert!(
+        rebuilt.uninstall(&package.full_id).is_err(),
+        "a persisted active pin must prevent package removal"
+    );
+    assert!(
+        package.root.is_dir(),
+        "rejected uninstall must preserve package files"
+    );
+
+    rebuilt.release_run_pins("run-persisted").unwrap();
+    rebuilt.uninstall(&package.full_id).unwrap();
+    assert!(
+        !package.root.exists(),
+        "released package may be uninstalled"
+    );
 }

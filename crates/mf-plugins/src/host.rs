@@ -3,7 +3,7 @@
 //! - 包按内容哈希存放(`packages/<sha256>/`),发布后不可变;
 //! - `resolve` 按 (full_id, version, hash) 精确取包并重验哈希;
 //! - 活动 Revision 通过 `pin_for_run` 固定包版本,插件更新不替换活动 pin;
-//! - 引用计数只在内存中维护,清理只能删除无引用哈希。
+//! - pin 以 CatalogStore 为事实源,内存引用计数是可重建投影。
 
 use crate::install::{self, InstallSource};
 use crate::manifest::PluginManifest;
@@ -12,6 +12,7 @@ use crate::PluginEntry;
 use anyhow::{bail, Context as _, Result};
 use mf_agent::pipeline::PipelineDraft;
 use mf_agent::runtime::AgentProfileSpec;
+use mf_agent::{CatalogStore, PluginPinRecord};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -47,6 +48,7 @@ struct PackageRecord {
 pub struct PluginHost {
     /// 插件根目录(包与锁文件都位于其下)。
     root: PathBuf,
+    catalog: Arc<CatalogStore>,
     plugins: RwLock<Vec<PluginEntry>>,
     /// 内置 profile(命令/参数/钩子全保真),加载时按固定顺序构建。
     builtin_profiles: RwLock<Vec<AgentProfileSpec>>,
@@ -65,15 +67,24 @@ pub struct PluginHost {
 impl PluginHost {
     /// 空宿主(指定插件根;不加载内置/已安装,用于测试与嵌入场景)。
     pub fn empty_at(root: PathBuf) -> Arc<PluginHost> {
+        Self::empty_at_with_catalog(
+            root,
+            CatalogStore::memory().expect("内存目录库初始化不应失败"),
+        )
+    }
+
+    pub fn empty_at_with_catalog(root: PathBuf, catalog: Arc<CatalogStore>) -> Arc<PluginHost> {
+        let (pins, pin_counts) = Self::load_pin_state(&catalog);
         Arc::new(PluginHost {
             root,
+            catalog,
             plugins: RwLock::new(Vec::new()),
             builtin_profiles: RwLock::new(Vec::new()),
             agent_overrides: RwLock::new(HashMap::new()),
             templates: RwLock::new(Vec::new()),
             packages: RwLock::new(HashMap::new()),
-            pins: RwLock::new(HashMap::new()),
-            pin_counts: RwLock::new(HashMap::new()),
+            pins: RwLock::new(pins),
+            pin_counts: RwLock::new(pin_counts),
         })
     }
 
@@ -83,11 +94,37 @@ impl PluginHost {
 
     /// 扫描插件目录 + 生成内置合成插件。
     pub fn load(config: &mf_agent::Config, skills: &[mf_skills::Skill]) -> Arc<PluginHost> {
-        Self::load_at(install::plugins_root(), config, skills)
+        Self::load_with_catalog(
+            CatalogStore::memory().expect("内存目录库初始化不应失败"),
+            config,
+            skills,
+        )
+    }
+
+    pub fn load_with_catalog(
+        catalog: Arc<CatalogStore>,
+        config: &mf_agent::Config,
+        skills: &[mf_skills::Skill],
+    ) -> Arc<PluginHost> {
+        Self::load_at_with_catalog(install::plugins_root(), catalog, config, skills)
     }
 
     pub fn load_at(
         root: PathBuf,
+        config: &mf_agent::Config,
+        skills: &[mf_skills::Skill],
+    ) -> Arc<PluginHost> {
+        Self::load_at_with_catalog(
+            root,
+            CatalogStore::memory().expect("内存目录库初始化不应失败"),
+            config,
+            skills,
+        )
+    }
+
+    pub fn load_at_with_catalog(
+        root: PathBuf,
+        catalog: Arc<CatalogStore>,
         config: &mf_agent::Config,
         skills: &[mf_skills::Skill],
     ) -> Arc<PluginHost> {
@@ -241,19 +278,65 @@ impl PluginHost {
             )
             .collect();
 
+        let (pins, pin_counts) = Self::load_pin_state(&catalog);
         let host = Arc::new(PluginHost {
             root,
+            catalog,
             plugins: RwLock::new(plugins),
             builtin_profiles: RwLock::new(builtin_profiles),
             agent_overrides: RwLock::new(HashMap::new()),
             templates: RwLock::new(Vec::new()),
             packages: RwLock::new(packages),
-            pins: RwLock::new(HashMap::new()),
-            pin_counts: RwLock::new(HashMap::new()),
+            pins: RwLock::new(pins),
+            pin_counts: RwLock::new(pin_counts),
         });
         host.refresh_detection();
         host.reload_templates();
         host
+    }
+
+    fn load_pin_state(
+        catalog: &CatalogStore,
+    ) -> (HashMap<String, Vec<PluginPin>>, HashMap<String, usize>) {
+        let records = match catalog.list_plugin_pins() {
+            Ok(records) => records,
+            Err(error) => {
+                log::error!("读取持久化插件 pin 失败: {error:#}");
+                Vec::new()
+            }
+        };
+        let mut pins: HashMap<String, Vec<PluginPin>> = HashMap::new();
+        let mut counts = HashMap::new();
+        for record in records {
+            let pin = PluginPin {
+                run_key: record.run_key.clone(),
+                full_id: record.full_id,
+                version: record.version,
+                content_hash: record.content_hash.clone(),
+            };
+            pins.entry(record.run_key).or_default().push(pin);
+            *counts.entry(record.content_hash).or_insert(0) += 1;
+        }
+        (pins, counts)
+    }
+
+    fn refresh_pin_state(&self) -> Result<()> {
+        let records = self.catalog.list_plugin_pins()?;
+        let mut pins: HashMap<String, Vec<PluginPin>> = HashMap::new();
+        let mut counts = HashMap::new();
+        for record in records {
+            let pin = PluginPin {
+                run_key: record.run_key.clone(),
+                full_id: record.full_id,
+                version: record.version,
+                content_hash: record.content_hash.clone(),
+            };
+            pins.entry(record.run_key).or_default().push(pin);
+            *counts.entry(record.content_hash).or_insert(0) += 1;
+        }
+        *self.pins.write() = pins;
+        *self.pin_counts.write() = counts;
+        Ok(())
     }
 
     /// 扫描内容寻址包目录,构建 hash → 包记录索引(不验证哈希;`resolve` 时验证)。
@@ -542,15 +625,14 @@ impl PluginHost {
             version: plugin.version.clone(),
             content_hash: plugin.content_hash.clone(),
         };
-        let mut pins = self.pins.write();
-        pins.entry(run_key.to_string())
-            .or_default()
-            .push(pin.clone());
-        *self
-            .pin_counts
-            .write()
-            .entry(plugin.content_hash.clone())
-            .or_insert(0) += 1;
+        self.catalog.record_plugin_pin(&PluginPinRecord {
+            run_key: pin.run_key.clone(),
+            full_id: pin.full_id.clone(),
+            version: pin.version.clone(),
+            content_hash: pin.content_hash.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        })?;
+        self.refresh_pin_state()?;
         Ok(pin)
     }
 
@@ -561,24 +643,43 @@ impl PluginHost {
 
     /// 释放一次运行的全部 pin(幂等);引用归零的哈希才可被清理。
     pub fn release_run_pins(&self, run_key: &str) -> Result<()> {
-        let removed = self.pins.write().remove(run_key);
-        if let Some(list) = removed {
-            let mut counts = self.pin_counts.write();
-            for pin in list {
-                if let Some(c) = counts.get_mut(&pin.content_hash) {
-                    *c = c.saturating_sub(1);
-                    if *c == 0 {
-                        counts.remove(&pin.content_hash);
-                    }
-                }
-            }
-        }
-        Ok(())
+        self.catalog.remove_plugin_pins_for_run(run_key)?;
+        self.refresh_pin_state()
     }
 
     /// 某哈希包的当前活动引用数(0 = 可清理)。
     pub fn active_pin_count(&self, hash: &str) -> usize {
         self.pin_counts.read().get(hash).copied().unwrap_or(0)
+    }
+
+    pub fn uninstall(&self, full_id: &str) -> Result<()> {
+        if self
+            .plugins
+            .read()
+            .iter()
+            .any(|plugin| plugin.full_id == full_id && plugin.builtin)
+        {
+            bail!("内置合成插件不可卸载");
+        }
+        let hashes: Vec<String> = self
+            .packages
+            .read()
+            .iter()
+            .filter(|(_, package)| package.manifest.full_id() == full_id)
+            .map(|(hash, _)| hash.clone())
+            .collect();
+        if hashes.is_empty() {
+            bail!("插件不存在: {full_id}");
+        }
+        for hash in &hashes {
+            if self.catalog.plugin_pin_count(hash)? > 0 {
+                bail!("插件仍被活动运行固定,无法卸载: {full_id}");
+            }
+        }
+        install::uninstall_at(&self.root, full_id)?;
+        *self.packages.write() = Self::scan_packages(&self.root);
+        self.reload_installed_locked();
+        Ok(())
     }
 
     // ---------- 贡献查找 ----------
@@ -602,10 +703,11 @@ mod tests {
         authorized: bool,
     ) -> PluginHost {
         // root 用一次性临时目录:enable/disable 会向 root 写锁文件,
-        // 不得污染真实插件目录或测试 CWD(into_path 后由测试进程生命周期托管)
-        let tmp_root = tempfile::tempdir().unwrap().into_path();
+        // 不得污染真实插件目录或测试 CWD(keep 后由测试进程生命周期托管)
+        let tmp_root = tempfile::tempdir().unwrap().keep();
         PluginHost {
             root: tmp_root,
+            catalog: CatalogStore::memory().expect("内存目录库初始化不应失败"),
             plugins: RwLock::new(vec![PluginEntry {
                 full_id: m.full_id(),
                 content_hash: "h".into(),

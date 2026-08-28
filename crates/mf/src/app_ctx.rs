@@ -130,13 +130,13 @@ impl AppCtx {
     pub fn new() -> Arc<AppCtx> {
         let config = mf_agent::Config::load().unwrap_or_default();
         let skills = mf_skills::load_skills(None);
-        let plugins = PluginRegistry::load(&config, &skills);
         let catalog_store = CatalogStore::open_default().unwrap_or_else(|e| {
             // 目录库打不开不阻塞启动(插件页/实例页后续访问时再暴露错误),
             // 但必须留下日志,不允许静默降级到无提示状态。
             log::error!("目录库打开失败: {e:#}");
             CatalogStore::memory().expect("内存目录库初始化不可能失败")
         });
+        let plugins = PluginRegistry::load_with_catalog(catalog_store.clone(), &config, &skills);
         let registry = SessionRegistry::new(config.clone());
         let limiter = GlobalLimiter::new(config.engine.global_concurrency.max(1));
         let keep_awake = Arc::new(KeepAwake::new());
