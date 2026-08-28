@@ -2,121 +2,157 @@
 //! 打开/关闭项目的入口在 Workspace(关闭需要确认弹窗,通过 close_intent 传递意图)。
 
 use crate::app_ctx::AppCtx;
+use crate::project_context::{normalize_project_path, ActivationTarget};
+use crate::project_overview::{ProjectOverviewSnapshot, TaskCardOverview};
+use crate::task_composer::{ComposerUiEvent, TaskComposer, TaskComposerState};
 use gpui::prelude::*;
 use gpui::*;
-use gpui::{px, AnyElement, Context, FocusHandle, FontWeight, Window};
-use mf_agent::model::{SessionStatus, TaskStatus, TaskView};
+use gpui::{px, AnyElement, Context, EventEmitter, FocusHandle, FontWeight, Window};
+use mf_agent::model::TaskStatus;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-struct TaskRow {
-    task: TaskView,
-    active_agents: usize,
-    open_questions: usize,
+/// TaskSidebar → Workspace 的意图事件(Workspace 统一走 activation seam)。
+pub enum TaskSidebarEvent {
+    /// 打开系统目录选择器，登记并激活一个新 Project。
+    AddProjectRequested,
+    Activate(ActivationTarget),
+    /// 用户点击「关闭项目」。
+    CloseRequested(PathBuf),
+    /// 任务已归档:清除上下文中的残留选择。
+    TaskArchived(PathBuf, i64),
 }
 
-struct ProjectAgg {
-    root: PathBuf,
-    name: String,
-    tasks: Vec<TaskRow>,
-    active_agents: usize,
-}
+impl EventEmitter<TaskSidebarEvent> for TaskSidebar {}
 
 pub struct TaskSidebar {
     app: Arc<AppCtx>,
-    projects: Vec<ProjectAgg>,
-    /// (project_root, task_id)
+    overview: Option<Arc<ProjectOverviewSnapshot>>,
+    /// (project_root, task_id);由 Workspace 通过 activation seam 设置。
     pub selected: Option<(PathBuf, i64)>,
-    /// 用户点击「关闭项目」的意图(Workspace 读取后弹确认框)。
-    pub close_intent: Option<PathBuf>,
-    new_task_title: String,
-    new_task_open: bool,
-    active_field: bool,
+    /// 当前前台项目根(用于 header 高亮);由 Workspace 设置。
+    foreground: Option<PathBuf>,
+    /// 显式新建任务 Composer(打开时存在;Project 必选,无隐式归属)。
+    composer: Option<Entity<TaskComposer>>,
+    /// Composer 提交失败的用户可见提示。
+    composer_error: Option<String>,
     focus_handle: FocusHandle,
-    pending_focus: bool,
 }
 
 impl TaskSidebar {
     pub fn new(app: Arc<AppCtx>, cx: &mut Context<Self>) -> TaskSidebar {
-        let sidebar = TaskSidebar {
+        TaskSidebar {
             app,
-            projects: Vec::new(),
+            overview: None,
             selected: None,
-            close_intent: None,
-            new_task_title: String::new(),
-            new_task_open: false,
-            active_field: false,
+            foreground: None,
+            composer: None,
+            composer_error: None,
             focus_handle: cx.focus_handle(),
-            pending_focus: false,
-        };
-        sidebar.start_polling(cx);
-        sidebar
-    }
-
-    pub fn unread_count(&self) -> usize {
-        self.projects
-            .iter()
-            .flat_map(|p| p.tasks.iter())
-            .filter(|t| t.task.unread)
-            .count()
-    }
-
-    fn start_polling(&self, cx: &mut Context<Self>) {
-        let app = self.app.clone();
-        cx.spawn(async move |this, cx| loop {
-            let app = app.clone();
-            let agg = cx
-                .background_executor()
-                .spawn(async move { poll_projects(&app) })
-                .await;
-            let alive = this
-                .update(cx, |s, cx| {
-                    s.projects = agg;
-                    cx.notify();
-                })
-                .is_ok();
-            if !alive {
-                return;
-            }
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(700))
-                .await;
-        })
-        .detach();
-    }
-
-    fn create_task(&mut self, cx: &mut Context<Self>) {
-        let Some(project_root) = self
-            .selected
-            .as_ref()
-            .map(|(r, _)| r.clone())
-            .or_else(|| self.projects.first().map(|p| p.root.clone()))
-        else {
-            return;
-        };
-        let title = self.new_task_title.trim().to_string();
-        if title.is_empty() {
-            return;
         }
-        if let Some(orch) = self.app.orchestrator_of(&project_root) {
-            if let Ok(task) = orch.create_task(&title, &title) {
-                self.selected = Some((project_root, task.id));
-            }
-            self.new_task_title.clear();
-        }
-        self.new_task_open = false;
+    }
+
+    /// Workspace 在 activation outcome 后同步选择与前台高亮。
+    pub fn set_selection(&mut self, sel: Option<(PathBuf, i64)>, cx: &mut Context<Self>) {
+        self.selected = sel;
         cx.notify();
     }
 
-    fn archive_task(&self, root: &PathBuf, task_id: i64) {
+    pub fn set_foreground(&mut self, root: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.foreground = root;
+        cx.notify();
+    }
+
+    pub fn unread_count(&self) -> usize {
+        self.overview
+            .as_ref()
+            .map(|o| {
+                o.projects
+                    .iter()
+                    .flat_map(|p| p.tasks.iter())
+                    .filter(|t| t.task.unread)
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Workspace 泵推送统一快照(同一 revision,TaskSidebar 不再自己轮询)。
+    pub fn set_overview(&mut self, snapshot: Arc<ProjectOverviewSnapshot>, cx: &mut Context<Self>) {
+        self.overview = Some(snapshot);
+        cx.notify();
+    }
+
+    /// 打开显式 Composer:Project 必选(默认当前项目,可更改),Title/Goal 必填。
+    fn open_composer(&mut self, cx: &mut Context<Self>) {
+        if self.composer.is_some() {
+            self.composer = None;
+            self.composer_error = None;
+            cx.notify();
+            return;
+        }
+        self.composer_error = None;
+        let projects: Vec<(PathBuf, String)> = self
+            .overview
+            .as_ref()
+            .map(|o| {
+                o.projects
+                    .iter()
+                    .map(|p| (p.root.clone(), p.name.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let state = TaskComposerState::new(projects, self.foreground.as_ref());
+        let composer = cx.new(|cx| TaskComposer::new(state, cx));
+        cx.subscribe(&composer, |s, _, ev: &ComposerUiEvent, cx| match ev {
+            ComposerUiEvent::Submit => s.submit_composer(cx),
+            ComposerUiEvent::Cancel => {
+                s.composer = None;
+                s.composer_error = None;
+                cx.notify();
+            }
+        })
+        .detach();
+        self.composer = Some(composer);
+        cx.notify();
+    }
+
+    /// 创建任务:只写入 Composer 显式选择的项目,激活 B + 新 task。
+    fn submit_composer(&mut self, cx: &mut Context<Self>) {
+        let Some(composer) = self.composer.clone() else {
+            return;
+        };
+        let state = composer.read(cx).state.clone();
+        let app = self.app.clone();
+        match state.submit(move |root| app.orchestrator_of(root)) {
+            Ok(target) => {
+                self.composer = None;
+                self.composer_error = None;
+                cx.emit(TaskSidebarEvent::Activate(target));
+            }
+            Err(e) => {
+                // 用户可见失败:保留 Composer,标题栏提示
+                log::warn!("创建任务失败: {e:#}");
+                self.composer_error = Some(format!("{e:#}"));
+            }
+        }
+        cx.notify();
+    }
+
+    fn archive_task(&self, root: &PathBuf, task_id: i64, cx: &mut Context<Self>) {
         if let Some(orch) = self.app.orchestrator_of(root) {
-            if let Err(e) = orch.archive_task(task_id) {
-                log::warn!("归档失败: {e:#}");
+            match orch.archive_task(task_id) {
+                Ok(()) => cx.emit(TaskSidebarEvent::TaskArchived(root.clone(), task_id)),
+                Err(e) => log::warn!("归档失败: {e:#}"),
             }
         }
     }
 
-    fn render_task_row(&self, row: &TaskRow, root: &PathBuf, cx: &Context<Self>) -> AnyElement {
+    fn render_task_row(
+        &self,
+        row: &TaskCardOverview,
+        root: &PathBuf,
+        cx: &Context<Self>,
+    ) -> AnyElement {
         let id = row.task.id;
         let root = root.clone();
         let root_for_archive = root.clone();
@@ -128,7 +164,7 @@ impl TaskSidebar {
         let color = task_color(row.task.status);
         let title: String = row.task.title.chars().take(40).collect();
         let unread = row.task.unread;
-        let agents = row.active_agents;
+        let agents = row.active_runs;
         let questions = row.open_questions;
         div()
             .id(("task-row", id as u64))
@@ -141,8 +177,13 @@ impl TaskSidebar {
             .cursor_pointer()
             .when(selected, |d| d.bg(rgb(crate::theme::Theme::bg_active())))
             .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
-            .on_click(cx.listener(move |s: &mut TaskSidebar, _, _, cx| {
-                s.selected = Some((root.clone(), id));
+            .on_click(cx.listener(move |_s: &mut TaskSidebar, _, _, cx| {
+                // 一次点击 = 激活 Task 所属 Project + 选择 Task(由 Workspace 统一联动)
+                let (pid, _) = normalize_project_path(&root);
+                cx.emit(TaskSidebarEvent::Activate(ActivationTarget::Task {
+                    project: pid,
+                    task_id: id,
+                }));
                 cx.notify();
             }))
             .child(
@@ -213,68 +254,13 @@ impl TaskSidebar {
                             .child("归档")
                             .on_click(cx.listener(move |s: &mut TaskSidebar, _, _, cx| {
                                 cx.stop_propagation();
-                                s.archive_task(&root_for_archive, id);
+                                s.archive_task(&root_for_archive, id, cx);
                                 cx.notify();
                             })),
                     ),
             )
             .into_any_element()
     }
-}
-
-fn poll_projects(app: &Arc<AppCtx>) -> Vec<ProjectAgg> {
-    // 锁内只取快照(orchestrator 是 Arc),DB 查询在锁外进行,
-    // 避免与 UI 线程(active_root 等)争抢 projects 锁
-    let snapshot: Vec<(PathBuf, Arc<mf_agent::orchestrator::Orchestrator>)> = {
-        let projects = app.projects.lock();
-        projects
-            .iter()
-            .map(|p| (p.root.clone(), p.orchestrator.clone()))
-            .collect()
-    };
-    snapshot
-        .iter()
-        .map(|(root, orch)| {
-            let orch = &*orch;
-            let tasks = orch.tasks().unwrap_or_default();
-            let runs = orch.store.running_runs().unwrap_or_default();
-            let sessions = orch.sessions().unwrap_or_default();
-            let rows = tasks
-                .into_iter()
-                .map(|t| {
-                    let active_agents = runs.iter().filter(|r| r.task_id == t.id).count();
-                    let open_questions = orch
-                        .store
-                        .open_questions(Some(t.id))
-                        .map(|q| q.len())
-                        .unwrap_or(0);
-                    TaskRow {
-                        task: t,
-                        active_agents,
-                        open_questions,
-                    }
-                })
-                .collect();
-            let active_agents = sessions
-                .iter()
-                .filter(|s| {
-                    matches!(
-                        s.status,
-                        SessionStatus::Working | SessionStatus::Starting | SessionStatus::Waiting
-                    )
-                })
-                .count();
-            ProjectAgg {
-                root: root.clone(),
-                name: root
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_else(|| root.display().to_string()),
-                tasks: rows,
-                active_agents,
-            }
-        })
-        .collect()
 }
 
 fn task_color(status: TaskStatus) -> u32 {
@@ -291,21 +277,42 @@ fn task_color(status: TaskStatus) -> u32 {
 }
 
 impl Render for TaskSidebar {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.pending_focus {
-            self.pending_focus = false;
-            window.focus(&self.focus_handle, cx);
-        }
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut list = div()
             .id("task-list")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .py_1();
-        for project in &self.projects {
+        let projects: Vec<crate::project_overview::ProjectOverview> = self
+            .overview
+            .as_ref()
+            .map(|o| {
+                o.projects
+                    .iter()
+                    .map(|p| crate::project_overview::ProjectOverview {
+                        root: p.root.clone(),
+                        name: p.name.clone(),
+                        tasks: p
+                            .tasks
+                            .iter()
+                            .map(|t| TaskCardOverview {
+                                task: t.task.clone(),
+                                active_runs: t.active_runs,
+                                open_questions: t.open_questions,
+                            })
+                            .collect(),
+                        active_sessions: p.active_sessions,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for project in &projects {
             let root = project.root.clone();
+            let root_close = project.root.clone();
             let name = project.name.clone();
             let close_id = name.clone();
+            let is_foreground = self.foreground.as_ref() == Some(&project.root);
             list = list.child(
                 div()
                     .id(ElementId::Name(format!("proj-head-{name}").into()))
@@ -314,19 +321,35 @@ impl Render for TaskSidebar {
                     .gap_1()
                     .px_2p5()
                     .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .when(is_foreground, |d| {
+                        d.bg(rgb(crate::theme::Theme::bg_active()))
+                    })
+                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                    .on_click(cx.listener(move |_s: &mut TaskSidebar, _, _, cx| {
+                        // Project header 点击 = 原子激活该项目
+                        let (pid, _) = normalize_project_path(&root);
+                        cx.emit(TaskSidebarEvent::Activate(ActivationTarget::Project(pid)));
+                        cx.notify();
+                    }))
                     .child(
                         div()
                             .text_size(px(10.5))
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(crate::theme::Theme::fg()))
+                            .text_color(rgb(if is_foreground {
+                                crate::theme::Theme::accent()
+                            } else {
+                                crate::theme::Theme::fg()
+                            }))
                             .child(name.clone()),
                     )
-                    .when(project.active_agents > 0, |d| {
+                    .when(project.active_sessions > 0, |d| {
                         d.child(
                             div()
                                 .text_size(px(9.5))
                                 .text_color(rgb(crate::theme::Theme::success()))
-                                .child(format!("●{}", project.active_agents)),
+                                .child(format!("●{}", project.active_sessions)),
                         )
                     })
                     .child(div().flex_1())
@@ -340,8 +363,9 @@ impl Render for TaskSidebar {
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                             .child("✕")
-                            .on_click(cx.listener(move |s: &mut TaskSidebar, _, _, cx| {
-                                s.close_intent = Some(root.clone());
+                            .on_click(cx.listener(move |_s: &mut TaskSidebar, _, _, cx| {
+                                cx.stop_propagation();
+                                cx.emit(TaskSidebarEvent::CloseRequested(root_close.clone()));
                                 cx.notify();
                             })),
                     ),
@@ -350,7 +374,7 @@ impl Render for TaskSidebar {
                 list = list.child(self.render_task_row(row, &project.root, cx));
             }
         }
-        if self.projects.is_empty() {
+        if projects.is_empty() {
             list = list.child(
                 div()
                     .p_3()
@@ -367,83 +391,65 @@ impl Render for TaskSidebar {
             .flex_col()
             .key_context("TaskSidebar")
             .track_focus(&self.focus_handle)
-            .on_key_down(
-                cx.listener(|s: &mut TaskSidebar, ev: &gpui::KeyDownEvent, window, cx| {
-                    if !s.new_task_open || !s.active_field || !s.focus_handle.is_focused(window) {
-                        return;
-                    }
-                    match ev.keystroke.key.as_str() {
-                        "enter" => s.create_task(cx),
-                        "escape" => {
-                            s.new_task_open = false;
-                            s.new_task_title.clear();
-                        }
-                        "backspace" => {
-                            s.new_task_title.pop();
-                        }
-                        _ => {
-                            if let Some(ch) = ev.keystroke.key_char.as_ref() {
-                                s.new_task_title.push_str(ch);
-                            }
-                        }
-                    }
-                    cx.notify();
-                }),
-            )
             .child(
-                div().flex().items_center().gap_1().px_1p5().py_1().child(
-                    div()
-                        .id("new-task-btn")
-                        .flex_1()
-                        .h(px(24.))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(crate::theme::Theme::border()))
-                        .cursor_pointer()
-                        .text_size(px(10.5))
-                        .text_color(rgb(crate::theme::Theme::fg_dim()))
-                        .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
-                        .child("+ 新建任务")
-                        .on_click(cx.listener(|s: &mut TaskSidebar, _, _, cx| {
-                            s.new_task_open = !s.new_task_open;
-                            s.active_field = s.new_task_open;
-                            s.pending_focus = s.new_task_open;
-                            cx.notify();
-                        })),
-                ),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1p5()
+                    .py_1()
+                    .child(
+                        div()
+                            .id("add-project-btn")
+                            .flex_1()
+                            .h(px(24.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(crate::theme::Theme::border()))
+                            .cursor_pointer()
+                            .text_size(px(10.5))
+                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                            .child("+ 添加项目")
+                            .on_click(cx.listener(|_s: &mut TaskSidebar, _, _, cx| {
+                                cx.emit(TaskSidebarEvent::AddProjectRequested);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("new-task-btn")
+                            .flex_1()
+                            .h(px(24.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(crate::theme::Theme::border()))
+                            .cursor_pointer()
+                            .text_size(px(10.5))
+                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                            .child("+ 新建任务")
+                            .on_click(cx.listener(|s: &mut TaskSidebar, _, _, cx| {
+                                s.open_composer(cx);
+                            })),
+                    ),
             )
-            .when(self.new_task_open, |d| {
+            .when_some(self.composer.clone(), |d, composer| d.child(composer))
+            .when_some(self.composer_error.clone(), |d, err| {
                 d.child(
                     div()
-                        .id("new-task-input")
+                        .id("composer-error")
                         .mx_1p5()
                         .mb_1()
-                        .h(px(26.))
                         .px_2()
-                        .flex()
-                        .items_center()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(rgb(
-                            if self.active_field && self.focus_handle.is_focused(window) {
-                                crate::theme::Theme::accent()
-                            } else {
-                                crate::theme::Theme::border()
-                            },
-                        ))
-                        .text_size(px(11.))
-                        .child(if self.new_task_title.is_empty() {
-                            div()
-                                .text_color(rgb(crate::theme::Theme::fg_faint()))
-                                .child("任务目标…")
-                        } else {
-                            div()
-                                .text_color(rgb(crate::theme::Theme::fg()))
-                                .child(self.new_task_title.clone())
-                        }),
+                        .text_size(px(10.))
+                        .text_color(rgb(crate::theme::Theme::danger()))
+                        .child(err),
                 )
             })
             .child(list)

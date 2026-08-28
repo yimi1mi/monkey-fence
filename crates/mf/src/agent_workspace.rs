@@ -6,9 +6,11 @@
 //!   (从模板创建 / AI 生成 / 添加 Step / 校验 / 确认并运行 / 暂停 / 继续 / 取消)。
 
 use crate::app_ctx::AppCtx;
+use crate::project_context::{normalize_project_path, ActivationTarget};
+use crate::project_overview::{AgentCardOverview, AttentionBucket, ProjectOverviewSnapshot};
 use gpui::prelude::*;
 use gpui::*;
-use gpui::{px, AnyElement, Context, FontWeight, Window};
+use gpui::{px, AnyElement, Context, EventEmitter, FontWeight, Window};
 use mf_agent::model::*;
 use mf_agent::orchestrator::Orchestrator;
 use mf_agent::pipeline::{PipelineDraft, SessionPolicy, StepDraft};
@@ -16,6 +18,13 @@ use mf_agent::Settlement;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+/// AgentWorkspace → Workspace 的意图事件(卡片打开走 activation seam)。
+pub enum AgentWorkspaceEvent {
+    Activate(ActivationTarget),
+}
+
+impl EventEmitter<AgentWorkspaceEvent> for AgentWorkspace {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceView {
@@ -31,6 +40,17 @@ enum Column {
     Idle,
 }
 
+impl From<AttentionBucket> for Column {
+    fn from(b: AttentionBucket) -> Self {
+        match b {
+            AttentionBucket::NeedsYou => Column::NeedsYou,
+            AttentionBucket::Working => Column::Working,
+            AttentionBucket::Done => Column::Done,
+            AttentionBucket::Idle => Column::Idle,
+        }
+    }
+}
+
 impl Column {
     fn title(&self) -> &'static str {
         match self {
@@ -40,19 +60,6 @@ impl Column {
             Column::Idle => "空闲",
         }
     }
-}
-
-struct CardData {
-    project_root: PathBuf,
-    project_name: String,
-    session: SessionView,
-    run: Option<RunView>,
-    task_title: Option<String>,
-    profile_display: String,
-    tail: Vec<String>,
-    alive: bool,
-    column: Column,
-    is_http: bool,
 }
 
 #[derive(Clone)]
@@ -82,7 +89,11 @@ enum Field {
 pub struct AgentWorkspace {
     app: Arc<AppCtx>,
     view: WorkspaceView,
-    cards: Vec<CardData>,
+    cards: Vec<AgentCardOverview>,
+    /// 快照项目根列表(filter_project 循环用,来自统一快照)。
+    project_roots: Vec<PathBuf>,
+    /// 快照的全局活动 run 数(工具栏显示)。
+    global_active_runs: usize,
     filter_project: Option<PathBuf>,
     filter_text: String,
     overlay: Option<Overlay>,
@@ -111,6 +122,8 @@ impl AgentWorkspace {
             app,
             view: WorkspaceView::Agents,
             cards: Vec::new(),
+            project_roots: Vec::new(),
+            global_active_runs: 0,
             filter_project: None,
             filter_text: String::new(),
             overlay: None,
@@ -132,8 +145,20 @@ impl AgentWorkspace {
             focus_handle: cx.focus_handle(),
             pending_focus: false,
         };
-        ws.start_polling(cx);
         ws
+    }
+
+    /// Workspace 泵推送统一快照(与 TaskSidebar 同一 revision)。
+    /// Pipeline detail 在 revision 变化时刷新;不恢复独立全局轮询。
+    pub fn set_overview(&mut self, snapshot: Arc<ProjectOverviewSnapshot>, cx: &mut Context<Self>) {
+        self.cards = snapshot.agent_cards.clone();
+        self.templates = snapshot.templates.clone();
+        self.project_roots = snapshot.projects.iter().map(|p| p.root.clone()).collect();
+        self.global_active_runs = snapshot.global_active_runs;
+        if !self.dirty {
+            self.refresh_pipeline_state();
+        }
+        cx.notify();
     }
 
     pub fn show_tab(&mut self, tab: crate::workspace::AgentTab, cx: &mut Context<Self>) {
@@ -158,36 +183,6 @@ impl AgentWorkspace {
             self.refresh_pipeline_state();
             cx.notify();
         }
-    }
-
-    fn start_polling(&self, cx: &mut Context<Self>) {
-        let app = self.app.clone();
-        cx.spawn(async move |this, cx| loop {
-            let app = app.clone();
-            let snapshot = cx
-                .background_executor()
-                .spawn(async move { poll_snapshot(&app) })
-                .await;
-            let alive = this
-                .update(cx, |ws, cx| {
-                    ws.cards = snapshot.cards;
-                    ws.templates = snapshot.templates;
-                    if !ws.dirty {
-                        ws.refresh_pipeline_state();
-                    }
-                    let working = ws.cards.iter().any(|c| c.column == Column::Working);
-                    ws.app.keep_awake.set_working(working);
-                    cx.notify();
-                })
-                .is_ok();
-            if !alive {
-                return;
-            }
-            cx.background_executor()
-                .timer(std::time::Duration::from_millis(600))
-                .await;
-        })
-        .detach();
     }
 
     fn orchestrator(&self) -> Option<Arc<Orchestrator>> {
@@ -438,9 +433,9 @@ impl AgentWorkspace {
             SessionStatus::Hidden
         };
         if let Some(orch) = self.app.orchestrator_of(project) {
-            let _ = orch
-                .store
-                .update_session(session_id, Some(status), None, None);
+            if let Err(e) = orch.set_session_status(session_id, status) {
+                log::warn!("更新会话状态失败: {e:#}");
+            }
         }
         cx.notify();
     }
@@ -449,9 +444,9 @@ impl AgentWorkspace {
         let project_str = project.to_string_lossy().to_string();
         self.app.registry.kill_session(&project_str, session_id);
         if let Some(orch) = self.app.orchestrator_of(project) {
-            let _ = orch
-                .store
-                .update_session(session_id, Some(SessionStatus::Dead), None, None);
+            if let Err(e) = orch.set_session_status(session_id, SessionStatus::Dead) {
+                log::warn!("更新会话状态失败: {e:#}");
+            }
         }
         cx.notify();
     }
@@ -525,13 +520,7 @@ impl AgentWorkspace {
                     .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                     .child(filter_label)
                     .on_click(cx.listener(|ws: &mut AgentWorkspace, _, _, cx| {
-                        let projects: Vec<PathBuf> = ws
-                            .app
-                            .projects
-                            .lock()
-                            .iter()
-                            .map(|p| p.root.clone())
-                            .collect();
+                        let projects = ws.project_roots.clone();
                         ws.filter_project = match &ws.filter_project {
                             None => projects.first().cloned(),
                             Some(cur) => {
@@ -591,9 +580,9 @@ impl AgentWorkspace {
                     .text_size(px(10.))
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child(format!(
-                        "{} 会话 · 全局并发 {}/{}",
+                        "{} 会话 · 活动运行 {} · 全局并发上限 {}",
                         filtered.len(),
-                        self.app.limiter.active(),
+                        self.global_active_runs,
                         self.app.limiter.max()
                     )),
             );
@@ -614,7 +603,7 @@ impl AgentWorkspace {
             let col_cards: Vec<usize> = filtered
                 .iter()
                 .copied()
-                .filter(|i| self.cards[*i].column == col)
+                .filter(|i| Column::from(self.cards[*i].bucket) == col)
                 .collect();
             let accent = match col {
                 Column::NeedsYou => crate::theme::Theme::warning(),
@@ -684,7 +673,8 @@ impl AgentWorkspace {
 
     fn render_card(&self, idx: usize, cx: &Context<Self>) -> AnyElement {
         let card = &self.cards[idx];
-        let accent = match card.column {
+        let column = Column::from(card.bucket);
+        let accent = match column {
             Column::NeedsYou => crate::theme::Theme::warning(),
             Column::Working => crate::theme::Theme::success(),
             Column::Done => crate::theme::Theme::accent(),
@@ -692,6 +682,7 @@ impl AgentWorkspace {
         };
         let session_id = card.session.id;
         let run_id = card.run.as_ref().map(|r| r.id);
+        let card_task_id = card.task_id;
         let is_http = card.is_http;
         let card_project = card.project_root.clone();
         let project = card.project_root.clone();
@@ -705,6 +696,11 @@ impl AgentWorkspace {
             .as_ref()
             .map(|r| r.status.as_str().to_string())
             .unwrap_or_else(|| card.session.status.as_str().to_string());
+        let status_label = if card.alive {
+            status_label
+        } else {
+            format!("{status_label}(已退出)")
+        };
         let last_user: String = card
             .session
             .last_instruction
@@ -724,7 +720,7 @@ impl AgentWorkspace {
             .collect();
 
         let mut actions = div().flex().items_center().gap_1().mt_1();
-        match card.column {
+        match column {
             Column::NeedsYou => {
                 if let Some(run_id) = run_id {
                     let p_ok = card_project.clone();
@@ -794,7 +790,7 @@ impl AgentWorkspace {
             .p_2()
             .rounded_lg()
             .border_1()
-            .border_color(rgb(if card.column == Column::NeedsYou {
+            .border_color(rgb(if column == Column::NeedsYou {
                 crate::theme::Theme::warning()
             } else {
                 crate::theme::Theme::border()
@@ -803,6 +799,14 @@ impl AgentWorkspace {
             .cursor_pointer()
             .hover(move |d| d.border_color(rgb(accent)))
             .on_click(cx.listener(move |ws: &mut AgentWorkspace, _, _, cx| {
+                // 卡片打开 = 先激活所属项目 + 清除 session 未读(activation seam),
+                // 同时在本视图打开终端/transcript overlay。
+                let (pid, _) = normalize_project_path(&project);
+                cx.emit(AgentWorkspaceEvent::Activate(ActivationTarget::AgentRun {
+                    project: pid,
+                    task_id: card_task_id,
+                    session_id,
+                }));
                 ws.overlay = Some(match run_id {
                     Some(run_id) if is_http => Overlay::Transcript {
                         project: project.clone(),
@@ -1939,116 +1943,6 @@ impl AgentWorkspace {
 }
 
 // ---------- 轮询聚合与辅助 ----------
-
-struct Snapshot {
-    cards: Vec<CardData>,
-    templates: Vec<(String, String, PipelineDraft)>,
-}
-
-fn poll_snapshot(app: &Arc<AppCtx>) -> Snapshot {
-    let mut cards = Vec::new();
-    // 锁内只取快照;DB 查询与 registry 调用在锁外
-    let snapshot: Vec<(PathBuf, Arc<Orchestrator>)> = {
-        let projects = app.projects.lock();
-        projects
-            .iter()
-            .map(|p| (p.root.clone(), p.orchestrator.clone()))
-            .collect()
-    };
-    for (root, orch) in &snapshot {
-        let orch = &**orch;
-        let p = root;
-        let project_name = p
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let sessions = orch.sessions().unwrap_or_default();
-        let mut all_runs = orch.store.running_runs().unwrap_or_default();
-        for t in orch.tasks().unwrap_or_default() {
-            for r in orch.runs_of_task(t.id).unwrap_or_default() {
-                if !all_runs.iter().any(|x| x.id == r.id) {
-                    all_runs.push(r);
-                }
-            }
-        }
-        let tasks: HashMap<i64, String> = orch
-            .tasks()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|t| (t.id, t.title))
-            .collect();
-        for session in sessions {
-            if session.status == SessionStatus::Hidden {
-                continue; // 已确认隐藏的会话不进实时看板(历史保留在数据库)
-            }
-            let run = all_runs
-                .iter()
-                .filter(|r| r.session_id == Some(session.id))
-                .max_by_key(|r| r.id)
-                .cloned();
-            let task_title = run.as_ref().and_then(|r| tasks.get(&r.task_id).cloned());
-            let profile_display = {
-                let catalog = app.catalog.read();
-                catalog
-                    .specs
-                    .get(&session.agent_profile)
-                    .map(|s| s.display_name.clone())
-                    .unwrap_or_else(|| session.agent_profile.clone())
-            };
-            let is_http = session.runtime == "http";
-            let project_str = p.to_string_lossy().to_string();
-            let tail = if is_http {
-                Vec::new()
-            } else {
-                app.registry.pty_tail(&project_str, session.id, 4)
-            };
-            let alive = app.registry.session_alive(&project_str, session.id) || is_http;
-            let column = column_of(&session, &run, alive);
-            cards.push(CardData {
-                project_root: p.clone(),
-                project_name: project_name.clone(),
-                session,
-                run,
-                task_title,
-                profile_display,
-                tail,
-                alive,
-                column,
-                is_http,
-            });
-        }
-    }
-    let templates = app.plugins.templates();
-    Snapshot { cards, templates }
-}
-
-fn column_of(session: &SessionView, run: &Option<RunView>, alive: bool) -> Column {
-    if let Some(run) = run {
-        match run.status {
-            RunStatus::Failed | RunStatus::Interrupted | RunStatus::AwaitingOutcome => {
-                return Column::NeedsYou;
-            }
-            RunStatus::Running => return Column::Working,
-            RunStatus::Succeeded => return Column::Done, // 成功但未确认 → 已完成
-            RunStatus::Cancelled => {}
-        }
-    }
-    match session.status {
-        SessionStatus::Waiting | SessionStatus::BlockedState | SessionStatus::Dead => {
-            Column::NeedsYou
-        }
-        SessionStatus::Working | SessionStatus::Starting => Column::Working,
-        SessionStatus::Done => Column::Done,
-        SessionStatus::Idle => {
-            if alive {
-                Column::Idle
-            } else {
-                Column::NeedsYou
-            }
-        }
-        SessionStatus::Hidden => Column::Idle,
-    }
-}
 
 fn step_color(status: StepStatus) -> u32 {
     match status {

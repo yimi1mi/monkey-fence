@@ -21,6 +21,9 @@ cargo run --release -- [项目路径]
 - `Ctrl+Shift+W` 任务侧边栏(按项目分组:新建 / 选择 / 归档)
 - `Ctrl+Shift+/` Agent 工作区(`Agents` 看板 / `Pipeline` 视图)
 - `Ctrl+,` 设置(智能体 / 插件 / Provider / 引擎 / 编辑器)
+- 活动栏顶部 `⋮` 打开“所有操作”:添加项目、快速打开、任务、版控、
+  Agent、Pipeline、搜索、终端、设置及常用编辑操作均可鼠标触达;快捷键只做加速
+- 任务侧栏同时提供 `+ 添加项目` 与 `+ 新建任务`,无需记忆快捷键
 
 ### 无 GUI 自测(v2 冒烟:验证流水线状态机端到端)
 
@@ -140,8 +143,12 @@ mfctl pipeline propose --file draft.json     # Planner 提案,须用户确认
 - 每项目 `<project>/.mf-agent/orchestration.db`(带 `schema_migrations` 正式迁移)
 - 迁移:旧 `runs→Task`、`tasks→Step`、`dispatches→Agent Run`;旧表与消息/问题历史保留为只读;`work-items.json` 兼容导入一次(忽略 `vcs_ref`,原文件保留)
 - 崩溃恢复:重开时未结算 Agent Run → `interrupted`,对应 Task → `needs-you`
-- 前台只显示一个项目的文件树/编辑上下文;其他项目的任务与 Agent 后台继续运行;关闭含活动 Agent Run 的项目必须先确认停止
-- 打开的项目列表与前台项目持久化到 `~/.monkeyfence/session.json`(原子写),重启应用自动恢复
+- 统一项目上下文:当前项目/任务由 `project_context.rs` 的原子 activation seam 唯一决定(`ProjectId` 为规范化绝对路径);项目、任务、编辑器标签、文件树、VCS、搜索与终端 cwd 属于同一个原子激活的项目上下文;点击项目标题、任务、Agent 卡片或跨项目文件都会先原子切换到所属项目
+- 编辑器标签与 ConsoleDock 按项目分桶:A→B→A 后标签顺序、活动标签与终端内容原样恢复;每项目终端首次创建时 cwd 即该项目根
+- 前台只显示一个项目的文件树/编辑上下文;其他项目的任务与 Agent 后台继续运行;关闭含活动 Agent Run 的项目必须先确认停止;关闭当前项目回退到最近激活的剩余项目
+- 新建任务使用显式 Composer(Project 必选、Title/Goal 必填),不存在"第一个项目"隐式归属
+- TaskSidebar 与 Agents 看板消费同一份带 revision 的统一项目总览快照(`project_overview.rs`):每个 Orchestrator 的 UI 事件由 Event Hub 持续消费(drain 线程),UI 变慢不会反压调度
+- 会话持久化到 `~/.monkeyfence/session.json`(原子写):打开项目、前台项目、每项目最近选中 Task 与干净编辑器文件;重启自动恢复(Diff/未保存 Buffer/终端 PTY 不持久化),旧格式仍可读取
 
 ## P4 / Git 面板(独立)
 

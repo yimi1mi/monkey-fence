@@ -63,7 +63,7 @@ impl QuickOpen {
         }
     }
 
-    pub fn register_commands(&mut self, cmds: Vec<(String, String)>) {
+    pub fn register_commands(&mut self, cmds: Vec<(String, String)>, cx: &App) {
         self.commands = cmds
             .into_iter()
             .map(|(id, label)| QuickItem::Command {
@@ -71,6 +71,7 @@ impl QuickOpen {
                 label: label.into(),
             })
             .collect();
+        self.recompute(cx);
     }
 
     pub fn set_on_pick(&mut self, cb: impl Fn(&QuickItem, &mut Window, &mut App) + 'static) {

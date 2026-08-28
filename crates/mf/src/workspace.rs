@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::agent_workspace::AgentWorkspace;
-use crate::app_ctx::AppCtx;
+use crate::app_ctx::{choose_restore_project, plan_restore, AppCtx, ProjectSessionState};
 use crate::console::ConsoleDock;
 use crate::diff_view::DiffView;
 use crate::editor::Editor;
@@ -13,11 +13,16 @@ use crate::file_tree::FileTree;
 use crate::navigation::{
     empty_state_for, BottomPanel, EmptyState, LeftPanel, NavAction, NavigationState, PrimarySurface,
 };
+use crate::project_context::{
+    deepest_owning_project, normalize_project_path, ActivationTarget, ProjectContextState,
+    ProjectId,
+};
 use crate::quick_open::{QuickItem, QuickOpen};
 use crate::search::ProjectSearch;
 use crate::settings::{Dismissed, Saved, SettingsView};
-use crate::task_sidebar::TaskSidebar;
+use crate::task_sidebar::{TaskSidebar, TaskSidebarEvent};
 use crate::vcs_panel::VcsPanel;
+use std::collections::HashMap;
 
 actions!(
     workspace,
@@ -41,13 +46,75 @@ actions!(
     ]
 );
 
-/// 标签页内容:编辑器或 diff 视图,携带所属项目标识。
-#[derive(Clone)]
-struct TabEntry {
-    project: PathBuf,
-    tab: Tab,
+/// 常驻「所有操作」菜单的数据源。快捷键只做加速，所有工作区命令都必须
+/// 能从鼠标打开的菜单触达；文件相关项在没有 Project/Tab 时不展示。
+pub(crate) fn workspace_command_entries(
+    has_project: bool,
+    has_tab: bool,
+) -> Vec<(&'static str, &'static str)> {
+    let mut commands = vec![
+        ("open_folder", "添加 / 打开项目…  Ctrl+Shift+O"),
+        ("toggle_left", "显示 / 隐藏左侧面板  Ctrl+B"),
+        ("toggle_explorer", "显示资源管理器  Ctrl+Shift+E"),
+        ("toggle_tasks", "显示任务与项目管理  Ctrl+Shift+W"),
+        ("toggle_vcs", "显示版本控制  Ctrl+Shift+G"),
+        ("show_agents", "Agent 看板  Ctrl+Shift+/"),
+        ("show_pipeline", "Pipeline 视图"),
+        ("toggle_console", "显示 / 隐藏终端  Ctrl+`"),
+        ("project_search", "项目搜索…  Ctrl+Shift+F"),
+        ("open_settings", "打开设置  Ctrl+,"),
+    ];
+    if has_project {
+        commands.splice(
+            1..1,
+            [
+                ("quick_open", "快速打开文件…  Ctrl+P"),
+                ("refresh_tree", "刷新当前项目文件树"),
+            ],
+        );
+    }
+    if has_tab {
+        commands.extend([
+            ("close_tab", "关闭当前标签页  Ctrl+W"),
+            ("next_tab", "下一个标签页  Ctrl+Tab"),
+            ("prev_tab", "上一个标签页  Ctrl+Shift+Tab"),
+            ("save_file", "保存当前文件  Ctrl+S"),
+            ("undo", "撤销  Ctrl+Z"),
+            ("redo", "重做  Ctrl+Y"),
+            ("select_all", "全选  Ctrl+A"),
+            ("duplicate_line", "复制当前行  Ctrl+D"),
+            ("move_line_up", "上移当前行  Alt+Up"),
+            ("move_line_down", "下移当前行  Alt+Down"),
+        ]);
+    }
+    commands
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ProjectSwitcherItem {
+    pub id: ProjectId,
+    pub name: String,
+    pub path: String,
+    pub active: bool,
+}
+
+/// Explorer 的项目选择器始终投影全部已打开项目，不因数量增加而截断。
+pub(crate) fn project_switcher_items(
+    projects: &[ProjectId],
+    active: Option<&ProjectId>,
+) -> Vec<ProjectSwitcherItem> {
+    projects
+        .iter()
+        .map(|project| ProjectSwitcherItem {
+            id: project.clone(),
+            name: project.display_name(),
+            path: project.as_path().display().to_string(),
+            active: active == Some(project),
+        })
+        .collect()
+}
+
+/// 标签页内容:编辑器或 diff 视图(归属由所在 ProjectSurfaceState 决定)。
 #[derive(Clone)]
 enum Tab {
     Editor(Entity<Editor>),
@@ -76,6 +143,24 @@ impl Tab {
     }
 }
 
+/// 每项目界面状态:标签与 ConsoleDock 按 Project 分桶;
+/// 切走后保留,切回时原样恢复(A→B→A 终端内容不变)。
+struct ProjectSurfaceState {
+    tabs: Vec<Tab>,
+    active_tab: usize,
+    console_dock: Option<Entity<ConsoleDock>>,
+}
+
+impl Default for ProjectSurfaceState {
+    fn default() -> Self {
+        Self {
+            tabs: Vec::new(),
+            active_tab: 0,
+            console_dock: None,
+        }
+    }
+}
+
 /// 关闭项目的确认状态(存在活动 Agent Run 时必须先确认停止)。
 struct CloseConfirm {
     root: PathBuf,
@@ -85,16 +170,19 @@ struct CloseConfirm {
 
 pub struct Workspace {
     app: Arc<AppCtx>,
-    /// 前台项目根(打开/切换时更新;与 projects 顺序无关)
-    foreground_root: Option<PathBuf>,
+    /// 会话恢复进行中:open_folder 只注册项目,不抢占前台。
+    restoring: bool,
+    /// 唯一可信的当前项目/任务来源(activation seam)。
+    context: ProjectContextState,
+    /// 每项目界面状态,键为规范化项目根。
+    surfaces: HashMap<PathBuf, ProjectSurfaceState>,
+    /// Explorer 顶部的已打开项目列表是否展开。
+    project_switcher_open: bool,
     /// 项目前台上下文:文件树 / VCS 面板(其他项目的任务与 Agent 后台继续运行)
     file_tree: Option<Entity<FileTree>>,
     vcs_panel: Option<Entity<VcsPanel>>,
-    tabs: Vec<TabEntry>,
-    active: usize,
     quick_open: Option<Entity<QuickOpen>>,
     search_overlay: Option<Entity<ProjectSearch>>,
-    console_dock: Option<Entity<ConsoleDock>>,
     task_sidebar: Option<Entity<TaskSidebar>>,
     agent_workspace: Option<Entity<AgentWorkspace>>,
     close_confirm: Option<CloseConfirm>,
@@ -114,16 +202,16 @@ impl Workspace {
         let agent_workspace = cx.new(|cx| AgentWorkspace::new(app.clone(), cx));
         let mut ws = Self {
             app,
-            foreground_root: None,
+            restoring: true,
+            context: ProjectContextState::new(),
+            surfaces: HashMap::new(),
+            project_switcher_open: false,
             file_tree: None,
             vcs_panel: None,
-            tabs: Vec::new(),
-            active: 0,
             quick_open: None,
             search_overlay: None,
-            console_dock: None,
-            task_sidebar: Some(task_sidebar),
-            agent_workspace: Some(agent_workspace),
+            task_sidebar: Some(task_sidebar.clone()),
+            agent_workspace: Some(agent_workspace.clone()),
             close_confirm: None,
             navigation: NavigationState::default(),
             settings_open: None,
@@ -133,7 +221,77 @@ impl Workspace {
             pending_focus: None,
             editor_font: mf_agent::EditorConfig::default(),
         };
+        // 唯一的轻量 snapshot 监听:revision 变化时把同一份快照推给
+        // TaskSidebar 与 AgentWorkspace(两者不再各自轮询数据库)。
+        {
+            let hub = ws.app.overview.clone();
+            cx.spawn(async move |this, cx| {
+                let mut last = 0u64;
+                loop {
+                    if let Some(snap) = hub.snapshot_if_new(last) {
+                        last = snap.revision;
+                        let alive = this
+                            .update(cx, |ws: &mut Workspace, cx| {
+                                if let Some(sb) = &ws.task_sidebar {
+                                    let s = snap.clone();
+                                    sb.update(cx, |sb, cx| sb.set_overview(s, cx));
+                                }
+                                if let Some(aw) = &ws.agent_workspace {
+                                    let s = snap.clone();
+                                    aw.update(cx, |aw, cx| aw.set_overview(s, cx));
+                                }
+                                cx.notify();
+                            })
+                            .is_ok();
+                        if !alive {
+                            return;
+                        }
+                    }
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(250))
+                        .await;
+                }
+            })
+            .detach();
+        }
+        cx.subscribe(
+            &task_sidebar,
+            |ws, _sb, ev: &TaskSidebarEvent, cx| match ev {
+                TaskSidebarEvent::AddProjectRequested => ws.prompt_open_folder(cx),
+                TaskSidebarEvent::Activate(target) => ws.apply_activation(target, cx),
+                TaskSidebarEvent::CloseRequested(root) => {
+                    let root = root.clone();
+                    ws.request_close_project(root, cx);
+                }
+                TaskSidebarEvent::TaskArchived(root, task_id) => {
+                    // 归档后从上下文移除,不得残留在 selected_task_by_project
+                    let (pid, _) = normalize_project_path(root);
+                    ws.context.task_gone(&pid, *task_id);
+                    ws.sync_context_views(cx);
+                    ws.persist_session(cx);
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &agent_workspace,
+            |ws, _aw, ev: &crate::agent_workspace::AgentWorkspaceEvent, cx| match ev {
+                crate::agent_workspace::AgentWorkspaceEvent::Activate(target) => {
+                    ws.apply_activation(target, cx);
+                }
+            },
+        )
+        .detach();
+        cx.on_app_quit(|workspace, cx| {
+            // 正常退出时重新检查 dirty Buffer，避免沿用文件刚打开时的
+            // “干净”会话记录。崩溃仍沿用最后一次安全快照。
+            workspace.persist_session(cx);
+            async {}
+        })
+        .detach();
         ws.restore_session(cx);
+        ws.restoring = false;
         ws
     }
 
@@ -141,64 +299,229 @@ impl Workspace {
         self.focus_handle.clone()
     }
 
-    /// 恢复上次会话打开的项目(存在性过滤;按保存顺序打开,最后切到保存的前台)。
+    /// 恢复上次会话:打开项目 → 恢复 context/干净编辑器标签 → 切到保存的前台。
+    /// 恢复失败局部降级,不影响启动。
     fn restore_session(&mut self, cx: &mut Context<Self>) {
         let session = AppCtx::load_session();
-        let projects: Vec<PathBuf> = session
-            .projects
-            .iter()
-            .filter(|p| p.is_dir())
-            .cloned()
-            .collect();
+        let mut projects = Vec::new();
+        for path in session.projects.iter().filter(|path| path.is_dir()) {
+            let root = normalize_project_path(path).0.root();
+            if !projects.contains(&root) {
+                projects.push(root);
+            }
+        }
         for root in &projects {
             self.open_folder(root.clone(), cx);
         }
-        if let Some(fg) = session.foreground {
-            if fg.is_dir() && projects.contains(&fg) && self.app.orchestrator_of(&fg).is_some() {
-                self.set_foreground_project(&fg, cx);
-                self.status_message = format!("已恢复 {} 个项目", projects.len()).into();
+        // 每项目恢复:仍存在的干净文件 + 仍存在的选中 Task
+        let plans = {
+            let app = self.app.clone();
+            plan_restore(&session, move |root, task_id| {
+                app.orchestrator_of(&root)
+                    .and_then(|o| o.tasks().ok())
+                    .map(|ts| {
+                        ts.iter()
+                            .any(|t| t.id == task_id && t.status != mf_agent::TaskStatus::Archived)
+                    })
+                    .unwrap_or(false)
+            })
+        };
+        for plan in &plans {
+            if !projects.contains(&plan.root) {
+                continue;
             }
+            for file in &plan.open_files {
+                self.open_path(file, cx);
+            }
+            if let Some(task_id) = plan.selected_task_id {
+                let (pid, _) = normalize_project_path(&plan.root);
+                self.apply_activation(
+                    &ActivationTarget::Restore {
+                        project: pid,
+                        task_id: Some(task_id),
+                    },
+                    cx,
+                );
+            }
+        }
+        // 前台:优先保存的 foreground;否则保持最近激活的项目
+        let foreground = session.foreground.and_then(|fg| {
+            if !fg.is_dir() {
+                return None;
+            }
+            let root = normalize_project_path(&fg).0.root();
+            projects.contains(&root).then_some(root)
+        });
+        let current = self
+            .context
+            .snapshot()
+            .project
+            .map(|project| project.root());
+        if let Some(fg) = choose_restore_project(foreground, current, &projects) {
+            if self.app.orchestrator_of(&fg).is_some() {
+                let (id, _) = normalize_project_path(&fg);
+                let saved_task = plans
+                    .iter()
+                    .find(|p| p.root == fg)
+                    .and_then(|p| p.selected_task_id);
+                self.apply_activation(
+                    &ActivationTarget::Restore {
+                        project: id,
+                        task_id: saved_task,
+                    },
+                    cx,
+                );
+            }
+        }
+        if !projects.is_empty() {
+            self.status_message = format!("已恢复 {} 个项目", projects.len()).into();
         }
     }
 
-    /// 项目列表/前台变化后持久化会话。
-    fn persist_session(&self) {
-        self.app.save_session(self.foreground_root.as_ref());
+    /// 项目列表/前台/每项目状态变化后持久化会话。
+    /// 只记录干净编辑器文件路径(未保存 Buffer 不持久化);Diff 不持久化。
+    fn persist_session(&self, cx: &App) {
+        let foreground = self.context.snapshot().project.map(|p| p.root());
+        let project_states: Vec<ProjectSessionState> = self
+            .context
+            .known_projects()
+            .iter()
+            .map(|pid| ProjectSessionState {
+                root: pid.root(),
+                selected_task_id: self.context.last_task_of(pid),
+                open_files: self.surface_clean_files(pid, cx),
+                active_file: self.surface_active_file(pid, cx),
+            })
+            .collect();
+        self.app.save_session(foreground.as_ref(), project_states);
     }
 
-    /// 前台项目根;用于终端 cwd、快速打开、搜索与标签归属。
-    fn active_root(&self) -> PathBuf {
-        self.foreground_root.clone().unwrap_or_default()
+    fn surface_clean_files(
+        &self,
+        pid: &crate::project_context::ProjectId,
+        cx: &App,
+    ) -> Vec<PathBuf> {
+        self.surfaces
+            .get(&pid.root())
+            .map(|s| {
+                s.tabs
+                    .iter()
+                    .filter_map(|t| match t {
+                        Tab::Editor(ed) => {
+                            let b = ed.read(cx).buffer.read(cx);
+                            if b.is_dirty() {
+                                None
+                            } else {
+                                b.path().map(|p| p.to_path_buf())
+                            }
+                        }
+                        Tab::Diff(_) => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn surface_active_file(
+        &self,
+        pid: &crate::project_context::ProjectId,
+        cx: &App,
+    ) -> Option<PathBuf> {
+        let root = pid.root();
+        let surface = self.surfaces.get(&root)?;
+        match surface.tabs.get(surface.active_tab)? {
+            Tab::Editor(ed) => {
+                let b = ed.read(cx).buffer.read(cx);
+                if b.is_dirty() {
+                    None
+                } else {
+                    b.path().map(|p| p.to_path_buf())
+                }
+            }
+            Tab::Diff(_) => None,
+        }
+    }
+
+    /// 前台项目根(来自 ActiveProjectContext);用于终端 cwd、快速打开、搜索与标签归属。
+    fn active_root(&self) -> Option<PathBuf> {
+        self.context.snapshot().project.map(|p| p.root())
+    }
+
+    /// 当前项目的界面状态(无项目时 None)。
+    fn current_surface(&self) -> Option<&ProjectSurfaceState> {
+        self.active_root().and_then(|r| self.surfaces.get(&r))
+    }
+
+    fn current_surface_mut(&mut self) -> Option<&mut ProjectSurfaceState> {
+        let root = self.active_root()?;
+        self.surfaces.get_mut(&root)
+    }
+
+    fn active_tab_index(&self) -> usize {
+        self.current_surface().map(|s| s.active_tab).unwrap_or(0)
+    }
+
+    /// 当前项目 ConsoleDock(每项目分桶,A→B→A 内容保留)。
+    fn current_console(&self) -> Option<Entity<ConsoleDock>> {
+        self.current_surface().and_then(|s| s.console_dock.clone())
+    }
+
+    /// 所有项目的编辑器(字体设置等全局操作)。
+    fn all_editor_tabs(&self) -> Vec<Entity<Editor>> {
+        self.surfaces
+            .values()
+            .flat_map(|s| s.tabs.iter())
+            .filter_map(|t| match t {
+                Tab::Editor(ed) => Some(ed.clone()),
+                Tab::Diff(_) => None,
+            })
+            .collect()
     }
 
     fn project_count(&self) -> usize {
-        self.app.projects.lock().len()
+        self.app.project_count()
+    }
+
+    /// 解析目录所属项目(基于规范化项目身份;路径本身先规范化再比较)。
+    fn find_owning_project(&self, dir: &Path) -> Option<PathBuf> {
+        let (dir_id, _) = normalize_project_path(dir);
+        let dir = dir_id.as_path();
+        deepest_owning_project(self.context.known_projects(), dir).map(|project| project.root())
     }
 
     // ---------- 多项目 ----------
 
     pub fn open_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        let path = std::path::absolute(&path).unwrap_or(path);
         if !path.is_dir() {
             self.status_message = format!("目录不存在: {}", path.display()).into();
             cx.notify();
             return;
         }
-        // 已打开 → 切换前台项目(不终止其他项目的 Agent)
-        let already = self.app.projects.lock().iter().any(|p| p.root == path);
+        let (id, warning) = normalize_project_path(&path);
+        if let Some(w) = warning {
+            log::warn!("{w}");
+        }
+        let root = id.root();
+        // 已打开 → 只激活(不终止其他项目的 Agent,也不重复建 Store/Orchestrator)
+        let already = self.app.orchestrator_of(&root).is_some();
         if already {
-            self.set_foreground_project(&path, cx);
-            self.status_message = format!("已切换到 {}", path.display()).into();
-            cx.notify();
+            self.apply_activation(&ActivationTarget::Project(id), cx);
+            self.status_message = format!("已切换到 {}", root.display()).into();
             return;
         }
-        match self.app.open_project(path.clone()) {
+        match self.app.open_project(root.clone()) {
             Ok(_) => {
-                self.foreground_root = Some(path.clone());
-                self.set_foreground_project(&path, cx);
+                self.context.open_project(id.clone());
+                self.surfaces.entry(root.clone()).or_default();
+                if self.restoring {
+                    // 恢复期只注册项目;前台由保存的 foreground 决定
+                    cx.notify();
+                    return;
+                }
+                self.apply_activation(&ActivationTarget::Project(id), cx);
                 self.status_message =
-                    format!("已打开 {}({} 个项目)", path.display(), self.project_count()).into();
-                self.persist_session();
+                    format!("已打开 {}({} 个项目)", root.display(), self.project_count()).into();
+                self.persist_session(cx);
             }
             Err(e) => {
                 self.status_message = format!("打开项目失败: {e:#}").into();
@@ -207,13 +530,81 @@ impl Workspace {
         cx.notify();
     }
 
-    /// 前台切换:只重建文件树 / VCS 面板与搜索;调度器与会话不受影响。
-    fn set_foreground_project(&mut self, root: &Path, cx: &mut Context<Self>) {
-        self.foreground_root = Some(root.to_path_buf());
+    /// 唯一 activation 入口:调用 context module 后统一联动
+    /// FileTree/VCS/搜索/分桶 surface/TaskSidebar/AgentWorkspace/mark-read/持久化。
+    fn apply_activation(&mut self, target: &ActivationTarget, cx: &mut Context<Self>) {
+        self.project_switcher_open = false;
+        let outcome = self.context.activate(target.clone());
+        if outcome.project_changed || outcome.task_changed {
+            log::debug!(
+                "activation: {:?} → {:?} (project_changed={}, task_changed={})",
+                outcome.previous,
+                outcome.current,
+                outcome.project_changed,
+                outcome.task_changed
+            );
+        }
+        if outcome.project_changed {
+            self.rebuild_foreground(cx);
+        }
+        // Task / Agent 卡片是注意力入口:打开时进入 Work 表面
+        if matches!(
+            target,
+            ActivationTarget::Task { .. } | ActivationTarget::AgentRun { .. }
+        ) {
+            self.navigation.apply(NavAction::ShowWork);
+        }
+        self.sync_context_views(cx);
+        // mark-read intent(幂等)
+        if let Some((pid, task_id)) = &outcome.mark_task_read {
+            if let Some(orch) = self.app.orchestrator_of(&pid.root()) {
+                if let Err(e) = orch.mark_task_read(*task_id) {
+                    log::warn!("清除任务未读失败: {e:#}");
+                }
+            }
+        }
+        if let Some((pid, session_id)) = &outcome.mark_session_read {
+            if let Some(orch) = self.app.orchestrator_of(&pid.root()) {
+                if let Err(e) = orch.mark_session_read(*session_id) {
+                    log::warn!("清除会话未读失败: {e:#}");
+                }
+            }
+        }
+        self.persist_session(cx);
+        cx.notify();
+    }
+
+    /// 将同一份 ActiveProjectContext 投影到两个 UI module。
+    /// Project 与 Task 不得由调用方分别拼接。
+    fn sync_context_views(&mut self, cx: &mut Context<Self>) {
+        let active = self.context.snapshot();
+        let selection = match (active.project.as_ref(), active.task_id) {
+            (Some(project), Some(task_id)) => Some((project.root(), task_id)),
+            _ => None,
+        };
+        if let Some(sidebar) = &self.task_sidebar {
+            sidebar.update(cx, |s, cx| {
+                s.set_selection(selection.clone(), cx);
+                s.set_foreground(active.project.as_ref().map(|p| p.root()), cx);
+            });
+        }
+        if let Some(aw) = &self.agent_workspace {
+            aw.update(cx, |aw, cx| aw.set_selected_task(selection, cx));
+        }
+    }
+
+    /// 项目切换后重建文件树/VCS/搜索;FileTree 与 VcsPanel 可重建,不缓存。
+    fn rebuild_foreground(&mut self, cx: &mut Context<Self>) {
+        let Some(root) = self.active_root() else {
+            self.file_tree = None;
+            self.vcs_panel = None;
+            self.search_overlay = None;
+            return;
+        };
         self.quick_open = None;
         self.search_overlay = None;
-        let _index = cx.new(|cx| FileIndex::new(root.to_path_buf(), cx));
-        let tree = cx.new(|cx| FileTree::new(root.to_path_buf(), cx));
+        let _index = cx.new(|cx| FileIndex::new(root.clone(), cx));
+        let tree = cx.new(|cx| FileTree::new(root.clone(), cx));
         let weak = cx.weak_entity();
         tree.update(cx, |tree, _| {
             tree.set_on_open(move |path, _window, cx| {
@@ -222,7 +613,7 @@ impl Workspace {
             });
         });
         self.file_tree = Some(tree);
-        let vcs = cx.new(|cx| VcsPanel::new(root.to_path_buf(), cx));
+        let vcs = cx.new(|cx| VcsPanel::new(root.clone(), cx));
         let weak = cx.weak_entity();
         vcs.update(cx, |vcs, _| {
             vcs.set_on_open_diff(move |title, local_path, _window, cx| {
@@ -233,12 +624,17 @@ impl Workspace {
             });
         });
         self.vcs_panel = Some(vcs);
-        self.persist_session();
         // 打开项目时刷新插件目录(项目级技能等)
         self.app.refresh_catalog();
-        // 关闭孤儿编辑器之外不动 tabs(标签携带项目标识,跨项目保留)
-        if !self.tabs.is_empty() {
-            self.activate_tab(self.active.min(self.tabs.len() - 1), cx);
+        // 恢复该项目的活动标签焦点
+        if let Some(surface) = self.current_surface() {
+            if !surface.tabs.is_empty() {
+                let idx = surface.active_tab.min(surface.tabs.len() - 1);
+                match &surface.tabs[idx] {
+                    Tab::Editor(_) => self.focus_active(cx),
+                    Tab::Diff(dv) => self.pending_focus = Some(dv.read(cx).focus_handle()),
+                }
+            }
         }
     }
 
@@ -262,25 +658,18 @@ impl Workspace {
     }
 
     fn do_close_project(&mut self, root: &PathBuf, cx: &mut Context<Self>) {
-        let was_foreground = self.active_root() == *root;
         self.app.close_project(root);
-        self.tabs.retain(|t| &t.project != root);
-        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        let (id, _) = normalize_project_path(root);
+        let outcome = self.context.remove_project(&id);
+        self.surfaces.remove(&id.root());
         self.close_confirm = None;
-        if was_foreground {
-            self.foreground_root = None;
-            self.file_tree = None;
-            self.vcs_panel = None;
-            let next = {
-                let projects = self.app.projects.lock();
-                projects.first().map(|p| p.root.clone())
-            };
-            if let Some(next) = next {
-                self.set_foreground_project(&next, cx);
-            }
+        if outcome.project_changed {
+            self.rebuild_foreground(cx);
         }
+        self.sync_context_views(cx);
+        // 关闭后台项目也必须从 session.json 移除。
+        self.persist_session(cx);
         self.status_message = "项目已关闭".into();
-        self.persist_session();
         cx.notify();
     }
 
@@ -298,28 +687,32 @@ impl Workspace {
 
     pub fn open_path(&mut self, path: &Path, cx: &mut Context<Self>) {
         self.navigation.apply(NavAction::ShowCode);
-        let project = path
-            .parent()
-            .map(|p| find_owning_project(&self.app, p))
-            .flatten()
-            .unwrap_or_else(|| self.active_root());
-        if let Some(pos) = self.tabs.iter().position(|t| match &t.tab {
+        // 先解析文件所属 Project;跨项目文件先原子激活所属项目再打开
+        let owning = path.parent().map(|p| self.find_owning_project(p)).flatten();
+        let Some(project_root) = owning.or_else(|| self.active_root()) else {
+            self.status_message = "先打开一个文件夹再打开文件".into();
+            cx.notify();
+            return;
+        };
+        if Some(&project_root) != self.active_root().as_ref() {
+            let (id, _) = normalize_project_path(&project_root);
+            self.apply_activation(&ActivationTarget::Tab { project: id }, cx);
+        }
+        let path = path.to_path_buf();
+        let surface = self.surfaces.entry(project_root).or_default();
+        if let Some(pos) = surface.tabs.iter().position(|t| match t {
             Tab::Editor(ed) => ed
                 .read(cx)
                 .buffer
                 .read(cx)
                 .path()
-                .map(|p| p == path)
+                .map(|p| p == &path)
                 .unwrap_or(false),
             Tab::Diff(_) => false,
         }) {
-            self.active = pos;
+            surface.active_tab = pos;
             // 已打开:未修改则从磁盘重载(agent 可能改动了文件)
-            if let Some(TabEntry {
-                tab: Tab::Editor(ed),
-                ..
-            }) = self.tabs.get(pos)
-            {
+            if let Some(Tab::Editor(ed)) = surface.tabs.get(pos) {
                 if !ed.read(cx).buffer.read(cx).is_dirty() {
                     ed.update(cx, |editor, cx| {
                         editor.buffer.update(cx, |buffer, _| {
@@ -330,21 +723,32 @@ impl Workspace {
                 }
             }
             self.focus_active(cx);
+            self.persist_session(cx);
             cx.notify();
             return;
         }
-        match mf_core::buffer::Buffer::load(path) {
+        match mf_core::buffer::Buffer::load(&path) {
             Ok(buf) => {
                 let buffer = cx.new(|_| buf);
                 let editor = cx.new(|cx| Editor::new(buffer, cx));
                 let font = self.editor_font.clone();
-                editor.update(cx, |ed, cx| ed.set_font(&font, cx));
-                self.tabs.push(TabEntry {
-                    project,
-                    tab: Tab::Editor(editor),
+                let weak = cx.weak_entity();
+                editor.update(cx, |ed, cx| {
+                    ed.set_font(&font, cx);
+                    ed.set_on_saved(move |_, cx| {
+                        let weak = weak.clone();
+                        // 当前 Editor 正在 update；延后到本轮结束，避免 Workspace
+                        // 持久化遍历标签时重入读取同一个 Entity。
+                        cx.defer(move |cx| {
+                            weak.update(cx, |workspace, cx| workspace.persist_session(cx))
+                                .ok();
+                        });
+                    });
                 });
-                self.active = self.tabs.len() - 1;
+                surface.tabs.push(Tab::Editor(editor));
+                surface.active_tab = surface.tabs.len() - 1;
                 self.focus_active(cx);
+                self.persist_session(cx);
                 cx.notify();
             }
             Err(e) => {
@@ -354,11 +758,15 @@ impl Workspace {
         }
     }
 
-    /// 打开文件的工作区 diff 标签页(P4 优先,回退 Git)
+    /// 打开文件的工作区 diff 标签页(P4 优先,回退 Git);Diff 标签归属创建它的 Project。
     pub fn open_diff(&mut self, title: &str, local_path: &Path, cx: &mut Context<Self>) {
         self.navigation.apply(NavAction::ShowCode);
-        let root = find_owning_project(&self.app, local_path.parent().unwrap_or(Path::new(".")))
-            .unwrap_or_else(|| self.active_root());
+        let root = self
+            .find_owning_project(local_path.parent().unwrap_or(Path::new(".")))
+            .or_else(|| self.active_root());
+        let Some(root) = root else {
+            return;
+        };
         let (diff_text, git_review) = {
             let p4 = mf_vcs::p4::P4::new(&root);
             match p4.diff_file(local_path) {
@@ -375,20 +783,15 @@ impl Workspace {
         };
         let view = cx.new(|cx| DiffView::new(title, &diff_text, cx));
         let view_id = view.entity_id();
-        let rel = local_path
-            .strip_prefix(&root)
-            .unwrap_or(local_path)
-            .to_path_buf();
-        let title_owned = title.to_string();
         let weak = cx.weak_entity();
         let root_for_reject = root.clone();
+        let root_for_remove = root.clone();
         if git_review {
             view.update(cx, |dv, _| {
                 dv.set_on_reject(move |patch, _window, cx| {
-                    let rel = rel.clone();
-                    let title = title_owned.clone();
                     let weak = weak.clone();
                     let review_root = root_for_reject.clone();
+                    let remove_root = root_for_remove.clone();
                     cx.spawn(async move |cx| {
                         let command_root = review_root.clone();
                         let applied = cx.background_executor().spawn(async move {
@@ -428,20 +831,16 @@ impl Workspace {
                             match r {
                                 Ok(()) => ws.status_message = "hunk 已拒绝(git apply -R)".into(),
                                 Err(e) => ws.status_message = format!("拒绝失败:{e}").into(),
-                            }
-                            if let Some(idx) = ws.tabs.iter().position(|t| {
-                                matches!(&t.tab, Tab::Diff(diff) if diff.entity_id() == view_id)
-                            }) {
-                                let project = ws.tabs[idx].project.clone();
-                                ws.tabs.remove(idx);
-                                if ws.active >= idx && ws.active > 0 {
-                                    ws.active -= 1;
+                            } // 关闭对应 diff 标签(在其所属项目的分桶中)
+                            if let Some(surface) = ws.surfaces.get_mut(&remove_root) {
+                                if let Some(idx) = surface.tabs.iter().position(
+                                    |t| matches!(t, Tab::Diff(diff) if diff.entity_id() == view_id),
+                                ) {
+                                    surface.tabs.remove(idx);
+                                    if surface.active_tab >= idx && surface.active_tab > 0 {
+                                        surface.active_tab -= 1;
+                                    }
                                 }
-                                let root = project.clone();
-                                let rel2 = rel.clone();
-                                let _ = root;
-                                let _ = rel2;
-                                let _ = &title;
                             }
                             cx.notify();
                         })
@@ -451,78 +850,104 @@ impl Workspace {
                 });
             });
         }
-        let project = root.clone();
-        self.tabs.push(TabEntry {
-            project,
-            tab: Tab::Diff(view.clone()),
-        });
-        self.active = self.tabs.len() - 1;
-        if let Some(TabEntry {
-            tab: Tab::Diff(dv), ..
-        }) = self.tabs.get(self.active)
-        {
+        let surface = self.surfaces.entry(root).or_default();
+        surface.tabs.push(Tab::Diff(view.clone()));
+        surface.active_tab = surface.tabs.len() - 1;
+        if let Some(Tab::Diff(dv)) = surface.tabs.get(surface.active_tab) {
             self.pending_focus = Some(dv.read(cx).focus_handle());
         }
         cx.notify();
     }
 
     fn focus_active(&mut self, _cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
+        if self
+            .current_surface()
+            .map(|s| !s.tabs.is_empty())
+            .unwrap_or(false)
+        {
             self.focus_editor_next = true;
         }
     }
 
     fn close_tab(&mut self, _: &CloseTab, _: &mut Window, cx: &mut Context<Self>) {
-        self.close_tab_at(self.active, cx);
+        self.close_tab_at(self.active_tab_index(), cx);
+    }
+
+    fn close_tab_in(surface: &mut ProjectSurfaceState, index: usize, cx: &mut Context<Self>) {
+        if let Some(tab) = surface.tabs.get(index) {
+            if tab.is_dirty(cx) {
+                return;
+            }
+        } else {
+            return;
+        }
+        surface.tabs.remove(index);
+        if index < surface.active_tab {
+            surface.active_tab -= 1;
+        }
+        surface.active_tab = surface.active_tab.min(surface.tabs.len().saturating_sub(1));
     }
 
     fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index >= self.tabs.len() {
+        let Some(surface) = self.current_surface_mut() else {
+            return;
+        };
+        if index >= surface.tabs.len() {
             return;
         }
-        self.active = index;
-        match &self.tabs.get(index).map(|t| &t.tab) {
+        surface.active_tab = index;
+        match surface.tabs.get(index) {
             Some(Tab::Editor(_)) => self.focus_active(cx),
             Some(Tab::Diff(diff)) => {
                 self.pending_focus = Some(diff.read(cx).focus_handle());
             }
             None => {}
         }
+        self.persist_session(cx);
         cx.notify();
     }
 
     fn close_tab_at(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(tab) = self.tabs.get(index) else {
-            return;
-        };
-        if tab.tab.is_dirty(cx) {
+        let dirty = self
+            .current_surface()
+            .and_then(|s| s.tabs.get(index))
+            .map(|t| t.is_dirty(cx))
+            .unwrap_or(false);
+        if dirty {
             self.status_message = "文件尚未保存;保存后才能关闭标签".into();
             cx.notify();
             return;
         }
-        self.tabs.remove(index);
-        if index < self.active {
-            self.active -= 1;
+        if let Some(surface) = self.current_surface_mut() {
+            Workspace::close_tab_in(surface, index, cx);
         }
-        self.active = self.active.min(self.tabs.len().saturating_sub(1));
-        if self.tabs.is_empty() {
-            cx.notify();
-        } else {
-            self.activate_tab(self.active, cx);
-        }
+        self.persist_session(cx);
+        cx.notify();
     }
 
     fn next_tab(&mut self, _: &NextTab, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            let next = (self.active + 1) % self.tabs.len();
-            self.activate_tab(next, cx);
+        self.activate_next_tab(cx);
+    }
+
+    fn activate_next_tab(&mut self, cx: &mut Context<Self>) {
+        if let Some(surface) = self.current_surface_mut() {
+            if !surface.tabs.is_empty() {
+                let next = (surface.active_tab + 1) % surface.tabs.len();
+                self.activate_tab(next, cx);
+            }
         }
     }
 
     fn prev_tab(&mut self, _: &PrevTab, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.tabs.is_empty() {
-            let previous = (self.active + self.tabs.len() - 1) % self.tabs.len();
-            self.activate_tab(previous, cx);
+        self.activate_prev_tab(cx);
+    }
+
+    fn activate_prev_tab(&mut self, cx: &mut Context<Self>) {
+        if let Some(surface) = self.current_surface_mut() {
+            if !surface.tabs.is_empty() {
+                let previous = (surface.active_tab + surface.tabs.len() - 1) % surface.tabs.len();
+                self.activate_tab(previous, cx);
+            }
         }
     }
 
@@ -534,13 +959,16 @@ impl Workspace {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_quick_files(cx);
+    }
+
+    fn open_quick_files(&mut self, cx: &mut Context<Self>) {
         self.settings_open = None;
-        let root = self.active_root();
-        if root.as_os_str().is_empty() {
-            self.status_message = "先打开一个文件夹 (Ctrl+Shift+O)".into();
+        let Some(root) = self.active_root() else {
+            self.status_message = "请先从“所有操作”或任务侧栏添加项目".into();
             cx.notify();
             return;
-        }
+        };
         let index = cx.new(|cx| FileIndex::new(root, cx));
         let qo = cx.new(|cx| QuickOpen::files(index, cx));
         self.wire_quick_open(qo, cx);
@@ -554,30 +982,16 @@ impl Workspace {
     ) {
         self.settings_open = None;
         let qo = cx.new(|cx| QuickOpen::commands(cx));
-        let has_folder = self.project_count() > 0;
-        let mut cmds = vec![
-            ("open_folder".into(), "打开文件夹…  Ctrl+Shift+O".into()),
-            (
-                "toggle_explorer".into(),
-                "显示资源管理器  Ctrl+Shift+E".into(),
-            ),
-            ("toggle_vcs".into(), "显示版本控制  Ctrl+Shift+G".into()),
-            ("toggle_tasks".into(), "显示任务  Ctrl+Shift+W".into()),
-            (
-                "show_agents".into(),
-                "Agent 看板(需要你/工作中/已完成/空闲)".into(),
-            ),
-            ("show_pipeline".into(), "Pipeline 视图".into()),
-            ("toggle_console".into(), "切换底部终端  Ctrl+`".into()),
-            ("project_search".into(), "项目搜索…  Ctrl+Shift+F".into()),
-            ("open_settings".into(), "打开设置  Ctrl+,".into()),
-            ("close_tab".into(), "关闭当前标签页  Ctrl+W".into()),
-        ];
-        if has_folder {
-            cmds.push(("refresh_tree".into(), "刷新文件树".into()));
-        }
-        qo.update(cx, |q, _| {
-            q.register_commands(cmds);
+        let cmds = workspace_command_entries(
+            self.project_count() > 0,
+            self.current_surface()
+                .is_some_and(|surface| !surface.tabs.is_empty()),
+        )
+        .into_iter()
+        .map(|(id, label)| (id.into(), label.into()))
+        .collect();
+        qo.update(cx, |q, cx| {
+            q.register_commands(cmds, cx);
         });
         self.wire_quick_open(qo, cx);
     }
@@ -593,11 +1007,9 @@ impl Workspace {
                             let path = if p.is_absolute() {
                                 p
                             } else {
-                                let root = ws.active_root();
-                                if root.as_os_str().is_empty() {
-                                    p
-                                } else {
-                                    root.join(&p)
+                                match ws.active_root() {
+                                    Some(root) => root.join(&p),
+                                    None => p,
                                 }
                             };
                             ws.navigation.apply(NavAction::ShowCode);
@@ -608,6 +1020,8 @@ impl Workspace {
                             ws.quick_open = None;
                             match id.as_ref() {
                                 "open_folder" => ws.prompt_open_folder(cx),
+                                "quick_open" => ws.open_quick_files(cx),
+                                "toggle_left" => ws.navigation.apply(NavAction::ToggleLeft),
                                 "toggle_explorer" => ws.navigation.apply(NavAction::ShowExplorer),
                                 "toggle_vcs" => ws.navigation.apply(NavAction::ShowVcs),
                                 "toggle_tasks" => ws.navigation.apply(NavAction::ShowTasks),
@@ -616,7 +1030,39 @@ impl Workspace {
                                 "toggle_console" => ws.toggle_console(cx),
                                 "project_search" => ws.open_project_search(cx),
                                 "open_settings" => ws.open_settings(cx),
-                                "close_tab" => ws.close_tab_at(ws.active, cx),
+                                "close_tab" => ws.close_tab_at(ws.active_tab_index(), cx),
+                                "next_tab" => ws.activate_next_tab(cx),
+                                "prev_tab" => ws.activate_prev_tab(cx),
+                                "save_file" => {
+                                    ws.focus_active(cx);
+                                    cx.defer(|cx| cx.dispatch_action(&crate::editor::Save));
+                                }
+                                "undo" => {
+                                    ws.focus_active(cx);
+                                    cx.defer(|cx| cx.dispatch_action(&crate::editor::Undo));
+                                }
+                                "redo" => {
+                                    ws.focus_active(cx);
+                                    cx.defer(|cx| cx.dispatch_action(&crate::editor::Redo));
+                                }
+                                "select_all" => {
+                                    ws.focus_active(cx);
+                                    cx.defer(|cx| cx.dispatch_action(&crate::editor::SelectAll));
+                                }
+                                "duplicate_line" => {
+                                    ws.focus_active(cx);
+                                    cx.defer(|cx| {
+                                        cx.dispatch_action(&crate::editor::DuplicateLine)
+                                    });
+                                }
+                                "move_line_up" => {
+                                    ws.focus_active(cx);
+                                    cx.defer(|cx| cx.dispatch_action(&crate::editor::MoveLineUp));
+                                }
+                                "move_line_down" => {
+                                    ws.focus_active(cx);
+                                    cx.defer(|cx| cx.dispatch_action(&crate::editor::MoveLineDown));
+                                }
                                 "refresh_tree" => {
                                     if let Some(t) = &ws.file_tree {
                                         t.update(cx, |t, _| t.refresh_all());
@@ -728,10 +1174,9 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let root = self.active_root();
-        if root.as_os_str().is_empty() {
+        let Some(root) = self.active_root() else {
             return;
-        }
+        };
         let s = cx.new(|cx| ProjectSearch::new(root, cx));
         let weak = cx.weak_entity();
         s.update(cx, |sv, _| {
@@ -739,10 +1184,8 @@ impl Workspace {
             sv.set_on_open(move |path, row, _window, cx| {
                 weak.update(cx, |ws, cx| {
                     ws.open_path(path, cx);
-                    if let Some(TabEntry {
-                        tab: Tab::Editor(ed),
-                        ..
-                    }) = ws.tabs.get(ws.active)
+                    if let Some(Tab::Editor(ed)) =
+                        ws.current_surface().and_then(|s| s.tabs.get(s.active_tab))
                     {
                         ed.update(cx, |e, cx| e.goto_line(row, cx));
                     }
@@ -780,17 +1223,15 @@ impl Workspace {
 
     // ---------- 控制台分屏 ----------
 
+    /// 每项目一份 ConsoleDock;首次创建 cwd 永远等于该项目 root。
     fn ensure_console(&mut self, cx: &mut Context<Self>) {
-        if self.console_dock.is_none() {
-            let cwd = {
-                let root = self.active_root();
-                if root.as_os_str().is_empty() {
-                    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-                } else {
-                    root
-                }
-            };
-            self.console_dock = Some(cx.new(|cx| ConsoleDock::new_in(cwd, cx)));
+        let Some(root) = self.active_root() else {
+            return;
+        };
+        let surface = self.surfaces.entry(root.clone()).or_default();
+        if surface.console_dock.is_none() {
+            let cwd = surface_cwd(&root);
+            surface.console_dock = Some(cx.new(|cx| ConsoleDock::new_in(cwd, cx)));
         }
     }
 
@@ -836,12 +1277,15 @@ impl Workspace {
     }
 
     fn apply_editor_font(&mut self, cfg: &mf_agent::EditorConfig, cx: &mut Context<Self>) {
-        for t in &mut self.tabs {
-            if let Tab::Editor(ed) = &t.tab {
-                ed.update(cx, |ed, cx| ed.set_font(cfg, cx));
-            }
+        for ed in self.all_editor_tabs() {
+            ed.update(cx, |ed, cx| ed.set_font(cfg, cx));
         }
     }
+}
+
+/// 终端 cwd:项目 root;无项目时不创建终端。
+fn surface_cwd(root: &Path) -> PathBuf {
+    root.to_path_buf()
 }
 
 /// AgentWorkspace 顶层页签(命令面板用)。
@@ -849,14 +1293,6 @@ impl Workspace {
 pub enum AgentTab {
     Agents,
     Pipeline,
-}
-
-fn find_owning_project(app: &Arc<AppCtx>, dir: &Path) -> Option<PathBuf> {
-    let projects = app.projects.lock();
-    projects
-        .iter()
-        .map(|p| p.root.clone())
-        .find(|root| dir.starts_with(root))
 }
 
 // ---------- 渲染 ----------
@@ -1175,30 +1611,18 @@ impl Workspace {
             )
     }
 
+    /// 只渲染当前项目的标签(标签栏本身已按项目分桶)。
     fn render_tabs(&self, cx: &Context<Self>) -> impl IntoElement {
-        let multi_project = self.project_count() > 1;
-        let tabs: Vec<(usize, String, String, bool, bool)> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let project_tag = if multi_project {
-                    t.project
-                        .file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                (
-                    i,
-                    t.tab.title(cx),
-                    project_tag,
-                    i == self.active,
-                    t.tab.is_dirty(cx),
-                )
+        let tabs: Vec<(usize, String, bool, bool)> = self
+            .current_surface()
+            .map(|s| &s.tabs)
+            .map(|tabs| {
+                tabs.iter()
+                    .enumerate()
+                    .map(|(i, t)| (i, t.title(cx), i == self.active_tab_index(), t.is_dirty(cx)))
+                    .collect()
             })
-            .collect();
+            .unwrap_or_default();
         let mut el = div()
             .id("tab-strip")
             .flex()
@@ -1210,7 +1634,7 @@ impl Workspace {
             .border_b_1()
             .border_color(rgb(crate::theme::Theme::border()))
             .bg(rgb(crate::theme::Theme::bg_panel()));
-        for (index, name, project_tag, is_active, dirty) in tabs {
+        for (index, name, is_active, dirty) in tabs {
             let label = if name.ends_with("(diff)") {
                 format!("◆ {name}")
             } else {
@@ -1244,18 +1668,6 @@ impl Workspace {
                         workspace.activate_tab(index, cx);
                     }))
                     .child(label)
-                    .when(!project_tag.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .text_size(px(9.))
-                                .py_0p5()
-                                .px_1()
-                                .rounded_sm()
-                                .bg(rgb(crate::theme::Theme::bg_active()))
-                                .text_color(rgb(crate::theme::Theme::fg_faint()))
-                                .child(project_tag.clone()),
-                        )
-                    })
                     .when(dirty, |d| {
                         d.child(
                             div()
@@ -1314,6 +1726,18 @@ impl Workspace {
             .bg(rgb(crate::theme::Theme::bg_panel()))
             .border_r_1()
             .border_color(rgb(crate::theme::Theme::border()));
+        bar = bar.child(activity_button(
+            "⋮",
+            "所有操作 Ctrl+Shift+P",
+            self.quick_open.is_some(),
+            cx.listener(|this: &mut Workspace, _, window, cx| {
+                if this.quick_open.is_some() {
+                    this.dismiss_quick_open(cx);
+                } else {
+                    this.show_command_palette(&CommandPalette, window, cx);
+                }
+            }),
+        ));
         for (icon, tip, panel) in icons {
             let is_active = self.navigation.left == Some(panel);
             let badge = if panel == LeftPanel::Vcs {
@@ -1488,7 +1912,7 @@ impl Workspace {
     fn render_bottom_dock(&self, cx: &Context<Self>) -> impl IntoElement {
         let selected = self.navigation.bottom.unwrap_or(BottomPanel::Terminal);
         let panel: AnyElement = match selected {
-            BottomPanel::Terminal => match &self.console_dock {
+            BottomPanel::Terminal => match self.current_console() {
                 Some(console) => div()
                     .size_full()
                     .flex()
@@ -1599,13 +2023,16 @@ impl Workspace {
     }
 
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
-        let cursor = self.tabs.get(self.active).and_then(|t| match &t.tab {
-            Tab::Editor(ed) => {
-                let (row, col) = ed.read(cx).cursor_pos(cx);
-                Some(format!("{}:{}", row + 1, col + 1))
-            }
-            Tab::Diff(_) => None,
-        });
+        let cursor = self
+            .current_surface()
+            .and_then(|s| s.tabs.get(s.active_tab))
+            .and_then(|t| match t {
+                Tab::Editor(ed) => {
+                    let (row, col) = ed.read(cx).cursor_pos(cx);
+                    Some(format!("{}:{}", row + 1, col + 1))
+                }
+                Tab::Diff(_) => None,
+            });
         let vcs_label = self.vcs_panel.as_ref().and_then(|v| {
             v.read(cx)
                 .client_label()
@@ -1618,12 +2045,12 @@ impl Workspace {
             .unwrap_or(0);
         let working = self.app.limiter.active();
         let projects = self.project_count();
-        let root_name = {
-            let root = self.active_root();
-            root.file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "未打开项目".into())
-        };
+        let root_name = self
+            .context
+            .snapshot()
+            .project
+            .map(|p| p.display_name())
+            .unwrap_or_else(|| "未打开项目".into());
         div()
             .id("status-bar")
             .h(px(26.))
@@ -1802,64 +2229,63 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some(handle) = self.pending_focus.take() {
             window.focus(&handle, cx);
-        } else if self.focus_editor_next && !self.tabs.is_empty() {
+        } else if self.focus_editor_next {
             self.focus_editor_next = false;
-            if let Some(TabEntry {
-                tab: Tab::Editor(ed),
-                ..
-            }) = self.tabs.get(self.active)
+            if let Some(Tab::Editor(ed)) = self
+                .current_surface()
+                .and_then(|s| s.tabs.get(s.active_tab))
+                .cloned()
             {
                 let handle = ed.read(cx).focus_handle(cx);
                 window.focus(&handle, cx);
             }
         }
-        // 任务侧边栏:选择同步到 AgentWorkspace;关闭意图 → 确认
-        let (intent, selected) = match &self.task_sidebar {
-            Some(sidebar) => {
-                let intent = sidebar.update(cx, |s, _| s.close_intent.take());
-                let selected = sidebar.read(cx).selected.clone();
-                (intent, selected)
-            }
-            None => (None, None),
-        };
-        if let Some(root) = intent {
-            self.request_close_project(root, cx);
-        }
-        if let Some(aw) = &self.agent_workspace {
-            aw.update(cx, |aw, cx| aw.set_selected_task(selected, cx));
-        }
+        let has_tabs = self
+            .current_surface()
+            .map(|s| !s.tabs.is_empty())
+            .unwrap_or(false);
 
-        let center: AnyElement =
-            match empty_state_for(self.project_count() > 0, !self.tabs.is_empty()) {
-                Some(EmptyState::FirstLaunch) => self.render_welcome(cx).into_any_element(),
-                Some(EmptyState::ProjectReady) => self.render_project_ready(cx).into_any_element(),
-                None => {
-                    let active_tab = self.tabs.get(self.active).map(|t| t.tab.clone());
-                    let mut col = div()
-                        .id("editor-col")
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .child(self.render_tabs(cx));
-                    match active_tab {
-                        Some(Tab::Editor(ed)) => {
-                            col = col.child(div().flex_1().child(ed));
-                        }
-                        Some(Tab::Diff(dv)) => {
-                            col = col.child(div().flex_1().child(dv));
-                        }
-                        None => {}
+        let center: AnyElement = match empty_state_for(self.project_count() > 0, has_tabs) {
+            Some(EmptyState::FirstLaunch) => self.render_welcome(cx).into_any_element(),
+            Some(EmptyState::ProjectReady) => self.render_project_ready(cx).into_any_element(),
+            None => {
+                let active_tab = self
+                    .current_surface()
+                    .and_then(|s| s.tabs.get(s.active_tab))
+                    .cloned();
+                let mut col = div()
+                    .id("editor-col")
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .child(self.render_tabs(cx));
+                match active_tab {
+                    Some(Tab::Editor(ed)) => {
+                        col = col.child(div().flex_1().child(ed));
                     }
-                    col.into_any_element()
+                    Some(Tab::Diff(dv)) => {
+                        col = col.child(div().flex_1().child(dv));
+                    }
+                    None => {}
                 }
-            };
+                col.into_any_element()
+            }
+        };
 
-        // 终端最后一个窗格关闭时只收起底 dock,实体其余状态不受影响。
-        if let Some(dock) = &self.console_dock {
-            if dock.read(cx).close_pending {
-                self.console_dock = None;
-                if self.navigation.bottom == Some(BottomPanel::Terminal) {
-                    self.navigation.apply(NavAction::CloseBottom);
+        // 终端最后一个窗格关闭时只收起底 dock;每项目分桶内的其余状态不受影响。
+        if let Some(root) = self.active_root() {
+            if let Some(dock) = self
+                .surfaces
+                .get(&root)
+                .and_then(|s| s.console_dock.clone())
+            {
+                if dock.read(cx).close_pending {
+                    if let Some(surface) = self.surfaces.get_mut(&root) {
+                        surface.console_dock = None;
+                    }
+                    if self.navigation.bottom == Some(BottomPanel::Terminal) {
+                        self.navigation.apply(NavAction::CloseBottom);
+                    }
                 }
             }
         }

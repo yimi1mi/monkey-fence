@@ -9,10 +9,19 @@ mod file_index;
 mod file_tree;
 mod navigation;
 mod pipe_server;
+mod project_context;
+mod project_overview;
+#[cfg(test)]
+mod project_overview_tests;
 mod quick_open;
 mod runtime_host;
 mod search;
+#[cfg(test)]
+mod session_restore_tests;
 mod settings;
+mod task_composer;
+#[cfg(test)]
+mod task_composer_tests;
 mod task_sidebar;
 mod term;
 mod theme;
@@ -20,6 +29,8 @@ mod vcs_panel;
 #[allow(dead_code)]
 mod work_items;
 mod workspace;
+#[cfg(test)]
+mod workspace_interaction_tests;
 
 use gpui::prelude::*;
 use gpui::{px, size, App, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions};
@@ -692,6 +703,7 @@ mod v2_tests {
         let state = SessionState {
             projects: vec!["D:/a".into(), "D:/b".into()],
             foreground: Some("D:/b".into()),
+            project_states: Vec::new(),
         };
         AppCtx::save_session_at(&path, &state);
         let back = AppCtx::load_session_at(&path);

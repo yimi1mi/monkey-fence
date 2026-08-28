@@ -17,7 +17,9 @@ fn main() {
 
     let pkg_version = env::var("CARGO_PKG_VERSION").unwrap_or_default();
     let mut file_version = String::new();
-    let mut parts = pkg_version.split('.').map(|p| p.parse::<u16>().unwrap_or(0));
+    let mut parts = pkg_version
+        .split('.')
+        .map(|p| p.parse::<u16>().unwrap_or(0));
     for i in 0..4 {
         let part = parts.next().unwrap_or(0);
         if i > 0 {

@@ -500,6 +500,50 @@ fn edit_rules_only_unstarted_steps() {
 // ---------- 调度器 ----------
 
 #[test]
+fn output_event_emits_unread_updates_for_snapshot_consumers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host: Arc<MockHost> = Arc::new(Default::default());
+    let (orch, _) = start_orch(tmp.path(), host.clone());
+    let task = orch.create_task("output-unread", "").unwrap();
+    orch.save_pipeline(task.id, &draft(vec![step("a", &[])]))
+        .unwrap();
+    orch.confirm_and_run(task.id).unwrap();
+    assert!(wait_until(Duration::from_secs(5), || host.launch_count() == 1));
+    let run = orch
+        .runs_of_task(task.id)
+        .unwrap()
+        .into_iter()
+        .find(|run| run.status == RunStatus::Running)
+        .unwrap();
+    let session_id = run.session_id.unwrap();
+    while orch.events_rx.try_recv().is_ok() {}
+
+    host.emit(run.id, RuntimeEvent::Output);
+
+    let mut saw_task = false;
+    let mut saw_session = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !(saw_task && saw_session) {
+        if let Ok(event) = orch.events_rx.recv_timeout(Duration::from_millis(100)) {
+            match event {
+                SchedulerEvent::TaskUpdated(updated) if updated.id == task.id && updated.unread => {
+                    saw_task = true;
+                }
+                SchedulerEvent::SessionUpdated(updated)
+                    if updated.id == session_id && updated.unread =>
+                {
+                    saw_session = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert!(saw_task, "Output 必须发布 unread TaskUpdated");
+    assert!(saw_session, "Output 必须发布 unread SessionUpdated");
+    orch.stop();
+}
+
+#[test]
 fn dispatch_and_settlement_unlocks_downstream() {
     let tmp = tempfile::tempdir().unwrap();
     let host: Arc<MockHost> = Arc::new(Default::default());

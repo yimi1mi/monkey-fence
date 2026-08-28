@@ -4,6 +4,7 @@
 //! 前台只显示一个项目;其他项目的任务和 Agent 在后台继续运行(见 ADR 0001)。
 
 use crate::pipe_server::{pipe_name_for_current_process, PipeServer};
+use crate::project_overview::{HubCtx, ProjectOverviewHub};
 use crate::runtime_host::{KeepAwake, RuntimeHostImpl, SessionRegistry};
 use anyhow::{Context as _, Result};
 use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
@@ -11,7 +12,7 @@ use mf_agent::Store;
 use mf_agent::TaskStatus;
 use mf_plugins::PluginRegistry;
 use parking_lot::{Mutex, RwLock};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub struct ProjectHandle {
@@ -19,14 +20,88 @@ pub struct ProjectHandle {
     pub orchestrator: Arc<Orchestrator>,
 }
 
+/// 单项目的会话恢复状态(新格式;全部字段带兼容默认)。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ProjectSessionState {
+    pub root: PathBuf,
+    #[serde(default)]
+    pub selected_task_id: Option<i64>,
+    #[serde(default)]
+    pub open_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub active_file: Option<PathBuf>,
+}
+
 /// 上次会话的打开项目(持久化到 ~/.monkeyfence/session.json)。
+/// 旧格式只有 `{projects, foreground}`;新格式增加每项目 project_states。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SessionState {
     pub projects: Vec<PathBuf>,
     pub foreground: Option<PathBuf>,
+    #[serde(default)]
+    pub project_states: Vec<ProjectSessionState>,
+}
+
+/// 纯恢复计划:过滤不存在/不属于项目的文件,校验选中 Task 仍存在。
+/// `task_exists` 由调用方注入(查该项目 Orchestrator 的 Store)。
+pub fn plan_restore(
+    session: &SessionState,
+    task_exists: impl Fn(&Path, i64) -> bool,
+) -> Vec<ProjectSessionState> {
+    session
+        .project_states
+        .iter()
+        .map(|ps| {
+            let (root_id, _) = crate::project_context::normalize_project_path(&ps.root);
+            let root = root_id.root();
+            let mut open_files: Vec<PathBuf> = ps
+                .open_files
+                .iter()
+                .filter_map(|file| {
+                    let (file_id, warning) = crate::project_context::normalize_project_path(file);
+                    (warning.is_none() && file_id.as_path().starts_with(&root))
+                        .then(|| file_id.root())
+                })
+                .collect();
+            let active_file = ps.active_file.as_ref().and_then(|file| {
+                let (file_id, warning) = crate::project_context::normalize_project_path(file);
+                (warning.is_none() && open_files.contains(&file_id.root())).then(|| file_id.root())
+            });
+            if let Some(active) = &active_file {
+                if let Some(index) = open_files.iter().position(|file| file == active) {
+                    let active = open_files.remove(index);
+                    open_files.push(active);
+                }
+            }
+            let selected_task_id = ps.selected_task_id.filter(|id| task_exists(&root, *id));
+            ProjectSessionState {
+                root,
+                selected_task_id,
+                open_files,
+                active_file,
+            }
+        })
+        .collect()
+}
+
+/// 恢复前台项目:保存值优先,其次恢复过程中已激活的项目,最后回退到
+/// 打开顺序的最后一项。输入路径均应已规范化且来自 `available`。
+pub fn choose_restore_project(
+    saved: Option<PathBuf>,
+    current: Option<PathBuf>,
+    available: &[PathBuf],
+) -> Option<PathBuf> {
+    saved
+        .filter(|root| available.contains(root))
+        .or_else(|| current.filter(|root| available.contains(root)))
+        .or_else(|| available.last().cloned())
 }
 
 fn session_path() -> PathBuf {
+    // GUI/E2E 可把会话状态隔离到测试目录，避免改写用户真实恢复状态。
+    if let Some(path) = std::env::var_os("MONKEYFENCE_SESSION_PATH") {
+        return PathBuf::from(path);
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".monkeyfence")
@@ -39,8 +114,10 @@ pub struct AppCtx {
     pub limiter: Arc<GlobalLimiter>,
     pub catalog: Arc<RwLock<ProfileCatalog>>,
     pub config: Arc<Mutex<mf_agent::Config>>,
-    pub projects: Mutex<Vec<ProjectHandle>>,
-    pub keep_awake: KeepAwake,
+    /// 统一项目总览快照 + Orchestrator Event Hub(UI 不再直接扫描项目列表)。
+    pub overview: Arc<ProjectOverviewHub>,
+    /// 已打开项目(私有:外部走 overview snapshot / 查询方法)。
+    projects: Mutex<Vec<ProjectHandle>>,
     #[allow(dead_code)]
     pipe: Mutex<Option<PipeServer>>,
     pipe_orchestrators: Option<Arc<Mutex<Vec<Arc<Orchestrator>>>>>,
@@ -53,6 +130,7 @@ impl AppCtx {
         let plugins = PluginRegistry::load(&config, &skills);
         let registry = SessionRegistry::new(config.clone());
         let limiter = GlobalLimiter::new(config.engine.global_concurrency.max(1));
+        let keep_awake = Arc::new(KeepAwake::new());
         let catalog = Arc::new(RwLock::new(ProfileCatalog::default()));
         let orchs: Arc<Mutex<Vec<Arc<Orchestrator>>>> = Arc::new(Mutex::new(Vec::new()));
         let pipe_server = PipeServer::start(orchs.clone()).ok();
@@ -60,18 +138,29 @@ impl AppCtx {
             log::warn!("mfctl 管道服务启动失败(结算将不可用)");
         }
         let ctx = Arc::new(AppCtx {
-            registry,
-            plugins,
-            limiter,
-            catalog,
+            registry: registry.clone(),
+            plugins: plugins.clone(),
+            limiter: limiter.clone(),
+            catalog: catalog.clone(),
             config: Arc::new(Mutex::new(config)),
+            overview: ProjectOverviewHub::new(Arc::new(HubCtx {
+                registry,
+                catalog: catalog.clone(),
+                plugins: plugins.clone(),
+                limiter: limiter.clone(),
+                keep_awake: keep_awake.clone(),
+            })),
             projects: Mutex::new(Vec::new()),
-            keep_awake: KeepAwake::new(),
             pipe: Mutex::new(pipe_server),
             pipe_orchestrators: Some(orchs),
         });
         ctx.refresh_catalog();
         ctx
+    }
+
+    /// 打开的项目数。
+    pub fn project_count(&self) -> usize {
+        self.projects.lock().len()
     }
 
     /// 插件注册表 → Orchestrator 的 Profile 目录投影。
@@ -103,6 +192,8 @@ impl AppCtx {
         }
         catalog.index = index;
         catalog.specs = specs;
+        drop(catalog);
+        self.overview.request_refresh();
     }
 
     /// 打开(或复用)一个项目:Store 迁移 + Orchestrator 启动 + work-items.json 一次性导入。
@@ -130,9 +221,11 @@ impl AppCtx {
         )?;
         import_legacy_work_items(&orch, &root);
         self.projects.lock().push(ProjectHandle {
-            root,
+            root: root.clone(),
             orchestrator: orch.clone(),
         });
+        // Event Hub:持续消费该 Orchestrator 的 UI 事件并构建 overview
+        self.overview.attach(root, orch.clone());
         self.sync_pipe_routing();
         Ok(orch)
     }
@@ -163,12 +256,19 @@ impl AppCtx {
                 }
             }
             h.orchestrator.stop();
+            // cancel_task 会 emit 状态事件；保持 drain 到所有取消操作结束，
+            // 避免关闭大型项目时 bounded events_rx 反压当前线程。
+            self.overview.detach(&h.root);
         }
         self.sync_pipe_routing();
     }
 
-    /// 持久化当前打开项目与前台项目(原子写)。
-    pub fn save_session(&self, foreground: Option<&PathBuf>) {
+    /// 持久化当前打开项目、前台项目与每项目恢复状态(原子写)。
+    pub fn save_session(
+        &self,
+        foreground: Option<&PathBuf>,
+        project_states: Vec<ProjectSessionState>,
+    ) {
         let projects: Vec<PathBuf> = self
             .projects
             .lock()
@@ -180,6 +280,7 @@ impl AppCtx {
             &SessionState {
                 projects,
                 foreground: foreground.cloned(),
+                project_states,
             },
         );
     }
@@ -209,7 +310,7 @@ impl AppCtx {
             .unwrap_or_default()
     }
 
-    pub fn orchestrator_of(&self, root: &PathBuf) -> Option<Arc<Orchestrator>> {
+    pub fn orchestrator_of(&self, root: &Path) -> Option<Arc<Orchestrator>> {
         self.projects
             .lock()
             .iter()

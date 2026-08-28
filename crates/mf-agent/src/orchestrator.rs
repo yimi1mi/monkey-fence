@@ -968,9 +968,15 @@ impl Orchestrator {
             RuntimeEvent::Output => {
                 if let Some(session_id) = run.session_id {
                     self.store.set_session_unread(session_id, true)?;
+                    if let Some(session) = self.store.session_view(session_id)? {
+                        self.emit(SchedulerEvent::SessionUpdated(session));
+                    }
                 }
-                if let Some(t) = self.store.task_view(run.task_id)? {
-                    self.store.set_task_unread(t.id, true)?;
+                if let Some(task) = self.store.task_view(run.task_id)? {
+                    self.store.set_task_unread(task.id, true)?;
+                    if let Some(task) = self.store.task_view(task.id)? {
+                        self.emit(SchedulerEvent::TaskUpdated(task));
+                    }
                 }
             }
             RuntimeEvent::Transcript { role, text } => {
@@ -1182,13 +1188,31 @@ impl Orchestrator {
     }
 
     pub fn mark_session_read(&self, session_id: i64) -> Result<()> {
-        self.store.set_session_unread(session_id, false)
+        self.store.set_session_unread(session_id, false)?;
+        if let Some(s) = self.store.session_view(session_id)? {
+            self.emit(SchedulerEvent::SessionUpdated(s));
+        }
+        Ok(())
+    }
+
+    /// 清除任务未读(用户打开了对应上下文);更新 Store 后 emit,保证快照最终一致。
+    pub fn mark_task_read(&self, task_id: i64) -> Result<()> {
+        self.store.set_task_unread(task_id, false)?;
+        if let Some(t) = self.store.task_view(task_id)? {
+            self.emit(SchedulerEvent::TaskUpdated(t));
+        }
+        Ok(())
     }
 
     pub fn hide_session(&self, session_id: i64) -> Result<()> {
-        if let Some(s) =
-            self.store
-                .update_session(session_id, Some(SessionStatus::Hidden), None, None)?
+        self.set_session_status(session_id, SessionStatus::Hidden)
+    }
+
+    /// 看板确认/隐藏/终止:统一经 Orchestrator 更新并 emit(UI 不直接写 Store)。
+    pub fn set_session_status(&self, session_id: i64, status: SessionStatus) -> Result<()> {
+        if let Some(s) = self
+            .store
+            .update_session(session_id, Some(status), None, None)?
         {
             self.emit(SchedulerEvent::SessionUpdated(s));
         }
