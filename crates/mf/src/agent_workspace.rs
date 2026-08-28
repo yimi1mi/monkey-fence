@@ -399,6 +399,10 @@ impl AgentWorkspace {
                 .replace_agent(step_id, profile.unwrap_or("mock"))
                 .map(|_| "已替换 Agent(新 Revision)".into())
                 .map_err(|e| format!("{e:#}")),
+            "retry-continue" => orch
+                .retry_step(step_id, mf_agent::RetryMode::ContinueSession)
+                .map(|_| "已继续会话重试".into())
+                .map_err(|e| format!("{e:#}")),
             _ => Ok(String::new()),
         };
         self.status_message = result.unwrap_or_default();
@@ -1183,6 +1187,17 @@ impl AgentWorkspace {
                                         move |ws, _, _, cx| {
                                             if let Some(id) = step_id {
                                                 ws.step_action(id, "retry", None, cx);
+                                            }
+                                        },
+                                    ))
+                                    .child(small_btn(
+                                        cx,
+                                        ElementId::Name(format!("step-retry-cont-{key}").into()),
+                                        "续会话重试",
+                                        crate::theme::Theme::accent_dim(),
+                                        move |ws, _, _, cx| {
+                                            if let Some(id) = step_id {
+                                                ws.step_action(id, "retry-continue", None, cx);
                                             }
                                         },
                                     ))

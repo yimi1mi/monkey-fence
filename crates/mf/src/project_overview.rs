@@ -33,6 +33,8 @@ pub struct TaskCardOverview {
     pub task: TaskView,
     pub active_runs: usize,
     pub open_questions: usize,
+    /// 「需要你」原因(Run Monitor 投影;设计 §11.4)。
+    pub needs_you_reasons: Vec<String>,
 }
 
 /// 每项目投影。
@@ -241,10 +243,18 @@ impl ProjectOverviewHub {
                     .open_questions(Some(t.id))
                     .map(|q| q.len())
                     .unwrap_or(0);
+                let steps = orch.store.task_steps(t.id).unwrap_or_default();
+                let runs = orch.store.list_runs_of_task(t.id).unwrap_or_default();
+                let reasons: Vec<String> = steps
+                    .iter()
+                    .flat_map(|s| crate::run_node_details::needs_you_reasons(s, None))
+                    .collect();
+                let _ = &runs;
                 task_cards.push(TaskCardOverview {
                     task: t.clone(),
                     active_runs,
                     open_questions,
+                    needs_you_reasons: reasons,
                 });
             }
             let active_sessions = sessions

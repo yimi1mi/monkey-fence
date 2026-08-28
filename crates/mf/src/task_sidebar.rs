@@ -169,6 +169,7 @@ impl TaskSidebar {
         let unread = row.task.unread;
         let agents = row.active_runs;
         let questions = row.open_questions;
+        let needs_reasons = row.needs_you_reasons.clone();
         let root2 = root.clone();
         let _ = &root2;
         div()
@@ -269,6 +270,14 @@ impl TaskSidebar {
                             div()
                                 .text_color(rgb(crate::theme::Theme::warning()))
                                 .child(format!("❓{questions}")),
+                        )
+                    })
+                    .when(!needs_reasons.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .text_size(px(9.))
+                                .text_color(rgb(crate::theme::Theme::warning()))
+                                .child(format!("⚑{}", needs_reasons.len())),
                         )
                     })
                     .child(div().flex_1())
@@ -520,6 +529,7 @@ impl Render for TaskSidebar {
                             .tasks
                             .iter()
                             .map(|t| TaskCardOverview {
+                                needs_you_reasons: t.needs_you_reasons.clone(),
                                 task: t.task.clone(),
                                 active_runs: t.active_runs,
                                 open_questions: t.open_questions,

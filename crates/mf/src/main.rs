@@ -21,6 +21,10 @@ mod project_overview_tests;
 mod quick_open;
 #[cfg(test)]
 mod quick_open_input_tests;
+mod run_monitor;
+#[cfg(test)]
+mod run_monitor_tests;
+mod run_node_details;
 mod runtime_host;
 mod search;
 #[cfg(test)]
