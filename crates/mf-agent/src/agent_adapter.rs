@@ -221,13 +221,16 @@ pub trait AgentAdapter: Send + Sync {
     fn extract_handoff(&self, obs: &ProcessObservation) -> Result<HandoffDraft>;
 }
 
+/// 敏感环境变量集合(ENV 名 → Redacted 明文)。
+pub type SecretEnv = Vec<(String, Redacted<String>)>;
+
 /// 通用逻辑:从快照 config 的 `secret_env` 映射(ENV 名 → secret-id)
 /// 解析出敏感环境变量。所有内置适配器共用此约定。
 /// 明文进入 Redacted 包装与脱敏表;缺 Secret 时报错阻止启动。
 pub fn resolve_secret_env(
     snapshot: &AgentInstanceSnapshot,
     ctx: &LaunchContext,
-) -> Result<(Vec<(String, Redacted<String>)>, Vec<Redacted<String>>)> {
+) -> Result<(SecretEnv, Vec<Redacted<String>>)> {
     let mut secret_env = Vec::new();
     let mut redactions = Vec::new();
     let Some(mapping) = snapshot

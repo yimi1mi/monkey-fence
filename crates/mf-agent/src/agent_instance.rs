@@ -139,6 +139,7 @@ impl AgentInstanceSnapshot {
     /// - `argv`:声明则整体替换;
     /// - `env`:按键覆盖,未覆盖的用户键保留;
     /// - `config`:对象浅合并,声明的顶层键覆盖;
+    ///
     /// 其余字段(名称、可执行文件、Secret 引用等)永不覆盖。
     pub fn apply_overrides(mut self, overrides: &AgentInstanceOverrides) -> AgentInstanceSnapshot {
         if let Some(argv) = &overrides.argv {

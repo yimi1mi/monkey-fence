@@ -173,7 +173,7 @@ impl BuiltinSecretStore {
             }
             Err(e) => return Err(anyhow::anyhow!("读取 keyring 主密钥失败: {e}")),
         };
-        Ok(Self::with_master_key(catalog, key)?)
+        Self::with_master_key(catalog, key)
     }
 
     /// 注入确定性主密钥(测试/嵌入式;不触 OS keyring)。
