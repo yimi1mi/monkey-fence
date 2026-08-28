@@ -1846,37 +1846,220 @@ impl Workspace {
             ))
     }
 
-    fn render_left_panel(&self, _cx: &Context<Self>) -> impl IntoElement {
+    fn render_project_switcher(&self, cx: &Context<Self>) -> AnyElement {
+        let active = self.context.snapshot().project;
+        let items = project_switcher_items(self.context.known_projects(), active.as_ref());
+        let active_name = active
+            .as_ref()
+            .map(ProjectId::display_name)
+            .unwrap_or_else(|| "尚未选择项目".into());
+        let count = items.len();
+        let expanded = self.project_switcher_open;
+        let mut selector = div()
+            .id("project-switcher")
+            .flex()
+            .flex_col()
+            .border_b_1()
+            .border_color(rgb(crate::theme::Theme::border()))
+            .bg(rgb(crate::theme::Theme::bg_panel()))
+            .child(
+                div()
+                    .h(px(38.))
+                    .px_1p5()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("project-switcher-trigger")
+                            .flex_1()
+                            .min_w_0()
+                            .h(px(28.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                            .on_click(cx.listener(|workspace: &mut Workspace, _, _, cx| {
+                                workspace.project_switcher_open = !workspace.project_switcher_open;
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(rgb(crate::theme::Theme::accent()))
+                                    .child("▱"),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(px(11.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(active_name),
+                            )
+                            .child(
+                                div()
+                                    .min_w(px(18.))
+                                    .h(px(18.))
+                                    .px_1()
+                                    .rounded_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(rgb(crate::theme::Theme::bg_active()))
+                                    .text_size(px(9.))
+                                    .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                    .child(count.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(crate::theme::Theme::fg_faint()))
+                                    .child(if expanded { "⌃" } else { "⌄" }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("project-switcher-add")
+                            .size(px(28.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(crate::theme::Theme::border()))
+                            .cursor_pointer()
+                            .text_size(px(15.))
+                            .text_color(rgb(crate::theme::Theme::accent()))
+                            .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                            .child("+")
+                            .on_click(cx.listener(|workspace: &mut Workspace, _, _, cx| {
+                                workspace.prompt_open_folder(cx);
+                            })),
+                    ),
+            );
+        if expanded {
+            let mut list = div()
+                .id("project-switcher-list")
+                .max_h(px(240.))
+                .overflow_y_scroll()
+                .px_1p5()
+                .pb_1()
+                .flex()
+                .flex_col()
+                .gap_0p5();
+            if items.is_empty() {
+                list = list.child(
+                    div()
+                        .px_2()
+                        .py_2()
+                        .text_size(px(10.))
+                        .text_color(rgb(crate::theme::Theme::fg_faint()))
+                        .child("还没有项目，点击右上角 + 添加"),
+                );
+            }
+            for (index, item) in items.into_iter().enumerate() {
+                let project = item.id.clone();
+                list = list.child(
+                    div()
+                        .id(ElementId::Name(format!("project-switch-{index}").into()))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .when(item.active, |d| d.bg(rgb(crate::theme::Theme::bg_active())))
+                        .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                        .on_click(cx.listener(move |workspace: &mut Workspace, _, _, cx| {
+                            workspace
+                                .apply_activation(&ActivationTarget::Project(project.clone()), cx);
+                            workspace.navigation.apply(NavAction::ShowExplorer);
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(div().size(px(6.)).rounded_full().bg(rgb(if item.active {
+                                    crate::theme::Theme::accent()
+                                } else {
+                                    crate::theme::Theme::fg_faint()
+                                })))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(crate::theme::Theme::fg()))
+                                        .child(item.name),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .ml(px(13.))
+                                .truncate()
+                                .text_size(px(8.5))
+                                .text_color(rgb(crate::theme::Theme::fg_faint()))
+                                .child(item.path),
+                        ),
+                );
+            }
+            selector = selector.child(list);
+        }
+        selector.into_any_element()
+    }
+
+    fn render_left_panel(&self, cx: &Context<Self>) -> impl IntoElement {
         let selected = self.navigation.left.unwrap_or(LeftPanel::Explorer);
         let title = match selected {
             LeftPanel::Explorer => "项目",
             LeftPanel::Tasks => "任务",
             LeftPanel::Vcs => "版控",
         };
-        let body = match selected {
-            LeftPanel::Explorer => match &self.file_tree {
-                Some(tree) => div().size_full().flex().child(tree.clone()),
-                None => div()
-                    .p_3()
-                    .text_size(px(12.))
-                    .text_color(rgb(crate::theme::Theme::fg_faint()))
-                    .child("尚未打开文件夹"),
-            },
+        let body: AnyElement = match selected {
+            LeftPanel::Explorer => {
+                let tree: AnyElement = match &self.file_tree {
+                    Some(tree) => div()
+                        .size_full()
+                        .flex()
+                        .child(tree.clone())
+                        .into_any_element(),
+                    None => div()
+                        .p_3()
+                        .text_size(px(12.))
+                        .text_color(rgb(crate::theme::Theme::fg_faint()))
+                        .child("从上方选择或添加一个项目")
+                        .into_any_element(),
+                };
+                div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(self.render_project_switcher(cx))
+                    .child(div().flex_1().min_h_0().flex().child(tree))
+                    .into_any_element()
+            }
             LeftPanel::Vcs => match &self.vcs_panel {
-                Some(v) => div().size_full().flex().child(v.clone()),
+                Some(v) => div().size_full().flex().child(v.clone()).into_any_element(),
                 None => div()
                     .p_3()
                     .text_size(px(12.))
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
-                    .child("尚未打开文件夹"),
+                    .child("尚未打开文件夹")
+                    .into_any_element(),
             },
             LeftPanel::Tasks => match &self.task_sidebar {
-                Some(t) => div().size_full().flex().child(t.clone()),
+                Some(t) => div().size_full().flex().child(t.clone()).into_any_element(),
                 None => div()
                     .p_3()
                     .text_size(px(12.))
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
-                    .child("—"),
+                    .child("—")
+                    .into_any_element(),
             },
         };
         div()
