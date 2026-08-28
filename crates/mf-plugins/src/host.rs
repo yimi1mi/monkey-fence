@@ -601,8 +601,11 @@ mod tests {
         enabled: bool,
         authorized: bool,
     ) -> PluginHost {
+        // root 用一次性临时目录:enable/disable 会向 root 写锁文件,
+        // 不得污染真实插件目录或测试 CWD(into_path 后由测试进程生命周期托管)
+        let tmp_root = tempfile::tempdir().unwrap().into_path();
         PluginHost {
-            root: PathBuf::from("."),
+            root: tmp_root,
             plugins: RwLock::new(vec![PluginEntry {
                 full_id: m.full_id(),
                 content_hash: "h".into(),
