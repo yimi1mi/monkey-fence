@@ -4,6 +4,8 @@ mod agent_instance_editor;
 #[cfg(test)]
 mod agent_instance_tests;
 mod agent_instances_view;
+#[cfg(test)]
+mod agent_workflow_e2e_tests;
 mod agent_workspace;
 mod app_ctx;
 mod console;
@@ -14,6 +16,7 @@ mod file_index;
 mod file_tree;
 mod navigation;
 mod pipe_server;
+mod plugin_contribution_view;
 mod project_context;
 mod project_overview;
 #[cfg(test)]

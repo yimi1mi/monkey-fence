@@ -1761,6 +1761,9 @@ impl SettingsView {
         };
         let summaries = app.plugins.summaries();
         let mut col = div().flex().flex_col().gap_2().child(section("已安装插件"));
+        // 贡献视图:类型/权限/固定版本/哈希(设计 §11.5)
+        let contribution_rows =
+            crate::plugin_contribution_view::summaries_from_registry(&app.plugins);
         if summaries.is_empty() {
             col = col.child(label_value("暂无插件"));
         }
@@ -1824,6 +1827,34 @@ impl SettingsView {
                                     }))
                                     .child(if enabled { "已启用" } else { "已禁用" }),
                             ),
+                    )
+                    .when(
+                        contribution_rows
+                            .iter()
+                            .find(|r| r.full_id == full_id)
+                            .map(|r| !r.contribution_counts.is_empty() || !r.requested_permissions.is_empty())
+                            .unwrap_or(false),
+                        |d| {
+                            let row = contribution_rows
+                                .iter()
+                                .find(|r| r.full_id == full_id)
+                                .unwrap();
+                            let counts = row
+                                .contribution_counts
+                                .iter()
+                                .map(|(k, c)| format!("{k}: {c}"))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let perms = row.requested_permissions.join(", ");
+                            d.child(
+                                div()
+                                    .text_size(px(9.))
+                                    .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                    .child(format!(
+                                        "贡献({counts})权限: {perms} · worker/CLI 以当前系统用户运行"
+                                    )),
+                            )
+                        },
                     )
                     .child(
                         div()

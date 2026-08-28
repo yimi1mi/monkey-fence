@@ -931,12 +931,9 @@ impl Orchestrator {
             .insert_ad_hoc_session(task_id, instance_snapshot)?;
         // 展示会话行(Agents 卡片/终端交互的既有通道);离散会话
         // 不建 Step / Agent Run,不参与任务成功判定(设计 §4.7)
-        let display = self.store.create_session(
-            None,
-            "pty",
-            &instance_snapshot.agent_type,
-            &view.title,
-        )?;
+        let display =
+            self.store
+                .create_session(None, "pty", &instance_snapshot.agent_type, &view.title)?;
         let view = self
             .store
             .attach_display_session(view.id, display.id)?
@@ -957,7 +954,8 @@ impl Orchestrator {
                 self.emit(SchedulerEvent::AdHocSessionUpdated(dead));
             }
             if let Some(dead_session) =
-                self.store.update_session(display.id, Some(SessionStatus::Dead), None, None)?
+                self.store
+                    .update_session(display.id, Some(SessionStatus::Dead), None, None)?
             {
                 self.emit(SchedulerEvent::SessionUpdated(dead_session));
             }
@@ -979,7 +977,8 @@ impl Orchestrator {
             }
         };
         if let Some(working) =
-            self.store.update_session(display.id, Some(SessionStatus::Working), None, None)?
+            self.store
+                .update_session(display.id, Some(SessionStatus::Working), None, None)?
         {
             self.emit(SchedulerEvent::SessionUpdated(working));
         }
@@ -1064,7 +1063,8 @@ impl Orchestrator {
             // 同步展示会话状态(卡片与终端视图)
             if let Some(display_id) = final_view.display_session_id {
                 if let Some(updated) =
-                    self.store.update_session(display_id, Some(status), None, None)?
+                    self.store
+                        .update_session(display_id, Some(status), None, None)?
                 {
                     self.emit(SchedulerEvent::SessionUpdated(updated));
                 }
