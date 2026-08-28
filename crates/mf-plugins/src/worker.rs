@@ -5,8 +5,8 @@
 //! 诊断文本(stderr、未匹配的 stdout 行)入库前按敏感 key 脱敏,上限 500 行。
 
 use crate::worker_protocol::{
-    ensure_matches, redact_text, WorkerRequest, WorkerResponse, WorkerHealth,
-    STDERR_LOG_LIMIT, WORKER_PROTOCOL_VERSION,
+    ensure_matches, redact_text, WorkerHealth, WorkerRequest, WorkerResponse, STDERR_LOG_LIMIT,
+    WORKER_PROTOCOL_VERSION,
 };
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
@@ -83,12 +83,7 @@ impl WorkerClient {
     /// 协议版本或响应 id 与请求不符 → 拒绝;其余行进入(脱敏后的)诊断日志。
     pub fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let req = WorkerRequest::new(
-            id,
-            method,
-            &self.capability_token.lock(),
-            params,
-        );
+        let req = WorkerRequest::new(id, method, &self.capability_token.lock(), params);
         let line = req.to_line()?;
         self.stdin
             .write_all(line.as_bytes())
@@ -129,10 +124,7 @@ impl WorkerClient {
             if resp.is_ok() {
                 return Ok(resp.result);
             }
-            bail!(
-                "worker 错误: {}",
-                resp.error.as_deref().unwrap_or("未知")
-            );
+            bail!("worker 错误: {}", resp.error.as_deref().unwrap_or("未知"));
         }
     }
 

@@ -77,7 +77,11 @@ impl WorkerResponse {
 }
 
 /// 校验响应与请求匹配(协议版本 + 请求 id)。
-pub fn ensure_matches(expected_protocol: i64, expected_id: i64, resp: &WorkerResponse) -> Result<()> {
+pub fn ensure_matches(
+    expected_protocol: i64,
+    expected_id: i64,
+    resp: &WorkerResponse,
+) -> Result<()> {
     if resp.protocol != expected_protocol {
         bail!(
             "worker 协议版本不匹配: 期望 {expected_protocol},收到 {}",
@@ -100,7 +104,10 @@ pub struct WorkerHealth {
 /// 包含 token / secret / password / api_key。
 fn is_sensitive_key(key: &str) -> bool {
     let low = key.to_lowercase().replace(['-', ' ', '.'], "_");
-    low.contains("token") || low.contains("secret") || low.contains("password") || low.contains("api_key")
+    low.contains("token")
+        || low.contains("secret")
+        || low.contains("password")
+        || low.contains("api_key")
 }
 
 /// 递归脱敏 JSON 值:命中敏感 key 的值替换为 `[redacted]`。

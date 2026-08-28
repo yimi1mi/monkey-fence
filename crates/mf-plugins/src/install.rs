@@ -288,10 +288,12 @@ fn install_staged_into(root: &Path, staging: &Path, origin: InstallSource) -> Re
 /// 加载已安装插件:只返回每个 full_id 的当前选择版本(历史版本经 `PluginHost::resolve` 按哈希取)。
 /// 包内容与目录名(哈希)不一致 → 视为篡改,拒绝加载。
 pub fn load_installed(root_override: Option<&Path>) -> Vec<(PathBuf, PluginManifest, LockEntry)> {
-    load_installed_at(root_override
-        .map(PathBuf::from)
-        .unwrap_or_else(plugins_root)
-        .as_path())
+    load_installed_at(
+        root_override
+            .map(PathBuf::from)
+            .unwrap_or_else(plugins_root)
+            .as_path(),
+    )
 }
 
 pub fn load_installed_at(root: &Path) -> Vec<(PathBuf, PluginManifest, LockEntry)> {
@@ -486,9 +488,7 @@ path = "skills/demo"
             assert!(pkg_dir.is_file());
             let lock = load_lock();
             assert!(lock.plugins.contains_key("test.p1"));
-            assert!(lock
-                .packages
-                .contains_key(&entry.content_hash.clone()));
+            assert!(lock.packages.contains_key(&entry.content_hash.clone()));
 
             // 路径逃逸拒绝
             let evil = tempfile::tempdir().unwrap();

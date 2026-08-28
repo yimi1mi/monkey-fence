@@ -233,7 +233,12 @@ impl PluginHost {
         let builtin_profiles: Vec<AgentProfileSpec> = crate::builtin::builtin_cli_agents()
             .iter()
             .map(crate::builtin::profile_spec_from_builtin)
-            .chain(config.providers.keys().map(|n| crate::builtin::http_profile(n)))
+            .chain(
+                config
+                    .providers
+                    .keys()
+                    .map(|n| crate::builtin::http_profile(n)),
+            )
             .collect();
 
         let host = Arc::new(PluginHost {
@@ -414,7 +419,9 @@ impl PluginHost {
             let plugins = self.plugins.read();
             for p in plugins.iter().filter(|p| p.enabled && !p.builtin) {
                 for a in &p.manifest.agent_types {
-                    out.push(crate::builtin::profile_spec_from_contribution(&p.full_id, a));
+                    out.push(crate::builtin::profile_spec_from_contribution(
+                        &p.full_id, a,
+                    ));
                 }
             }
         }
@@ -536,7 +543,9 @@ impl PluginHost {
             content_hash: plugin.content_hash.clone(),
         };
         let mut pins = self.pins.write();
-        pins.entry(run_key.to_string()).or_default().push(pin.clone());
+        pins.entry(run_key.to_string())
+            .or_default()
+            .push(pin.clone());
         *self
             .pin_counts
             .write()
@@ -583,9 +592,7 @@ impl PluginHost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{
-        Capabilities, ManifestHeader, PluginManifest as M, WorkerSpec,
-    };
+    use crate::manifest::{Capabilities, ManifestHeader, PluginManifest as M, WorkerSpec};
     use std::collections::HashMap as Map;
 
     fn make_host_with_plugin(

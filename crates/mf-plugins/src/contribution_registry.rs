@@ -3,8 +3,8 @@
 //! 因此贡献 id 本身允许包含 `.`。
 
 use crate::manifest::{
-    AgentTypeContribution, ExecutionDirectoryContribution, NodeTypeContribution,
-    PluginManifest, SecretStoreContribution, UiSchemaContribution, WorkflowTemplateContribution,
+    AgentTypeContribution, ExecutionDirectoryContribution, NodeTypeContribution, PluginManifest,
+    SecretStoreContribution, UiSchemaContribution, WorkflowTemplateContribution,
 };
 use crate::PluginEntry;
 

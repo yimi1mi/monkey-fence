@@ -8,8 +8,7 @@
 use crate::model::*;
 use crate::pipeline::{PipelineDraft, SessionPolicy};
 use crate::schema::{
-    initialize_schema, schema_version_of, table_names_of, PROJECT_SCHEMA_V1,
-    PROJECT_SCHEMA_VERSION,
+    initialize_schema, schema_version_of, table_names_of, PROJECT_SCHEMA_V1, PROJECT_SCHEMA_VERSION,
 };
 use anyhow::{Context as _, Result};
 use parking_lot::Mutex;

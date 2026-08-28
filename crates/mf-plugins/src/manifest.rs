@@ -491,10 +491,10 @@ path = "skills/demo"
         )
         .is_err());
         // adapter 缺失
-        assert!(PluginManifest::parse(
-            VALID.replace("adapter = \"generic-command\"", "").as_str()
-        )
-        .is_err());
+        assert!(
+            PluginManifest::parse(VALID.replace("adapter = \"generic-command\"", "").as_str())
+                .is_err()
+        );
     }
 
     #[test]

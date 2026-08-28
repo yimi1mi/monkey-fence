@@ -60,7 +60,10 @@ config_schema = ""
 
 [[node_types]]"#,
     );
-    assert!(PluginManifest::parse(&dup_agent).is_err(), "agent_types id 重复必须拒绝");
+    assert!(
+        PluginManifest::parse(&dup_agent).is_err(),
+        "agent_types id 重复必须拒绝"
+    );
     // node_types id 重复
     let dup_node = base.replace(
         r#"[[execution_directory_providers]]"#,
@@ -71,7 +74,10 @@ kind = "agent"
 
 [[execution_directory_providers]]"#,
     );
-    assert!(PluginManifest::parse(&dup_node).is_err(), "node_types id 重复必须拒绝");
+    assert!(
+        PluginManifest::parse(&dup_node).is_err(),
+        "node_types id 重复必须拒绝"
+    );
     // 不同类别允许同 id(类别内独立校验)
     assert!(PluginManifest::parse(base).is_ok());
 }

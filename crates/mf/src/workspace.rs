@@ -1803,15 +1803,8 @@ impl Workspace {
                     .rounded_md()
                     .text_size(px(17.))
                     .cursor_pointer()
-                    .when(expanded, |d| {
-                        d.w_full()
-                            .h(px(36.))
-                            .px_2()
-                            .gap_2()
-                    })
-                    .when(!expanded, |d| {
-                        d.size(px(36.)).justify_center()
-                    })
+                    .when(expanded, |d| d.w_full().h(px(36.)).px_2().gap_2())
+                    .when(!expanded, |d| d.size(px(36.)).justify_center())
                     .when(is_active, |d| {
                         d.bg(rgb(crate::theme::Theme::bg_active()))
                             .text_color(rgb(crate::theme::Theme::accent()))
@@ -1822,13 +1815,7 @@ impl Workspace {
                     })
                     .child(icon)
                     .when(expanded, |d| {
-                        d.child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .text_size(px(12.))
-                                .child(text),
-                        )
+                        d.child(div().min_w_0().flex_1().text_size(px(12.)).child(text))
                     })
                     .when(badge > 0, |d| {
                         d.child(
@@ -2583,12 +2570,8 @@ fn activity_button(
         .items_center()
         .rounded_md()
         .cursor_pointer()
-        .when(expanded, |d| {
-            d.w_full().h(px(36.)).px_2().gap_2()
-        })
-        .when(!expanded, |d| {
-            d.size(px(36.)).justify_center()
-        })
+        .when(expanded, |d| d.w_full().h(px(36.)).px_2().gap_2())
+        .when(!expanded, |d| d.size(px(36.)).justify_center())
         .text_color(rgb(if active {
             crate::theme::Theme::accent()
         } else {

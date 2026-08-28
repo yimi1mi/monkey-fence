@@ -31,5 +31,7 @@ pub use model::{
 pub use orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
 pub use pipeline::{PipelineDraft, ProfileIndex, SessionPolicy, StepDraft};
 pub use runtime::{AgentProfileSpec, HookSpec, LaunchSpec, RuntimeEvent, RuntimeHost, RuntimeKind};
-pub use schema::{catalog_db_path, project_db_path, CATALOG_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION};
+pub use schema::{
+    catalog_db_path, project_db_path, CATALOG_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION,
+};
 pub use store::Store;

@@ -65,9 +65,13 @@ fn resolve_requires_matching_identity_and_intact_content() {
     let host = fixture_host();
     let v1 = host.install_fixture("demo-v1").unwrap();
     // 版本不匹配
-    assert!(host.resolve(&v1.full_id, "9.9.9", &v1.content_hash).is_err());
+    assert!(host
+        .resolve(&v1.full_id, "9.9.9", &v1.content_hash)
+        .is_err());
     // 插件 id 不匹配
-    assert!(host.resolve("other.plugin", &v1.version, &v1.content_hash).is_err());
+    assert!(host
+        .resolve("other.plugin", &v1.version, &v1.content_hash)
+        .is_err());
     // 未知哈希
     assert!(host
         .resolve(
@@ -78,7 +82,9 @@ fn resolve_requires_matching_identity_and_intact_content() {
         .is_err());
     // 包内容被篡改(重算哈希与目录名不符)
     std::fs::write(v1.root.join("TAMPER.txt"), "boom").unwrap();
-    assert!(host.resolve(&v1.full_id, &v1.version, &v1.content_hash).is_err());
+    assert!(host
+        .resolve(&v1.full_id, &v1.version, &v1.content_hash)
+        .is_err());
 }
 
 #[test]
@@ -118,12 +124,13 @@ fn new_install_is_disabled_until_authorized() {
     assert!(!summary.enabled, "新装插件默认禁用");
     // 启用 = 授权
     host.enable(&v1.full_id, true).unwrap();
-    assert!(host
-        .summaries()
-        .into_iter()
-        .find(|s| s.full_id == v1.full_id)
-        .unwrap()
-        .enabled);
+    assert!(
+        host.summaries()
+            .into_iter()
+            .find(|s| s.full_id == v1.full_id)
+            .unwrap()
+            .enabled
+    );
 }
 
 #[test]
@@ -131,7 +138,10 @@ fn contribution_lookup_by_full_id() {
     let host = fixture_host();
     let v1 = host.install_fixture("demo-v1").unwrap();
     // 未启用时贡献不可见
-    assert!(host.contributions().find_agent_type("test.demo.demo-agent").is_none());
+    assert!(host
+        .contributions()
+        .find_agent_type("test.demo.demo-agent")
+        .is_none());
     host.enable(&v1.full_id, true).unwrap();
     let reg = host.contributions();
     let (src, agent) = reg.find_agent_type("test.demo.demo-agent").unwrap();

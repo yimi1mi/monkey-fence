@@ -22,8 +22,11 @@ fn request_response_roundtrip() {
     assert_eq!(parsed.id, 7);
     assert_eq!(parsed.method, "echo");
 
-    let resp = WorkerResponse::parse_for(WORKER_PROTOCOL_VERSION, r#"{"protocol":1,"id":7,"result":{"ok":true}}"#)
-        .unwrap();
+    let resp = WorkerResponse::parse_for(
+        WORKER_PROTOCOL_VERSION,
+        r#"{"protocol":1,"id":7,"result":{"ok":true}}"#,
+    )
+    .unwrap();
     assert_eq!(resp.id, 7);
     assert!(resp.is_ok());
     assert!(ensure_matches(WORKER_PROTOCOL_VERSION, 7, &resp).is_ok());
