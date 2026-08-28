@@ -119,7 +119,9 @@ impl RuntimeHost for MockHost {
     }
     fn kill_session(&self, _project: &str, _session_id: i64) {}
     fn answer_question(&self, _project: &str, _run_id: i64, _answer: &str) {}
-    fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) {}
+    fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {

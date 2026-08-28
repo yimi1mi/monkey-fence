@@ -8,6 +8,7 @@ use crate::project_overview::{HubCtx, ProjectOverviewHub};
 use crate::runtime_host::{KeepAwake, RuntimeHostImpl, SessionRegistry};
 use anyhow::{Context as _, Result};
 use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
+use mf_agent::secrets::SecretStore;
 use mf_agent::{CatalogStore, Store, TaskStatus};
 use mf_plugins::PluginRegistry;
 use parking_lot::{Mutex, RwLock};
@@ -105,6 +106,20 @@ fn session_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".monkeyfence")
         .join("session.json")
+}
+
+fn legacy_builtin_adapter_id(agent_type: &str) -> Option<&'static str> {
+    match agent_type {
+        "claude" | "claude-code" => Some("claude-code"),
+        "codex" => Some("codex"),
+        "generic-command" | "opencode" | "cursor" | "gemini" | "copilot" | "qwen"
+        | "iflow" | "aider" | "amp" | "kimi" => Some("generic-command"),
+        _ => None,
+    }
+}
+
+fn contribution_supports_mode(modes: &[String], mode: mf_agent::RunMode) -> bool {
+    modes.iter().any(|declared| declared == mode.as_str())
 }
 
 pub struct AppCtx {
@@ -344,7 +359,75 @@ impl AppCtx {
         let orch = self
             .orchestrator_of(root)
             .ok_or_else(|| anyhow::anyhow!("项目未打开: {}", root.display()))?;
-        orch.create_ad_hoc_session(task_id, instance_snapshot, launch_mode)
+        if !instance_snapshot.enabled {
+            anyhow::bail!("Agent Instance `{}` 已禁用", instance_snapshot.name);
+        }
+        let task = orch
+            .store
+            .task_view(task_id)?
+            .ok_or_else(|| anyhow::anyhow!("任务 {task_id} 不存在"))?;
+        let contributions = self.plugins.contributions();
+        let resolved = contributions.find_agent_type(&instance_snapshot.agent_type);
+        if let Some((_, contribution)) = &resolved {
+            if !contribution_supports_mode(&contribution.modes, launch_mode) {
+                anyhow::bail!(
+                    "Agent Type `{}` 不支持 {} 模式",
+                    instance_snapshot.agent_type,
+                    launch_mode
+                );
+            }
+        }
+        let adapter_id = match &resolved {
+            Some((_, contribution)) => contribution.adapter.as_str(),
+            None => legacy_builtin_adapter_id(&instance_snapshot.agent_type).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Agent Type `{}` 不存在、已禁用或所属插件未启用",
+                    instance_snapshot.agent_type
+                )
+            })?,
+        };
+        let adapter = mf_plugins::builtin::adapter_for(adapter_id)
+            .ok_or_else(|| anyhow::anyhow!("尚不支持 Agent Adapter: {adapter_id}"))?;
+        let validation_errors = adapter.validate(instance_snapshot);
+        if !validation_errors.is_empty() {
+            anyhow::bail!("Agent Instance 配置无效: {}", validation_errors.join("; "));
+        }
+        let grants_shell = resolved
+            .as_ref()
+            .and_then(|(source, _)| {
+                self.plugins
+                    .summaries()
+                    .into_iter()
+                    .find(|summary| summary.full_id == source.plugin_full_id)
+            })
+            .is_some_and(|summary| summary.enabled && summary.capabilities.shell);
+
+        let nonce = chrono::Utc::now()
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| chrono::Utc::now().timestamp_micros());
+        let run_temp = std::env::temp_dir()
+            .join("monkeyfence")
+            .join("ad-hoc")
+            .join(format!("{}-{task_id}-{nonce}", std::process::id()));
+        let mut launch_ctx = mf_agent::LaunchContext::new(run_temp.clone(), root.to_path_buf());
+        launch_ctx.grants_shell = grants_shell;
+        if !task.goal.trim().is_empty() {
+            launch_ctx.prompt = Some(task.goal.clone());
+        }
+        let run_token = format!("ad-hoc:{}:{task_id}:{nonce}", root.display());
+        if !instance_snapshot.sealed_secret_ids.is_empty() {
+            let secret_store = mf_plugins::builtin_secret_store::BuiltinSecretStore::open(
+                self.catalog_store.clone(),
+            )?;
+            for secret_id in &instance_snapshot.sealed_secret_ids {
+                let lease = secret_store.unseal_for_run(&run_token, secret_id)?;
+                launch_ctx
+                    .secrets
+                    .insert(secret_id.clone(), Arc::new(lease));
+            }
+        }
+        let plan = adapter.compile_launch(instance_snapshot, &launch_ctx)?;
+        orch.create_ad_hoc_session(task_id, instance_snapshot, launch_mode, run_temp, plan)
     }
 
     /// 活动项目数(用于关闭确认)。
@@ -372,5 +455,34 @@ impl AppCtx {
                 list.push(p.orchestrator.clone());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod agent_launch_selection_tests {
+    use super::*;
+
+    #[test]
+    fn only_explicit_legacy_builtin_ids_have_adapter_fallbacks() {
+        assert_eq!(legacy_builtin_adapter_id("claude"), Some("claude-code"));
+        assert_eq!(legacy_builtin_adapter_id("codex"), Some("codex"));
+        assert_eq!(
+            legacy_builtin_adapter_id("generic-command"),
+            Some("generic-command")
+        );
+        assert_eq!(legacy_builtin_adapter_id("missing.plugin.agent"), None);
+    }
+
+    #[test]
+    fn contribution_must_declare_requested_run_mode() {
+        let modes = vec!["interactive".to_string()];
+        assert!(contribution_supports_mode(
+            &modes,
+            mf_agent::RunMode::Interactive
+        ));
+        assert!(!contribution_supports_mode(
+            &modes,
+            mf_agent::RunMode::OneShot
+        ));
     }
 }

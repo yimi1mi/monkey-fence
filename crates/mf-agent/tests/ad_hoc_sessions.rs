@@ -2,21 +2,37 @@
 //! 没有 Step / Agent Run,绝不改变 Task 状态(设计 §4.7 / §10)。
 
 use crossbeam_channel::Sender;
+use mf_agent::agent_adapter::{CompletionDetector, InputInjection, LaunchPlan};
 use mf_agent::agent_instance::AgentInstanceSnapshot;
 use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
 use mf_agent::runtime::{AdHocLaunchSpec, LaunchSpec, RuntimeEvent, RuntimeHost};
 use mf_agent::store::Store;
 use mf_agent::{HandoffDraft, RunMode, SessionStatus, TaskStatus};
 use parking_lot::Mutex;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 // ---------- 测试宿主:记录离散启动,不真正拉进程 ----------
 
-#[derive(Default)]
 struct MockHost {
     ad_hoc_launches: Mutex<Vec<AdHocLaunchSpec>>,
+    fail_ad_hoc: bool,
+}
+
+impl MockHost {
+    fn healthy() -> MockHost {
+        MockHost {
+            ad_hoc_launches: Mutex::new(Vec::new()),
+            fail_ad_hoc: false,
+        }
+    }
+
+    fn failing() -> MockHost {
+        MockHost {
+            ad_hoc_launches: Mutex::new(Vec::new()),
+            fail_ad_hoc: true,
+        }
+    }
 }
 
 impl RuntimeHost for MockHost {
@@ -25,8 +41,12 @@ impl RuntimeHost for MockHost {
     fn stop_run(&self, _project: &str, _run_id: i64) {}
     fn kill_session(&self, _project: &str, _session_id: i64) {}
     fn answer_question(&self, _project: &str, _run_id: i64, _answer: &str) {}
-    fn launch_ad_hoc(&self, spec: AdHocLaunchSpec) {
+    fn launch_ad_hoc(&self, spec: AdHocLaunchSpec) -> anyhow::Result<()> {
         self.ad_hoc_launches.lock().push(spec);
+        if self.fail_ad_hoc {
+            anyhow::bail!("spawn failed")
+        }
+        Ok(())
     }
 }
 
@@ -40,16 +60,21 @@ struct Fixture {
 impl Fixture {
     fn memory() -> Fixture {
         let store = Store::memory().unwrap();
-        Self::with_store(store)
+        Self::with_store_and_host(store, MockHost::healthy())
+    }
+
+    fn failing() -> Fixture {
+        let store = Store::memory().unwrap();
+        Self::with_store_and_host(store, MockHost::failing())
     }
 
     fn file(path: &std::path::Path) -> Fixture {
         let store = Store::open(path).unwrap();
-        Self::with_store(store)
+        Self::with_store_and_host(store, MockHost::healthy())
     }
 
-    fn with_store(store: Arc<Store>) -> Fixture {
-        let host = Arc::new(MockHost::default());
+    fn with_store_and_host(store: Arc<Store>, host: MockHost) -> Fixture {
+        let host = Arc::new(host);
         let orch = Orchestrator::start(
             store,
             PathBuf::from("."),
@@ -64,8 +89,28 @@ impl Fixture {
     }
 
     fn create_ad_hoc(&self, task_id: i64) -> anyhow::Result<mf_agent::AdHocSessionView> {
-        self.orch
-            .create_ad_hoc_session(task_id, &snapshot(), RunMode::Interactive)
+        self.orch.create_ad_hoc_session(
+            task_id,
+            &snapshot(),
+            RunMode::Interactive,
+            PathBuf::from("C:/tmp/run"),
+            launch_plan(),
+        )
+    }
+}
+
+fn launch_plan() -> LaunchPlan {
+    LaunchPlan {
+        run_temp: PathBuf::from("C:/tmp/run"),
+        executable: PathBuf::from("agent.exe"),
+        argv: vec!["--chat".into()],
+        env: vec![("LANG".into(), "C".into())],
+        secret_env: vec![],
+        cwd: Some(PathBuf::from(".")),
+        temp_files: vec![],
+        input: InputInjection::Argv(String::new()),
+        completion: CompletionDetector::Manual,
+        uses_shell: false,
     }
 }
 
@@ -116,8 +161,9 @@ fn ad_hoc_launches_host_without_inventing_step_or_run() {
     assert_eq!(launches.len(), 1);
     assert_eq!(launches[0].session_id, view.id);
     assert_eq!(launches[0].task_id, task.id);
-    assert_eq!(launches[0].profile.command, "agent.exe");
-    assert_eq!(launches[0].profile.args, vec!["--chat".to_string()]);
+    assert_eq!(launches[0].plan.executable, PathBuf::from("agent.exe"));
+    assert_eq!(launches[0].plan.argv, vec!["--chat".to_string()]);
+    assert_eq!(launches[0].run_temp, PathBuf::from("C:/tmp/run"));
     assert_eq!(launches[0].run_mode, RunMode::Interactive);
     drop(launches);
 
@@ -147,8 +193,73 @@ fn unknown_task_rejects_ad_hoc_session() {
     let fixture = Fixture::memory();
     assert!(fixture
         .orch
-        .create_ad_hoc_session(999, &snapshot(), RunMode::Interactive)
+        .create_ad_hoc_session(
+            999,
+            &snapshot(),
+            RunMode::Interactive,
+            PathBuf::from("C:/tmp/run"),
+            launch_plan(),
+        )
         .is_err());
+}
+
+#[test]
+fn adapter_cannot_replace_trusted_run_temp() {
+    let fixture = Fixture::memory();
+    let task = fixture.orch.create_task("t", "goal").unwrap();
+    let mut plan = launch_plan();
+    plan.run_temp = PathBuf::from("C:/Users/example/.codex");
+
+    let error = fixture
+        .orch
+        .create_ad_hoc_session(
+            task.id,
+            &snapshot(),
+            RunMode::Interactive,
+            PathBuf::from("C:/tmp/run"),
+            plan,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("run-temp"));
+    assert!(fixture.host.ad_hoc_launches.lock().is_empty());
+    assert!(fixture
+        .orch
+        .store
+        .list_ad_hoc_sessions(task.id)
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn spawn_failure_marks_session_dead_without_touching_task() {
+    let fixture = Fixture::failing();
+    let task = fixture.orch.create_task("t", "goal").unwrap();
+
+    let err = fixture.create_ad_hoc(task.id).unwrap_err();
+    assert!(err.to_string().contains("spawn failed"));
+
+    let sessions = fixture.orch.store.list_ad_hoc_sessions(task.id).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].status, SessionStatus::Dead);
+    assert!(sessions[0].launched_at.is_none());
+    assert!(sessions[0].ended_at.is_some());
+    assert_eq!(
+        fixture
+            .orch
+            .store
+            .task_view(task.id)
+            .unwrap()
+            .unwrap()
+            .status,
+        TaskStatus::Draft
+    );
+    assert!(fixture.orch.store.task_steps(task.id).unwrap().is_empty());
+    assert!(fixture
+        .orch
+        .store
+        .list_runs_of_task(task.id)
+        .unwrap()
+        .is_empty());
 }
 
 #[test]
@@ -214,25 +325,4 @@ fn restart_preserves_ad_hoc_sessions_and_task_status() {
     assert_eq!(listed[0].snapshot.executable, "agent.exe");
     assert_eq!(listed[0].snapshot.name, "咨询 Agent");
     fixture.orch.stop();
-}
-
-#[test]
-fn fixture_store_helper_exists() {
-    // 编译期确认:fixture.store 计划式用法(Orchestrator::store 公有)
-    let fixture = Fixture::memory();
-    let task = fixture.orch.store.create_task("t", "goal").unwrap();
-    fixture.create_ad_hoc(task.id).unwrap();
-    assert_eq!(
-        fixture
-            .orch
-            .store
-            .task_view(task.id)
-            .unwrap()
-            .unwrap()
-            .status,
-        TaskStatus::Draft
-    );
-    let _view: Option<mf_agent::AdHocSessionView> =
-        fixture.orch.store.ad_hoc_session_view(1).unwrap();
-    let _events: HashMap<(), ()> = HashMap::new();
 }

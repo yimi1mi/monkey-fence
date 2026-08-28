@@ -16,7 +16,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// 临时文件规格:启动前由 Runtime Host 物化。
+/// 临时文件规格:启动前由 Runtime Host 在可信 run-temp 下物化。
+/// `path` 必须是相对路径,不得自行携带根目录。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TempFileSpec {
     pub path: PathBuf,
@@ -52,6 +53,8 @@ pub enum CompletionDetector {
 /// Debug 输出不含任何 Secret 值,最后一个引用释放时明文被 zeroize。
 #[derive(Debug, Clone)]
 pub struct LaunchPlan {
+    /// 本次运行可物化临时文件的唯一根目录。
+    pub run_temp: PathBuf,
     pub executable: PathBuf,
     /// 参数数组(不含 executable 本身;边界由数组元素保证,不经 Shell 拼接)。
     pub argv: Vec<String>,

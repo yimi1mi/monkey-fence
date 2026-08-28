@@ -15,7 +15,9 @@ use std::time::Duration;
 struct NoopHost;
 impl RuntimeHost for NoopHost {
     fn launch(&self, _spec: LaunchSpec, _events: crossbeam_channel::Sender<(i64, RuntimeEvent)>) {}
-    fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) {}
+    fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn send_prompt(&self, _p: &str, _r: i64, _s: i64, _t: &str) {}
     fn stop_run(&self, _p: &str, _r: i64) {}
     fn kill_session(&self, _p: &str, _s: i64) {}

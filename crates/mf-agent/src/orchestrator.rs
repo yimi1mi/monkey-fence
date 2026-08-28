@@ -6,7 +6,7 @@
 use crate::config::Config;
 use crate::model::*;
 use crate::pipeline::{PipelineDraft, ProfileIndex, SessionPolicy};
-use crate::runtime::{AgentProfileSpec, LaunchSpec, RuntimeEvent, RuntimeHost, RuntimeKind};
+use crate::runtime::{AgentProfileSpec, LaunchSpec, RuntimeEvent, RuntimeHost};
 use crate::store::Store;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
@@ -778,37 +778,33 @@ impl Orchestrator {
         task_id: i64,
         instance_snapshot: &crate::agent_instance::AgentInstanceSnapshot,
         launch_mode: crate::model::RunMode,
+        trusted_run_temp: PathBuf,
+        plan: crate::agent_adapter::LaunchPlan,
     ) -> Result<AdHocSessionView> {
+        if plan.run_temp != trusted_run_temp {
+            anyhow::bail!("Agent Adapter 试图改写可信 run-temp,已拒绝启动");
+        }
         self.store
             .task_view(task_id)?
             .ok_or_else(|| anyhow::anyhow!("任务 {task_id} 不存在"))?;
         let view = self
             .store
             .insert_ad_hoc_session(task_id, instance_snapshot)?;
-        // 从实例快照直接合成启动配置:离散会话不走 Profile 目录,
-        // 编辑过的实例配置(命令/参数/环境)原样生效。
-        let profile = AgentProfileSpec {
-            id: instance_snapshot.agent_type.clone(),
-            display_name: instance_snapshot.name.clone(),
-            runtime: RuntimeKind::Pty,
-            command: instance_snapshot.executable.clone(),
-            args: instance_snapshot.argv.clone(),
-            env: instance_snapshot.env.clone(),
-            permission_args: vec![],
-            provider: None,
-            icon: None,
-            homepage: None,
-            hook: None,
-        };
-        self.host.launch_ad_hoc(crate::runtime::AdHocLaunchSpec {
+        let launch = self.host.launch_ad_hoc(crate::runtime::AdHocLaunchSpec {
             task_id,
             session_id: view.id,
             title: view.title.clone(),
             run_mode: launch_mode,
-            profile,
-            prompt: None,
+            plan,
+            run_temp: trusted_run_temp,
             workdir: self.root.clone(),
         });
+        if let Err(error) = launch {
+            if let Some(dead) = self.store.set_ad_hoc_status(view.id, SessionStatus::Dead)? {
+                self.emit(SchedulerEvent::AdHocSessionUpdated(dead));
+            }
+            return Err(anyhow::anyhow!("离散会话 {} 启动失败: {error:#}", view.id));
+        }
         let launched = self
             .store
             .mark_ad_hoc_launched(view.id)?

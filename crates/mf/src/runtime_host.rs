@@ -17,6 +17,7 @@ use mf_agent::runtime::{
     AdHocLaunchSpec, AgentProfileSpec, LaunchSpec, RuntimeEvent, RuntimeHost, RuntimeKind,
 };
 use mf_agent::Settlement;
+use mf_agent::{InputInjection, TempFileSpec};
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize};
 use std::collections::HashMap;
@@ -490,56 +491,94 @@ fn launch_pty(registry: &SessionRegistry, spec: &LaunchSpec, events: Sender<(i64
 /// 离散 CLI 会话启动(设计 §4.7 / §10):挂在 Task 下,
 /// 无 Step / Agent Run / 结算事件流;注册表仍以 (project, session_id)
 /// 路由,UI 终端视图、send_prompt、kill 与普通会话一致。
-fn launch_ad_hoc_pty(registry: &SessionRegistry, spec: &AdHocLaunchSpec) {
+fn materialize_temp_files(run_temp: &Path, files: &[TempFileSpec]) -> Result<()> {
+    std::fs::create_dir_all(run_temp)
+        .with_context(|| format!("创建运行临时目录失败: {}", run_temp.display()))?;
+    for file in files {
+        if file.path.as_os_str().is_empty()
+            || file.path.is_absolute()
+            || file.path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir
+                        | std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            anyhow::bail!("临时文件路径不得逃许运行临时目录: {}", file.path.display());
+        }
+        let target = run_temp.join(&file.path);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建临时文件目录失败: {}", parent.display()))?;
+        }
+        std::fs::write(&target, &file.contents)
+            .with_context(|| format!("写入临时文件失败: {}", target.display()))?;
+    }
+    Ok(())
+}
+
+fn launch_ad_hoc_pty(registry: &SessionRegistry, spec: &AdHocLaunchSpec) -> Result<()> {
     let project = spec.workdir.to_string_lossy().to_string();
     registry.kill_ad_hoc(&project, spec.session_id); // 同键旧会话清理
 
-    let pty_system: Box<dyn portable_pty::PtySystem> = Box::new(NativePtySystem::default());
-    let pair = match pty_system.openpty(PtySize {
-        rows: TERM_ROWS as u16,
-        cols: TERM_COLS as u16,
-        pixel_width: 0,
-        pixel_height: 0,
-    }) {
-        Ok(p) => p,
-        Err(e) => {
-            log::error!("离散会话 openpty 失败: {e}");
-            return;
-        }
-    };
-
-    let mut cmd = CommandBuilder::new(&spec.profile.command);
-    cmd.args(&spec.profile.args);
-    // 一次性模式或显式提示:prompt 作为尾随参数(与 run 启动一致)
-    if let Some(prompt) = spec.prompt.as_deref() {
-        if !prompt.trim().is_empty() {
-            cmd.arg(prompt);
-        }
+    if spec.plan.uses_shell {
+        anyhow::bail!("离散 CLI Runtime 尚不支持 Shell 启动计划");
     }
-    for (k, v) in &spec.profile.env {
+    if spec.plan.executable.as_os_str().is_empty() {
+        anyhow::bail!("离散 CLI 的可执行文件不能为空");
+    }
+    materialize_temp_files(&spec.run_temp, &spec.plan.temp_files)?;
+
+    let pty_system: Box<dyn portable_pty::PtySystem> = Box::new(NativePtySystem::default());
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: TERM_ROWS as u16,
+            cols: TERM_COLS as u16,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("离散会话 openpty 失败")?;
+
+    let mut cmd = CommandBuilder::new(&spec.plan.executable);
+    cmd.args(&spec.plan.argv);
+    for (k, v) in &spec.plan.env {
         cmd.env(k, v);
     }
-    cmd.cwd(&spec.workdir);
+    for (key, lease) in &spec.plan.secret_env {
+        let value = std::str::from_utf8(lease.as_slice()).with_context(|| {
+            format!(
+                "Secret `{}` 不是有效 UTF-8,无法注入环境变量 {key}",
+                lease.id()
+            )
+        })?;
+        cmd.env(key, value);
+    }
+    cmd.cwd(spec.plan.cwd.as_deref().unwrap_or(&spec.workdir));
 
-    let child = match pair.slave.spawn_command(cmd) {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!(
-                "离散会话启动 `{}` 失败: {e}(CLI 未安装?)",
-                spec.profile.command
-            );
-            return;
-        }
-    };
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .context("离散会话克隆 PTY reader 失败")?;
+    let mut writer = pair
+        .master
+        .take_writer()
+        .context("离散会话 take_writer 失败")?;
+    let child = pair.slave.spawn_command(cmd).with_context(|| {
+        format!(
+            "离散会话启动 `{}` 失败(CLI 未安装或配置无效)",
+            spec.plan.executable.display()
+        )
+    })?;
     drop(pair.slave);
-    let Ok(mut reader) = pair.master.try_clone_reader() else {
-        log::error!("离散会话克隆 PTY reader 失败");
-        return;
-    };
-    let Ok(writer) = pair.master.take_writer() else {
-        log::error!("离散会话 take_writer 失败");
-        return;
-    };
+    if let InputInjection::Stdin(bytes) = &spec.plan.input {
+        writer
+            .write_all(bytes)
+            .context("向离散会话 stdin 写入初始提示失败")?;
+        writer.flush().context("刷新离散会话 stdin 失败")?;
+    }
 
     let session = Arc::new(PtySession {
         session_id: spec.session_id,
@@ -557,7 +596,8 @@ fn launch_ad_hoc_pty(registry: &SessionRegistry, spec: &AdHocLaunchSpec) {
         SessionInner::Pty(session.clone()),
     );
 
-    std::thread::Builder::new()
+    let reader_project = project.clone();
+    if let Err(error) = std::thread::Builder::new()
         .name(format!("ad-hoc-pty-reader-{}", spec.session_id))
         .spawn(move || {
             let mut buf = [0u8; 8192];
@@ -585,7 +625,11 @@ fn launch_ad_hoc_pty(registry: &SessionRegistry, spec: &AdHocLaunchSpec) {
             session.writer.lock().take();
             session.master.lock().take();
         })
-        .ok();
+    {
+        registry.kill_ad_hoc(&reader_project, spec.session_id);
+        return Err(error).context("启动离散会话 reader 线程失败");
+    }
+    Ok(())
 }
 
 // ---------------- HTTP Adapter ----------------
@@ -1073,8 +1117,8 @@ impl RuntimeHost for RuntimeHostImpl {
         }
     }
 
-    fn launch_ad_hoc(&self, spec: AdHocLaunchSpec) {
-        launch_ad_hoc_pty(&self.registry, &spec);
+    fn launch_ad_hoc(&self, spec: AdHocLaunchSpec) -> Result<()> {
+        launch_ad_hoc_pty(&self.registry, &spec)
     }
 
     fn send_prompt(&self, project: &str, _run_id: i64, session_id: i64, text: &str) {
@@ -1099,6 +1143,41 @@ impl RuntimeHost for RuntimeHostImpl {
 /// 保持唤醒(Windows SetThreadExecutionState)。
 pub struct KeepAwake {
     active: AtomicBool,
+}
+
+#[cfg(test)]
+mod ad_hoc_launch_tests {
+    use super::*;
+    use mf_agent::TempFileSpec;
+
+    #[test]
+    fn materializes_temp_files_only_inside_run_root() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("codex").join("config.toml");
+        materialize_temp_files(
+            root.path(),
+            &[TempFileSpec {
+                path: PathBuf::from("codex").join("config.toml"),
+                contents: b"model = \"gpt-5\"\n".to_vec(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(nested).unwrap(),
+            "model = \"gpt-5\"\n"
+        );
+
+        let escaped = PathBuf::from("..").join("escape.txt");
+        let error = materialize_temp_files(
+            root.path(),
+            &[TempFileSpec {
+                path: escaped,
+                contents: b"no".to_vec(),
+            }],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("运行临时目录"));
+    }
 }
 
 impl KeepAwake {

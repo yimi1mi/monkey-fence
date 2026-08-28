@@ -83,7 +83,7 @@ pub(crate) fn compile_cli_launch(
             mf_agent::agent_adapter::InputMode::PromptFile => {
                 let path = ctx.run_temp.join(PROMPT_FILE_NAME);
                 temp_files.push(TempFileSpec {
-                    path: path.clone(),
+                    path: PathBuf::from(PROMPT_FILE_NAME),
                     contents: prompt.as_bytes().to_vec(),
                 });
                 InputInjection::PromptFile(path)
@@ -110,6 +110,7 @@ pub(crate) fn compile_cli_launch(
     };
 
     Ok(LaunchPlan {
+        run_temp: ctx.run_temp.clone(),
         executable: PathBuf::from(&snapshot.executable),
         argv,
         env,
@@ -135,13 +136,17 @@ fn config_file_specs(snapshot: &AgentInstanceSnapshot, dir: &Path) -> Result<Vec
     };
     for (rel, value) in files {
         let rel_path = safe_relative_path(rel, "配置文件")?;
-        let target = dir.join(rel_path);
+        let relative = dir
+            .file_name()
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow::anyhow!("隔离配置目录缺少相对目录名: {}", dir.display()))?
+            .join(rel_path);
         let contents = match value {
             serde_json::Value::String(s) => s.as_bytes().to_vec(),
             other => serde_json::to_vec_pretty(other)?,
         };
         specs.push(TempFileSpec {
-            path: target,
+            path: relative,
             contents,
         });
     }

@@ -122,10 +122,11 @@ fn argv_stdin_and_prompt_file_injection() {
     let plan = adapter().compile_launch(&snapshot, &context).unwrap();
     match &plan.input {
         InputInjection::PromptFile(path) => {
+            assert_eq!(path, &PathBuf::from("C:/tmp/run").join("prompt.txt"));
             let spec = plan
                 .temp_files
                 .iter()
-                .find(|f| &f.path == path)
+                .find(|f| f.path == PathBuf::from("prompt.txt"))
                 .expect("prompt 文件必须同时出现在 temp_files");
             assert_eq!(spec.contents, b"do the work");
         }

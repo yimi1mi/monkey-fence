@@ -2,6 +2,7 @@
 //! 不感知 PTY / HTTP / 插件 worker 的实现细节(见 ADR 0002)。
 
 use crate::model::AgentState;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -113,8 +114,11 @@ pub struct AdHocLaunchSpec {
     pub session_id: i64,
     pub title: String,
     pub run_mode: crate::model::RunMode,
-    pub profile: AgentProfileSpec,
-    pub prompt: Option<String>,
+    /// Adapter 已编译完成的启动计划;Runtime Host 不解释 Agent 专属配置。
+    pub plan: crate::agent_adapter::LaunchPlan,
+    /// App/Orchestrator 提供的可信物化根,不得由 Adapter 改写。
+    pub run_temp: PathBuf,
+    /// 项目路由键;真正的进程 cwd 取自 plan.cwd。
     pub workdir: PathBuf,
 }
 
@@ -150,7 +154,7 @@ pub trait RuntimeHost: Send + Sync {
     fn launch(&self, spec: LaunchSpec, events: crossbeam_channel::Sender<TaggedRuntimeEvent>);
     /// 启动离散 CLI 会话:无 run 事件流,状态由宿主直接管理;
     /// 不得发明 Step / Agent Run,也不得触碰 Task 状态。
-    fn launch_ad_hoc(&self, spec: AdHocLaunchSpec);
+    fn launch_ad_hoc(&self, spec: AdHocLaunchSpec) -> Result<()>;
     /// 向运行中的 Agent 追加提示。
     /// `project`:项目根路径 —— run/session id 是各项目数据库的行号,
     /// 跨项目会碰撞,宿主必须以 (project, id) 定位真实会话。

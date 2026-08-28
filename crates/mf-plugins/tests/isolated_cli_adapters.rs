@@ -101,7 +101,7 @@ fn materializes_only_snapshot_config_into_isolated_home() {
         .compile_launch(&snapshot, &ctx_at(root.path()))
         .unwrap();
 
-    let settings = root.path().join("claude").join("settings.json");
+    let settings = PathBuf::from("claude").join("settings.json");
     let spec = plan
         .temp_files
         .iter()
@@ -119,7 +119,7 @@ fn materializes_only_snapshot_config_into_isolated_home() {
     let codex_plan = codex_adapter()
         .compile_launch(&snapshot, &ctx_at(root.path()))
         .unwrap();
-    let toml = root.path().join("codex").join("config.toml");
+    let toml = PathBuf::from("codex").join("config.toml");
     assert!(codex_plan.temp_files.iter().any(|file| {
         file.path == toml && String::from_utf8_lossy(&file.contents).contains("gpt-5")
     }));
