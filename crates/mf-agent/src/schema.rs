@@ -173,6 +173,7 @@ CREATE TABLE IF NOT EXISTS agent_instances (
     name TEXT NOT NULL,
     agent_type TEXT NOT NULL,
     scope TEXT NOT NULL DEFAULT 'user',
+    project_key TEXT,
     current_version INTEGER NOT NULL DEFAULT 1,
     enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,

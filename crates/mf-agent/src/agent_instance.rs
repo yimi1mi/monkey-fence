@@ -17,6 +17,8 @@ pub struct AgentInstance {
     pub name: String,
     pub agent_type: String,
     pub scope: InstanceScope,
+    /// Project 作用域绑定的项目键;User 作用域恒为 None。
+    pub project_key: Option<String>,
     pub current_version: i64,
     pub enabled: bool,
 }
@@ -27,6 +29,8 @@ pub struct AgentInstanceDraft {
     pub name: String,
     pub agent_type: String,
     pub scope: InstanceScope,
+    /// Project 作用域必须携带;User 作用域必须为 None。
+    pub project_key: Option<String>,
     pub enabled: bool,
     pub run_mode: RunMode,
     pub executable: String,
@@ -43,8 +47,9 @@ pub struct AgentInstanceDraft {
 }
 
 impl AgentInstanceDraft {
-    /// 基础校验:核心字段非空。结构化契约校验由 Agent Adapter 的
-    /// `validate` 负责(插件知道自己声明了哪些键)。
+    /// 基础校验:核心字段非空 + 作用域与项目键一致。
+    /// 结构化契约校验由 Agent Adapter 的 `validate` 负责
+    /// (插件知道自己声明了哪些键)。
     pub fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() {
             return Err("实例名称不能为空".into());
@@ -54,6 +59,18 @@ impl AgentInstanceDraft {
         }
         if self.executable.trim().is_empty() {
             return Err("可执行文件不能为空".into());
+        }
+        match (self.scope, self.project_key.as_deref()) {
+            (InstanceScope::Project, None) => {
+                return Err("project 作用域实例必须携带 project_key".into());
+            }
+            (InstanceScope::User, Some(_)) => {
+                return Err("user 作用域实例不能携带 project_key".into());
+            }
+            (InstanceScope::Project, Some(k)) if k.trim().is_empty() => {
+                return Err("project_key 不能为空白".into());
+            }
+            _ => {}
         }
         Ok(())
     }

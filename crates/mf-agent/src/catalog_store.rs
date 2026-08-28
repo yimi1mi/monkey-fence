@@ -59,8 +59,8 @@ impl CatalogStore {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         initialize_schema(&conn, CATALOG_SCHEMA_V1, CATALOG_SCHEMA_VERSION)
             .context("初始化目录库 v1 schema 失败")?;
-        // 早期开发库没有 enabled 列(CREATE IF NOT EXISTS 不会补列),补齐
-        ensure_agent_instances_enabled(&conn)?;
+        // 早期开发库缺少后续列(CREATE IF NOT EXISTS 不会补列),幂等补齐
+        ensure_agent_instances_columns(&conn)?;
         Ok(CatalogStore {
             conn: Mutex::new(conn),
         })
@@ -181,13 +181,14 @@ impl CatalogStore {
             let key = gen_instance_key();
             tx.execute(
                 "INSERT INTO agent_instances
-                    (instance_key, name, agent_type, scope, current_version, enabled, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?6)",
+                    (instance_key, name, agent_type, scope, project_key, current_version, enabled, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, ?7, ?7)",
                 params![
                     key,
                     draft.name,
                     draft.agent_type,
                     draft.scope.as_str(),
+                    draft.project_key,
                     draft.enabled as i64,
                     ts
                 ],
@@ -218,14 +219,15 @@ impl CatalogStore {
             let ts = now();
             tx.execute(
                 "UPDATE agent_instances
-                 SET name = ?2, agent_type = ?3, scope = ?4, current_version = ?5,
-                     enabled = ?6, updated_at = ?7
+                 SET name = ?2, agent_type = ?3, scope = ?4, project_key = ?5,
+                     current_version = ?6, enabled = ?7, updated_at = ?8
                  WHERE instance_key = ?1",
                 params![
                     id,
                     draft.name,
                     draft.agent_type,
                     draft.scope.as_str(),
+                    draft.project_key,
                     next,
                     draft.enabled as i64,
                     ts
@@ -240,13 +242,13 @@ impl CatalogStore {
         self.with_conn(|c| instance_row(c, id))
     }
 
-    /// 列出实例;`project` 为 None 时只返回用户作用域,
-    /// Some 时返回用户 + 项目作用域(项目覆盖解析在快照阶段完成)。
+    /// 列出实例;`project` 为 None 时只返回用户作用域;Some(key) 时返回
+    /// 用户作用域 + 绑定该 key 的项目作用域实例(跨项目互不可见)。
     pub fn list_agent_instances(&self, project: Option<&str>) -> Result<Vec<AgentInstance>> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(
                 "SELECT instance_key FROM agent_instances
-                 WHERE (?1 IS NOT NULL OR scope = 'user')
+                 WHERE (scope = 'user' OR (?1 IS NOT NULL AND scope = 'project' AND project_key = ?1))
                  ORDER BY instance_key",
             )?;
             let keys: Vec<String> = stmt
@@ -355,19 +357,27 @@ impl CatalogStore {
     }
 }
 
-/// 补齐旧开发库缺失的 `agent_instances.enabled` 列(幂等)。
-fn ensure_agent_instances_enabled(conn: &Connection) -> Result<()> {
+/// 补齐旧开发库缺失的列(CREATE IF NOT EXISTS 不会补列;幂等)。
+fn ensure_agent_instances_columns(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(agent_instances)")?;
-    let has_enabled = stmt
+    let existing: Vec<String> = stmt
         .query_map([], |r| r.get::<_, String>(1))?
-        .any(|c| c.map(|c| c == "enabled").unwrap_or(false));
+        .filter_map(|c| c.ok())
+        .collect();
     drop(stmt);
-    if !has_enabled {
+    if !existing.iter().any(|c| c == "enabled") {
         conn.execute(
             "ALTER TABLE agent_instances ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
             [],
         )
         .context("补齐 agent_instances.enabled 列失败")?;
+    }
+    if !existing.iter().any(|c| c == "project_key") {
+        conn.execute(
+            "ALTER TABLE agent_instances ADD COLUMN project_key TEXT",
+            [],
+        )
+        .context("补齐 agent_instances.project_key 列失败")?;
     }
     Ok(())
 }
@@ -453,7 +463,7 @@ fn instance_rowid(c: &Connection, id: &str) -> Result<Option<i64>> {
 
 fn instance_row(c: &Connection, id: &str) -> Result<Option<AgentInstance>> {
     c.query_row(
-        "SELECT instance_key, name, agent_type, scope, current_version, enabled
+        "SELECT instance_key, name, agent_type, scope, project_key, current_version, enabled
          FROM agent_instances WHERE instance_key = ?1",
         params![id],
         |r| {
@@ -462,8 +472,9 @@ fn instance_row(c: &Connection, id: &str) -> Result<Option<AgentInstance>> {
                 name: r.get(1)?,
                 agent_type: r.get(2)?,
                 scope: InstanceScope::parse(&r.get::<_, String>(3)?).unwrap_or(InstanceScope::User),
-                current_version: r.get(4)?,
-                enabled: r.get::<_, i64>(5)? != 0,
+                project_key: r.get(4)?,
+                current_version: r.get(5)?,
+                enabled: r.get::<_, i64>(6)? != 0,
             })
         },
     )

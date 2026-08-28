@@ -12,6 +12,7 @@ fn draft(name: &str) -> AgentInstanceDraft {
         name: name.into(),
         agent_type: "generic-command".into(),
         scope: InstanceScope::User,
+        project_key: None,
         enabled: true,
         run_mode: RunMode::OneShot,
         executable: "agent.exe".into(),
@@ -167,6 +168,7 @@ fn list_filter_and_toggle_enabled() {
     let b = store
         .create_agent_instance(AgentInstanceDraft {
             scope: InstanceScope::Project,
+            project_key: Some("proj-a".into()),
             ..draft("b")
         })
         .unwrap();
@@ -174,8 +176,11 @@ fn list_filter_and_toggle_enabled() {
     let all = store.list_agent_instances(None).unwrap();
     assert_eq!(all.len(), 1, "无项目上下文时只返回用户作用域实例");
     assert_eq!(all[0].id, a.id);
-    let with_project = store.list_agent_instances(Some("proj")).unwrap();
+    let with_project = store.list_agent_instances(Some("proj-a")).unwrap();
     assert_eq!(with_project.len(), 2);
+    let other_project = store.list_agent_instances(Some("proj-b")).unwrap();
+    assert_eq!(other_project.len(), 1);
+    assert_eq!(other_project[0].id, a.id);
 
     let toggled = store
         .set_agent_instance_enabled(&a.id, false)
@@ -204,6 +209,18 @@ fn draft_validation_rejects_empty_core_fields() {
     assert!(store.create_agent_instance(bad).is_err());
     let bad = AgentInstanceDraft {
         executable: String::new(),
+        ..draft("x")
+    };
+    assert!(store.create_agent_instance(bad).is_err());
+    let bad = AgentInstanceDraft {
+        scope: InstanceScope::Project,
+        project_key: None,
+        ..draft("x")
+    };
+    assert!(store.create_agent_instance(bad).is_err());
+    let bad = AgentInstanceDraft {
+        scope: InstanceScope::User,
+        project_key: Some("proj-a".into()),
         ..draft("x")
     };
     assert!(store.create_agent_instance(bad).is_err());
