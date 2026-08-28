@@ -119,7 +119,6 @@ impl RuntimeHost for MockHost {
     }
     fn kill_session(&self, _project: &str, _session_id: i64) {}
     fn kill_ad_hoc(&self, _project: &str, _session_id: i64) {}
-    fn kill_ad_hoc(&self, _project: &str, _session_id: i64) {}
     fn answer_question(&self, _project: &str, _run_id: i64, _answer: &str) {}
     fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) -> anyhow::Result<()> {
         Ok(())
@@ -692,7 +691,8 @@ fn retry_creates_new_session_for_fresh_step() {
     .unwrap();
     // 独立 Step 重试:创建新会话
     let a = orch.store.task_steps(task.id).unwrap()[0].clone();
-    orch.retry_step(a.id).unwrap();
+    orch.retry_step(a.id, mf_agent::RetryMode::FreshSession)
+        .unwrap();
     assert!(wait_until(Duration::from_secs(5), || host.launch_count() == 2));
     assert_ne!(
         host.spec_of(1).session_id,

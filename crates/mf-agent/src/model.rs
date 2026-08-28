@@ -178,6 +178,8 @@ pub struct StepView {
     pub session_policy: String,
     pub status: StepStatus,
     pub attempts: i32,
+    /// 剩余自动重试上限(0 = 手动重试;设计 §9.6)。
+    pub auto_retry: i32,
     pub result: Option<String>,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
@@ -241,6 +243,30 @@ pub struct AdHocSessionView {
     pub created_at: String,
     pub launched_at: Option<String>,
     pub ended_at: Option<String>,
+}
+
+/// 手动重试模式(设计 §9.6):继续仍存活的交互式会话,或创建新会话。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryMode {
+    /// 继续存活会话(仅当存在 live session 时合法)。
+    ContinueSession,
+    /// 创建全新 Agent Session(自动重试固定使用此模式;保留文件修改)。
+    FreshSession,
+}
+
+/// 节点重试策略:有限自动重试次数(0 = 默认手动重试)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RetryPolicy {
+    #[serde(default)]
+    pub automatic_attempts: u32,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        RetryPolicy {
+            automatic_attempts: 0,
+        }
+    }
 }
 
 /// Agent Run 的显式结算:唯一成功依据(见 ADR 0001 与 `mfctl`)。

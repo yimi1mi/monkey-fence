@@ -104,7 +104,6 @@ impl RuntimeHost for MockHost {
     }
     fn kill_session(&self, _project: &str, _session_id: i64) {}
     fn kill_ad_hoc(&self, _project: &str, _session_id: i64) {}
-    fn kill_ad_hoc(&self, _project: &str, _session_id: i64) {}
     fn answer_question(&self, _project: &str, _run_id: i64, _answer: &str) {}
     fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) -> anyhow::Result<()> {
         Ok(())
@@ -226,7 +225,8 @@ fn retry_cancels_orphan_awaiting_run() {
     let run_id = orch.runs_of_task(task.id).unwrap()[0].id;
 
     let s = orch.task_detail(task.id).unwrap().unwrap().1;
-    orch.retry_step(s[0].id).unwrap();
+    orch.retry_step(s[0].id, mf_agent::RetryMode::FreshSession)
+        .unwrap();
     let r = orch.store.run_view(run_id).unwrap().unwrap();
     assert_eq!(
         r.status,

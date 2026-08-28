@@ -46,6 +46,7 @@ pub use model::{
     SchedulerEvent, SessionStatus, SettleError, SettleOutcome, Settlement, StepQuestionView,
     StepStatus, StepView, TaskStatus, TaskView,
 };
+pub use model::{RetryMode, RetryPolicy};
 pub use orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
 pub use pipeline::{PipelineDraft, ProfileIndex, SessionPolicy, StepDraft};
 pub use runtime::{

@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS steps (
     session_policy TEXT NOT NULL DEFAULT 'fresh',
     status TEXT NOT NULL DEFAULT 'pending',
     attempts INTEGER NOT NULL DEFAULT 0,
+    auto_retry INTEGER NOT NULL DEFAULT 0,
     result TEXT,
     started_at TEXT,
     ended_at TEXT,

@@ -94,6 +94,8 @@ pub struct Orchestrator {
     stop: Arc<AtomicBool>,
     /// 本调度器派发、仍占用并发槽的 run。
     active_dispatches: Mutex<HashSet<i64>>,
+    /// 手动"继续会话"重试:step → 存活会话 id(一次性,dispatch 消费)。
+    continue_sessions: Mutex<HashMap<i64, i64>>,
 }
 
 impl Orchestrator {
@@ -135,6 +137,7 @@ impl Orchestrator {
             runtime_rx,
             stop: stop.clone(),
             active_dispatches: Mutex::new(HashSet::new()),
+            continue_sessions: Mutex::new(HashMap::new()),
         });
         for run in &recovered {
             if let Some(t) = orch.store.task_view(run.task_id)? {
@@ -258,6 +261,23 @@ impl Orchestrator {
 
     fn task_has_active_runs(&self, task_id: i64) -> Result<bool> {
         self.store.task_has_active_runs(task_id)
+    }
+
+    /// Step 最近一次 run 关联的存活会话(继续会话重试的前提)。
+    fn live_session_of_step(&self, step_id: i64) -> Result<Option<SessionView>> {
+        let session_id = self
+            .store
+            .list_runs_of_step(step_id)?
+            .into_iter()
+            .rev()
+            .find_map(|run| run.session_id);
+        let Some(session_id) = session_id else {
+            return Ok(None);
+        };
+        Ok(self
+            .store
+            .session_view(session_id)?
+            .filter(|s| !matches!(s.status, SessionStatus::Dead | SessionStatus::Hidden)))
     }
 
     pub fn pause_task(&self, task_id: i64) -> Result<TaskView> {
@@ -400,8 +420,9 @@ impl Orchestrator {
         Ok(t)
     }
 
-    /// 失败节点操作:重试。
-    pub fn retry_step(&self, step_id: i64) -> Result<StepView> {
+    /// 失败节点操作:重试。`RetryMode::ContinueSession` 只对存活会话合法,
+    /// 其余场景必须显式 `FreshSession`(设计 §9.6)。
+    pub fn retry_step(&self, step_id: i64, mode: RetryMode) -> Result<StepView> {
         let step = self
             .store
             .step_view(step_id)?
@@ -424,6 +445,19 @@ impl Orchestrator {
         if !deps_ok {
             anyhow::bail!("上游依赖尚未成功/跳过;请先重试失败的上游节点");
         }
+        // 继续会话只对存活的会话合法;否则必须显式选择新会话
+        let continue_session = match mode {
+            RetryMode::FreshSession => None,
+            RetryMode::ContinueSession => {
+                let live = self.live_session_of_step(step_id)?;
+                let Some(session) = live else {
+                    anyhow::bail!(
+                        "Step {step_id} 没有存活的会话可继续;请使用 FreshSession 创建新会话"
+                    );
+                };
+                Some(session.id)
+            }
+        };
         // 先取消该 step 的活动 run(否则 awaiting-outcome run 永远占用
         // task_attention_cleared 与 busy_keys,needs-you 无法清除、reuse 键死锁)
         if let Some(active) = self.store.active_run_of_step(step_id)? {
@@ -431,6 +465,11 @@ impl Orchestrator {
                 self.release_slot(r.id);
                 self.emit(SchedulerEvent::RunUpdated(r));
             }
+        }
+        if let Some(session_id) = continue_session {
+            self.continue_sessions.lock().insert(step_id, session_id);
+        } else {
+            self.continue_sessions.lock().remove(&step_id);
         }
         let s = self
             .store
@@ -611,6 +650,48 @@ impl Orchestrator {
                 }
             }
             Settlement::Fail { .. } => {
+                // 有限自动重试(设计 §9.6):attempts 计入已消耗尝试,
+                // 未超过上限时以全新会话重跑(保留文件修改),
+                // 不阻塞下游、不进入 needs-you。
+                let step = self.store.step_view(run.step_id).ok().flatten();
+                let auto_retry_left = step
+                    .as_ref()
+                    .map(|s| s.attempts <= s.auto_retry)
+                    .unwrap_or(false);
+                if auto_retry_left {
+                    if let Some(s) = self
+                        .store
+                        .set_step_status(run.step_id, StepStatus::Ready)
+                        .ok()
+                        .flatten()
+                    {
+                        self.emit(SchedulerEvent::StepUpdated(s));
+                    }
+                    if let Some(t) = self.store.task_view(run.task_id).ok().flatten() {
+                        if matches!(
+                            t.status,
+                            TaskStatus::NeedsYou | TaskStatus::Failed | TaskStatus::Ready
+                        ) {
+                            if let Some(t) = self
+                                .store
+                                .set_task_status(t.id, TaskStatus::Running)
+                                .ok()
+                                .flatten()
+                            {
+                                self.emit(SchedulerEvent::TaskUpdated(t));
+                            }
+                        }
+                    }
+                    self.emit(SchedulerEvent::Log {
+                        run_id: run.id,
+                        text: format!(
+                            "自动重试:第 {} 次尝试失败,上限内以新会话重跑",
+                            step.map(|s| s.attempts).unwrap_or(0)
+                        ),
+                    });
+                    // 自动重试路径不检查收敛(节点回到 ready)
+                    return;
+                }
                 if let Ok(blocked) = self.store.block_descendants(run.step_id) {
                     for s in blocked {
                         self.emit(SchedulerEvent::StepUpdated(s));
@@ -1005,31 +1086,55 @@ impl Orchestrator {
             let runtime = spec.runtime;
             (spec, runtime)
         };
-        // 会话:fresh → 新建;reuse → 复用活的,否则新建
-        let (session, attach_existing) = match policy {
-            SessionPolicy::Fresh => (
-                self.store.create_session(
-                    None,
-                    runtime.as_str(),
-                    &step.agent_profile,
-                    &step.title,
-                )?,
-                false,
-            ),
-            SessionPolicy::Reuse { key } => {
-                match self.store.find_reusable_session(key, &step.agent_profile)? {
-                    Some(s) if !matches!(s.status, SessionStatus::Dead | SessionStatus::Hidden) => {
-                        (s, true)
+        // 会话:fresh → 新建;reuse → 复用活的,否则新建;
+        // 手动"继续会话"重试 → 固定复用指定存活会话(一次性映射)
+        let (session, attach_existing) = if let Some(session_id) =
+            self.continue_sessions.lock().remove(&step.id)
+        {
+            let live = self
+                .store
+                .session_view(session_id)?
+                .filter(|s| !matches!(s.status, SessionStatus::Dead | SessionStatus::Hidden));
+            match live {
+                Some(s) => (s, true),
+                None => (
+                    self.store.create_session(
+                        None,
+                        runtime.as_str(),
+                        &step.agent_profile,
+                        &step.title,
+                    )?,
+                    false,
+                ),
+            }
+        } else {
+            match policy {
+                SessionPolicy::Fresh => (
+                    self.store.create_session(
+                        None,
+                        runtime.as_str(),
+                        &step.agent_profile,
+                        &step.title,
+                    )?,
+                    false,
+                ),
+                SessionPolicy::Reuse { key } => {
+                    match self.store.find_reusable_session(key, &step.agent_profile)? {
+                        Some(s)
+                            if !matches!(s.status, SessionStatus::Dead | SessionStatus::Hidden) =>
+                        {
+                            (s, true)
+                        }
+                        _ => (
+                            self.store.create_session(
+                                Some(key),
+                                runtime.as_str(),
+                                &step.agent_profile,
+                                &step.title,
+                            )?,
+                            false,
+                        ),
                     }
-                    _ => (
-                        self.store.create_session(
-                            Some(key),
-                            runtime.as_str(),
-                            &step.agent_profile,
-                            &step.title,
-                        )?,
-                        false,
-                    ),
                 }
             }
         };

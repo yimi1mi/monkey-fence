@@ -371,7 +371,7 @@ impl AgentWorkspace {
         };
         let result: std::result::Result<String, String> = match action {
             "retry" => orch
-                .retry_step(step_id)
+                .retry_step(step_id, mf_agent::RetryMode::FreshSession)
                 .map(|_| "已重试".into())
                 .map_err(|e| format!("{e:#}")),
             "skip" => orch

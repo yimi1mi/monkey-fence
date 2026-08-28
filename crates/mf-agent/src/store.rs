@@ -73,7 +73,21 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         initialize_schema(&conn, PROJECT_SCHEMA_V1, PROJECT_SCHEMA_VERSION)
             .context("初始化项目库 v1 schema 失败")?;
-        // 早期开发库的 pipeline_revisions 没有 snapshot_json 列,幂等补齐
+        // 早期开发库的 steps/pipeline_revisions 缺列(CREATE IF NOT EXISTS 不补列)
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(steps)")?;
+            let has_auto = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .any(|c| c.map(|c| c == "auto_retry").unwrap_or(false));
+            drop(stmt);
+            if !has_auto {
+                conn.execute(
+                    "ALTER TABLE steps ADD COLUMN auto_retry INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .context("补齐 steps.auto_retry 列失败")?;
+            }
+        }
         {
             let mut stmt = conn.prepare("PRAGMA table_info(pipeline_revisions)")?;
             let has_snapshot = stmt
@@ -450,7 +464,7 @@ impl Store {
     fn revision_steps_by_id(c: &Connection, revision_id: i64) -> Result<Vec<StepView>> {
         let mut stmt = c.prepare(
             "SELECT id, revision_id, task_id, step_key, title, instructions, agent_profile,
-                    session_policy, status, attempts, result, started_at, ended_at
+                    session_policy, status, attempts, auto_retry, result, started_at, ended_at
              FROM steps WHERE revision_id = ?1 ORDER BY id",
         )?;
         let mut rows: Vec<StepView> = stmt
@@ -467,9 +481,10 @@ impl Store {
                     status: StepStatus::parse(&r.get::<_, String>(8)?)
                         .unwrap_or(StepStatus::Pending),
                     attempts: r.get(9)?,
-                    result: r.get(10)?,
-                    started_at: r.get(11)?,
-                    ended_at: r.get(12)?,
+                    auto_retry: r.get::<_, i64>(10)? as i32,
+                    result: r.get(11)?,
+                    started_at: r.get(12)?,
+                    ended_at: r.get(13)?,
                     deps: Vec::new(),
                 })
             })?
@@ -557,6 +572,29 @@ impl Store {
                 .optional()?;
             match rev {
                 Some(r) => Ok(Self::revision_steps_by_id(c, r)?.into_iter().find(|s| s.id == step_id)),
+                None => Ok(None),
+            }
+        })
+    }
+
+    /// 配置节点自动重试上限(0 = 手动重试;设计 §9.6)。
+    pub fn set_step_auto_retry(&self, step_id: i64, limit: i32) -> Result<Option<StepView>> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE steps SET auto_retry = ?2, updated_at = ?3 WHERE id = ?1",
+                params![step_id, limit, now()],
+            )?;
+            let rev: Option<i64> = c
+                .query_row(
+                    "SELECT revision_id FROM steps WHERE id = ?1",
+                    params![step_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match rev {
+                Some(r) => Ok(Self::revision_steps_by_id(c, r)?
+                    .into_iter()
+                    .find(|s| s.id == step_id)),
                 None => Ok(None),
             }
         })
@@ -1159,6 +1197,25 @@ impl Store {
                  WHERE id = ?1 AND status NOT IN ('succeeded','failed','skipped','cancelled')",
                 params![step_id, settlement.step_status().as_str(), settlement.payload(), ts],
             )?;
+            // 成功结算与 Handoff 落库同一事务:下游解锁的前提是两者都已持久化
+            if settlement.kind_str() == "complete" {
+                let handoff = crate::handoff::Handoff {
+                    status: "complete".into(),
+                    summary: settlement.payload().to_string(),
+                    ..Default::default()
+                };
+                tx.execute(
+                    "INSERT INTO handoffs (task_id, step_id, run_id, handoff_json, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        run.task_id,
+                        step_id,
+                        run.id,
+                        serde_json::to_string(&handoff)?,
+                        ts
+                    ],
+                )?;
+            }
             let updated = Self::run_view_by_id_tx(tx, run.id)?
                 .ok_or(SettleError::UnknownToken)?;
             Ok((updated, SettleOutcome::Applied))
