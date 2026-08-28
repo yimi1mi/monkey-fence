@@ -111,6 +111,8 @@ pub struct AppCtx {
     pub registry: Arc<SessionRegistry>,
     pub plugins: Arc<PluginRegistry>,
     /// 用户级目录库(Agent Instance、模板、Secret、插件包;~/.monkeyfence/catalog-v1.db)。
+    /// 读写 API 随 Agent Instance / Secret Store 里程碑接入。
+    #[allow(dead_code)]
     pub catalog_store: Arc<CatalogStore>,
     pub limiter: Arc<GlobalLimiter>,
     pub catalog: Arc<RwLock<ProfileCatalog>>,
