@@ -1285,6 +1285,7 @@ impl SettingsView {
             let homepage = p.homepage.clone().unwrap_or_default();
             let has_hook = p.hook.is_some();
             let hook_cfg = p.hook.clone();
+            let is_default = default_agent == p.id;
             col = col.child(
                 div()
                     .id(ElementId::Name(format!("agent-row-{pid}").into()))
@@ -1343,16 +1344,24 @@ impl SettingsView {
                                     homepage.clone(),
                                 ))
                             })
-                            .child(mini_btn(
-                                cx,
-                                format!("agent-default-{pid}"),
-                                "设为默认",
-                                crate::theme::Theme::accent(),
-                                move |s: &mut SettingsView, _, _, cx| {
-                                    s.draft.agents.default_agent = pid2.clone();
-                                    cx.notify();
-                                },
-                            ))
+                            .when(is_default, |d| {
+                                d.child(mini_btn_disabled(
+                                    format!("agent-default-{pid}"),
+                                    "✓ 当前默认",
+                                ))
+                            })
+                            .when(!is_default, |d| {
+                                d.child(mini_btn(
+                                    cx,
+                                    format!("agent-default-{pid}"),
+                                    "设为默认",
+                                    crate::theme::Theme::accent(),
+                                    move |s: &mut SettingsView, _, _, cx| {
+                                        s.draft.agents.default_agent = pid2.clone();
+                                        cx.notify();
+                                    },
+                                ))
+                            })
                             .child(mini_btn(
                                 cx,
                                 format!("agent-expand-{pid}"),
@@ -2107,6 +2116,21 @@ fn mini_btn(
         .hover(move |d| d.bg(rgb(color)).text_color(rgb(crate::theme::Theme::bg())))
         .child(label.to_string())
         .on_click(cx.listener(handler))
+}
+
+fn mini_btn_disabled(id: impl Into<gpui::ElementId>, label: &str) -> impl IntoElement {
+    div()
+        .id(id)
+        .px_2()
+        .h(px(18.))
+        .flex()
+        .items_center()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(crate::theme::Theme::border()))
+        .text_size(px(9.5))
+        .text_color(rgb(crate::theme::Theme::fg_faint()))
+        .child(label.to_string())
 }
 
 fn link_btn(
