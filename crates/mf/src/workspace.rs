@@ -168,6 +168,18 @@ struct CloseConfirm {
     active_runs: usize,
 }
 
+/// 分隔条拖拽进行中:记录起点鼠标位置与起点尺寸。
+#[derive(Clone, Copy)]
+enum PanelDrag {
+    Left { start_x: f32, start_w: f32 },
+    Bottom { start_y: f32, start_h: f32 },
+}
+
+const LEFT_PANEL_MIN: f32 = 180.;
+const LEFT_PANEL_MAX: f32 = 640.;
+const BOTTOM_DOCK_MIN: f32 = 150.;
+const BOTTOM_DOCK_MAX: f32 = 720.;
+
 pub struct Workspace {
     app: Arc<AppCtx>,
     /// 会话恢复进行中:open_folder 只注册项目,不抢占前台。
@@ -193,6 +205,9 @@ pub struct Workspace {
     focus_editor_next: bool,
     pending_focus: Option<FocusHandle>,
     editor_font: mf_agent::EditorConfig,
+    left_panel_width: Pixels,
+    bottom_panel_height: Pixels,
+    panel_drag: Option<PanelDrag>,
 }
 
 impl Workspace {
@@ -220,6 +235,9 @@ impl Workspace {
             focus_editor_next: false,
             pending_focus: None,
             editor_font: mf_agent::EditorConfig::default(),
+            left_panel_width: px(284.),
+            bottom_panel_height: px(228.),
+            panel_drag: None,
         };
         // 唯一的轻量 snapshot 监听:revision 变化时把同一份快照推给
         // TaskSidebar 与 AgentWorkspace(两者不再各自轮询数据库)。
@@ -2064,7 +2082,8 @@ impl Workspace {
         };
         div()
             .id("left-panel")
-            .w(px(284.))
+            .w(self.left_panel_width)
+            .flex_none()
             .flex()
             .flex_col()
             .bg(rgb(crate::theme::Theme::bg_panel()))
@@ -2129,7 +2148,7 @@ impl Workspace {
 
         div()
             .id("bottom-dock")
-            .h(px(228.))
+            .h(self.bottom_panel_height)
             .min_h(px(150.))
             .flex()
             .flex_col()
@@ -2203,6 +2222,87 @@ impl Workspace {
                     ),
             )
             .child(div().flex_1().min_h_0().child(panel))
+    }
+
+    // ---------- 面板分隔条拖拽 ----------
+
+    /// 左面板右缘竖向拖拽条:拖动调左栏宽。
+    fn render_left_divider(&self, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .id("left-panel-resize")
+            .w(px(5.))
+            .h_full()
+            .flex_none()
+            .cursor_col_resize()
+            .hover(|d| d.bg(rgb(crate::theme::Theme::accent_dim())))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|ws, e: &MouseDownEvent, window, cx| {
+                    ws.panel_drag = Some(PanelDrag::Left {
+                        start_x: e.position.x.as_f32(),
+                        start_w: ws.left_panel_width.as_f32(),
+                    });
+                    window.prevent_default();
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// 底部 dock 上缘横向拖拽条:拖动调高度。
+    fn render_bottom_divider(&self, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .id("bottom-dock-resize")
+            .w_full()
+            .h(px(5.))
+            .flex_none()
+            .cursor_row_resize()
+            .hover(|d| d.bg(rgb(crate::theme::Theme::accent_dim())))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|ws, e: &MouseDownEvent, window, cx| {
+                    ws.panel_drag = Some(PanelDrag::Bottom {
+                        start_y: e.position.y.as_f32(),
+                        start_h: ws.bottom_panel_height.as_f32(),
+                    });
+                    window.prevent_default();
+                    cx.notify();
+                }),
+            )
+    }
+
+    fn on_panel_drag_move(&mut self, e: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(drag) = self.panel_drag else {
+            return;
+        };
+        // 按键已放开(可能没收到 mouse up):自愈并结束拖拽。
+        if e.pressed_button != Some(MouseButton::Left) {
+            self.panel_drag = None;
+            cx.notify();
+            return;
+        }
+        match drag {
+            PanelDrag::Left { start_x, start_w } => {
+                let w = (start_w + e.position.x.as_f32() - start_x).clamp(LEFT_PANEL_MIN, LEFT_PANEL_MAX);
+                if (w - self.left_panel_width.as_f32()).abs() > 0.5 {
+                    self.left_panel_width = px(w);
+                    cx.notify();
+                }
+            }
+            PanelDrag::Bottom { start_y, start_h } => {
+                let h = (start_h + start_y - e.position.y.as_f32())
+                    .clamp(BOTTOM_DOCK_MIN, BOTTOM_DOCK_MAX);
+                if (h - self.bottom_panel_height.as_f32()).abs() > 0.5 {
+                    self.bottom_panel_height = px(h);
+                    cx.notify();
+                }
+            }
+        }
+    }
+
+    fn on_panel_drag_end(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.panel_drag.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn render_status_bar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -2508,12 +2608,16 @@ impl Render for Workspace {
             .flex_col()
             .child(div().flex_1().min_h_0().flex().child(primary));
         if self.navigation.bottom.is_some() {
-            center_stack = center_stack.child(self.render_bottom_dock(cx));
+            center_stack = center_stack
+                .child(self.render_bottom_divider(cx))
+                .child(self.render_bottom_dock(cx));
         }
 
         let mut content = div().flex_1().min_w_0().min_h_0().flex().relative();
         if self.navigation.left.is_some() {
-            content = content.child(self.render_left_panel(cx));
+            content = content
+                .child(self.render_left_panel(cx))
+                .child(self.render_left_divider(cx));
         }
         content = content.child(center_stack);
         if self.close_confirm.is_some() {
@@ -2529,6 +2633,15 @@ impl Render for Workspace {
             .flex_col()
             .bg(rgb(crate::theme::Theme::bg()))
             .text_color(rgb(crate::theme::Theme::fg()))
+            .when(matches!(self.panel_drag, Some(PanelDrag::Left { .. })), |d| {
+                d.cursor_col_resize()
+            })
+            .when(
+                matches!(self.panel_drag, Some(PanelDrag::Bottom { .. })),
+                |d| d.cursor_row_resize(),
+            )
+            .on_mouse_move(cx.listener(Self::on_panel_drag_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_panel_drag_end))
             .on_action(cx.listener(Self::act_open_folder))
             .on_action(cx.listener(Self::show_quick_open_files))
             .on_action(cx.listener(Self::show_command_palette))
