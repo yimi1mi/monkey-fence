@@ -73,6 +73,21 @@ impl Store {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         initialize_schema(&conn, PROJECT_SCHEMA_V1, PROJECT_SCHEMA_VERSION)
             .context("初始化项目库 v1 schema 失败")?;
+        // 早期开发库的 pipeline_revisions 没有 snapshot_json 列,幂等补齐
+        {
+            let mut stmt = conn.prepare("PRAGMA table_info(pipeline_revisions)")?;
+            let has_snapshot = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .any(|c| c.map(|c| c == "snapshot_json").unwrap_or(false));
+            drop(stmt);
+            if !has_snapshot {
+                conn.execute(
+                    "ALTER TABLE pipeline_revisions ADD COLUMN snapshot_json TEXT",
+                    [],
+                )
+                .context("补齐 pipeline_revisions.snapshot_json 列失败")?;
+            }
+        }
         Ok(Store {
             conn: Mutex::new(conn),
         })
@@ -1438,6 +1453,107 @@ impl Store {
                 params![id, handoff_json, now()],
             )?;
             Self::ad_hoc_view_by_id(c, id)
+        })
+    }
+
+    // ---------- Workflow 快照与 Handoff ----------
+
+    /// 保存序列化工作流快照为新 Revision(draft 状态;无 steps 投影,
+    /// 执行接线由 Run Coordinator 负责)。
+    pub fn create_workflow_revision(
+        &self,
+        task_id: i64,
+        snapshot: &crate::workflow::WorkflowSnapshot,
+    ) -> Result<RevisionView> {
+        self.with_conn(|c| {
+            let ts = now();
+            let next: i64 = c.query_row(
+                "SELECT COALESCE(MAX(revision), 0) + 1 FROM pipeline_revisions WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )?;
+            c.execute(
+                "INSERT INTO pipeline_revisions (task_id, revision, status, snapshot_json, created_at)
+                 VALUES (?1, ?2, 'draft', ?3, ?4)",
+                params![task_id, next, serde_json::to_string(snapshot)?, ts],
+            )?;
+            Ok(RevisionView {
+                id: c.last_insert_rowid(),
+                task_id,
+                revision: next,
+                status: RevisionStatus::Draft,
+                created_at: ts,
+            })
+        })
+    }
+
+    /// 读取 Revision 冻结的工作流快照(旧 PipelineDraft revision 为 None)。
+    pub fn revision_snapshot(
+        &self,
+        revision_id: i64,
+    ) -> Result<Option<crate::workflow::WorkflowSnapshot>> {
+        self.with_conn(|c| {
+            let json: Option<String> = c
+                .query_row(
+                    "SELECT snapshot_json FROM pipeline_revisions WHERE id = ?1",
+                    params![revision_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match json {
+                Some(json) => {
+                    Ok(Some(serde_json::from_str(&json).with_context(|| {
+                        format!("Revision {revision_id} 快照损坏")
+                    })?))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
+    /// 记录 Handoff(与结算同事务的写入由 Run Coordinator 组合)。
+    /// 返回 handoff 行 id。
+    pub fn insert_handoff(
+        &self,
+        task_id: i64,
+        step_id: Option<i64>,
+        run_id: Option<i64>,
+        handoff: &crate::handoff::Handoff,
+    ) -> Result<i64> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO handoffs (task_id, step_id, run_id, handoff_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    task_id,
+                    step_id,
+                    run_id,
+                    serde_json::to_string(handoff)?,
+                    now()
+                ],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    /// 任务的 Handoff 列表(升序):(行 id, Handoff)。
+    pub fn list_handoffs(&self, task_id: i64) -> Result<Vec<(i64, crate::handoff::Handoff)>> {
+        self.with_conn(|c| {
+            let mut stmt =
+                c.prepare("SELECT id, handoff_json FROM handoffs WHERE task_id = ?1 ORDER BY id")?;
+            let rows: Vec<(i64, String)> = stmt
+                .query_map(params![task_id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            drop(stmt);
+            rows.into_iter()
+                .map(|(id, json)| {
+                    let handoff: crate::handoff::Handoff = serde_json::from_str(&json)
+                        .with_context(|| format!("handoff 行 {id} 损坏"))?;
+                    Ok((id, handoff))
+                })
+                .collect()
         })
     }
 }

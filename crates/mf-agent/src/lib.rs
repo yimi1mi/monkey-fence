@@ -14,6 +14,7 @@ pub mod agent_adapter;
 pub mod agent_instance;
 pub mod catalog_store;
 pub mod config;
+pub mod handoff;
 pub mod model;
 pub mod orchestrator;
 pub mod pipeline;
@@ -22,11 +23,13 @@ pub mod runtime;
 pub mod schema;
 pub mod secrets;
 pub mod store;
+pub mod workflow;
 
+/// 适配器构造 Handoff 时使用的别名:规范类型是 `handoff::Handoff`。
+pub use crate::handoff::Handoff as HandoffDraft;
 pub use agent_adapter::{
     AgentAdapter, CompletionDetector, CompletionMode, CompletionObservation, ExecutionContract,
-    HandoffDraft, InputInjection, InputMode, LaunchContext, LaunchPlan, ProcessObservation,
-    TempFileSpec,
+    InputInjection, InputMode, LaunchContext, LaunchPlan, ProcessObservation, TempFileSpec,
 };
 pub use agent_instance::{
     AgentInstance, AgentInstanceDraft, AgentInstanceOverrides, AgentInstanceSnapshot,
@@ -36,6 +39,7 @@ pub use catalog_store::{CatalogStore, PluginPinRecord};
 pub use config::{
     Config, EditorConfig, EngineConfig, ProviderConfig, ProviderKind, TerminalConfig,
 };
+pub use handoff::Handoff;
 pub use model::{
     AdHocSessionView, AgentState, InstanceScope, RevisionStatus, RunMode, RunStatus,
     SchedulerEvent, SessionStatus, SettleError, SettleOutcome, Settlement, StepQuestionView,

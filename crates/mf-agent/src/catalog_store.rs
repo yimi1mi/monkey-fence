@@ -355,29 +355,207 @@ impl CatalogStore {
                 .collect()
         })
     }
+
+    // ---------- Workflow 模板 ----------
+
+    /// 保存模板草案:同 key 追加不可变版本行并推进 current_version,
+    /// 既有版本(与已冻结快照)不受影响。
+    pub fn save_template(
+        &self,
+        draft: &crate::workflow::WorkflowTemplateDraft,
+    ) -> Result<crate::workflow::WorkflowTemplateVersion> {
+        if draft.key.trim().is_empty() || draft.name.trim().is_empty() {
+            anyhow::bail!("模板 key/name 不能为空");
+        }
+        if draft.nodes.is_empty() {
+            anyhow::bail!("模板至少需要一个节点");
+        }
+        self.with_tx(|tx| {
+            let ts = now();
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT current_version FROM workflow_templates WHERE template_key = ?1",
+                    params![draft.key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let (version, task_local) = match existing {
+                Some(current) => (current + 1, None),
+                None => (1, Some(draft.task_local)),
+            };
+            if let Some(local) = task_local {
+                tx.execute(
+                    "INSERT INTO workflow_templates
+                        (template_key, name, current_version, task_local, created_at, updated_at)
+                     VALUES (?1, ?2, 1, ?3, ?4, ?4)",
+                    params![draft.key, draft.name, local as i64, ts],
+                )?;
+            } else {
+                tx.execute(
+                    "UPDATE workflow_templates
+                     SET name = ?2, current_version = ?3, updated_at = ?4
+                     WHERE template_key = ?1",
+                    params![draft.key, draft.name, version, ts],
+                )?;
+            }
+            let nodes_json = serde_json::to_string(&draft.nodes)?;
+            tx.execute(
+                "INSERT INTO workflow_template_versions (template_id, version, graph_json, created_at)
+                 VALUES ((SELECT id FROM workflow_templates WHERE template_key = ?1), ?2, ?3, ?4)",
+                params![draft.key, version, nodes_json, ts],
+            )?;
+            Self::template_version_rowid_tx(tx, tx.last_insert_rowid())?
+                .ok_or_else(|| anyhow::anyhow!("模板版本插入后读取失败"))
+        })
+    }
+
+    /// 按版本行 rowid 读取固定版本(编译/冻结都走它)。
+    pub fn template_version(
+        &self,
+        version_id: i64,
+    ) -> Result<Option<crate::workflow::WorkflowTemplateVersion>> {
+        self.with_conn(|c| Self::template_version_rowid_tx(c, version_id))
+    }
+
+    fn template_version_rowid_tx(
+        c: &Connection,
+        version_id: i64,
+    ) -> Result<Option<crate::workflow::WorkflowTemplateVersion>> {
+        let row: Option<(String, i64, String, String)> = c
+            .query_row(
+                "SELECT t.template_key, v.version, v.graph_json, v.created_at
+                 FROM workflow_template_versions v
+                 JOIN workflow_templates t ON t.id = v.template_id
+                 WHERE v.id = ?1",
+                params![version_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        match row {
+            Some((template_key, version, graph_json, created_at)) => {
+                let nodes: Vec<crate::workflow::WorkflowNodeDraft> =
+                    serde_json::from_str(&graph_json)
+                        .with_context(|| format!("模板 `{template_key}` 版本 {version} 行损坏"))?;
+                Ok(Some(crate::workflow::WorkflowTemplateVersion {
+                    version_id,
+                    template_key,
+                    version,
+                    nodes,
+                    created_at,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// 模板版本历史(升序)。
+    pub fn template_versions(
+        &self,
+        key: &str,
+    ) -> Result<Vec<crate::workflow::WorkflowTemplateVersion>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT v.id FROM workflow_template_versions v
+                 JOIN workflow_templates t ON t.id = v.template_id
+                 WHERE t.template_key = ?1 ORDER BY v.version",
+            )?;
+            let ids: Vec<i64> = stmt
+                .query_map(params![key], |r| r.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            drop(stmt);
+            Ok(ids
+                .iter()
+                .filter_map(|id| Self::template_version_rowid_tx(c, *id).ok().flatten())
+                .collect())
+        })
+    }
+
+    /// 列出模板;`include_task_local = false` 只返回全局模板
+    /// (任务本地模板默认私有,设计 §9.1)。
+    pub fn list_templates(
+        &self,
+        include_task_local: bool,
+    ) -> Result<Vec<crate::workflow::WorkflowTemplate>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT template_key, name, current_version, task_local
+                 FROM workflow_templates
+                 WHERE (?1 OR task_local = 0)
+                 ORDER BY template_key",
+            )?;
+            let rows = stmt
+                .query_map(params![include_task_local], |r| {
+                    Ok(crate::workflow::WorkflowTemplate {
+                        key: r.get(0)?,
+                        name: r.get(1)?,
+                        current_version: r.get(2)?,
+                        task_local: r.get::<_, i64>(3)? != 0,
+                    })
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// 任务本地模板显式"另存为模板":提升为全局(设计 §9.1)。
+    pub fn promote_template_to_global(&self, key: &str) -> Result<()> {
+        let n = self.with_conn(|c| {
+            Ok(c.execute(
+                "UPDATE workflow_templates SET task_local = 0, updated_at = ?2
+                 WHERE template_key = ?1",
+                params![key, now()],
+            )?)
+        })?;
+        if n == 0 {
+            anyhow::bail!("模板 `{key}` 不存在");
+        }
+        Ok(())
+    }
 }
 
 /// 补齐旧开发库缺失的列(CREATE IF NOT EXISTS 不会补列;幂等)。
 fn ensure_agent_instances_columns(conn: &Connection) -> Result<()> {
-    let mut stmt = conn.prepare("PRAGMA table_info(agent_instances)")?;
-    let existing: Vec<String> = stmt
-        .query_map([], |r| r.get::<_, String>(1))?
-        .filter_map(|c| c.ok())
-        .collect();
-    drop(stmt);
-    if !existing.iter().any(|c| c == "enabled") {
-        conn.execute(
-            "ALTER TABLE agent_instances ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
-            [],
-        )
-        .context("补齐 agent_instances.enabled 列失败")?;
-    }
-    if !existing.iter().any(|c| c == "project_key") {
-        conn.execute(
-            "ALTER TABLE agent_instances ADD COLUMN project_key TEXT",
-            [],
-        )
-        .context("补齐 agent_instances.project_key 列失败")?;
+    ensure_table_columns(
+        conn,
+        "agent_instances",
+        &[
+            (
+                "enabled",
+                "ALTER TABLE agent_instances ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
+            ),
+            (
+                "project_key",
+                "ALTER TABLE agent_instances ADD COLUMN project_key TEXT",
+            ),
+            (
+                "task_local",
+                "ALTER TABLE workflow_templates ADD COLUMN task_local INTEGER NOT NULL DEFAULT 0",
+            ),
+        ],
+    )
+}
+
+/// 幂等补列:`checks` 是 (列名, 该列所在表的 ALTER 语句) 集合。
+fn ensure_table_columns(conn: &Connection, _table: &str, checks: &[(&str, &str)]) -> Result<()> {
+    // 逐条探测对应表的列;探测失败(表/列不存在)时执行 ALTER
+    for (column, alter) in checks {
+        let table = alter
+            .split_whitespace()
+            .nth(2)
+            .unwrap_or_default()
+            .trim_end_matches(';');
+        let existing: Vec<String> = {
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let cols = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .filter_map(|c| c.ok())
+                .collect();
+            cols
+        };
+        if !existing.iter().any(|c| c == column) {
+            conn.execute(alter, [])
+                .with_context(|| format!("补齐 {table}.{column} 列失败"))?;
+        }
     }
     Ok(())
 }

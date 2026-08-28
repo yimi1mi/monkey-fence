@@ -179,20 +179,8 @@ pub enum CompletionObservation {
     Failed(String),
 }
 
-/// Handoff 草案:固定字段 + 自定义 `output`(设计 §4.5)。
-/// 原始终端输出只通过 `raw_log_ref` 引用,不复制内容。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct HandoffDraft {
-    pub status: String,
-    pub summary: String,
-    pub changed_files: Vec<String>,
-    pub artifacts: Vec<String>,
-    pub verification: Option<serde_json::Value>,
-    pub blockers: Vec<String>,
-    pub recommendations: Vec<String>,
-    pub output: serde_json::Value,
-    pub raw_log_ref: Option<String>,
-}
+/// 适配器提取的 Handoff:规范类型定义在 `handoff` 模块(设计 §4.5)。
+pub use crate::handoff::Handoff as HandoffDraft;
 
 /// Agent Adapter:每个 Agent Type 的执行行为(设计 §6.1)。
 pub trait AgentAdapter: Send + Sync {

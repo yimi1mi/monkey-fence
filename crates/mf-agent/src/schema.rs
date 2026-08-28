@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS pipeline_revisions (
     task_id INTEGER NOT NULL REFERENCES agent_tasks(id),
     revision INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'draft',
+    snapshot_json TEXT,
     created_at TEXT NOT NULL,
     UNIQUE(task_id, revision)
 );
@@ -162,6 +163,16 @@ CREATE TABLE IF NOT EXISTS ad_hoc_sessions (
     ended_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ad_hoc_task ON ad_hoc_sessions(task_id);
+CREATE TABLE IF NOT EXISTS handoffs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES agent_tasks(id),
+    step_id INTEGER,
+    run_id INTEGER,
+    handoff_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_handoffs_task ON handoffs(task_id);
+CREATE INDEX IF NOT EXISTS idx_handoffs_run ON handoffs(run_id);
 ";
 
 /// 目录库 v1 DDL:仅空表地基(字段随后续里程碑补全);
@@ -192,6 +203,7 @@ CREATE TABLE IF NOT EXISTS workflow_templates (
     template_key TEXT NOT NULL UNIQUE,
     name TEXT NOT NULL,
     current_version INTEGER NOT NULL DEFAULT 1,
+    task_local INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
