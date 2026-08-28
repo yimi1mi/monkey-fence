@@ -1,8 +1,13 @@
 #![recursion_limit = "256"]
 
+mod agent_instance_editor;
+#[cfg(test)]
+mod agent_instance_tests;
+mod agent_instances_view;
 mod agent_workspace;
 mod app_ctx;
 mod console;
+mod declarative_form;
 mod diff_view;
 mod editor;
 mod file_index;
@@ -559,6 +564,7 @@ mod v2_tests {
             test_catalog(),
             GlobalLimiter::new(4),
             pipe_name_for_current_process(),
+            std::sync::Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
         )
         .unwrap()
     }

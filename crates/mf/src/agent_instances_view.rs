@@ -1,0 +1,929 @@
+//! Agent Instance 列表视图模型(UI 计划 Task 1)。
+//!
+//! Agent Type(默认 CLI 引导入口)与用户实例同页展示、视觉区分:
+//! 默认 CLI 条目只是"快速打开全部已检测 Agent"的入口(不落库);
+//! 持久化实例独立列出。缺失 CLI 置灰并解释原因(设计 §11.1)。
+
+use crate::agent_instance_editor::AgentTypeInfo;
+use mf_agent::agent_instance::AgentInstance;
+use mf_agent::{InstanceScope, RunMode};
+
+/// 列表行(渲染投影):default-cli = 类型引导入口;instance = 已存实例。
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstanceListEntry {
+    pub kind: &'static str,
+    pub title: String,
+    pub subtitle: String,
+    pub available: bool,
+    pub id: Option<String>,
+}
+
+/// 实例条目数据(从目录库装载)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct InstanceListInstance {
+    pub id: String,
+    pub name: String,
+    pub agent_type: String,
+    pub type_name: String,
+    pub enabled: bool,
+    pub current_version: i64,
+    pub scope: InstanceScope,
+    pub executable: String,
+    pub run_mode: RunMode,
+}
+
+pub type InstanceListEntryLegacy = InstanceListInstance;
+
+/// 列表视图模型(纯状态)。
+#[derive(Debug, Default)]
+pub struct AgentInstancesViewModel {
+    types: Vec<AgentTypeInfo>,
+    instances: Vec<InstanceListInstance>,
+}
+
+impl AgentInstancesViewModel {
+    pub fn push_type(&mut self, info: AgentTypeInfo) {
+        self.types.push(info);
+    }
+
+    pub fn type_infos(&self) -> &[AgentTypeInfo] {
+        &self.types
+    }
+
+    pub fn instances(&self) -> &[InstanceListInstance] {
+        &self.instances
+    }
+
+    pub fn push_instance(&mut self, instance: InstanceListInstance) {
+        self.instances.push(instance);
+    }
+
+    /// 从目录库行装载(类型名解析失败的显示原始 id)。
+    pub fn load_instances(&mut self, rows: &[AgentInstance]) {
+        for row in rows {
+            let type_name = self
+                .types
+                .iter()
+                .find(|t| t.id == row.agent_type)
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| row.agent_type.clone());
+            self.instances.push(InstanceListInstance {
+                id: row.id.clone(),
+                name: row.name.clone(),
+                agent_type: row.agent_type.clone(),
+                type_name,
+                enabled: row.enabled,
+                current_version: row.current_version,
+                scope: row.scope,
+                executable: String::new(),
+                run_mode: RunMode::Interactive,
+            });
+        }
+    }
+
+    /// 全部条目:默认 CLI 引导入口在前,实例在后。
+    pub fn entries(&self) -> Vec<InstanceListEntry> {
+        let mut out = Vec::new();
+        for t in &self.types {
+            out.push(InstanceListEntry {
+                kind: "default-cli",
+                title: t.name.clone(),
+                subtitle: if t.detected {
+                    format!("{} · 默认 CLI(不保存实例)", t.plugin_name)
+                } else {
+                    format!("{} · 未检测到 {}", t.plugin_name, t.default_command)
+                },
+                available: t.detected,
+                id: None,
+            });
+        }
+        for i in &self.instances {
+            out.push(InstanceListEntry {
+                kind: "instance",
+                title: i.name.clone(),
+                subtitle: format!(
+                    "{} · v{} · {}{}",
+                    i.type_name,
+                    i.current_version,
+                    if i.enabled { "已启用" } else { "已禁用" },
+                    match i.scope {
+                        InstanceScope::User => String::new(),
+                        InstanceScope::Project => " · 项目作用域".into(),
+                    }
+                ),
+                available: true,
+                id: Some(i.id.clone()),
+            });
+        }
+        out
+    }
+
+    /// 文本过滤(标题 + 副标题,大小写不敏感)。
+    pub fn filtered(&self, text: &str) -> Vec<InstanceListEntry> {
+        let needle = text.trim().to_lowercase();
+        self.entries()
+            .into_iter()
+            .filter(|e| {
+                needle.is_empty()
+                    || e.title.to_lowercase().contains(&needle)
+                    || e.subtitle.to_lowercase().contains(&needle)
+            })
+            .collect()
+    }
+}
+
+// ---------- GPUI 页面(设计 §11.1)----------
+
+use gpui::prelude::*;
+use gpui::{px, rgb, AnyElement, Context, FocusHandle, Window};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PageField {
+    None,
+    Filter,
+    Name,
+    Executable,
+    Argv,
+    Env,
+}
+
+/// Agent 实例页(独立 GPUI 实体,模式同 TaskComposer):
+/// 左侧类型/实例列表,右侧编辑器;默认 CLI 行可快速启动到当前任务。
+pub struct AgentInstancesPage {
+    pub app: std::sync::Arc<crate::app_ctx::AppCtx>,
+    pub model: AgentInstancesViewModel,
+    pub filter: String,
+    pub editor: Option<crate::agent_instance_editor::AgentInstanceEditorState>,
+    /// 编辑器当前编辑字段。
+    field: PageField,
+    focus_handle: FocusHandle,
+    pub status: String,
+    /// 当前选中任务(默认 CLI 启动的离散会话挂载点)。
+    pub selected_task: Option<(std::path::PathBuf, i64)>,
+}
+
+impl AgentInstancesPage {
+    pub fn new(
+        app: std::sync::Arc<crate::app_ctx::AppCtx>,
+        cx: &mut Context<Self>,
+    ) -> AgentInstancesPage {
+        let mut page = AgentInstancesPage {
+            app,
+            model: AgentInstancesViewModel::default(),
+            filter: String::new(),
+            editor: None,
+            field: PageField::None,
+            focus_handle: cx.focus_handle(),
+            status: String::new(),
+            selected_task: None,
+        };
+        page.refresh();
+        page
+    }
+
+    /// 从插件贡献 + 目录库刷新。
+    pub fn refresh(&mut self) {
+        let mut model = AgentInstancesViewModel::default();
+        let contributions = self.app.plugins.contributions();
+        let mut types: Vec<crate::agent_instance_editor::AgentTypeInfo> = contributions
+            .agent_types()
+            .into_iter()
+            .map(|(src, a)| {
+                let detected = mf_plugins::builtin::detect_on_path(&a.command).is_some()
+                    || a.command.is_empty();
+                crate::agent_instance_editor::AgentTypeInfo {
+                    id: a.id.clone(),
+                    name: a.name.clone(),
+                    plugin_name: src.plugin_full_id.clone(),
+                    detected,
+                    supports_isolated_config: a.supports_isolated_config,
+                    default_command: a.command.clone(),
+                    adapter: a.adapter.clone(),
+                    modes: a
+                        .modes
+                        .iter()
+                        .filter_map(|m| mf_agent::RunMode::parse(m))
+                        .collect(),
+                }
+            })
+            .collect();
+        types.sort_by(|a, b| a.name.cmp(&b.name));
+        for info in types {
+            model.push_type(info);
+        }
+        if let Ok(rows) = self.app.catalog_store.list_agent_instances(None) {
+            model.load_instances(&rows);
+        }
+        self.model = model;
+    }
+
+    /// 任务选择变化(workspace 推送)。
+    pub fn set_selected_task(
+        &mut self,
+        task: Option<(std::path::PathBuf, i64)>,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected_task = task;
+        cx.notify();
+    }
+
+    fn type_info_of(
+        &self,
+        agent_type: &str,
+    ) -> Option<crate::agent_instance_editor::AgentTypeInfo> {
+        self.model
+            .type_infos()
+            .iter()
+            .find(|t| t.id == agent_type)
+            .cloned()
+    }
+
+    /// 默认 CLI 快速启动:在当前选中任务下创建离散会话(不改变任务状态)。
+    pub fn launch_default_cli(&mut self, agent_type: &str, cx: &mut Context<Self>) {
+        let Some(info) = self.type_info_of(agent_type) else {
+            self.status = format!("未找到 Agent 类型 {agent_type}");
+            cx.notify();
+            return;
+        };
+        let Some((root, task_id)) = self.selected_task.clone() else {
+            self.status = "请先选择一个任务(默认 CLI 在任务下以离散会话启动)".into();
+            cx.notify();
+            return;
+        };
+        let snapshot = mf_agent::AgentInstanceSnapshot {
+            id: format!("default-{}", info.id),
+            name: format!("{} 默认 CLI", info.name),
+            agent_type: info.id.clone(),
+            version: 0,
+            enabled: true,
+            run_mode: mf_agent::RunMode::Interactive,
+            executable: info.default_command.clone(),
+            argv: vec![],
+            env: vec![],
+            config: serde_json::json!({}),
+            execution_contract: serde_json::json!({ "completion": "manual" }),
+            sealed_secret_ids: vec![],
+        };
+        match self.app.create_ad_hoc_session(
+            &root,
+            task_id,
+            &snapshot,
+            mf_agent::RunMode::Interactive,
+        ) {
+            Ok(view) => self.status = format!("已在任务 {task_id} 下启动 {}", view.title),
+            Err(e) => self.status = format!("启动失败: {e:#}"),
+        }
+        cx.notify();
+    }
+
+    /// 以类型预填打开新建编辑器。
+    pub fn open_editor_for_type(&mut self, agent_type: &str, cx: &mut Context<Self>) {
+        if let Some(info) = self.type_info_of(agent_type) {
+            self.editor = Some(crate::agent_instance_editor::AgentInstanceEditorState::new(
+                info,
+            ));
+            self.field = PageField::Name;
+            cx.notify();
+        }
+    }
+
+    pub fn open_editor_for_instance(&mut self, instance_id: &str, cx: &mut Context<Self>) {
+        match self
+            .app
+            .catalog_store
+            .snapshot_agent_instance(instance_id, None)
+        {
+            Ok(snapshot) => {
+                let info = self
+                    .type_info_of(&snapshot.agent_type)
+                    .unwrap_or_else(|| fallback_type_info(&snapshot.agent_type));
+                self.editor = Some(
+                    crate::agent_instance_editor::AgentInstanceEditorState::from_instance(
+                        info, &snapshot,
+                    ),
+                );
+                self.field = PageField::None;
+                cx.notify();
+            }
+            Err(e) => {
+                self.status = format!("读取实例失败: {e:#}");
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn save(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.editor.clone() else {
+            return;
+        };
+        if !state.can_save() {
+            self.status = "配置无效,无法保存".into();
+            cx.notify();
+            return;
+        }
+        let draft = state.to_draft(mf_agent::InstanceScope::User, None);
+        let result = match &state.editing_instance_id {
+            Some(id) => self
+                .app
+                .catalog_store
+                .update_agent_instance(id, draft)
+                .map(|i| i.id),
+            None => self
+                .app
+                .catalog_store
+                .create_agent_instance(draft)
+                .map(|i| i.id),
+        };
+        match result {
+            Ok(id) => {
+                self.status = format!("已保存实例 {id}");
+                self.editor = None;
+                self.field = PageField::None;
+                self.refresh();
+            }
+            Err(e) => self.status = format!("保存失败: {e:#}"),
+        }
+        cx.notify();
+    }
+
+    pub fn delete_current(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.editor.clone() else {
+            return;
+        };
+        let Some(id) = state.editing_instance_id.clone() else {
+            return;
+        };
+        match self.app.catalog_store.delete_agent_instance(&id) {
+            Ok(true) => {
+                self.status = format!("已删除实例 {id}");
+                self.editor = None;
+                self.refresh();
+            }
+            Ok(false) => self.status = "实例不存在".into(),
+            Err(e) => self.status = format!("删除失败: {e:#}"),
+        }
+        cx.notify();
+    }
+
+    fn handle_key(&mut self, ev: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        if self.field == PageField::None {
+            return;
+        }
+        let key = ev.keystroke.key.as_str();
+        if key == "escape" {
+            self.field = PageField::None;
+            cx.notify();
+            return;
+        }
+        if self.field == PageField::Filter {
+            match key {
+                "backspace" => {
+                    self.filter.pop();
+                }
+                "enter" => self.field = PageField::None,
+                _ => {
+                    if let Some(ch) = ev.keystroke.key_char.as_ref() {
+                        self.filter.push_str(ch);
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+        let Some(state) = self.editor.as_mut() else {
+            self.field = PageField::None;
+            return;
+        };
+        match key {
+            "enter" => {
+                if self.field == PageField::Env {
+                    if let Some(ch) = ev.keystroke.key_char.as_ref() {
+                        push_field(state, self.field, ch);
+                    }
+                } else {
+                    self.field = PageField::None;
+                }
+            }
+            "backspace" => {
+                if let Some(mut text) = field_text(state, self.field) {
+                    text.pop();
+                    set_field_text(state, self.field, &text);
+                }
+            }
+            _ => {
+                if let Some(ch) = ev.keystroke.key_char.as_ref() {
+                    push_field(state, self.field, ch);
+                }
+            }
+        }
+        cx.notify();
+    }
+}
+
+fn field_text(
+    state: &crate::agent_instance_editor::AgentInstanceEditorState,
+    field: PageField,
+) -> Option<String> {
+    match field {
+        PageField::Name => Some(state.name.clone()),
+        PageField::Executable => Some(state.executable.clone()),
+        PageField::Argv => Some(state.argv_text.clone()),
+        PageField::Env => Some(state.env_text.clone()),
+        _ => None,
+    }
+}
+
+fn set_field_text(
+    state: &mut crate::agent_instance_editor::AgentInstanceEditorState,
+    field: PageField,
+    text: &str,
+) {
+    match field {
+        PageField::Name => state.set_name(text),
+        PageField::Executable => state.set_executable(text),
+        PageField::Argv => state.set_argv(text),
+        PageField::Env => state.set_env_lines(text),
+        _ => {}
+    }
+}
+
+fn push_field(
+    state: &mut crate::agent_instance_editor::AgentInstanceEditorState,
+    field: PageField,
+    ch: &str,
+) {
+    if let Some(mut text) = field_text(state, field) {
+        text.push_str(ch);
+        set_field_text(state, field, &text);
+    }
+}
+
+fn fallback_type_info(agent_type: &str) -> crate::agent_instance_editor::AgentTypeInfo {
+    crate::agent_instance_editor::AgentTypeInfo {
+        id: agent_type.to_string(),
+        name: agent_type.to_string(),
+        plugin_name: "未知来源".into(),
+        detected: false,
+        supports_isolated_config: false,
+        default_command: String::new(),
+        adapter: "generic-command".into(),
+        modes: vec![mf_agent::RunMode::Interactive],
+    }
+}
+
+fn action_chip(
+    id: gpui::ElementId,
+    label: &str,
+    color: u32,
+    enabled: bool,
+) -> gpui::Stateful<gpui::Div> {
+    let mut chip = gpui::div()
+        .id(id)
+        .px_2()
+        .h(px(20.))
+        .flex()
+        .items_center()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(if enabled {
+            color
+        } else {
+            crate::theme::Theme::border()
+        }))
+        .text_size(px(9.5))
+        .text_color(rgb(if enabled {
+            color
+        } else {
+            crate::theme::Theme::fg_dim()
+        }))
+        .child(label.to_string());
+    if enabled {
+        chip = chip.cursor_pointer();
+    }
+    chip
+}
+
+impl Render for AgentInstancesPage {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let filter = self.filter.clone();
+        let entries = self.model.filtered(&filter);
+        let mut list = gpui::div().flex().flex_col().gap_1();
+        for (idx, entry) in entries.iter().enumerate() {
+            let is_default = entry.kind == "default-cli";
+            let (title_color, sub_color) = if entry.available {
+                (crate::theme::Theme::fg(), crate::theme::Theme::fg_dim())
+            } else {
+                (
+                    crate::theme::Theme::fg_dim(),
+                    crate::theme::Theme::warning(),
+                )
+            };
+            let entry_id = entry.id.clone();
+            let title = entry.title.clone();
+            let subtitle = entry.subtitle.clone();
+            let available = entry.available;
+            let idx2 = idx;
+            list = list.child(
+                gpui::div()
+                    .id(gpui::ElementId::Name(format!("inst-entry-{idx}").into()))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(crate::theme::Theme::border()))
+                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_panel())))
+                    .cursor_pointer()
+                    .on_click(
+                        cx.listener(move |page: &mut AgentInstancesPage, _ev, _w, cx| {
+                            let entry = page.model.filtered(&page.filter).get(idx2).cloned();
+                            if let Some(entry) = entry {
+                                if entry.kind == "default-cli" {
+                                    if let Some(info) = page
+                                        .model
+                                        .type_infos()
+                                        .iter()
+                                        .find(|t| t.name == entry.title)
+                                    {
+                                        let id = info.id.clone();
+                                        page.open_editor_for_type(&id, cx);
+                                    }
+                                } else if let Some(id) = entry.id {
+                                    page.open_editor_for_instance(&id, cx);
+                                }
+                            }
+                        }),
+                    )
+                    .child(
+                        gpui::div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                gpui::div()
+                                    .text_size(px(11.))
+                                    .text_color(rgb(title_color))
+                                    .child(title),
+                            )
+                            .child(
+                                gpui::div()
+                                    .flex_1()
+                                    .text_size(px(9.))
+                                    .text_color(rgb(sub_color))
+                                    .child(subtitle),
+                            )
+                            .when(is_default && available, |d| {
+                                d.child(
+                                    action_chip(
+                                        gpui::ElementId::Name(format!("inst-launch-{idx}").into()),
+                                        "启动",
+                                        crate::theme::Theme::accent(),
+                                        true,
+                                    )
+                                    .on_click(cx.listener(
+                                        move |page: &mut AgentInstancesPage, _ev, _w, cx| {
+                                            let entry = page
+                                                .model
+                                                .filtered(&page.filter)
+                                                .get(idx2)
+                                                .cloned();
+                                            if let Some(entry) = entry {
+                                                if let Some(info) = page
+                                                    .model
+                                                    .type_infos()
+                                                    .iter()
+                                                    .find(|t| t.name == entry.title)
+                                                {
+                                                    let id = info.id.clone();
+                                                    page.launch_default_cli(&id, cx);
+                                                }
+                                            }
+                                        },
+                                    )),
+                                )
+                            }),
+                    ),
+            );
+            let _ = entry_id;
+        }
+
+        let editor: AnyElement =
+            match &self.editor {
+                None => gpui::div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(rgb(crate::theme::Theme::fg_dim()))
+                    .text_size(px(11.))
+                    .child("从左侧选择 Agent 类型新建实例,或点击既有实例编辑")
+                    .into_any_element(),
+                Some(state) => {
+                    let errors = state.validation();
+                    let can_save = state.can_save();
+                    let editing = state.editing_instance_id.is_some();
+                    let error_text = errors
+                        .iter()
+                        .map(|e| e.message.clone())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    let secret_display = state.secret_display();
+                    let header = if editing {
+                        format!("编辑实例 · {}", state.info.name)
+                    } else {
+                        format!("新建实例 · {}", state.info.name)
+                    };
+                    let adapter_note = format!(
+                        "适配器 {} · {}",
+                        state.info.adapter,
+                        if state.info.supports_isolated_config {
+                            "支持隔离配置"
+                        } else {
+                            "不支持隔离配置"
+                        }
+                    );
+                    let values = [
+                        (PageField::Name, "名称", state.name.clone()),
+                        (
+                            PageField::Executable,
+                            "可执行文件",
+                            state.executable.clone(),
+                        ),
+                        (PageField::Argv, "参数(空格分隔)", state.argv_text.clone()),
+                        (
+                            PageField::Env,
+                            "环境变量(每行 KEY=VALUE)",
+                            state.env_text.clone(),
+                        ),
+                    ];
+                    gpui::div()
+                    .id("inst-editor-scroll")
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_y_scroll()
+                    .child(
+                        gpui::div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .p_2()
+                            .child(
+                                gpui::div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(gpui::div().text_size(px(12.)).child(header))
+                                    .child(
+                                        gpui::div()
+                                            .text_size(px(9.))
+                                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                            .child(adapter_note),
+                                    ),
+                            )
+                            .children(values.iter().map(|(field, label, value)| {
+                                let display = if value.is_empty() {
+                                    "(空)".to_string()
+                                } else {
+                                    value.replace('\n', " ⏎ ")
+                                };
+                                let focused = self.field == *field;
+                                let f = *field;
+                                gpui::div()
+                                    .id(gpui::ElementId::Name(
+                                        format!("inst-field-{label}").into(),
+                                    ))
+                                    .flex()
+                                    .gap_2()
+                                    .items_start()
+                                    .child(
+                                        gpui::div()
+                                            .w(px(140.))
+                                            .text_size(px(10.))
+                                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                            .child(label.to_string()),
+                                    )
+                                    .child(
+                                        gpui::div()
+                                            .id(gpui::ElementId::Name(
+                                                format!("inst-field-box-{label}").into(),
+                                            ))
+                                            .flex_1()
+                                            .px_2()
+                                            .py_1()
+                                            .min_h(px(22.))
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(rgb(if focused {
+                                                crate::theme::Theme::accent()
+                                            } else {
+                                                crate::theme::Theme::border()
+                                            }))
+                                            .text_size(px(10.))
+                                            .cursor_pointer()
+                                            .child(display)
+                                            .on_click(cx.listener(
+                                                move |page: &mut AgentInstancesPage,
+                                                      _ev,
+                                                      _w,
+                                                      cx| {
+                                                    page.field = f;
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                            }))
+                            .child(
+                                gpui::div()
+                                    .flex()
+                                    .gap_2()
+                                    .items_start()
+                                    .child(
+                                        gpui::div()
+                                            .w(px(140.))
+                                            .text_size(px(10.))
+                                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                            .child("Secret 引用"),
+                                    )
+                                    .child(
+                                        gpui::div()
+                                            .flex_1()
+                                            .text_size(px(10.))
+                                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                            .child(if secret_display.is_empty() {
+                                                "(无;Secret 由 Secret Store 管理,不在此输入明文)"
+                                                    .to_string()
+                                            } else {
+                                                secret_display
+                                            }),
+                                    ),
+                            )
+                            .child(
+                                gpui::div()
+                                    .flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        action_chip(
+                                            gpui::ElementId::Name("inst-validate".into()),
+                                            "校验",
+                                            crate::theme::Theme::accent(),
+                                            true,
+                                        )
+                                        .on_click(cx.listener(
+                                            |page: &mut AgentInstancesPage, _ev, _w, cx| {
+                                                if let Some(state) = page.editor.as_ref() {
+                                                    let errors = state.validation();
+                                                    page.status = if errors.is_empty() {
+                                                        "配置有效".into()
+                                                    } else {
+                                                        errors
+                                                            .iter()
+                                                            .map(|e| e.message.clone())
+                                                            .collect::<Vec<_>>()
+                                                            .join("; ")
+                                                    };
+                                                }
+                                                cx.notify();
+                                            },
+                                        )),
+                                    )
+                                    .child(
+                                        action_chip(
+                                            gpui::ElementId::Name("inst-save".into()),
+                                            if editing { "保存修改" } else { "保存实例" },
+                                            crate::theme::Theme::accent(),
+                                            can_save,
+                                        )
+                                        .on_click(cx.listener(
+                                            |page: &mut AgentInstancesPage, _ev, _w, cx| {
+                                                page.save(cx);
+                                            },
+                                        )),
+                                    )
+                                    .child(
+                                        action_chip(
+                                            gpui::ElementId::Name("inst-close".into()),
+                                            "关闭",
+                                            crate::theme::Theme::fg_dim(),
+                                            true,
+                                        )
+                                        .on_click(cx.listener(
+                                            |page: &mut AgentInstancesPage, _ev, _w, cx| {
+                                                page.editor = None;
+                                                page.field = PageField::None;
+                                                cx.notify();
+                                            },
+                                        )),
+                                    )
+                                    .when(editing, |d| {
+                                        d.child(
+                                            action_chip(
+                                                gpui::ElementId::Name("inst-delete".into()),
+                                                "删除",
+                                                crate::theme::Theme::danger(),
+                                                true,
+                                            )
+                                            .on_click(cx.listener(
+                                                |page: &mut AgentInstancesPage, _ev, _w, cx| {
+                                                    page.delete_current(cx);
+                                                },
+                                            )),
+                                        )
+                                    }),
+                            )
+                            .when(!errors.is_empty(), |d| {
+                                d.child(
+                                    gpui::div()
+                                        .text_size(px(9.))
+                                        .text_color(rgb(crate::theme::Theme::danger()))
+                                        .child(error_text),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+                }
+            };
+
+        let status = self.status.clone();
+        let filter_focused = self.field == PageField::Filter;
+        let filter_display = if self.filter.is_empty() {
+            "过滤:点击后输入名称…".to_string()
+        } else {
+            self.filter.clone()
+        };
+        gpui::div()
+            .id("instances-page")
+            .size_full()
+            .flex()
+            .gap_2()
+            .p_2()
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(
+                |page: &mut AgentInstancesPage, ev: &gpui::KeyDownEvent, _w, cx| {
+                    page.handle_key(ev, cx);
+                },
+            ))
+            .child(
+                gpui::div()
+                    .w(px(320.))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        gpui::div()
+                            .text_size(px(12.))
+                            .text_color(rgb(crate::theme::Theme::fg()))
+                            .child("Agent 实例"),
+                    )
+                    .child(
+                        gpui::div()
+                            .id("inst-filter-box")
+                            .px_2()
+                            .h(px(24.))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(if filter_focused {
+                                crate::theme::Theme::accent()
+                            } else {
+                                crate::theme::Theme::border()
+                            }))
+                            .text_size(px(10.))
+                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .cursor_pointer()
+                            .child(filter_display)
+                            .on_click(cx.listener(|page: &mut AgentInstancesPage, _ev, _w, cx| {
+                                page.field = PageField::Filter;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        gpui::div()
+                            .id("inst-list-scroll")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(list),
+                    ),
+            )
+            .child(
+                gpui::div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(editor)
+                    .when(!status.is_empty(), |d| {
+                        d.child(
+                            gpui::div()
+                                .text_size(px(9.))
+                                .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                .child(status),
+                        )
+                    }),
+            )
+    }
+}

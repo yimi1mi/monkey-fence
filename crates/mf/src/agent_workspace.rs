@@ -30,6 +30,7 @@ impl EventEmitter<AgentWorkspaceEvent> for AgentWorkspace {}
 enum WorkspaceView {
     Agents,
     Pipeline,
+    Instances,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,10 +115,13 @@ pub struct AgentWorkspace {
     field_buffer: String,
     focus_handle: FocusHandle,
     pending_focus: bool,
+    /// Agent 实例页(独立实体;设计 §11.1)。
+    instances_page: gpui::Entity<crate::agent_instances_view::AgentInstancesPage>,
 }
 
 impl AgentWorkspace {
     pub fn new(app: Arc<AppCtx>, cx: &mut Context<Self>) -> AgentWorkspace {
+        let app_for_page = app.clone();
         let ws = AgentWorkspace {
             app,
             view: WorkspaceView::Agents,
@@ -144,6 +148,8 @@ impl AgentWorkspace {
             field_buffer: String::new(),
             focus_handle: cx.focus_handle(),
             pending_focus: false,
+            instances_page: cx
+                .new(|cx| crate::agent_instances_view::AgentInstancesPage::new(app_for_page, cx)),
         };
         ws
     }
@@ -171,7 +177,10 @@ impl AgentWorkspace {
 
     pub fn set_selected_task(&mut self, sel: Option<(PathBuf, i64)>, cx: &mut Context<Self>) {
         if self.selected_task != sel {
-            self.selected_task = sel;
+            self.selected_task = sel.clone();
+            // 实例页的默认 CLI 启动挂载点跟随任务选择
+            self.instances_page
+                .update(cx, |page, cx| page.set_selected_task(sel, cx));
             self.dirty = false;
             self.draft.clear();
             self.loaded_revision = None;
@@ -2051,10 +2060,12 @@ impl Render for AgentWorkspace {
             .border_b_1()
             .border_color(rgb(crate::theme::Theme::border()))
             .child(tab_btn(cx, WorkspaceView::Agents, "Agents", self.view))
-            .child(tab_btn(cx, WorkspaceView::Pipeline, "Pipeline", self.view));
+            .child(tab_btn(cx, WorkspaceView::Pipeline, "Pipeline", self.view))
+            .child(tab_btn(cx, WorkspaceView::Instances, "实例", self.view));
         let body = match self.view {
             WorkspaceView::Agents => self.render_agents_view(cx, window),
             WorkspaceView::Pipeline => self.render_pipeline_view(cx, window),
+            WorkspaceView::Instances => self.instances_page.clone().into_any_element(),
         };
         div()
             .id("agent-workspace")
