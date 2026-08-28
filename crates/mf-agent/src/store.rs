@@ -1389,11 +1389,13 @@ impl Store {
         })
     }
 
-    /// 启动成功:状态 → working,记录 launched_at。
+    /// 启动成功:仅 starting 行推进为 working(快速退出已终结的行不得覆盖)。
     pub fn mark_ad_hoc_launched(&self, id: i64) -> Result<Option<AdHocSessionView>> {
         self.with_conn(|c| {
             c.execute(
-                "UPDATE ad_hoc_sessions SET status = 'working', launched_at = ?2 WHERE id = ?1",
+                "UPDATE ad_hoc_sessions
+                 SET status = 'working', launched_at = ?2
+                 WHERE id = ?1 AND status = 'starting'",
                 params![id, now()],
             )?;
             Self::ad_hoc_view_by_id(c, id)

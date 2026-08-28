@@ -112,14 +112,21 @@ fn legacy_builtin_adapter_id(agent_type: &str) -> Option<&'static str> {
     match agent_type {
         "claude" | "claude-code" => Some("claude-code"),
         "codex" => Some("codex"),
-        "generic-command" | "opencode" | "cursor" | "gemini" | "copilot" | "qwen"
-        | "iflow" | "aider" | "amp" | "kimi" => Some("generic-command"),
+        "generic-command" | "opencode" | "cursor" | "gemini" | "copilot" | "qwen" | "iflow"
+        | "aider" | "amp" | "kimi" => Some("generic-command"),
         _ => None,
     }
 }
 
 fn contribution_supports_mode(modes: &[String], mode: mf_agent::RunMode) -> bool {
     modes.iter().any(|declared| declared == mode.as_str())
+}
+
+/// 离散 CLI 会话继承 Task 目标作为初始提示(空白目标不注入)。
+fn apply_task_goal(launch_ctx: &mut mf_agent::LaunchContext, goal: &str) {
+    if !goal.trim().is_empty() {
+        launch_ctx.prompt = Some(goal.to_string());
+    }
 }
 
 pub struct AppCtx {
@@ -411,9 +418,7 @@ impl AppCtx {
             .join(format!("{}-{task_id}-{nonce}", std::process::id()));
         let mut launch_ctx = mf_agent::LaunchContext::new(run_temp.clone(), root.to_path_buf());
         launch_ctx.grants_shell = grants_shell;
-        if !task.goal.trim().is_empty() {
-            launch_ctx.prompt = Some(task.goal.clone());
-        }
+        apply_task_goal(&mut launch_ctx, &task.goal);
         let run_token = format!("ad-hoc:{}:{task_id}:{nonce}", root.display());
         if !instance_snapshot.sealed_secret_ids.is_empty() {
             let secret_store = mf_plugins::builtin_secret_store::BuiltinSecretStore::open(
@@ -484,5 +489,14 @@ mod agent_launch_selection_tests {
             &modes,
             mf_agent::RunMode::OneShot
         ));
+    }
+
+    #[test]
+    fn task_goal_becomes_launch_prompt_only_when_meaningful() {
+        let mut ctx = mf_agent::LaunchContext::new(PathBuf::from("C:/t"), PathBuf::from("C:/w"));
+        apply_task_goal(&mut ctx, "  ");
+        assert!(ctx.prompt.is_none(), "空白目标不得注入提示");
+        apply_task_goal(&mut ctx, "修复登录超时");
+        assert_eq!(ctx.prompt.as_deref(), Some("修复登录超时"));
     }
 }

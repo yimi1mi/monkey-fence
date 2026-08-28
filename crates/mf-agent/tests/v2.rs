@@ -118,6 +118,8 @@ impl RuntimeHost for MockHost {
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
     fn kill_session(&self, _project: &str, _session_id: i64) {}
+    fn kill_ad_hoc(&self, _project: &str, _session_id: i64) {}
+    fn kill_ad_hoc(&self, _project: &str, _session_id: i64) {}
     fn answer_question(&self, _project: &str, _run_id: i64, _answer: &str) {}
     fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) -> anyhow::Result<()> {
         Ok(())

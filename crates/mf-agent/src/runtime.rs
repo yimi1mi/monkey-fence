@@ -120,6 +120,9 @@ pub struct AdHocLaunchSpec {
     pub run_temp: PathBuf,
     /// 项目路由键;真正的进程 cwd 取自 plan.cwd。
     pub workdir: PathBuf,
+    /// 退出事件通道(tag 为 session_id):进程结束时宿主上报
+    /// `RuntimeEvent::AdHocExited`,由 Orchestrator 做完成分类。
+    pub events: crossbeam_channel::Sender<TaggedRuntimeEvent>,
 }
 
 /// Runtime → Orchestrator 事件。
@@ -141,11 +144,21 @@ pub enum RuntimeEvent {
     Question(String),
     /// 进程退出 / API 轮次结束(未结算 → awaiting-outcome)。
     Exited { code: Option<i32> },
+    /// 离散 CLI 会话退出(tag 是 ad_hoc 行号):由 Orchestrator 按
+    /// 完成契约与退出码分类,不会发明 Step / Agent Run。
+    AdHocExited {
+        session_id: i64,
+        exit_code: Option<i32>,
+        /// stdout-marker 契约:标记是否出现。
+        marker_seen: bool,
+        /// result-file 契约:结果文件是否出现。
+        result_file_present: bool,
+    },
     /// 结构化 Runtime 直接提交结算。
     Settled(crate::model::Settlement),
 }
 
-/// Runtime → Orchestrator 事件(带 run_id)。
+/// Runtime → Orchestrator 事件(带 run_id;离散会话事件带 session_id)。
 pub type TaggedRuntimeEvent = (i64, RuntimeEvent);
 
 /// Orchestrator 调用宿主(GPUI 进程内实现)执行 Agent Run。
@@ -163,6 +176,9 @@ pub trait RuntimeHost: Send + Sync {
     fn stop_run(&self, project: &str, run_id: i64);
     /// 强制终止整个会话(进程)。
     fn kill_session(&self, project: &str, session_id: i64);
+    /// 强制终止离散 CLI 会话(补偿路径:启动后 DB 写失败等场景,
+    /// 必须杀掉进程,不留孤儿)。
+    fn kill_ad_hoc(&self, project: &str, session_id: i64);
     /// 回答 Agent 的提问(阻塞等待中的 HTTP Runtime)。
     fn answer_question(&self, project: &str, run_id: i64, answer: &str);
 }

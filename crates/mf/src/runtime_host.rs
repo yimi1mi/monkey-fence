@@ -44,6 +44,9 @@ struct PtySession {
     master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
     writer: Mutex<Option<Box<dyn Write + Send>>>,
     child: Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>,
+    /// 独立 kill 句柄(离散会话:child 由 waiter 线程持有等待,
+    /// kill 经此克隆执行,避免跨线程争抢 Child)。
+    killer: Mutex<Option<Box<dyn portable_pty::ChildKiller + Send>>>,
     screen: Mutex<Screen>,
     title: Mutex<String>,
     output_tail: Mutex<Vec<u8>>,
@@ -230,12 +233,22 @@ impl SessionRegistry {
         Self::kill_at(&self.sessions, &key);
     }
 
+    /// 自然退出后摘除离散会话条目(不 kill:进程已结束并 wait)。
+    pub fn detach_ad_hoc(&self, project: &str, session_id: i64) {
+        self.sessions
+            .lock()
+            .remove(&ad_hoc_session_key(project, session_id));
+    }
+
     fn kill_at(sessions: &Mutex<HashMap<String, SessionInner>>, key: &str) {
         if let Some(s) = sessions.lock().remove(key) {
             match &s {
                 SessionInner::Pty(p) => {
                     p.alive.store(false, Ordering::SeqCst);
                     p.writer.lock().take();
+                    if let Some(mut killer) = p.killer.lock().take() {
+                        let _ = killer.kill();
+                    }
                     if let Some(mut child) = p.child.lock().take() {
                         let _ = child.kill();
                     }
@@ -418,6 +431,7 @@ fn launch_pty(registry: &SessionRegistry, spec: &LaunchSpec, events: Sender<(i64
         master: Mutex::new(Some(pair.master)),
         writer: Mutex::new(Some(writer)),
         child: Mutex::new(Some(child)),
+        killer: Mutex::new(None),
         screen: Mutex::new(Screen::new(TERM_ROWS, TERM_COLS)),
         title: Mutex::new(spec.profile.display_name.clone()),
         output_tail: Mutex::new(Vec::new()),
@@ -491,6 +505,34 @@ fn launch_pty(registry: &SessionRegistry, spec: &LaunchSpec, events: Sender<(i64
 /// 离散 CLI 会话启动(设计 §4.7 / §10):挂在 Task 下,
 /// 无 Step / Agent Run / 结算事件流;注册表仍以 (project, session_id)
 /// 路由,UI 终端视图、send_prompt、kill 与普通会话一致。
+
+/// 拒绝符号链接/接合点/junction 逃逸:从 run_temp 到 target 的
+/// 每一级都必须是真实目录(create_dir_all 可能静默穿过已存在的链接)。
+fn ensure_no_link_escape(run_temp: &Path, target: &Path) -> Result<()> {
+    let relative = target
+        .strip_prefix(run_temp)
+        .map_err(|_| anyhow::anyhow!("目标不在运行临时目录内: {}", target.display()))?;
+    let mut current = run_temp.to_path_buf();
+    let mut check = |path: &Path| -> Result<()> {
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            // Windows 上 junction/reparse point 同样以 is_symlink 呈现
+            if meta.file_type().is_symlink() {
+                anyhow::bail!(
+                    "运行临时目录内不允许符号链接/接合点(路径逃逸): {}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    };
+    check(&current)?;
+    for component in relative.components() {
+        current.push(component);
+        check(&current)?;
+    }
+    Ok(())
+}
+
 fn materialize_temp_files(run_temp: &Path, files: &[TempFileSpec]) -> Result<()> {
     std::fs::create_dir_all(run_temp)
         .with_context(|| format!("创建运行临时目录失败: {}", run_temp.display()))?;
@@ -507,20 +549,48 @@ fn materialize_temp_files(run_temp: &Path, files: &[TempFileSpec]) -> Result<()>
                 )
             })
         {
-            anyhow::bail!("临时文件路径不得逃许运行临时目录: {}", file.path.display());
+            anyhow::bail!("临时文件路径不得逃逸运行临时目录: {}", file.path.display());
         }
         let target = run_temp.join(&file.path);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("创建临时文件目录失败: {}", parent.display()))?;
         }
+        ensure_no_link_escape(run_temp, &target)
+            .with_context(|| format!("临时文件路径可疑: {}", file.path.display()))?;
         std::fs::write(&target, &file.contents)
             .with_context(|| format!("写入临时文件失败: {}", target.display()))?;
     }
     Ok(())
 }
 
-fn launch_ad_hoc_pty(registry: &SessionRegistry, spec: &AdHocLaunchSpec) -> Result<()> {
+/// spawn 成功后的看护:线程接管生命周期前任何初始化失败都会在
+/// drop 时 kill(经 killer 克隆)并摘除注册表条目;child 的 reap
+/// 由 waiter 线程完成(kill 后 wait 返回),不留孤儿 CLI。
+struct AdHocReapGuard<'a> {
+    registry: &'a SessionRegistry,
+    project: &'a str,
+    session: Option<Arc<PtySession>>,
+}
+
+impl Drop for AdHocReapGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(session) = self.session.take() {
+            self.registry.kill_ad_hoc(self.project, session.session_id);
+            if let Some(mut killer) = session.killer.lock().take() {
+                let _ = killer.kill();
+            }
+            session.writer.lock().take();
+            session.master.lock().take();
+            session.alive.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// 离散 CLI 会话启动。输出在进入 screen/output_tail 前经
+/// `StreamingRedactor` 跨块脱敏;进程退出时向 Orchestrator 上报
+/// `AdHocExited`(tag 为 session_id)并从注册表摘除会话。
+fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) -> Result<()> {
     let project = spec.workdir.to_string_lossy().to_string();
     registry.kill_ad_hoc(&project, spec.session_id); // 同键旧会话清理
 
@@ -547,6 +617,16 @@ fn launch_ad_hoc_pty(registry: &SessionRegistry, spec: &AdHocLaunchSpec) -> Resu
     for (k, v) in &spec.plan.env {
         cmd.env(k, v);
     }
+    // Secret 值只进入 spawn 调用的环境块;不写日志、不进任何持久化
+    let mut redactor = {
+        let secret_values = spec
+            .plan
+            .secret_env
+            .iter()
+            .map(|(_, lease)| lease.as_slice().to_vec())
+            .collect();
+        mf_agent::secrets::StreamingRedactor::new(secret_values)
+    };
     for (key, lease) in &spec.plan.secret_env {
         let value = std::str::from_utf8(lease.as_slice()).with_context(|| {
             format!(
@@ -562,29 +642,26 @@ fn launch_ad_hoc_pty(registry: &SessionRegistry, spec: &AdHocLaunchSpec) -> Resu
         .master
         .try_clone_reader()
         .context("离散会话克隆 PTY reader 失败")?;
-    let mut writer = pair
+    let writer = pair
         .master
         .take_writer()
         .context("离散会话 take_writer 失败")?;
-    let child = pair.slave.spawn_command(cmd).with_context(|| {
+    let mut child = pair.slave.spawn_command(cmd).with_context(|| {
         format!(
             "离散会话启动 `{}` 失败(CLI 未安装或配置无效)",
             spec.plan.executable.display()
         )
     })?;
     drop(pair.slave);
-    if let InputInjection::Stdin(bytes) = &spec.plan.input {
-        writer
-            .write_all(bytes)
-            .context("向离散会话 stdin 写入初始提示失败")?;
-        writer.flush().context("刷新离散会话 stdin 失败")?;
-    }
+    let killer = child.clone_killer();
 
     let session = Arc::new(PtySession {
         session_id: spec.session_id,
         master: Mutex::new(Some(pair.master)),
         writer: Mutex::new(Some(writer)),
-        child: Mutex::new(Some(child)),
+        // child 由 waiter 线程持有并 wait;kill 经 killer 克隆执行
+        child: Mutex::new(None),
+        killer: Mutex::new(Some(killer)),
         screen: Mutex::new(Screen::new(TERM_ROWS, TERM_COLS)),
         title: Mutex::new(spec.title.clone()),
         output_tail: Mutex::new(Vec::new()),
@@ -595,9 +672,45 @@ fn launch_ad_hoc_pty(registry: &SessionRegistry, spec: &AdHocLaunchSpec) -> Resu
         spec.session_id,
         SessionInner::Pty(session.clone()),
     );
+    // 看护 armed:下方任何失败路径(初始 stdin 写入、线程启动)
+    // 都会 kill 并摘除注册表条目
+    let mut reap = AdHocReapGuard {
+        registry,
+        project: &project,
+        session: Some(session.clone()),
+    };
 
+    if let InputInjection::Stdin(bytes) = &spec.plan.input {
+        let mut stdin = session.writer.lock();
+        let handle = stdin.as_mut().ok_or_else(|| anyhow!("离散会话已关闭"))?;
+        handle
+            .write_all(bytes)
+            .and_then(|_| handle.flush())
+            .context("向离散会话 stdin 写入初始提示失败")?;
+    }
+
+    // ConPTY 在 master 存续期间不会给 reader EOF:waiter 拥有 child,
+    // wait 返回后记录退出码并关闭 master,解除 reader 阻塞。
+    let exit_code_slot = Arc::new(Mutex::new(None::<i32>));
+    let waiter_session = session.clone();
+    let waiter_slot = exit_code_slot.clone();
+    let waiter = std::thread::Builder::new()
+        .name(format!("ad-hoc-pty-waiter-{}", spec.session_id))
+        .spawn(move || {
+            let code = child.wait().ok().map(|status| status.exit_code() as i32);
+            *waiter_slot.lock() = code;
+            // 先写 slot 再关 master:reader 被解除阻塞时退出码已就绪
+            waiter_session.master.lock().take();
+        })
+        .context("启动离散会话 waiter 线程失败")?;
+
+    let completion = spec.plan.completion.clone();
+    let events = spec.events.clone();
     let reader_project = project.clone();
-    if let Err(error) = std::thread::Builder::new()
+    let reader_session = session.clone();
+    let reader_registry = registry.clone();
+    let exit_code_slot_reader = exit_code_slot.clone();
+    let build = std::thread::Builder::new()
         .name(format!("ad-hoc-pty-reader-{}", spec.session_id))
         .spawn(move || {
             let mut buf = [0u8; 8192];
@@ -605,30 +718,72 @@ fn launch_ad_hoc_pty(registry: &SessionRegistry, spec: &AdHocLaunchSpec) -> Resu
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        let mut screen = session.screen.lock();
-                        screen.feed(&buf[..n]);
-                        if !screen.title.is_empty() {
-                            *session.title.lock() = screen.title.clone();
-                        }
-                        drop(screen);
-                        let mut tail = session.output_tail.lock();
-                        tail.extend_from_slice(&buf[..n]);
-                        if tail.len() > OUT_BUFFER_CAP {
-                            let drop = tail.len() - OUT_BUFFER_CAP;
-                            tail.drain(..drop);
+                        // 脱敏在进入 screen/output_tail 之前(跨块部分匹配)
+                        let clean = redactor.redact_chunk(&buf[..n]);
+                        if !clean.is_empty() {
+                            let mut screen = reader_session.screen.lock();
+                            screen.feed(&clean);
+                            if !screen.title.is_empty() {
+                                *reader_session.title.lock() = screen.title.clone();
+                            }
+                            drop(screen);
+                            let mut tail = reader_session.output_tail.lock();
+                            tail.extend_from_slice(&clean);
+                            if tail.len() > OUT_BUFFER_CAP {
+                                let drop = tail.len() - OUT_BUFFER_CAP;
+                                tail.drain(..drop);
+                            }
                         }
                     }
                 }
             }
-            session.alive.store(false, Ordering::SeqCst);
-            let _ = session.child.lock().as_mut().and_then(|c| c.wait().ok());
-            session.writer.lock().take();
-            session.master.lock().take();
-        })
-    {
-        registry.kill_ad_hoc(&reader_project, spec.session_id);
+            let rest = redactor.finish();
+            if !rest.is_empty() {
+                let mut screen = reader_session.screen.lock();
+                screen.feed(&rest);
+                let mut tail = reader_session.output_tail.lock();
+                tail.extend_from_slice(&rest);
+                if tail.len() > OUT_BUFFER_CAP {
+                    let drop = tail.len() - OUT_BUFFER_CAP;
+                    tail.drain(..drop);
+                }
+            }
+            reader_session.alive.store(false, Ordering::SeqCst);
+            let exit_code = *exit_code_slot_reader.lock();
+            reader_session.writer.lock().take();
+            reader_session.master.lock().take();
+            // 完成检测素材:marker 扫描(脱敏后的缓冲足够,标记不得是 Secret)
+            let tail_bytes = reader_session.output_tail.lock().clone();
+            let tail_text = String::from_utf8_lossy(&tail_bytes).into_owned();
+            let marker_seen = match &completion {
+                mf_agent::CompletionDetector::StdoutMarker(marker) => {
+                    tail_text.contains(marker.as_str())
+                }
+                _ => false,
+            };
+            let result_file_present = match &completion {
+                mf_agent::CompletionDetector::ResultFile(path) => path.is_file(),
+                _ => false,
+            };
+            let _ = events.send((
+                reader_session.session_id,
+                RuntimeEvent::AdHocExited {
+                    session_id: reader_session.session_id,
+                    exit_code,
+                    marker_seen,
+                    result_file_present,
+                },
+            ));
+            // 退出后从注册表摘除(不 kill:进程已自然结束并 wait)
+            reader_registry.detach_ad_hoc(&reader_project, reader_session.session_id);
+        });
+    if let Err(error) = build {
+        // guard 仍 armed → drop 时 kill(killer)+摘除注册表;waiter 负责 reap
+        drop(reap);
         return Err(error).context("启动离散会话 reader 线程失败");
     }
+    // reader/waiter 线程接管生命周期:解除看护
+    reap.session = None;
     Ok(())
 }
 
@@ -1121,6 +1276,10 @@ impl RuntimeHost for RuntimeHostImpl {
         launch_ad_hoc_pty(&self.registry, &spec)
     }
 
+    fn kill_ad_hoc(&self, project: &str, session_id: i64) {
+        self.registry.kill_ad_hoc(project, session_id);
+    }
+
     fn send_prompt(&self, project: &str, _run_id: i64, session_id: i64, text: &str) {
         let _ = self.registry.send_prompt(project, session_id, text);
     }
@@ -1177,6 +1336,182 @@ mod ad_hoc_launch_tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("运行临时目录"));
+    }
+
+    #[test]
+    fn junction_inside_run_root_is_rejected() {
+        // Windows junction(mklink /J)不需要特权;非 Windows 或创建失败时跳过
+        if !cfg!(windows) {
+            return;
+        }
+        let outside = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let link = root.path().join("link");
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(outside.path())
+            .output()
+            .expect("启动 cmd 失败");
+        if !output.status.success() {
+            eprintln!("跳过:当前环境无法创建 junction");
+            return;
+        }
+        let error = materialize_temp_files(
+            root.path(),
+            &[TempFileSpec {
+                path: PathBuf::from("link").join("evil.txt"),
+                contents: b"no".to_vec(),
+            }],
+        )
+        .unwrap_err();
+        let chain = format!("{error:#}");
+        assert!(
+            chain.contains("符号链接") || chain.contains("逃逸"),
+            "{chain}"
+        );
+        assert!(!outside.path().join("evil.txt").exists());
+    }
+
+    // ---------- 真实进程的离散启动 ----------
+
+    fn ad_hoc_spec(
+        registry_events: crossbeam_channel::Sender<(i64, RuntimeEvent)>,
+        executable: &str,
+        argv: &[&str],
+        secret: Option<(&str, &str)>,
+    ) -> AdHocLaunchSpec {
+        let run_temp = std::env::temp_dir().join("mf-ad-hoc-test");
+        let mut plan = mf_agent::LaunchPlan {
+            run_temp: run_temp.clone(),
+            executable: PathBuf::from(executable),
+            argv: argv.iter().map(|s| s.to_string()).collect(),
+            env: vec![],
+            secret_env: vec![],
+            cwd: Some(run_temp.clone()),
+            temp_files: vec![],
+            input: mf_agent::InputInjection::Argv(String::new()),
+            completion: mf_agent::CompletionDetector::ProcessExit,
+            uses_shell: false,
+        };
+        if let Some((name, value)) = secret {
+            plan.secret_env.push((
+                name.to_string(),
+                Arc::new(mf_agent::secrets::SecretLease::new(
+                    "sec-test",
+                    value.as_bytes().to_vec(),
+                )),
+            ));
+        }
+        AdHocLaunchSpec {
+            task_id: 1,
+            session_id: 4242,
+            title: "测试离散会话".into(),
+            run_mode: mf_agent::RunMode::OneShot,
+            plan,
+            run_temp: run_temp.clone(),
+            // project 路由键固定用 ".":测试快照/摘除用同一键;
+            // 真实 cwd 由 plan.cwd 提供
+            workdir: PathBuf::from("."),
+            events: registry_events,
+        }
+    }
+
+    #[test]
+    fn missing_executable_errors_without_registry_entry() {
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        let (events, _rx) = crossbeam_channel::bounded(16);
+        let spec = ad_hoc_spec(events, "definitely-not-a-real-cli-xyz", &[], None);
+        let error = launch_ad_hoc_pty(&registry, &spec).unwrap_err();
+        assert!(error.to_string().contains("启动"), "{error}");
+        // 失败路径不得留下注册表条目(无孤儿会话句柄)
+        assert!(registry.snapshot_ad_hoc(".", 4242).is_none());
+    }
+
+    #[test]
+    fn real_process_exit_reports_code_and_detaches() {
+        let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        let (events, rx) = crossbeam_channel::bounded(16);
+        // 输出内容后非零退出:同时覆盖"有输出"与"非零码"两条路径
+        let spec = ad_hoc_spec(events, &cmd, &["/C", "echo bye&&exit 2"], None);
+        launch_ad_hoc_pty(&registry, &spec).unwrap();
+        assert!(
+            registry.snapshot_ad_hoc(".", 4242).is_some(),
+            "启动后应可快照"
+        );
+
+        let (tag, event) = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("等待退出事件超时");
+        assert_eq!(tag, 4242);
+        match event {
+            RuntimeEvent::AdHocExited {
+                session_id,
+                exit_code,
+                ..
+            } => {
+                assert_eq!(session_id, 4242);
+                assert_eq!(exit_code, Some(2));
+            }
+            other => panic!("应为 AdHocExited,得到 {other:?}"),
+        }
+        // 退出后会话从注册表摘除
+        let still_present = (0..150).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            registry.snapshot_ad_hoc(".", 4242).is_some()
+        });
+        assert!(!still_present, "会话应在退出后从注册表移除");
+    }
+
+    #[test]
+    fn silent_exit_still_reports_exit_event() {
+        // 无任何输出、直接非零退出:不得让会话永远停在 reader 循环
+        let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        let (events, rx) = crossbeam_channel::bounded(16);
+        let spec = ad_hoc_spec(events, &cmd, &["/C", "exit", "3"], None);
+        launch_ad_hoc_pty(&registry, &spec).unwrap();
+        let (tag, event) = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("静默退出的进程也必须上报退出事件");
+        assert_eq!(tag, 4242);
+        assert!(matches!(event, RuntimeEvent::AdHocExited { .. }));
+    }
+
+    #[test]
+    fn secret_echo_is_redacted_before_screen_and_tail() {
+        // 真实 CLI 回显 Secret:screen 不得包含明文
+        let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+        let secret = "sk-live-secret-4242";
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        let (events, _rx) = crossbeam_channel::bounded(16);
+        let spec = ad_hoc_spec(
+            events,
+            &cmd,
+            &["/C", "echo", secret],
+            Some(("MY_TOKEN", secret)),
+        );
+        launch_ad_hoc_pty(&registry, &spec).unwrap();
+
+        // 在摘除前轮询快照:回显到达时断言已脱敏
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut saw_output = false;
+        while std::time::Instant::now() < deadline {
+            match registry.snapshot_ad_hoc(".", 4242) {
+                Some(snapshot) => {
+                    let text = snapshot.screen_rows.concat();
+                    if !text.trim().is_empty() {
+                        saw_output = true;
+                        assert!(!text.contains(secret), "screen 泄露 Secret: {text:?}");
+                        assert!(text.contains("***"), "应替换为占位: {text:?}");
+                    }
+                }
+                None => break, // 进程退出并摘除
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        assert!(saw_output, "应在会话存活期间观察到回显输出");
     }
 }
 

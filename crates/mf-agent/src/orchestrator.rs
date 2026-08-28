@@ -798,6 +798,7 @@ impl Orchestrator {
             plan,
             run_temp: trusted_run_temp,
             workdir: self.root.clone(),
+            events: self.runtime_tx.clone(),
         });
         if let Err(error) = launch {
             if let Some(dead) = self.store.set_ad_hoc_status(view.id, SessionStatus::Dead)? {
@@ -805,13 +806,102 @@ impl Orchestrator {
             }
             return Err(anyhow::anyhow!("离散会话 {} 启动失败: {error:#}", view.id));
         }
-        let launched = self
-            .store
-            .mark_ad_hoc_launched(view.id)?
-            .ok_or_else(|| anyhow::anyhow!("离散会话 {} 启动后读取失败", view.id))?;
+        // 启动成功但 DB 写失败:必须补偿杀进程,不留孤儿 CLI
+        let launched = match self.store.mark_ad_hoc_launched(view.id) {
+            Ok(Some(view)) => view,
+            Ok(None) => anyhow::bail!("离散会话 {} 启动后读取失败", view.id),
+            Err(db_error) => {
+                self.host.kill_ad_hoc(&self.root_str, view.id);
+                if let Some(dead) = self.store.set_ad_hoc_status(view.id, SessionStatus::Dead)? {
+                    self.emit(SchedulerEvent::AdHocSessionUpdated(dead));
+                }
+                return Err(db_error.context(format!(
+                    "离散会话 {} 启动后状态写入失败,已终止进程",
+                    view.id
+                )));
+            }
+        };
         self.emit(SchedulerEvent::AdHocSessionUpdated(launched.clone()));
         // 显式不触碰 Task 状态:离散会话不参与成功判定
         Ok(launched)
+    }
+
+    /// 离散 CLI 会话退出处理(宿主经 `RuntimeEvent::AdHocExited` 上报;
+    /// mfctl/测试也可直接调用)。按完成契约与退出码分类终态:
+    /// - oneshot + process-exit:退出码 0 → Done,否则 Dead;
+    /// - oneshot + stdout-marker / result-file:以标记/文件为准;
+    /// - interactive / manual:退出不判成功 → Dead(不误报 Done)。
+    /// 迟到事件(已终结/已提交 Handoff 的行)不复活、不改写。
+    pub fn handle_ad_hoc_exit(
+        &self,
+        session_id: i64,
+        exit_code: Option<i32>,
+        marker_seen: bool,
+        result_file_present: bool,
+    ) {
+        if let Err(error) =
+            self.apply_ad_hoc_exit(session_id, exit_code, marker_seen, result_file_present)
+        {
+            self.emit(SchedulerEvent::Error(format!(
+                "离散会话退出处理失败: {error:#}"
+            )));
+        }
+    }
+
+    fn apply_ad_hoc_exit(
+        &self,
+        session_id: i64,
+        exit_code: Option<i32>,
+        marker_seen: bool,
+        result_file_present: bool,
+    ) -> Result<()> {
+        let Some(view) = self.store.ad_hoc_session_view(session_id)? else {
+            return Ok(());
+        };
+        if matches!(
+            view.status,
+            SessionStatus::Done | SessionStatus::Dead | SessionStatus::Hidden
+        ) {
+            return Ok(()); // 迟到事件:人工已收口,不复活
+        }
+        let contract = crate::agent_adapter::ExecutionContract::parse(&view.snapshot).ok();
+        let status = match view.snapshot.run_mode {
+            crate::model::RunMode::Interactive => SessionStatus::Dead,
+            crate::model::RunMode::OneShot => {
+                let mode = contract
+                    .map(|c| c.completion)
+                    .unwrap_or(crate::agent_adapter::CompletionMode::ProcessExit);
+                use crate::agent_adapter::CompletionMode as M;
+                match mode {
+                    M::ProcessExit => {
+                        if exit_code == Some(0) {
+                            SessionStatus::Done
+                        } else {
+                            SessionStatus::Dead
+                        }
+                    }
+                    M::StdoutMarker => {
+                        if marker_seen {
+                            SessionStatus::Done
+                        } else {
+                            SessionStatus::Dead
+                        }
+                    }
+                    M::ResultFile => {
+                        if result_file_present {
+                            SessionStatus::Done
+                        } else {
+                            SessionStatus::Dead
+                        }
+                    }
+                    M::Manual => SessionStatus::Dead,
+                }
+            }
+        };
+        if let Some(final_view) = self.store.set_ad_hoc_status(session_id, status)? {
+            self.emit(SchedulerEvent::AdHocSessionUpdated(final_view));
+        }
+        Ok(())
     }
 
     /// 用户显式把离散会话输出提交为 Handoff(可多次提交,以最后一次为准)。
@@ -986,6 +1076,17 @@ impl Orchestrator {
     }
 
     fn apply_runtime_event(&self, run_id: i64, ev: RuntimeEvent) -> Result<()> {
+        // 离散会话事件:tag 是 ad_hoc 行号,不走 run 状态机
+        if let RuntimeEvent::AdHocExited {
+            session_id,
+            exit_code,
+            marker_seen,
+            result_file_present,
+        } = ev
+        {
+            self.apply_ad_hoc_exit(session_id, exit_code, marker_seen, result_file_present)?;
+            return Ok(());
+        }
         let run = match self.store.run_view(run_id)? {
             Some(r) => r,
             None => return Ok(()),
@@ -1002,6 +1103,7 @@ impl Orchestrator {
             return Ok(());
         }
         match ev {
+            RuntimeEvent::AdHocExited { .. } => unreachable!("已在函数入口分流"),
             RuntimeEvent::Launched => {
                 if let Some(session_id) = run.session_id {
                     if let Some(s) = self.store.update_session(
