@@ -4,7 +4,7 @@
 //! 同时承载 CLI 适配器的共享编译逻辑(`compile_cli_launch` / 契约观察),
 //! Claude Code / Codex 隔离适配器在其上叠加 run-temp 配置目录注入。
 
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use mf_agent::agent_adapter::{
     resolve_secret_env, AgentAdapter, CompletionDetector, CompletionObservation, ExecutionContract,
     HandoffDraft, InputInjection, LaunchContext, LaunchPlan, ProcessObservation, TempFileSpec,
@@ -50,12 +50,11 @@ pub(crate) fn compile_cli_launch(
     }
 
     let mut env = snapshot.env.clone();
+    let mut temp_files = Vec::new();
     match isolation {
         Some(iso) => {
             let dir = ctx.run_temp.join(iso.subdir);
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("创建隔离配置目录失败: {}", dir.display()))?;
-            materialize_config_files(snapshot, &dir)?;
+            temp_files.extend(config_file_specs(snapshot, &dir)?);
             env.push((iso.env_name.to_string(), dir.to_string_lossy().to_string()));
         }
         None => {
@@ -68,10 +67,9 @@ pub(crate) fn compile_cli_launch(
         }
     }
 
-    let (secret_env, redactions) = resolve_secret_env(snapshot, ctx)?;
+    let secret_env = resolve_secret_env(snapshot, ctx)?;
 
     let mut argv = snapshot.argv.clone();
-    let mut temp_files = Vec::new();
     let input = match (&contract.input, ctx.prompt.as_deref()) {
         (_, None) => InputInjection::Argv(String::new()),
         (mode, Some(prompt)) => match mode {
@@ -105,7 +103,8 @@ pub(crate) fn compile_cli_launch(
             if contract.result_file.is_empty() {
                 anyhow::bail!("result-file 完成检测缺少 result_file 文件名");
             }
-            CompletionDetector::ResultFile(ctx.run_temp.join(&contract.result_file))
+            let result_file = safe_relative_path(&contract.result_file, "结果文件")?;
+            CompletionDetector::ResultFile(ctx.run_temp.join(result_file))
         }
         mf_agent::agent_adapter::CompletionMode::Manual => CompletionDetector::Manual,
     };
@@ -119,45 +118,48 @@ pub(crate) fn compile_cli_launch(
         temp_files,
         input,
         completion,
-        redactions,
         uses_shell: contract.use_shell,
     })
 }
 
-/// 物化快照声明的 `config_files`(相对隔离目录;字符串值原样,其余 pretty JSON)。
-/// 拒绝绝对路径与 `..` 逃逸;只写实例快照内容,不复制用户真实 CLI 主目录。
-fn materialize_config_files(snapshot: &AgentInstanceSnapshot, dir: &Path) -> Result<()> {
+/// 编译快照声明的 `config_files` 为待物化规格。
+/// Adapter 保持纯函数;Runtime Host 负责统一写入。
+fn config_file_specs(snapshot: &AgentInstanceSnapshot, dir: &Path) -> Result<Vec<TempFileSpec>> {
+    let mut specs = Vec::new();
     let Some(files) = snapshot
         .config
         .get("config_files")
         .and_then(|v| v.as_object())
     else {
-        return Ok(());
+        return Ok(specs);
     };
     for (rel, value) in files {
-        let rel_path = Path::new(rel);
-        if rel_path.is_absolute() {
-            anyhow::bail!("配置文件路径必须是相对路径(不允许逃逸隔离目录): {rel}");
-        }
-        if rel_path
-            .components()
-            .any(|c| c == std::path::Component::ParentDir)
-        {
-            anyhow::bail!("配置文件路径不允许 `..`(路径逃逸): {rel}");
-        }
+        let rel_path = safe_relative_path(rel, "配置文件")?;
         let target = dir.join(rel_path);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("创建配置目录失败: {}", parent.display()))?;
-        }
         let contents = match value {
-            serde_json::Value::String(s) => s.clone(),
-            other => serde_json::to_string_pretty(other)?,
+            serde_json::Value::String(s) => s.as_bytes().to_vec(),
+            other => serde_json::to_vec_pretty(other)?,
         };
-        std::fs::write(&target, contents)
-            .with_context(|| format!("物化配置文件失败: {}", target.display()))?;
+        specs.push(TempFileSpec {
+            path: target,
+            contents,
+        });
     }
-    Ok(())
+    Ok(specs)
+}
+
+fn safe_relative_path<'a>(value: &'a str, label: &str) -> Result<&'a Path> {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        anyhow::bail!("{label}路径必须是相对路径(不允许逃逸运行目录): {value}");
+    }
+    if path
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        anyhow::bail!("{label}路径不允许 `..`(路径逃逸): {value}");
+    }
+    Ok(path)
 }
 
 /// CLI 适配器共享的完成观察(按执行契约判定)。

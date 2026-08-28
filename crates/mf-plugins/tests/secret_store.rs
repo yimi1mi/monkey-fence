@@ -81,7 +81,6 @@ fn lease_and_redacted_never_leak_in_debug() {
     assert_eq!(format!("{redacted}"), "<redacted>");
     // 内部仍可读(启动进程需要真实值)
     assert_eq!(redacted.get(), "secret-value");
-    assert_eq!(redacted.into_inner(), "secret-value");
 }
 
 #[test]

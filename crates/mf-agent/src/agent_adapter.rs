@@ -4,16 +4,17 @@
 //! 安全不变量:
 //! - LaunchPlan 默认 `executable + argv` 直启,不经 Shell;
 //!   `uses_shell` 只有在插件拥有 `capabilities.shell` 授权时才允许为真。
-//! - Secret 明文只出现在 `secret_env`(Redacted 包装)与 `redactions`
-//!   (日志脱敏表)中;两者 Debug 输出一律 `<redacted>`。
+//! - Secret 明文只存在于共享的 `SecretLease` 中,LaunchPlan 只持有租约引用;
+//!   Debug 输出一律脱敏,不会复制成普通 String。
 //! - 临时文件只写入本次运行的 run-temp 目录,不触碰用户全局配置。
 
 use crate::agent_instance::AgentInstanceSnapshot;
-use crate::secrets::Redacted;
+use crate::secrets::SecretLease;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// 临时文件规格:启动前由 Runtime Host 物化。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,8 +48,8 @@ pub enum CompletionDetector {
 }
 
 /// 启动计划:Runtime Host 执行的全部输入。
-/// `secret_env`/`redactions` 持有启动期明文(Redacted 防日志泄露);
-/// Debug 输出不含任何 Secret 值。
+/// `secret_env` 只持有启动期 Secret 租约的共享引用;
+/// Debug 输出不含任何 Secret 值,最后一个引用释放时明文被 zeroize。
 #[derive(Debug, Clone)]
 pub struct LaunchPlan {
     pub executable: PathBuf,
@@ -56,14 +57,12 @@ pub struct LaunchPlan {
     pub argv: Vec<String>,
     /// 非敏感环境变量。
     pub env: Vec<(String, String)>,
-    /// 敏感环境变量(值为 Redacted 包装的明文)。
-    pub secret_env: Vec<(String, Redacted<String>)>,
+    /// 敏感环境变量(值为 zeroizing Secret 租约的共享引用)。
+    pub secret_env: Vec<(String, Arc<SecretLease>)>,
     pub cwd: Option<PathBuf>,
     pub temp_files: Vec<TempFileSpec>,
     pub input: InputInjection,
     pub completion: CompletionDetector,
-    /// 日志/Handoff 脱敏表:出现这些值的地方一律替换。
-    pub redactions: Vec<Redacted<String>>,
     /// Shell 模式(必须已通过插件 shell 权限门控)。
     pub uses_shell: bool,
 }
@@ -71,17 +70,10 @@ pub struct LaunchPlan {
 impl LaunchPlan {
     /// 脱敏明文值列表(仅启动期使用;不进日志)。
     pub fn redaction_values(&self) -> Vec<&str> {
-        self.redactions.iter().map(|r| r.get().as_str()).collect()
-    }
-
-    /// 合并后的完整环境(启动进程时用;非敏感 + 敏感)。
-    pub fn full_env(&self) -> Vec<(String, String)> {
-        let mut env = self.env.clone();
-        for (k, v) in &self.secret_env {
-            env.retain(|(ek, _)| ek != k);
-            env.push((k.clone(), v.get().clone()));
-        }
-        env
+        self.secret_env
+            .iter()
+            .filter_map(|(_, lease)| std::str::from_utf8(lease.as_slice()).ok())
+            .collect()
     }
 }
 
@@ -135,7 +127,7 @@ impl ExecutionContract {
 }
 
 /// 编译上下文:Runtime Host 在启动前准备好的环境。
-/// `secrets` 是已解封的明文(secret-id → value),只在启动内存中存在。
+/// `secrets` 是已解封的 zeroizing 租约(secret-id → lease),只在启动期存在。
 #[derive(Debug, Clone)]
 pub struct LaunchContext {
     /// 本次 Agent Run 专属临时目录(配置/结果文件都写在这里)。
@@ -146,8 +138,8 @@ pub struct LaunchContext {
     pub prompt: Option<String>,
     /// 插件是否被授权 Shell 能力(capabilities.shell)。
     pub grants_shell: bool,
-    /// 已解封 Secret(secret-id → 明文)。
-    pub secrets: HashMap<String, String>,
+    /// 已解封 Secret(secret-id → zeroizing 租约)。
+    pub secrets: HashMap<String, Arc<SecretLease>>,
 }
 
 impl LaunchContext {
@@ -221,34 +213,39 @@ pub trait AgentAdapter: Send + Sync {
     fn extract_handoff(&self, obs: &ProcessObservation) -> Result<HandoffDraft>;
 }
 
-/// 敏感环境变量集合(ENV 名 → Redacted 明文)。
-pub type SecretEnv = Vec<(String, Redacted<String>)>;
+/// 敏感环境变量集合(ENV 名 → zeroizing 租约引用)。
+pub type SecretEnv = Vec<(String, Arc<SecretLease>)>;
 
 /// 通用逻辑:从快照 config 的 `secret_env` 映射(ENV 名 → secret-id)
 /// 解析出敏感环境变量。所有内置适配器共用此约定。
-/// 明文进入 Redacted 包装与脱敏表;缺 Secret 时报错阻止启动。
+/// 不复制明文;缺 Secret 或引用未声明的 Secret 时报错阻止启动。
 pub fn resolve_secret_env(
     snapshot: &AgentInstanceSnapshot,
     ctx: &LaunchContext,
-) -> Result<(SecretEnv, Vec<Redacted<String>>)> {
+) -> Result<SecretEnv> {
     let mut secret_env = Vec::new();
-    let mut redactions = Vec::new();
     let Some(mapping) = snapshot
         .config
         .get("secret_env")
         .and_then(|v| v.as_object())
     else {
-        return Ok((secret_env, redactions));
+        return Ok(secret_env);
     };
     for (env_name, secret_id) in mapping {
         let Some(id) = secret_id.as_str() else {
             anyhow::bail!("secret_env.{env_name} 必须是 secret id 字符串");
         };
+        if !snapshot
+            .sealed_secret_ids
+            .iter()
+            .any(|declared| declared == id)
+        {
+            anyhow::bail!("Secret `{id}` 未在 Agent Instance 快照中声明,阻止启动");
+        }
         let Some(value) = ctx.secrets.get(id) else {
             anyhow::bail!("Secret `{id}` 未解封,阻止启动(env {env_name})");
         };
-        secret_env.push((env_name.clone(), Redacted::new(value.clone())));
-        redactions.push(Redacted::new(value.clone()));
+        secret_env.push((env_name.clone(), Arc::clone(value)));
     }
-    Ok((secret_env, redactions))
+    Ok(secret_env)
 }

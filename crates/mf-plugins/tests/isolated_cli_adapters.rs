@@ -4,9 +4,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use mf_agent::agent_adapter::{AgentAdapter, LaunchContext};
 use mf_agent::agent_instance::AgentInstanceSnapshot;
+use mf_agent::secrets::SecretLease;
 use mf_agent::RunMode;
 use mf_plugins::claude_adapter::ClaudeCodeAdapter;
 use mf_plugins::codex_adapter::CodexAdapter;
@@ -43,7 +45,6 @@ fn ctx_at(root: &Path) -> LaunchContext {
 fn env_value(plan: &mf_agent::LaunchPlan, key: &str) -> Option<String> {
     plan.env
         .iter()
-        .chain(plan.full_env().iter())
         .find(|(k, _)| k == key)
         .map(|(_, v)| v.clone())
 }
@@ -71,9 +72,9 @@ fn adapters_never_target_real_homes() {
         "Codex 必须使用 run-temp 下的独立主目录"
     );
 
-    // 目标目录在启动前创建
-    assert!(claude_dir.is_dir());
-    assert!(codex_dir.is_dir());
+    // Adapter 编译是纯函数:目录与文件由 Runtime Host 统一物化
+    assert!(!claude_dir.exists());
+    assert!(!codex_dir.exists());
 
     // 绝不指向真实全局配置
     let home = dirs::home_dir().unwrap();
@@ -101,12 +102,12 @@ fn materializes_only_snapshot_config_into_isolated_home() {
         .unwrap();
 
     let settings = root.path().join("claude").join("settings.json");
-    assert!(
-        settings.is_file(),
-        "配置文件必须在启动前物化: {}",
-        settings.display()
-    );
-    let text = std::fs::read_to_string(&settings).unwrap();
+    let spec = plan
+        .temp_files
+        .iter()
+        .find(|file| file.path == settings)
+        .expect("settings.json 必须由 LaunchPlan 声明");
+    let text = String::from_utf8(spec.contents.clone()).unwrap();
     let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(parsed["permissions"]["allow"][0], "Bash(ls*)");
 
@@ -115,21 +116,17 @@ fn materializes_only_snapshot_config_into_isolated_home() {
     snapshot.config = serde_json::json!({
         "config_files": { "config.toml": "model = \"gpt-5\"\n" }
     });
-    codex_adapter()
+    let codex_plan = codex_adapter()
         .compile_launch(&snapshot, &ctx_at(root.path()))
         .unwrap();
     let toml = root.path().join("codex").join("config.toml");
-    assert!(toml.is_file());
-    assert!(std::fs::read_to_string(&toml).unwrap().contains("gpt-5"));
+    assert!(codex_plan.temp_files.iter().any(|file| {
+        file.path == toml && String::from_utf8_lossy(&file.contents).contains("gpt-5")
+    }));
 
     // 不复制用户真实 CLI 主目录:隔离目录只包含快照声明的文件
-    let claude_entries: Vec<String> = std::fs::read_dir(root.path().join("claude"))
-        .unwrap()
-        .filter_map(|e| e.ok())
-        .map(|e| e.file_name().to_string_lossy().to_string())
-        .collect();
-    assert_eq!(claude_entries, vec!["settings.json".to_string()]);
-    let _ = plan;
+    assert!(!root.path().join("claude").exists());
+    assert!(!root.path().join("codex").exists());
 }
 
 #[test]
@@ -163,7 +160,10 @@ fn secrets_go_through_redacted_env_only() {
     snapshot.sealed_secret_ids = vec!["api-key".into()];
     let mut context = ctx_at(root.path());
     let mut secrets = HashMap::new();
-    secrets.insert("api-key".to_string(), "sk-ant-secret-99".to_string());
+    secrets.insert(
+        "api-key".to_string(),
+        Arc::new(SecretLease::new("api-key", b"sk-ant-secret-99".to_vec())),
+    );
     context.secrets = secrets;
 
     let plan = claude_adapter()
@@ -172,7 +172,7 @@ fn secrets_go_through_redacted_env_only() {
     assert!(plan
         .secret_env
         .iter()
-        .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v.get() == "sk-ant-secret-99"));
+        .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v.as_slice() == b"sk-ant-secret-99"));
     let debug = format!("{plan:?}");
     assert!(!debug.contains("sk-ant-secret-99"), "Debug 泄露: {debug}");
 
@@ -186,7 +186,7 @@ fn secrets_go_through_redacted_env_only() {
     assert!(plan
         .secret_env
         .iter()
-        .any(|(k, v)| k == "OPENAI_API_KEY" && v.get() == "sk-ant-secret-99"));
+        .any(|(k, v)| k == "OPENAI_API_KEY" && v.as_slice() == b"sk-ant-secret-99"));
 }
 
 #[test]

@@ -4,12 +4,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use mf_agent::agent_adapter::{
     AgentAdapter, CompletionDetector, CompletionObservation, InputInjection, LaunchContext,
     LaunchPlan,
 };
 use mf_agent::agent_instance::AgentInstanceSnapshot;
+use mf_agent::secrets::SecretLease;
 use mf_agent::RunMode;
 use mf_plugins::generic_command_adapter::GenericCommandAdapter;
 
@@ -60,7 +62,10 @@ fn plan_debug_never_contains_secret_values() {
     snapshot.sealed_secret_ids = vec!["api-key".into()];
     let mut context = ctx();
     let mut secrets = HashMap::new();
-    secrets.insert("api-key".to_string(), "sk-plaintext-42".to_string());
+    secrets.insert(
+        "api-key".to_string(),
+        Arc::new(SecretLease::new("api-key", b"sk-plaintext-42".to_vec())),
+    );
     context.secrets = secrets;
 
     let plan = adapter().compile_launch(&snapshot, &context).unwrap();
@@ -70,7 +75,7 @@ fn plan_debug_never_contains_secret_values() {
     assert!(plan
         .secret_env
         .iter()
-        .any(|(k, v)| k == "MY_TOKEN" && v.get() == "sk-plaintext-42"));
+        .any(|(k, v)| k == "MY_TOKEN" && v.as_slice() == b"sk-plaintext-42"));
     assert!(plan.redaction_values().contains(&"sk-plaintext-42"));
     // Debug 输出全链路脱敏
     let debug = format!("{plan:?}");
@@ -151,6 +156,10 @@ fn completion_detector_modes() {
     snapshot.execution_contract = serde_json::json!({ "completion": "manual" });
     let plan = adapter().compile_launch(&snapshot, &ctx()).unwrap();
     assert_eq!(plan.completion, CompletionDetector::Manual);
+
+    snapshot.execution_contract =
+        serde_json::json!({ "completion": "result-file", "result_file": "../escape.json" });
+    assert!(adapter().compile_launch(&snapshot, &ctx()).is_err());
 }
 
 #[test]
