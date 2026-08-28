@@ -37,15 +37,15 @@ pub use config::{
     Config, EditorConfig, EngineConfig, ProviderConfig, ProviderKind, TerminalConfig,
 };
 pub use model::{
-    AgentState, InstanceScope, RevisionStatus, RunMode, RunStatus, SchedulerEvent, SessionStatus,
-    SettleError, SettleOutcome, Settlement, StepQuestionView, StepStatus, StepView, TaskStatus,
-    TaskView,
+    AdHocSessionView, AgentState, InstanceScope, RevisionStatus, RunMode, RunStatus,
+    SchedulerEvent, SessionStatus, SettleError, SettleOutcome, Settlement, StepQuestionView,
+    StepStatus, StepView, TaskStatus, TaskView,
 };
 pub use orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
 pub use pipeline::{PipelineDraft, ProfileIndex, SessionPolicy, StepDraft};
 pub use runtime::{
-    AgentProfileSpec, AgentTypeDescriptor, HookSpec, LaunchSpec, RuntimeEvent, RuntimeHost,
-    RuntimeKind,
+    AdHocLaunchSpec, AgentProfileSpec, AgentTypeDescriptor, HookSpec, LaunchSpec, RuntimeEvent,
+    RuntimeHost, RuntimeKind,
 };
 pub use schema::{
     catalog_db_path, project_db_path, CATALOG_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION,

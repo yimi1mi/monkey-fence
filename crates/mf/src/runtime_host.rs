@@ -13,7 +13,9 @@ const TERM_COLS: usize = 120;
 use anyhow::{anyhow, Context as _, Result};
 use crossbeam_channel::Sender;
 use mf_agent::provider::{complete, AssistantBlock, ChatMessage, ToolDef};
-use mf_agent::runtime::{AgentProfileSpec, LaunchSpec, RuntimeEvent, RuntimeHost, RuntimeKind};
+use mf_agent::runtime::{
+    AdHocLaunchSpec, AgentProfileSpec, LaunchSpec, RuntimeEvent, RuntimeHost, RuntimeKind,
+};
 use mf_agent::Settlement;
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, NativePtySystem, PtySize};
@@ -77,6 +79,12 @@ pub fn session_key(project: &str, id: i64) -> String {
     format!("{}#{}", project.replace('#', "_"), id)
 }
 
+/// 离散 CLI 会话键:ad_hoc_sessions 行号与 agent_sessions 行号是两套
+/// 自增序列,同项目下会撞号,必须用独立命名空间隔离路由。
+pub fn ad_hoc_session_key(project: &str, id: i64) -> String {
+    format!("{}#ad#{}", project.replace('#', "_"), id)
+}
+
 pub struct SessionRegistry {
     sessions: Mutex<HashMap<String, SessionInner>>,
     run_sessions: Mutex<HashMap<String, String>>,
@@ -96,11 +104,24 @@ impl SessionRegistry {
         *self.config.lock() = config;
     }
 
+    fn get_inner(&self, key: &str) -> Option<SessionInner> {
+        self.sessions.lock().get(key).cloned()
+    }
+
     /// UI 终端视图重新挂载时恢复当前屏幕。
     pub fn snapshot(&self, project: &str, session_id: i64) -> Option<SessionSnapshot> {
         let key = session_key(project, session_id);
-        let sessions = self.sessions.lock();
-        match sessions.get(&key)? {
+        self.snapshot_at(&key, session_id)
+    }
+
+    /// 离散 CLI 会话快照(独立命名空间,见 `ad_hoc_session_key`)。
+    pub fn snapshot_ad_hoc(&self, project: &str, session_id: i64) -> Option<SessionSnapshot> {
+        let key = ad_hoc_session_key(project, session_id);
+        self.snapshot_at(&key, session_id)
+    }
+
+    fn snapshot_at(&self, key: &str, session_id: i64) -> Option<SessionSnapshot> {
+        match self.get_inner(key)? {
             SessionInner::Pty(p) => {
                 let screen = p.screen.lock();
                 let mut rows = Vec::with_capacity(TERM_ROWS);
@@ -145,11 +166,18 @@ impl SessionRegistry {
 
     pub fn send_prompt(&self, project: &str, session_id: i64, text: &str) -> Result<()> {
         let key = session_key(project, session_id);
-        let sess = {
-            let sessions = self.sessions.lock();
-            sessions.get(&key).cloned()
-        };
-        // 锁外做阻塞 I/O(ConPTY 输入缓冲满时 write 会阻塞,不能拿着注册表锁)
+        self.send_prompt_at(&key, session_id, text)
+    }
+
+    /// 向离散 CLI 会话写入提示(独立命名空间)。
+    pub fn send_prompt_ad_hoc(&self, project: &str, session_id: i64, text: &str) -> Result<()> {
+        let key = ad_hoc_session_key(project, session_id);
+        self.send_prompt_at(&key, session_id, text)
+    }
+
+    /// 锁外做阻塞 I/O(ConPTY 输入缓冲满时 write 会阻塞,不能拿着注册表锁)。
+    fn send_prompt_at(&self, key: &str, session_id: i64, text: &str) -> Result<()> {
+        let sess = self.get_inner(key);
         match sess {
             Some(SessionInner::Pty(p)) => {
                 let mut writer = p.writer.lock();
@@ -192,11 +220,17 @@ impl SessionRegistry {
 
     pub fn kill_session(&self, project: &str, session_id: i64) {
         let key = session_key(project, session_id);
-        let sess = {
-            let mut sessions = self.sessions.lock();
-            sessions.remove(&key)
-        };
-        if let Some(s) = sess {
+        Self::kill_at(&self.sessions, &key);
+    }
+
+    /// 终止离散 CLI 会话(独立命名空间)。
+    pub fn kill_ad_hoc(&self, project: &str, session_id: i64) {
+        let key = ad_hoc_session_key(project, session_id);
+        Self::kill_at(&self.sessions, &key);
+    }
+
+    fn kill_at(sessions: &Mutex<HashMap<String, SessionInner>>, key: &str) {
+        if let Some(s) = sessions.lock().remove(key) {
             match &s {
                 SessionInner::Pty(p) => {
                     p.alive.store(false, Ordering::SeqCst);
@@ -241,6 +275,13 @@ impl SessionRegistry {
         self.sessions
             .lock()
             .insert(session_key(project, session_id), inner);
+    }
+
+    /// 离散 CLI 会话注册(独立命名空间,不与 agent_sessions 撞号)。
+    fn register_ad_hoc(&self, project: &str, session_id: i64, inner: SessionInner) {
+        self.sessions
+            .lock()
+            .insert(ad_hoc_session_key(project, session_id), inner);
     }
 
     fn bind_run(&self, project: &str, run_id: i64, session_id: i64) {
@@ -440,6 +481,109 @@ fn launch_pty(registry: &SessionRegistry, spec: &LaunchSpec, events: Sender<(i64
             session.master.lock().take();
             let _ = events_out.send((run_id, RuntimeEvent::Exited { code }));
             let _ = events_out.send((run_id, RuntimeEvent::AgentState(mf_agent::AgentState::Dead)));
+        })
+        .ok();
+}
+
+// ---------------- Ad-hoc CLI 会话 ----------------
+
+/// 离散 CLI 会话启动(设计 §4.7 / §10):挂在 Task 下,
+/// 无 Step / Agent Run / 结算事件流;注册表仍以 (project, session_id)
+/// 路由,UI 终端视图、send_prompt、kill 与普通会话一致。
+fn launch_ad_hoc_pty(registry: &SessionRegistry, spec: &AdHocLaunchSpec) {
+    let project = spec.workdir.to_string_lossy().to_string();
+    registry.kill_ad_hoc(&project, spec.session_id); // 同键旧会话清理
+
+    let pty_system: Box<dyn portable_pty::PtySystem> = Box::new(NativePtySystem::default());
+    let pair = match pty_system.openpty(PtySize {
+        rows: TERM_ROWS as u16,
+        cols: TERM_COLS as u16,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            log::error!("离散会话 openpty 失败: {e}");
+            return;
+        }
+    };
+
+    let mut cmd = CommandBuilder::new(&spec.profile.command);
+    cmd.args(&spec.profile.args);
+    // 一次性模式或显式提示:prompt 作为尾随参数(与 run 启动一致)
+    if let Some(prompt) = spec.prompt.as_deref() {
+        if !prompt.trim().is_empty() {
+            cmd.arg(prompt);
+        }
+    }
+    for (k, v) in &spec.profile.env {
+        cmd.env(k, v);
+    }
+    cmd.cwd(&spec.workdir);
+
+    let child = match pair.slave.spawn_command(cmd) {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!(
+                "离散会话启动 `{}` 失败: {e}(CLI 未安装?)",
+                spec.profile.command
+            );
+            return;
+        }
+    };
+    drop(pair.slave);
+    let Ok(mut reader) = pair.master.try_clone_reader() else {
+        log::error!("离散会话克隆 PTY reader 失败");
+        return;
+    };
+    let Ok(writer) = pair.master.take_writer() else {
+        log::error!("离散会话 take_writer 失败");
+        return;
+    };
+
+    let session = Arc::new(PtySession {
+        session_id: spec.session_id,
+        master: Mutex::new(Some(pair.master)),
+        writer: Mutex::new(Some(writer)),
+        child: Mutex::new(Some(child)),
+        screen: Mutex::new(Screen::new(TERM_ROWS, TERM_COLS)),
+        title: Mutex::new(spec.title.clone()),
+        output_tail: Mutex::new(Vec::new()),
+        alive: AtomicBool::new(true),
+    });
+    registry.register_ad_hoc(
+        &project,
+        spec.session_id,
+        SessionInner::Pty(session.clone()),
+    );
+
+    std::thread::Builder::new()
+        .name(format!("ad-hoc-pty-reader-{}", spec.session_id))
+        .spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let mut screen = session.screen.lock();
+                        screen.feed(&buf[..n]);
+                        if !screen.title.is_empty() {
+                            *session.title.lock() = screen.title.clone();
+                        }
+                        drop(screen);
+                        let mut tail = session.output_tail.lock();
+                        tail.extend_from_slice(&buf[..n]);
+                        if tail.len() > OUT_BUFFER_CAP {
+                            let drop = tail.len() - OUT_BUFFER_CAP;
+                            tail.drain(..drop);
+                        }
+                    }
+                }
+            }
+            session.alive.store(false, Ordering::SeqCst);
+            let _ = session.child.lock().as_mut().and_then(|c| c.wait().ok());
+            session.writer.lock().take();
+            session.master.lock().take();
         })
         .ok();
 }
@@ -929,6 +1073,10 @@ impl RuntimeHost for RuntimeHostImpl {
         }
     }
 
+    fn launch_ad_hoc(&self, spec: AdHocLaunchSpec) {
+        launch_ad_hoc_pty(&self.registry, &spec);
+    }
+
     fn send_prompt(&self, project: &str, _run_id: i64, session_id: i64, text: &str) {
         let _ = self.registry.send_prompt(project, session_id, text);
     }
@@ -985,5 +1133,26 @@ pub fn provider_kind_of(spec: &AgentProfileSpec) -> String {
     match (&spec.runtime, &spec.provider) {
         (RuntimeKind::Http, Some(p)) => format!("{:?}", p.kind).to_lowercase(),
         _ => spec.runtime.as_str().to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ad_hoc_sessions_use_separate_key_namespace() {
+        // ad_hoc_sessions 与 agent_sessions 是两套自增行号,
+        // 同项目下同号必须路由到不同注册表条目。
+        assert_ne!(session_key("proj", 7), ad_hoc_session_key("proj", 7));
+        assert_eq!(ad_hoc_session_key("pro#j", 7), "pro_j#ad#7");
+    }
+
+    #[test]
+    fn ad_hoc_snapshot_missing_is_none() {
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        assert!(registry.snapshot_ad_hoc("proj", 1).is_none());
+        assert!(registry.send_prompt_ad_hoc("proj", 1, "hi").is_err());
+        registry.kill_ad_hoc("proj", 1); // 不存在时是 no-op
     }
 }

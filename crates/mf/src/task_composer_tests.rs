@@ -5,7 +5,7 @@ use crate::project_context::ActivationTarget;
 use crate::task_composer::TaskComposerState;
 use mf_agent::config::Config;
 use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
-use mf_agent::runtime::{LaunchSpec, RuntimeEvent, RuntimeHost};
+use mf_agent::runtime::{AdHocLaunchSpec, LaunchSpec, RuntimeEvent, RuntimeHost};
 use mf_agent::store::Store;
 use parking_lot::RwLock;
 use std::path::PathBuf;
@@ -14,6 +14,7 @@ use std::sync::Arc;
 struct NoopHost;
 impl RuntimeHost for NoopHost {
     fn launch(&self, _spec: LaunchSpec, _events: crossbeam_channel::Sender<(i64, RuntimeEvent)>) {}
+    fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) {}
     fn send_prompt(&self, _p: &str, _r: i64, _s: i64, _t: &str) {}
     fn stop_run(&self, _p: &str, _r: i64) {}
     fn kill_session(&self, _p: &str, _s: i64) {}

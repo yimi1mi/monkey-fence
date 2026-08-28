@@ -43,6 +43,14 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+/// 离散会话的"终态"集合(用于决定是否写 ended_at)。
+fn ad_hoc_status_terminal(status: SessionStatus) -> bool {
+    matches!(
+        status,
+        SessionStatus::Done | SessionStatus::Dead | SessionStatus::Hidden
+    )
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Arc<Store>> {
         if let Some(parent) = path.parent() {
@@ -1301,6 +1309,133 @@ impl Store {
                 })?
                 .collect::<std::result::Result<_, _>>()?;
             Ok(rows)
+        })
+    }
+
+    // ---------- 离散 CLI 会话 ----------
+
+    /// 行 → 视图(快照 JSON 解析失败时返回数据库错误,不 panic)。
+    fn ad_hoc_view_row(r: &rusqlite::Row) -> rusqlite::Result<AdHocSessionView> {
+        let snapshot_json: String = r.get(4)?;
+        Ok(AdHocSessionView {
+            id: r.get(0)?,
+            task_id: r.get(1)?,
+            title: r.get(2)?,
+            status: SessionStatus::parse(&r.get::<_, String>(3)?).unwrap_or(SessionStatus::Idle),
+            snapshot: serde_json::from_str(&snapshot_json).map_err(|e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("ad_hoc 快照损坏: {e}"),
+                    )),
+                )
+            })?,
+            handoff: r.get(5)?,
+            created_at: r.get(6)?,
+            launched_at: r.get(7)?,
+            ended_at: r.get(8)?,
+        })
+    }
+
+    const AD_HOC_COLS: &'static str = "id, task_id, title, status, snapshot_json, handoff_json, created_at, launched_at, ended_at";
+
+    /// 插入离散会话行(状态 starting;启动后由 mark_ad_hoc_launched 推进)。
+    pub fn insert_ad_hoc_session(
+        &self,
+        task_id: i64,
+        snapshot: &crate::agent_instance::AgentInstanceSnapshot,
+    ) -> Result<AdHocSessionView> {
+        self.with_conn(|c| {
+            let ts = now();
+            c.execute(
+                "INSERT INTO ad_hoc_sessions (task_id, title, status, snapshot_json, created_at)
+                 VALUES (?1, ?2, 'starting', ?3, ?4)",
+                params![task_id, snapshot.name, serde_json::to_string(snapshot)?, ts],
+            )?;
+            Self::ad_hoc_view_by_id(c, c.last_insert_rowid())?
+                .ok_or_else(|| anyhow::anyhow!("ad_hoc 插入后读取失败"))
+        })
+    }
+
+    fn ad_hoc_view_by_id(c: &Connection, id: i64) -> Result<Option<AdHocSessionView>> {
+        c.query_row(
+            &format!(
+                "SELECT {} FROM ad_hoc_sessions WHERE id = ?1",
+                Self::AD_HOC_COLS
+            ),
+            params![id],
+            Self::ad_hoc_view_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub fn ad_hoc_session_view(&self, id: i64) -> Result<Option<AdHocSessionView>> {
+        self.with_conn(|c| Self::ad_hoc_view_by_id(c, id))
+    }
+
+    pub fn list_ad_hoc_sessions(&self, task_id: i64) -> Result<Vec<AdHocSessionView>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {} FROM ad_hoc_sessions WHERE task_id = ?1 ORDER BY id",
+                Self::AD_HOC_COLS
+            ))?;
+            let rows = stmt
+                .query_map(params![task_id], Self::ad_hoc_view_row)?
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// 启动成功:状态 → working,记录 launched_at。
+    pub fn mark_ad_hoc_launched(&self, id: i64) -> Result<Option<AdHocSessionView>> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE ad_hoc_sessions SET status = 'working', launched_at = ?2 WHERE id = ?1",
+                params![id, now()],
+            )?;
+            Self::ad_hoc_view_by_id(c, id)
+        })
+    }
+
+    pub fn set_ad_hoc_status(
+        &self,
+        id: i64,
+        status: SessionStatus,
+    ) -> Result<Option<AdHocSessionView>> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE ad_hoc_sessions
+                 SET status = ?2,
+                     ended_at = CASE WHEN ?3 = 1 THEN ?4 ELSE ended_at END
+                 WHERE id = ?1",
+                params![
+                    id,
+                    status.as_str(),
+                    ad_hoc_status_terminal(status) as i64,
+                    now()
+                ],
+            )?;
+            Self::ad_hoc_view_by_id(c, id)
+        })
+    }
+
+    /// 用户显式提交 Handoff:记录 JSON 并终结会话。
+    pub fn submit_ad_hoc_handoff(
+        &self,
+        id: i64,
+        handoff_json: &str,
+    ) -> Result<Option<AdHocSessionView>> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE ad_hoc_sessions
+                 SET handoff_json = ?2, status = 'done', ended_at = ?3
+                 WHERE id = ?1",
+                params![id, handoff_json, now()],
+            )?;
+            Self::ad_hoc_view_by_id(c, id)
         })
     }
 }

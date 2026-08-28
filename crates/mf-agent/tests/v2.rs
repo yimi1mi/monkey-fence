@@ -5,7 +5,9 @@ use mf_agent::config::Config;
 use mf_agent::model::*;
 use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
 use mf_agent::pipeline::{PipelineDraft, ProfileIndex, SessionPolicy, StepDraft};
-use mf_agent::runtime::{AgentProfileSpec, LaunchSpec, RuntimeEvent, RuntimeHost, RuntimeKind};
+use mf_agent::runtime::{
+    AdHocLaunchSpec, AgentProfileSpec, LaunchSpec, RuntimeEvent, RuntimeHost, RuntimeKind,
+};
 use mf_agent::store::Store;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -117,6 +119,7 @@ impl RuntimeHost for MockHost {
     }
     fn kill_session(&self, _project: &str, _session_id: i64) {}
     fn answer_question(&self, _project: &str, _run_id: i64, _answer: &str) {}
+    fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) {}
 }
 
 fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {

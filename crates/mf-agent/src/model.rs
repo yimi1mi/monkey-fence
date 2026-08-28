@@ -227,6 +227,22 @@ pub struct StepQuestionView {
     pub created_at: String,
 }
 
+/// 离散 CLI 会话视图:挂在 Task 下但不属于 Pipeline Revision,
+/// 没有 step_id / Agent Run,不参与 Task 成功判定(设计 §4.7)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdHocSessionView {
+    pub id: i64,
+    pub task_id: i64,
+    pub title: String,
+    pub status: SessionStatus,
+    pub snapshot: crate::agent_instance::AgentInstanceSnapshot,
+    /// 用户显式提交的 Handoff(JSON),未提交为 None。
+    pub handoff: Option<String>,
+    pub created_at: String,
+    pub launched_at: Option<String>,
+    pub ended_at: Option<String>,
+}
+
 /// Agent Run 的显式结算:唯一成功依据(见 ADR 0001 与 `mfctl`)。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -290,6 +306,7 @@ pub enum SchedulerEvent {
     StepUpdated(StepView),
     RunUpdated(RunView),
     SessionUpdated(SessionView),
+    AdHocSessionUpdated(AdHocSessionView),
     QuestionOpened(StepQuestionView),
     QuestionAnswered(StepQuestionView),
     /// 运行日志/终端输出摘要(推移给详情视图)。

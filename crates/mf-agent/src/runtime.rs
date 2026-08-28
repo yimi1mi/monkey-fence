@@ -104,6 +104,20 @@ pub struct LaunchSpec {
     pub workdir: PathBuf,
 }
 
+/// 离散 CLI 会话启动规格(设计 §4.7 / §10):挂在 Task 下,
+/// 但没有 Step / Agent Run / 结算令牌,不参与 Task 成功判定。
+/// 宿主以 `(project, session_id)` 路由,session_id 是 ad_hoc_sessions 行号。
+#[derive(Debug, Clone)]
+pub struct AdHocLaunchSpec {
+    pub task_id: i64,
+    pub session_id: i64,
+    pub title: String,
+    pub run_mode: crate::model::RunMode,
+    pub profile: AgentProfileSpec,
+    pub prompt: Option<String>,
+    pub workdir: PathBuf,
+}
+
 /// Runtime → Orchestrator 事件。
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
@@ -132,8 +146,11 @@ pub type TaggedRuntimeEvent = (i64, RuntimeEvent);
 
 /// Orchestrator 调用宿主(GPUI 进程内实现)执行 Agent Run。
 pub trait RuntimeHost: Send + Sync {
-    /// 启动(或复用会话并发送 prompt)。事件通过 `events` 回传(首元素为 run_id)。
+    /// 启动(或复用会话并发送 prompt)。事件通过 `events` 回调(首元素为 run_id)。
     fn launch(&self, spec: LaunchSpec, events: crossbeam_channel::Sender<TaggedRuntimeEvent>);
+    /// 启动离散 CLI 会话:无 run 事件流,状态由宿主直接管理;
+    /// 不得发明 Step / Agent Run,也不得触碰 Task 状态。
+    fn launch_ad_hoc(&self, spec: AdHocLaunchSpec);
     /// 向运行中的 Agent 追加提示。
     /// `project`:项目根路径 —— run/session id 是各项目数据库的行号,
     /// 跨项目会碰撞,宿主必须以 (project, id) 定位真实会话。

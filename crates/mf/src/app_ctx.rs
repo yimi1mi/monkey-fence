@@ -330,6 +330,23 @@ impl AppCtx {
             .map(|p| p.orchestrator.clone())
     }
 
+    /// 在项目任务下创建离散 CLI 会话(设计 §4.7 / §10):
+    /// 不属于 DAG、没有 Step / Agent Run,不改变 Task 状态。
+    /// UI(`+` 菜单)接线在界面里程碑;先落地宿主路由与持久化。
+    #[allow(dead_code)]
+    pub fn create_ad_hoc_session(
+        &self,
+        root: &Path,
+        task_id: i64,
+        instance_snapshot: &mf_agent::AgentInstanceSnapshot,
+        launch_mode: mf_agent::RunMode,
+    ) -> Result<mf_agent::AdHocSessionView> {
+        let orch = self
+            .orchestrator_of(root)
+            .ok_or_else(|| anyhow::anyhow!("项目未打开: {}", root.display()))?;
+        orch.create_ad_hoc_session(task_id, instance_snapshot, launch_mode)
+    }
+
     /// 活动项目数(用于关闭确认)。
     pub fn active_runs_of(&self, root: &PathBuf) -> usize {
         self.orchestrator_of(root)

@@ -6,7 +6,7 @@
 use crate::config::Config;
 use crate::model::*;
 use crate::pipeline::{PipelineDraft, ProfileIndex, SessionPolicy};
-use crate::runtime::{AgentProfileSpec, LaunchSpec, RuntimeEvent, RuntimeHost};
+use crate::runtime::{AgentProfileSpec, LaunchSpec, RuntimeEvent, RuntimeHost, RuntimeKind};
 use crate::store::Store;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
@@ -766,6 +766,75 @@ impl Orchestrator {
         }
         self.emit(SchedulerEvent::QuestionAnswered(answered));
         Ok(())
+    }
+
+    // ---------- 离散 CLI 会话 ----------
+
+    /// 在任务下创建离散 CLI 会话(设计 §4.7 / §10):
+    /// 不属于 Revision、没有 Step / Agent Run、绝不改变 Task 状态。
+    /// 路由键是 ad_hoc_sessions 行号,宿主以 (project, session_id) 定位进程。
+    pub fn create_ad_hoc_session(
+        &self,
+        task_id: i64,
+        instance_snapshot: &crate::agent_instance::AgentInstanceSnapshot,
+        launch_mode: crate::model::RunMode,
+    ) -> Result<AdHocSessionView> {
+        self.store
+            .task_view(task_id)?
+            .ok_or_else(|| anyhow::anyhow!("任务 {task_id} 不存在"))?;
+        let view = self
+            .store
+            .insert_ad_hoc_session(task_id, instance_snapshot)?;
+        // 从实例快照直接合成启动配置:离散会话不走 Profile 目录,
+        // 编辑过的实例配置(命令/参数/环境)原样生效。
+        let profile = AgentProfileSpec {
+            id: instance_snapshot.agent_type.clone(),
+            display_name: instance_snapshot.name.clone(),
+            runtime: RuntimeKind::Pty,
+            command: instance_snapshot.executable.clone(),
+            args: instance_snapshot.argv.clone(),
+            env: instance_snapshot.env.clone(),
+            permission_args: vec![],
+            provider: None,
+            icon: None,
+            homepage: None,
+            hook: None,
+        };
+        self.host.launch_ad_hoc(crate::runtime::AdHocLaunchSpec {
+            task_id,
+            session_id: view.id,
+            title: view.title.clone(),
+            run_mode: launch_mode,
+            profile,
+            prompt: None,
+            workdir: self.root.clone(),
+        });
+        let launched = self
+            .store
+            .mark_ad_hoc_launched(view.id)?
+            .ok_or_else(|| anyhow::anyhow!("离散会话 {} 启动后读取失败", view.id))?;
+        self.emit(SchedulerEvent::AdHocSessionUpdated(launched.clone()));
+        // 显式不触碰 Task 状态:离散会话不参与成功判定
+        Ok(launched)
+    }
+
+    /// 用户显式把离散会话输出提交为 Handoff(可多次提交,以最后一次为准)。
+    pub fn submit_ad_hoc_handoff(
+        &self,
+        session_id: i64,
+        handoff: &crate::agent_adapter::HandoffDraft,
+    ) -> Result<AdHocSessionView> {
+        let json = serde_json::to_string(handoff)?;
+        let view = self
+            .store
+            .submit_ad_hoc_handoff(session_id, &json)?
+            .ok_or_else(|| anyhow::anyhow!("离散会话 {session_id} 不存在"))?;
+        self.emit(SchedulerEvent::AdHocSessionUpdated(view.clone()));
+        Ok(view)
+    }
+
+    pub fn list_ad_hoc_sessions(&self, task_id: i64) -> Result<Vec<AdHocSessionView>> {
+        self.store.list_ad_hoc_sessions(task_id)
     }
 
     // ---------- 调度 ----------

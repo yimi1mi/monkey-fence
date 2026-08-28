@@ -150,6 +150,18 @@ CREATE TABLE IF NOT EXISTS step_questions (
     created_at TEXT NOT NULL,
     answered_at TEXT
 );
+CREATE TABLE IF NOT EXISTS ad_hoc_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES agent_tasks(id),
+    title TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'starting',
+    snapshot_json TEXT NOT NULL,
+    handoff_json TEXT,
+    created_at TEXT NOT NULL,
+    launched_at TEXT,
+    ended_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ad_hoc_task ON ad_hoc_sessions(task_id);
 ";
 
 /// 目录库 v1 DDL:仅空表地基(字段随后续里程碑补全);
