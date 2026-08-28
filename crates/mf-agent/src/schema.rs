@@ -162,6 +162,7 @@ CREATE TABLE IF NOT EXISTS agent_instances (
     agent_type TEXT NOT NULL,
     scope TEXT NOT NULL DEFAULT 'user',
     current_version INTEGER NOT NULL DEFAULT 1,
+    enabled INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );

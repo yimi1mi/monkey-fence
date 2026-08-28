@@ -131,6 +131,18 @@ str_enum!(RevisionStatus {
     Cancelled => "cancelled",
 });
 
+// Agent Instance 作用域:用户级全局,或绑定单个项目。
+str_enum!(InstanceScope {
+    User => "user",
+    Project => "project",
+});
+
+// Agent Instance 默认运行模式(设计 §2:支持一次性和交互式 CLI)。
+str_enum!(RunMode {
+    OneShot => "oneshot",
+    Interactive => "interactive",
+});
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskView {
     pub id: i64,

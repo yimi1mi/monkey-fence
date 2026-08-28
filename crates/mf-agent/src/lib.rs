@@ -10,6 +10,7 @@
 //! - `provider`:OpenAI 兼容 / Anthropic / mock 提供方
 //! - `tools`:worker 工具沙箱
 
+pub mod agent_instance;
 pub mod catalog_store;
 pub mod config;
 pub mod model;
@@ -20,13 +21,18 @@ pub mod runtime;
 pub mod schema;
 pub mod store;
 
+pub use agent_instance::{
+    AgentInstance, AgentInstanceDraft, AgentInstanceOverrides, AgentInstanceSnapshot,
+    AgentInstanceVersion,
+};
 pub use catalog_store::{CatalogStore, PluginPinRecord};
 pub use config::{
     Config, EditorConfig, EngineConfig, ProviderConfig, ProviderKind, TerminalConfig,
 };
 pub use model::{
-    AgentState, RevisionStatus, RunStatus, SchedulerEvent, SessionStatus, SettleError,
-    SettleOutcome, Settlement, StepQuestionView, StepStatus, StepView, TaskStatus, TaskView,
+    AgentState, InstanceScope, RevisionStatus, RunMode, RunStatus, SchedulerEvent, SessionStatus,
+    SettleError, SettleOutcome, Settlement, StepQuestionView, StepStatus, StepView, TaskStatus,
+    TaskView,
 };
 pub use orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
 pub use pipeline::{PipelineDraft, ProfileIndex, SessionPolicy, StepDraft};

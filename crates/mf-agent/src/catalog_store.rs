@@ -4,13 +4,18 @@
 //! 默认位于 `~/.monkeyfence/catalog-v1.db`。本阶段只提供 schema 与连接管理,
 //! 读写 API 随后续里程碑补全。
 
+use crate::agent_instance::{
+    AgentInstance, AgentInstanceDraft, AgentInstanceOverrides, AgentInstanceSnapshot,
+    AgentInstanceVersion,
+};
+use crate::model::InstanceScope;
 use crate::schema::{
     catalog_db_path, initialize_schema, schema_version_of, table_names_of, CATALOG_SCHEMA_V1,
     CATALOG_SCHEMA_VERSION,
 };
 use anyhow::{Context as _, Result};
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -54,6 +59,8 @@ impl CatalogStore {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         initialize_schema(&conn, CATALOG_SCHEMA_V1, CATALOG_SCHEMA_VERSION)
             .context("初始化目录库 v1 schema 失败")?;
+        // 早期开发库没有 enabled 列(CREATE IF NOT EXISTS 不会补列),补齐
+        ensure_agent_instances_enabled(&conn)?;
         Ok(CatalogStore {
             conn: Mutex::new(conn),
         })
@@ -70,6 +77,15 @@ impl CatalogStore {
     pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = self.conn.lock();
         f(&conn)
+    }
+
+    /// 在写事务中执行(多行写入的原子性)。
+    pub fn with_tx<T>(&self, f: impl FnOnce(&rusqlite::Transaction) -> Result<T>) -> Result<T> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
     }
 
     pub fn record_plugin_pin(&self, pin: &PluginPinRecord) -> Result<bool> {
@@ -151,5 +167,335 @@ impl CatalogStore {
             )?;
             Ok(count.max(0) as usize)
         })
+    }
+
+    // ---------- Agent Instance ----------
+
+    /// 创建实例:插入行 + 版本 1(同一事务,失败不留半行)。
+    pub fn create_agent_instance(&self, draft: AgentInstanceDraft) -> Result<AgentInstance> {
+        draft
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Agent Instance 草案非法: {e}"))?;
+        self.with_tx(|tx| {
+            let ts = now();
+            let key = gen_instance_key();
+            tx.execute(
+                "INSERT INTO agent_instances
+                    (instance_key, name, agent_type, scope, current_version, enabled, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?6)",
+                params![
+                    key,
+                    draft.name,
+                    draft.agent_type,
+                    draft.scope.as_str(),
+                    draft.enabled as i64,
+                    ts
+                ],
+            )?;
+            let rowid = tx.last_insert_rowid();
+            insert_version_row(tx, rowid, 1, &draft, &ts)?;
+            instance_row(tx, &key)?
+                .ok_or_else(|| anyhow::anyhow!("instance 插入后读取失败"))
+        })
+    }
+
+    /// 编辑实例:只影响下一次启动 —— 追加新版本行并推进 current_version,
+    /// 既有快照与已冻结 Revision 不变。
+    pub fn update_agent_instance(
+        &self,
+        id: &str,
+        draft: AgentInstanceDraft,
+    ) -> Result<AgentInstance> {
+        draft
+            .validate()
+            .map_err(|e| anyhow::anyhow!("Agent Instance 草案非法: {e}"))?;
+        self.with_tx(|tx| {
+            let existing = instance_row(tx, id)?
+                .ok_or_else(|| anyhow::anyhow!("Agent Instance `{id}` 不存在"))?;
+            let rowid = instance_rowid(tx, id)?
+                .ok_or_else(|| anyhow::anyhow!("Agent Instance `{id}` 不存在"))?;
+            let next = existing.current_version + 1;
+            let ts = now();
+            tx.execute(
+                "UPDATE agent_instances
+                 SET name = ?2, agent_type = ?3, scope = ?4, current_version = ?5,
+                     enabled = ?6, updated_at = ?7
+                 WHERE instance_key = ?1",
+                params![
+                    id,
+                    draft.name,
+                    draft.agent_type,
+                    draft.scope.as_str(),
+                    next,
+                    draft.enabled as i64,
+                    ts
+                ],
+            )?;
+            insert_version_row(tx, rowid, next, &draft, &ts)?;
+            instance_row(tx, id)?.ok_or_else(|| anyhow::anyhow!("instance 更新后读取失败"))
+        })
+    }
+
+    pub fn get_agent_instance(&self, id: &str) -> Result<Option<AgentInstance>> {
+        self.with_conn(|c| instance_row(c, id))
+    }
+
+    /// 列出实例;`project` 为 None 时只返回用户作用域,
+    /// Some 时返回用户 + 项目作用域(项目覆盖解析在快照阶段完成)。
+    pub fn list_agent_instances(&self, project: Option<&str>) -> Result<Vec<AgentInstance>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT instance_key FROM agent_instances
+                 WHERE (?1 IS NOT NULL OR scope = 'user')
+                 ORDER BY instance_key",
+            )?;
+            let keys: Vec<String> = stmt
+                .query_map(params![project], |r| r.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            drop(stmt);
+            Ok(keys
+                .iter()
+                .filter_map(|k| instance_row(c, k).ok().flatten())
+                .collect())
+        })
+    }
+
+    pub fn set_agent_instance_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<Option<AgentInstance>> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE agent_instances SET enabled = ?2, updated_at = ?3 WHERE instance_key = ?1",
+                params![id, enabled as i64, now()],
+            )?;
+            instance_row(c, id)
+        })
+    }
+
+    /// 删除实例(含版本行)。返回是否真的删除了。
+    pub fn delete_agent_instance(&self, id: &str) -> Result<bool> {
+        self.with_tx(|tx| {
+            let rowid = instance_rowid(tx, id)?;
+            if let Some(rowid) = rowid {
+                tx.execute(
+                    "DELETE FROM agent_instance_versions WHERE instance_id = ?1",
+                    params![rowid],
+                )?;
+            }
+            let rows = tx.execute(
+                "DELETE FROM agent_instances WHERE instance_key = ?1",
+                params![id],
+            )?;
+            Ok(rows == 1)
+        })
+    }
+
+    /// 当前版本的解析快照(`overrides` 为项目覆盖,可空)。
+    pub fn snapshot_agent_instance(
+        &self,
+        id: &str,
+        overrides: Option<&AgentInstanceOverrides>,
+    ) -> Result<AgentInstanceSnapshot> {
+        self.snapshot_agent_instance_version(id, None, overrides)
+    }
+
+    /// 指定版本的解析快照;`version = None` 表示当前版本,
+    /// `Some(v)` 固定历史版本(Revision 冻结后重放用)。
+    pub fn snapshot_agent_instance_version(
+        &self,
+        id: &str,
+        version: Option<i64>,
+        overrides: Option<&AgentInstanceOverrides>,
+    ) -> Result<AgentInstanceSnapshot> {
+        self.with_conn(|c| {
+            let instance = instance_row(c, id)?
+                .ok_or_else(|| anyhow::anyhow!("Agent Instance `{id}` 不存在"))?;
+            let rowid = instance_rowid(c, id)?
+                .ok_or_else(|| anyhow::anyhow!("Agent Instance `{id}` 不存在"))?;
+            let version = match version {
+                Some(v) => v,
+                None => instance.current_version,
+            };
+            let ver = version_row(c, rowid, version, id)?
+                .ok_or_else(|| anyhow::anyhow!("Agent Instance `{id}` 版本 {version} 不存在"))?;
+            let snapshot = AgentInstanceSnapshot::resolve(&instance, &ver);
+            Ok(match overrides {
+                Some(o) if !o.is_empty() => snapshot.apply_overrides(o),
+                _ => snapshot,
+            })
+        })
+    }
+
+    /// 版本历史(升序)。
+    pub fn agent_instance_versions(&self, id: &str) -> Result<Vec<AgentInstanceVersion>> {
+        self.with_conn(|c| {
+            let rowid = instance_rowid(c, id)?
+                .ok_or_else(|| anyhow::anyhow!("Agent Instance `{id}` 不存在"))?;
+            let mut stmt = c.prepare(
+                "SELECT version, config_json, created_at FROM agent_instance_versions
+                 WHERE instance_id = ?1 ORDER BY version",
+            )?;
+            let rows: Vec<(i64, String, String)> = stmt
+                .query_map(params![rowid], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<std::result::Result<_, _>>()?;
+            drop(stmt);
+            rows.into_iter()
+                .map(|(version, json, created_at)| {
+                    let mut v: AgentInstanceVersion = serde_json::from_str(&json)
+                        .with_context(|| format!("Agent Instance `{id}` 版本行损坏"))?;
+                    v.instance_id = id.to_string();
+                    v.version = version;
+                    v.created_at = created_at;
+                    Ok(v)
+                })
+                .collect()
+        })
+    }
+}
+
+/// 补齐旧开发库缺失的 `agent_instances.enabled` 列(幂等)。
+fn ensure_agent_instances_enabled(conn: &Connection) -> Result<()> {
+    let mut stmt = conn.prepare("PRAGMA table_info(agent_instances)")?;
+    let has_enabled = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .any(|c| c.map(|c| c == "enabled").unwrap_or(false));
+    drop(stmt);
+    if !has_enabled {
+        conn.execute(
+            "ALTER TABLE agent_instances ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
+            [],
+        )
+        .context("补齐 agent_instances.enabled 列失败")?;
+    }
+    Ok(())
+}
+
+fn now() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// 稳定实例键:时间 + 计数器哈希(与 `store::gen_capability_token` 同风格)。
+fn gen_instance_key() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut h1 = std::collections::hash_map::RandomState::new().build_hasher();
+    let mut h2 = std::collections::hash_map::RandomState::new().build_hasher();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    h1.write_u64(nanos);
+    h1.write_u64(n);
+    h2.write_u64(nanos ^ 0x9e37_79b9_7f4a_7c15);
+    h2.write_u64(n);
+    format!("inst_{:016x}{:016x}", h1.finish(), h2.finish())
+}
+
+/// 版本行内容(敏感字段不落明文;payload 整体序列化进 config_json)。
+#[derive(serde::Serialize)]
+struct VersionPayload<'a> {
+    name: &'a str,
+    agent_type: &'a str,
+    run_mode: &'a crate::model::RunMode,
+    executable: &'a str,
+    argv: &'a [String],
+    env: &'a [(String, String)],
+    config: &'a serde_json::Value,
+    execution_contract: &'a serde_json::Value,
+    sealed_secret_ids: &'a [String],
+}
+
+fn insert_version_row(
+    tx: &rusqlite::Transaction,
+    instance_rowid: i64,
+    version: i64,
+    draft: &AgentInstanceDraft,
+    ts: &str,
+) -> Result<()> {
+    let payload = VersionPayload {
+        name: &draft.name,
+        agent_type: &draft.agent_type,
+        run_mode: &draft.run_mode,
+        executable: &draft.executable,
+        argv: &draft.argv,
+        env: &draft.env,
+        config: &draft.config,
+        execution_contract: &draft.execution_contract,
+        sealed_secret_ids: &draft.sealed_secret_ids,
+    };
+    tx.execute(
+        "INSERT INTO agent_instance_versions (instance_id, version, config_json, created_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            instance_rowid,
+            version,
+            serde_json::to_string(&payload)?,
+            ts
+        ],
+    )?;
+    Ok(())
+}
+
+/// 版本行 FK 指向整数 rowid(`agent_instances.id`);
+/// 对外仍以稳定字符串键(instance_key)标识实例。
+fn instance_rowid(c: &Connection, id: &str) -> Result<Option<i64>> {
+    c.query_row(
+        "SELECT id FROM agent_instances WHERE instance_key = ?1",
+        params![id],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn instance_row(c: &Connection, id: &str) -> Result<Option<AgentInstance>> {
+    c.query_row(
+        "SELECT instance_key, name, agent_type, scope, current_version, enabled
+         FROM agent_instances WHERE instance_key = ?1",
+        params![id],
+        |r| {
+            Ok(AgentInstance {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                agent_type: r.get(2)?,
+                scope: InstanceScope::parse(&r.get::<_, String>(3)?).unwrap_or(InstanceScope::User),
+                current_version: r.get(4)?,
+                enabled: r.get::<_, i64>(5)? != 0,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn version_row(
+    c: &Connection,
+    instance_rowid: i64,
+    version: i64,
+    instance_key: &str,
+) -> Result<Option<AgentInstanceVersion>> {
+    let row: Option<(String, String)> = c
+        .query_row(
+            "SELECT config_json, created_at FROM agent_instance_versions
+             WHERE instance_id = ?1 AND version = ?2",
+            params![instance_rowid, version],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        Some((json, created_at)) => {
+            let mut v: AgentInstanceVersion = serde_json::from_str(&json).with_context(|| {
+                format!("Agent Instance `{instance_key}` 版本 {version} 行损坏")
+            })?;
+            v.instance_id = instance_key.to_string();
+            v.version = version;
+            v.created_at = created_at;
+            Ok(Some(v))
+        }
+        None => Ok(None),
     }
 }
