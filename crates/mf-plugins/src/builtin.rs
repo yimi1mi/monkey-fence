@@ -1,9 +1,10 @@
 //! 内置 Agent 插件(合成插件):本地 CLI Agent + API Provider + 现有技能。
 //! CLI 只检测 PATH,不自动安装;不复制本地 Agent 的凭据与配置目录。
+//!
+//! v2 清单只声明 Agent Type 契约(adapter/检测/运行模式);
+//! 内置 profile 的完整命令/参数/钩子由 `profile_spec_from_builtin` 直接合成。
 
-use crate::manifest::{
-    AgentContribution, AgentHookSpec, Capabilities, ManifestHeader, PluginManifest,
-};
+use crate::manifest::{AgentTypeContribution, Capabilities, ManifestHeader, PluginManifest};
 use mf_agent::runtime::{AgentProfileSpec, HookSpec, RuntimeKind};
 use std::path::PathBuf;
 
@@ -185,11 +186,26 @@ pub fn install_spec_of(profile_id: &str) -> Option<InstallSpec> {
         .and_then(|a| a.install.clone())
 }
 
-/// 生成一个内置 CLI Agent 的合成插件清单。
+/// 内置 CLI 的 Agent Adapter 契约标识。
+/// Claude Code 与 Codex 有专属适配器;其余走通用命令适配器。
+fn adapter_of(profile_id: &str) -> &'static str {
+    match profile_id {
+        "claude" => "claude-code",
+        "codex" => "codex",
+        _ => "generic-command",
+    }
+}
+
+/// 是否支持进程级隔离配置(不改写真实 CLI 全局配置的前提)。
+fn supports_isolated_config(profile_id: &str) -> bool {
+    matches!(profile_id, "claude" | "codex")
+}
+
+/// 生成一个内置 CLI Agent 的合成插件清单(v2)。
 pub fn synthetic_manifest(agent: &BuiltinAgent) -> PluginManifest {
     PluginManifest {
         manifest: ManifestHeader {
-            version: 1,
+            version: crate::manifest::MANIFEST_VERSION,
             publisher: "monkeyfence".into(),
             id: agent.profile_id.clone(),
             name: format!("{} (内置)", agent.name),
@@ -205,25 +221,23 @@ pub fn synthetic_manifest(agent: &BuiltinAgent) -> PluginManifest {
             ..Default::default()
         },
         worker: None,
-        agents: vec![AgentContribution {
+        agent_types: vec![AgentTypeContribution {
             id: agent.profile_id.clone(),
             name: agent.name.clone(),
-            runtime: "pty".into(),
+            adapter: adapter_of(&agent.profile_id).into(),
+            config_schema: String::new(),
             command: agent.command.clone(),
-            args: agent.args.clone(),
-            env: Default::default(),
-            permission_args: agent.permission_args.clone(),
-            homepage: agent.homepage.clone(),
-            icon: agent.icon.clone(),
-            hook: agent.hook_config.map(|p| AgentHookSpec {
-                config_path: p.to_string(),
-                namespace: "monkeyfence".into(),
-                command_template: "mfctl agent-state {state}".into(),
-            }),
+            detect_commands: vec![agent.command.clone()],
+            modes: vec!["interactive".into(), "oneshot".into()],
+            supports_isolated_config: supports_isolated_config(&agent.profile_id),
         }],
-        pipelines: vec![],
+        node_types: vec![],
+        execution_directory_providers: vec![],
+        secret_stores: vec![],
+        workflow_templates: vec![],
         skills: vec![],
         tools: vec![],
+        ui_schemas: vec![],
     }
 }
 
@@ -257,31 +271,68 @@ pub fn detect_on_path(command: &str) -> Option<PathBuf> {
     None
 }
 
-/// 把 AgentContribution 合成可执行的 AgentProfileSpec。
+/// 内置 BuiltinAgent → 完整保真的 AgentProfileSpec(命令/参数/状态钩子不丢失)。
+pub fn profile_spec_from_builtin(agent: &BuiltinAgent) -> AgentProfileSpec {
+    AgentProfileSpec {
+        id: agent.profile_id.clone(),
+        display_name: agent.name.clone(),
+        runtime: RuntimeKind::Pty,
+        command: agent.command.clone(),
+        args: agent.args.clone(),
+        env: vec![],
+        permission_args: agent.permission_args.clone(),
+        provider: None,
+        icon: (!agent.icon.is_empty()).then(|| agent.icon.clone()),
+        homepage: (!agent.homepage.is_empty()).then(|| agent.homepage.clone()),
+        hook: agent.hook_config.map(|p| HookSpec {
+            config_path: p.to_string(),
+            namespace: "monkeyfence".into(),
+            command_template: "mfctl agent-state {state}".into(),
+        }),
+    }
+}
+
+/// 内置 API Provider 的合成 profile(与 v1 行为一致:provider 配置由运行时按 id 解析)。
+pub fn http_profile(name: &str) -> AgentProfileSpec {
+    AgentProfileSpec {
+        id: name.to_string(),
+        display_name: name.to_string(),
+        runtime: RuntimeKind::Http,
+        command: String::new(),
+        args: vec![],
+        env: vec![],
+        permission_args: vec![],
+        provider: None,
+        icon: None,
+        homepage: None,
+        hook: None,
+    }
+}
+
+/// 把第三方插件的 AgentTypeContribution 合成基础 AgentProfileSpec。
+/// 完整执行契约(参数/环境/Secret)由 Agent Instance 配置在启动时注入,
+/// 这里只提供适配器路由所需的最小信息。
 pub fn profile_spec_from_contribution(
     _plugin_full_id: &str,
-    a: &AgentContribution,
+    a: &AgentTypeContribution,
 ) -> AgentProfileSpec {
     AgentProfileSpec {
         id: a.id.clone(),
         display_name: a.name.clone(),
-        runtime: match a.runtime.as_str() {
-            "pty" => RuntimeKind::Pty,
+        runtime: match a.adapter.as_str() {
             "http" => RuntimeKind::Http,
-            _ => RuntimeKind::PluginWorker,
+            "plugin-worker" => RuntimeKind::PluginWorker,
+            // claude-code / codex / generic-command 等 CLI 适配器
+            _ => RuntimeKind::Pty,
         },
         command: a.command.clone(),
-        args: a.args.clone(),
-        env: a.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
-        permission_args: a.permission_args.clone(),
+        args: vec![],
+        env: vec![],
+        permission_args: vec![],
         provider: None,
-        icon: (!a.icon.is_empty()).then(|| a.icon.clone()),
-        homepage: (!a.homepage.is_empty()).then(|| a.homepage.clone()),
-        hook: a.hook.as_ref().map(|h| HookSpec {
-            config_path: h.config_path.clone(),
-            namespace: h.namespace.clone(),
-            command_template: h.command_template.clone(),
-        }),
+        icon: None,
+        homepage: None,
+        hook: None,
     }
 }
 

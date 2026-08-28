@@ -1,0 +1,63 @@
+[manifest]
+version = 2
+publisher = "zhipu"
+id = "demo"
+name = "Demo Plugin"
+version_str = "0.2.0"
+min_app_version = "0.1.0"
+description = "v2 贡献词汇表演示"
+
+[capabilities]
+fs_read = true
+fs_write = true
+net = true
+spawn = true
+shell = false
+secrets = true
+vcs = false
+background_worker = true
+
+[[agent_types]]
+id = "demo-agent"
+name = "Demo Agent"
+adapter = "generic-command"
+config_schema = "schemas/agent.json"
+command = "demo"
+detect_commands = ["demo"]
+modes = ["oneshot", "interactive"]
+supports_isolated_config = false
+
+[[node_types]]
+id = "agent-node"
+name = "Agent Node"
+kind = "agent"
+config_schema = "schemas/node.json"
+
+[[execution_directory_providers]]
+id = "project-dir"
+name = "Project Directory"
+kind = "project-dir"
+supports_parallel = false
+
+[[secret_stores]]
+id = "local"
+name = "Local Secret Store"
+backend = "os-credential"
+
+[[workflow_templates]]
+id = "t1"
+name = "演示模板"
+file = "templates/t1.json"
+
+[[ui_schemas]]
+id = "settings-form"
+surface = "settings-form"
+file = "schemas/settings.json"
+
+[[tools]]
+id = "probe"
+name = "Probe"
+description = "演示工具"
+
+[[skills]]
+path = "skills/demo"

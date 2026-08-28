@@ -57,6 +57,8 @@ pub struct PluginSummary {
 
 pub struct PluginRegistry {
     plugins: RwLock<Vec<PluginEntry>>,
+    /// 内置 profile(命令/参数/钩子全保真),加载时按固定顺序构建。
+    builtin_profiles: RwLock<Vec<AgentProfileSpec>>,
     /// 用户覆盖的 agent 命令/参数(设置页编辑)。
     agent_overrides: RwLock<HashMap<String, AgentProfileSpec>>,
     /// 插件流水线模板(id → (模板名, draft))。
@@ -85,11 +87,11 @@ impl PluginRegistry {
             });
         }
 
-        // API Provider → 内置合成 profile(openai 兼容 / anthropic / mock)
+        // API Provider → 内置合成 Agent Type(openai 兼容 / anthropic / mock)
         {
-            let mut m = PluginManifest {
+            let m = PluginManifest {
                 manifest: manifest::ManifestHeader {
-                    version: 1,
+                    version: manifest::MANIFEST_VERSION,
                     publisher: "monkeyfence".into(),
                     id: "api-providers".into(),
                     name: "API 智能体(内置)".into(),
@@ -106,27 +108,28 @@ impl PluginRegistry {
                     ..Default::default()
                 },
                 worker: None,
-                agents: config
+                agent_types: config
                     .providers
                     .iter()
-                    .map(|(name, _p)| manifest::AgentContribution {
+                    .map(|(name, _p)| manifest::AgentTypeContribution {
                         id: name.clone(),
                         name: name.clone(),
-                        runtime: "http".into(),
+                        adapter: "http".into(),
+                        config_schema: String::new(),
                         command: String::new(),
-                        args: vec![],
-                        env: Default::default(),
-                        permission_args: vec![],
-                        homepage: String::new(),
-                        icon: String::new(),
-                        hook: None,
+                        detect_commands: vec![],
+                        modes: vec!["oneshot".into()],
+                        supports_isolated_config: false,
                     })
                     .collect(),
-                pipelines: vec![],
+                node_types: vec![],
+                execution_directory_providers: vec![],
+                secret_stores: vec![],
+                workflow_templates: vec![],
                 skills: vec![],
                 tools: vec![],
+                ui_schemas: vec![],
             };
-            m.manifest.id = "api-providers".into();
             plugins.push(PluginEntry {
                 content_hash: String::new(),
                 permission_fingerprint: m.permission_fingerprint("builtin"),
@@ -145,7 +148,7 @@ impl PluginRegistry {
         {
             let m = PluginManifest {
                 manifest: manifest::ManifestHeader {
-                    version: 1,
+                    version: manifest::MANIFEST_VERSION,
                     publisher: "monkeyfence".into(),
                     id: "skills".into(),
                     name: "技能(兼容合成插件)".into(),
@@ -157,8 +160,11 @@ impl PluginRegistry {
                 },
                 capabilities: manifest::Capabilities::default(),
                 worker: None,
-                agents: vec![],
-                pipelines: vec![],
+                agent_types: vec![],
+                node_types: vec![],
+                execution_directory_providers: vec![],
+                secret_stores: vec![],
+                workflow_templates: vec![],
                 skills: skills
                     .iter()
                     .map(|s| manifest::SkillContribution {
@@ -166,6 +172,7 @@ impl PluginRegistry {
                     })
                     .collect(),
                 tools: vec![],
+                ui_schemas: vec![],
             };
             plugins.push(PluginEntry {
                 content_hash: String::new(),
@@ -197,8 +204,16 @@ impl PluginRegistry {
             });
         }
 
+        // 内置 profile:CLI Agent(全保真)→ API Provider(按 id 解析配置)
+        let builtin_profiles: Vec<AgentProfileSpec> = builtin::builtin_cli_agents()
+            .iter()
+            .map(builtin::profile_spec_from_builtin)
+            .chain(config.providers.keys().map(|n| builtin::http_profile(n)))
+            .collect();
+
         let reg = Arc::new(PluginRegistry {
             plugins: RwLock::new(plugins),
+            builtin_profiles: RwLock::new(builtin_profiles),
             agent_overrides: RwLock::new(HashMap::new()),
             templates: RwLock::new(Vec::new()),
         });
@@ -207,17 +222,20 @@ impl PluginRegistry {
         reg
     }
 
-    /// 刷新 CLI Agent PATH 检测。
+    /// 刷新 Agent Type 检测:detect_commands 走 PATH;http 适配器始终可用;
+    /// plugin-worker 适配器在实现前视为不可用。
     pub fn refresh_detection(&self) {
         let mut plugins = self.plugins.write();
         for p in plugins.iter_mut() {
-            for a in &p.manifest.agents {
-                let detected = if a.runtime == "pty" && !a.command.is_empty() {
-                    builtin::detect_on_path(&a.command).is_some()
-                } else if a.runtime == "http" {
+            for a in &p.manifest.agent_types {
+                let detected = if !a.detect_commands.is_empty() {
+                    a.detect_commands
+                        .iter()
+                        .any(|c| builtin::detect_on_path(c).is_some())
+                } else if a.adapter == "http" {
                     true
                 } else {
-                    false // plugin-worker:未实现前视为不可用
+                    false
                 };
                 p.detected.insert(a.id.clone(), detected);
             }
@@ -230,7 +248,7 @@ impl PluginRegistry {
         let plugins = self.plugins.read();
         for p in plugins.iter() {
             let Some(root) = &p.root else { continue };
-            for t in &p.manifest.pipelines {
+            for t in &p.manifest.workflow_templates {
                 let full = root.join(&t.file);
                 let Ok(text) = std::fs::read_to_string(&full) else {
                     log::warn!("流水线模板缺失: {}", full.display());
@@ -268,7 +286,12 @@ impl PluginRegistry {
                 enabled: p.enabled,
                 builtin: p.builtin,
                 authorized_at: p.authorized_at.clone(),
-                agents: p.manifest.agents.iter().map(|a| a.id.clone()).collect(),
+                agents: p
+                    .manifest
+                    .agent_types
+                    .iter()
+                    .map(|a| a.id.clone())
+                    .collect(),
                 has_worker: p.manifest.worker.is_some(),
                 capabilities: p.manifest.capabilities.clone(),
             })
@@ -321,19 +344,24 @@ impl PluginRegistry {
         self.agent_overrides.write().remove(profile_id);
     }
 
-    /// 全部可执行 Agent Profile(仅来自启用插件;含覆盖与检测状态)。
+    /// 全部可执行 Agent Profile:内置(全保真)+ 启用的第三方插件 Agent Type;
+    /// 最后统一应用用户覆盖。
     pub fn agent_profiles(&self) -> Vec<AgentProfileSpec> {
-        let plugins = self.plugins.read();
         let overrides = self.agent_overrides.read();
-        let mut out = Vec::new();
+        let mut out: Vec<AgentProfileSpec> = Vec::new();
         out.push(builtin::blank_terminal_profile());
-        for p in plugins.iter().filter(|p| p.enabled) {
-            for a in &p.manifest.agents {
-                let mut spec = builtin::profile_spec_from_contribution(&p.full_id, a);
-                if let Some(over) = overrides.get(&a.id) {
-                    spec = over.clone();
+        out.extend(self.builtin_profiles.read().iter().cloned());
+        {
+            let plugins = self.plugins.read();
+            for p in plugins.iter().filter(|p| p.enabled && !p.builtin) {
+                for a in &p.manifest.agent_types {
+                    out.push(builtin::profile_spec_from_contribution(&p.full_id, a));
                 }
-                out.push(spec);
+            }
+        }
+        for spec in out.iter_mut() {
+            if let Some(over) = overrides.get(&spec.id) {
+                *spec = over.clone();
             }
         }
         out
@@ -405,6 +433,7 @@ mod tests {
                 builtin: false,
                 detected: HashMap::new(),
             }]),
+            builtin_profiles: RwLock::new(Vec::new()),
             agent_overrides: RwLock::new(HashMap::new()),
             templates: RwLock::new(Vec::new()),
         }
@@ -413,7 +442,7 @@ mod tests {
     fn worker_manifest() -> PluginManifest {
         PluginManifest {
             manifest: ManifestHeader {
-                version: 1,
+                version: MANIFEST_VERSION,
                 publisher: "t".into(),
                 id: "w".into(),
                 name: "W".into(),
@@ -428,10 +457,14 @@ mod tests {
                 command: "w.exe".into(),
                 args: vec![],
             }),
-            agents: vec![],
-            pipelines: vec![],
+            agent_types: vec![],
+            node_types: vec![],
+            execution_directory_providers: vec![],
+            secret_stores: vec![],
+            workflow_templates: vec![],
             skills: vec![],
             tools: vec![],
+            ui_schemas: vec![],
         }
     }
 

@@ -352,7 +352,7 @@ pub fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::PipelineContribution;
+    use crate::manifest::WorkflowTemplateContribution;
 
     fn write_plugin(dir: &Path, pipeline_body: &str) {
         std::fs::create_dir_all(dir.join("pipelines")).unwrap();
@@ -361,7 +361,7 @@ mod tests {
             dir.join(MANIFEST_FILE),
             r#"
 [manifest]
-version = 1
+version = 2
 publisher = "test"
 id = "p1"
 name = "Test Plugin"
@@ -371,13 +371,14 @@ description = "测试"
 [capabilities]
 net = true
 
-[[agents]]
+[[agent_types]]
 id = "demo"
 name = "Demo"
-runtime = "pty"
+adapter = "generic-command"
 command = "demo"
+detect_commands = ["demo"]
 
-[[pipelines]]
+[[workflow_templates]]
 id = "p1"
 name = "管道"
 file = "pipelines/p1.json"
@@ -448,7 +449,7 @@ path = "skills/demo"
             let evil = tempfile::tempdir().unwrap();
             write_plugin(evil.path(), "{}");
             let bad_manifest = PluginManifest {
-                pipelines: vec![PipelineContribution {
+                workflow_templates: vec![WorkflowTemplateContribution {
                     id: "x".into(),
                     name: "x".into(),
                     file: "../../escape.json".into(),

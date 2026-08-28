@@ -1,12 +1,15 @@
-//! 插件根清单 `monkeyfence-plugin.toml` 的类型与校验。
+//! 插件根清单 `monkeyfence-plugin.toml` 的类型与校验(v2 贡献词汇表)。
+//!
+//! v2 移除 v1 的 `agents` 字段(不做兼容别名),改用 Agent Type /
+//! Node Type / Execution Directory / Secret Store / Workflow Template /
+//! UI Schema 等统一贡献词汇(ADR 0002 / 0003)。
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::Path;
 
 pub const MANIFEST_FILE: &str = "monkeyfence-plugin.toml";
-pub const MANIFEST_VERSION: i64 = 1;
+pub const MANIFEST_VERSION: i64 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
@@ -16,13 +19,21 @@ pub struct PluginManifest {
     #[serde(default)]
     pub worker: Option<WorkerSpec>,
     #[serde(default)]
-    pub agents: Vec<AgentContribution>,
+    pub agent_types: Vec<AgentTypeContribution>,
     #[serde(default)]
-    pub pipelines: Vec<PipelineContribution>,
+    pub node_types: Vec<NodeTypeContribution>,
+    #[serde(default)]
+    pub execution_directory_providers: Vec<ExecutionDirectoryContribution>,
+    #[serde(default)]
+    pub secret_stores: Vec<SecretStoreContribution>,
+    #[serde(default)]
+    pub workflow_templates: Vec<WorkflowTemplateContribution>,
     #[serde(default)]
     pub skills: Vec<SkillContribution>,
     #[serde(default)]
     pub tools: Vec<ToolContribution>,
+    #[serde(default)]
+    pub ui_schemas: Vec<UiSchemaContribution>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +64,14 @@ pub struct Capabilities {
     #[serde(default)]
     pub spawn: bool,
     #[serde(default)]
+    pub shell: bool,
+    #[serde(default)]
+    pub secrets: bool,
+    #[serde(default)]
+    pub vcs: bool,
+    #[serde(default)]
+    pub background_worker: bool,
+    #[serde(default)]
     pub hooks: bool,
 }
 
@@ -60,8 +79,17 @@ pub struct Capabilities {
 impl Capabilities {
     pub fn fingerprint_part(&self) -> String {
         format!(
-            "fs_read={} fs_write={} net={} spawn={} hooks={}",
-            self.fs_read, self.fs_write, self.net, self.spawn, self.hooks
+            "fs_read={} fs_write={} net={} spawn={} shell={} secrets={} vcs={} \
+             background_worker={} hooks={}",
+            self.fs_read,
+            self.fs_write,
+            self.net,
+            self.spawn,
+            self.shell,
+            self.secrets,
+            self.vcs,
+            self.background_worker,
+            self.hooks
         )
     }
 }
@@ -73,40 +101,69 @@ pub struct WorkerSpec {
     pub args: Vec<String>,
 }
 
+/// Agent Type:插件贡献的 CLI 执行类型(配置 Schema、检测方式、运行模式与适配器契约)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentContribution {
+pub struct AgentTypeContribution {
     pub id: String,
     pub name: String,
-    /// pty | http | plugin-worker
-    pub runtime: String,
+    /// 适配器契约标识(claude-code / codex / generic-command / http / plugin-worker ...)。
+    pub adapter: String,
+    /// 相对插件根目录的配置 Schema 文件路径;空表示无自定义配置。
+    #[serde(default)]
+    pub config_schema: String,
     #[serde(default)]
     pub command: String,
     #[serde(default)]
-    pub args: Vec<String>,
+    pub detect_commands: Vec<String>,
+    /// 支持的运行模式(oneshot / interactive ...)。
     #[serde(default)]
-    pub env: BTreeMap<String, String>,
+    pub modes: Vec<String>,
     #[serde(default)]
-    pub permission_args: Vec<String>,
-    #[serde(default)]
-    pub homepage: String,
-    #[serde(default)]
-    pub icon: String,
-    #[serde(default)]
-    pub hook: Option<AgentHookSpec>,
+    pub supports_isolated_config: bool,
 }
 
+/// Node Type:工作流节点类型(第一版仅 agent / join,由内核识别;其余由插件扩展)。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AgentHookSpec {
-    /// 相对用户主目录(~/...)或绝对路径。
-    pub config_path: String,
-    /// MonkeyFence 命名空间键名。
-    pub namespace: String,
-    /// 状态回调命令模板,{state} 会被替换为 working/waiting/blocked/done。
-    pub command_template: String,
+pub struct NodeTypeContribution {
+    pub id: String,
+    pub name: String,
+    /// 节点运行语义(agent | join ...)。
+    pub kind: String,
+    /// 相对插件根目录的节点属性 Schema;空表示无。
+    #[serde(default)]
+    pub config_schema: String,
+    #[serde(default)]
+    pub description: String,
 }
 
+/// Execution Directory Provider:为 Agent Run 提供路径租约的策略。
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PipelineContribution {
+pub struct ExecutionDirectoryContribution {
+    pub id: String,
+    pub name: String,
+    /// 策略实现标识(project-dir | worktree ...)。
+    pub kind: String,
+    #[serde(default)]
+    pub supports_parallel: bool,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Secret Store:加密 Secret 的存储实现。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretStoreContribution {
+    pub id: String,
+    pub name: String,
+    /// 后端实现标识(os-credential ...)。
+    #[serde(default)]
+    pub backend: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+/// Workflow Template:可复用的 DAG 模板文件贡献。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowTemplateContribution {
     pub id: String,
     pub name: String,
     /// 相对插件根目录的 JSON 文件路径(PipelineDraft)。
@@ -125,6 +182,16 @@ pub struct ToolContribution {
     pub name: String,
     #[serde(default)]
     pub description: String,
+}
+
+/// 声明式 UI 贡献:插件只提供 Schema 文件,由宿主统一渲染(不得注入 GPUI)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiSchemaContribution {
+    pub id: String,
+    /// UI 目标区域(settings-form | node-properties | badge | action ...)。
+    pub surface: String,
+    /// 相对插件根目录的 Schema 文件路径(JSON)。
+    pub file: String,
 }
 
 impl PluginManifest {
@@ -148,7 +215,7 @@ impl PluginManifest {
         format!("{}.{}", self.manifest.publisher, self.manifest.id)
     }
 
-    /// 结构校验:清单版本、命名、贡献 id 唯一。
+    /// 结构校验:清单版本、命名、各类贡献 id 在类别内唯一、适配器非空。
     pub fn validate(&self) -> Result<()> {
         if self.manifest.version != MANIFEST_VERSION {
             bail!(
@@ -168,16 +235,55 @@ impl PluginManifest {
         if self.manifest.name.trim().is_empty() {
             bail!("插件 name 不能为空");
         }
-        let mut agent_ids: Vec<&str> = self.agents.iter().map(|a| a.id.as_str()).collect();
-        agent_ids.sort();
-        agent_ids.dedup();
-        if agent_ids.len() != self.agents.len() {
-            bail!("agents 贡献 id 重复");
+        fn ensure_unique(name: &str, ids: Vec<&str>) -> Result<()> {
+            let total = ids.len();
+            let mut sorted = ids;
+            sorted.sort();
+            sorted.dedup();
+            if sorted.len() != total {
+                bail!("{name} 贡献 id 重复");
+            }
+            Ok(())
         }
-        for a in &self.agents {
-            match a.runtime.as_str() {
-                "pty" | "http" | "plugin-worker" => {}
-                other => bail!("agent `{}` runtime 非法: {other}", a.id),
+        ensure_unique(
+            "agent_types",
+            self.agent_types.iter().map(|a| a.id.as_str()).collect(),
+        )?;
+        ensure_unique(
+            "node_types",
+            self.node_types.iter().map(|a| a.id.as_str()).collect(),
+        )?;
+        ensure_unique(
+            "execution_directory_providers",
+            self.execution_directory_providers
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect(),
+        )?;
+        ensure_unique(
+            "secret_stores",
+            self.secret_stores.iter().map(|a| a.id.as_str()).collect(),
+        )?;
+        ensure_unique(
+            "workflow_templates",
+            self.workflow_templates
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect(),
+        )?;
+        ensure_unique("tools", self.tools.iter().map(|a| a.id.as_str()).collect())?;
+        ensure_unique(
+            "ui_schemas",
+            self.ui_schemas.iter().map(|a| a.id.as_str()).collect(),
+        )?;
+        for a in &self.agent_types {
+            if a.adapter.trim().is_empty() {
+                bail!("agent_type `{}` 缺少 adapter 契约标识", a.id);
+            }
+        }
+        for t in &self.ui_schemas {
+            if t.surface.trim().is_empty() {
+                bail!("ui_schema `{}` 缺少 surface", t.id);
             }
         }
         if !self.manifest.min_app_version.is_empty() {
@@ -194,7 +300,7 @@ impl PluginManifest {
         Ok(())
     }
 
-    /// 权限相关指纹:能力 + worker + 钩子 + 描述变化都要求重新授权。
+    /// 权限相关指纹:能力 + worker + 描述变化都要求重新授权。
     pub fn permission_fingerprint(&self, content_hash: &str) -> String {
         let mut parts: Vec<String> = vec![
             self.capabilities.fingerprint_part(),
@@ -202,14 +308,6 @@ impl PluginManifest {
         ];
         if let Some(w) = &self.worker {
             parts.push(format!("worker={} {:?}", w.command, w.args));
-        }
-        for a in &self.agents {
-            if let Some(h) = &a.hook {
-                parts.push(format!(
-                    "hook={} {} {}",
-                    a.id, h.config_path, h.command_template
-                ));
-            }
         }
         parts.push(format!("content={content_hash}"));
         let mut hasher = Sha256::new();
@@ -289,13 +387,26 @@ pub fn safe_relative_path(root: &Path, rel: &str) -> Result<std::path::PathBuf> 
     Ok(full)
 }
 
-/// 校验清单引用的所有相对路径存在且不逃逸。
+/// 校验清单引用的所有相对路径存在且不逃逸(空字符串跳过)。
 pub fn validate_manifest_paths(root: &Path, m: &PluginManifest) -> Result<()> {
-    for p in &m.pipelines {
-        safe_relative_path(root, &p.file)?;
+    for a in &m.agent_types {
+        if !a.config_schema.is_empty() {
+            safe_relative_path(root, &a.config_schema)?;
+        }
+    }
+    for n in &m.node_types {
+        if !n.config_schema.is_empty() {
+            safe_relative_path(root, &n.config_schema)?;
+        }
+    }
+    for t in &m.workflow_templates {
+        safe_relative_path(root, &t.file)?;
     }
     for s in &m.skills {
         safe_relative_path(root, &s.path)?;
+    }
+    for u in &m.ui_schemas {
+        safe_relative_path(root, &u.file)?;
     }
     if let Some(w) = &m.worker {
         safe_relative_path(root, &w.command).or_else(|_| {
@@ -321,7 +432,7 @@ mod tests {
 
     const VALID: &str = r#"
 [manifest]
-version = 1
+version = 2
 publisher = "zhipu"
 id = "demo"
 name = "Demo Plugin"
@@ -332,13 +443,15 @@ description = "演示"
 [capabilities]
 net = true
 
-[[agents]]
+[[agent_types]]
 id = "demo"
 name = "Demo"
-runtime = "pty"
+adapter = "generic-command"
 command = "demo"
+detect_commands = ["demo"]
+modes = ["interactive"]
 
-[[pipelines]]
+[[workflow_templates]]
 id = "p1"
 name = "管道"
 file = "pipelines/p1.json"
@@ -351,9 +464,10 @@ path = "skills/demo"
     fn parse_and_validate_ok() {
         let m = PluginManifest::parse(VALID).unwrap();
         assert_eq!(m.full_id(), "zhipu.demo");
-        assert_eq!(m.agents.len(), 1);
+        assert_eq!(m.agent_types.len(), 1);
         assert!(m.capabilities.net);
         assert!(!m.capabilities.fs_write);
+        assert!(!m.capabilities.shell);
     }
 
     #[test]
@@ -368,11 +482,17 @@ path = "skills/demo"
                 .as_str()
         )
         .is_err());
-        // runtime 非法
+        // v1 清单(agents 字段)不再受支持
         assert!(PluginManifest::parse(
             VALID
-                .replace("runtime = \"pty\"", "runtime = \"telepathy\"")
+                .replace("version = 2", "version = 1")
+                .replace("adapter = \"generic-command\"", "runtime = \"pty\"")
                 .as_str()
+        )
+        .is_err());
+        // adapter 缺失
+        assert!(PluginManifest::parse(
+            VALID.replace("adapter = \"generic-command\"", "").as_str()
         )
         .is_err());
     }
@@ -382,7 +502,7 @@ path = "skills/demo"
         let tmp = tempfile::tempdir().unwrap();
         let m = PluginManifest::parse(VALID).unwrap();
         let bad = PluginManifest {
-            pipelines: vec![PipelineContribution {
+            workflow_templates: vec![WorkflowTemplateContribution {
                 id: "p".into(),
                 name: "p".into(),
                 file: "../outside.json".into(),
@@ -409,6 +529,18 @@ path = "skills/demo"
         assert_ne!(
             m1.permission_fingerprint("h"),
             m2.permission_fingerprint("h")
+        );
+        let m3 = PluginManifest {
+            capabilities: Capabilities {
+                vcs: true,
+                background_worker: true,
+                ..m1.capabilities.clone()
+            },
+            ..m1.clone()
+        };
+        assert_ne!(
+            m1.permission_fingerprint("h"),
+            m3.permission_fingerprint("h")
         );
         // 内容哈希变化也改变指纹
         assert_ne!(
