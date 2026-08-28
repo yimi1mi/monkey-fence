@@ -1,0 +1,142 @@
+//! Plugin Host 验收:内容寻址安装、按哈希解析、活动 pin 不被插件更新替换。
+
+use mf_plugins::host::{PluginHost, ResolvedPlugin};
+use mf_plugins::install::InstallSource;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+fn fixtures_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+/// 测试辅助:把 fixtures 中的具名插件装入宿主。
+trait FixtureInstall {
+    fn install_fixture(&self, name: &str) -> anyhow::Result<ResolvedPlugin>;
+}
+
+impl FixtureInstall for PluginHost {
+    fn install_fixture(&self, name: &str) -> anyhow::Result<ResolvedPlugin> {
+        let dir = fixtures_dir().join(name);
+        self.install_package(
+            &dir,
+            InstallSource::Local {
+                path: dir.display().to_string(),
+            },
+        )
+    }
+}
+
+/// 隔离宿主:独立临时插件根,不扫描真实 ~/.monkeyfence。
+struct HostEnv {
+    host: Arc<PluginHost>,
+    _tmp: tempfile::TempDir,
+}
+
+impl std::ops::Deref for HostEnv {
+    type Target = PluginHost;
+    fn deref(&self) -> &PluginHost {
+        &self.host
+    }
+}
+
+fn fixture_host() -> HostEnv {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = PluginHost::empty_at(tmp.path().to_path_buf());
+    HostEnv { host, _tmp: tmp }
+}
+
+#[test]
+fn update_does_not_replace_active_pin() {
+    let host = fixture_host();
+    let v1 = host.install_fixture("demo-v1").unwrap();
+    let pin = host.pin_for_run("run-1", &v1).unwrap();
+    host.install_fixture("demo-v2").unwrap();
+    assert_eq!(
+        host.resolve_pin(&pin).unwrap().content_hash,
+        v1.content_hash
+    );
+    // pin 固定的版本仍可完整解析(清单来自 v1 包)
+    let resolved = host.resolve_pin(&pin).unwrap();
+    assert_eq!(resolved.manifest.manifest.version_str, "0.1.0");
+}
+
+#[test]
+fn resolve_requires_matching_identity_and_intact_content() {
+    let host = fixture_host();
+    let v1 = host.install_fixture("demo-v1").unwrap();
+    // 版本不匹配
+    assert!(host.resolve(&v1.full_id, "9.9.9", &v1.content_hash).is_err());
+    // 插件 id 不匹配
+    assert!(host.resolve("other.plugin", &v1.version, &v1.content_hash).is_err());
+    // 未知哈希
+    assert!(host
+        .resolve(
+            &v1.full_id,
+            &v1.version,
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        )
+        .is_err());
+    // 包内容被篡改(重算哈希与目录名不符)
+    std::fs::write(v1.root.join("TAMPER.txt"), "boom").unwrap();
+    assert!(host.resolve(&v1.full_id, &v1.version, &v1.content_hash).is_err());
+}
+
+#[test]
+fn reinstall_same_content_is_idempotent() {
+    let host = fixture_host();
+    let a = host.install_fixture("demo-v1").unwrap();
+    let b = host.install_fixture("demo-v1").unwrap();
+    assert_eq!(a.content_hash, b.content_hash);
+    assert_eq!(a.root, b.root, "相同内容必须复用同一内容寻址目录");
+}
+
+#[test]
+fn release_run_pins_drops_references_idempotently() {
+    let host = fixture_host();
+    let v1 = host.install_fixture("demo-v1").unwrap();
+    let p1 = host.pin_for_run("run-a", &v1).unwrap();
+    let _p2 = host.pin_for_run("run-b", &v1).unwrap();
+    assert_eq!(host.active_pin_count(&v1.content_hash), 2);
+    host.release_run_pins("run-a").unwrap();
+    assert_eq!(host.active_pin_count(&v1.content_hash), 1);
+    // 重复释放幂等
+    host.release_run_pins("run-a").unwrap();
+    assert_eq!(host.active_pin_count(&v1.content_hash), 1);
+    // 释放只解除引用,不删除包(pin 之外的解析仍可用)
+    assert!(host.resolve_pin(&p1).is_ok());
+}
+
+#[test]
+fn new_install_is_disabled_until_authorized() {
+    let host = fixture_host();
+    let v1 = host.install_fixture("demo-v1").unwrap();
+    let summary = host
+        .summaries()
+        .into_iter()
+        .find(|s| s.full_id == v1.full_id)
+        .unwrap();
+    assert!(!summary.enabled, "新装插件默认禁用");
+    // 启用 = 授权
+    host.enable(&v1.full_id, true).unwrap();
+    assert!(host
+        .summaries()
+        .into_iter()
+        .find(|s| s.full_id == v1.full_id)
+        .unwrap()
+        .enabled);
+}
+
+#[test]
+fn contribution_lookup_by_full_id() {
+    let host = fixture_host();
+    let v1 = host.install_fixture("demo-v1").unwrap();
+    // 未启用时贡献不可见
+    assert!(host.contributions().find_agent_type("test.demo.demo-agent").is_none());
+    host.enable(&v1.full_id, true).unwrap();
+    let reg = host.contributions();
+    let (src, agent) = reg.find_agent_type("test.demo.demo-agent").unwrap();
+    assert_eq!(src.plugin_full_id, v1.full_id);
+    assert_eq!(src.content_hash, v1.content_hash);
+    assert_eq!(agent.adapter, "generic-command");
+    assert!(reg.find_agent_type("test.demo.missing").is_none());
+}

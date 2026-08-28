@@ -1,0 +1,15 @@
+[manifest]
+version = 2
+publisher = "test"
+id = "demo"
+name = "Demo Plugin"
+version_str = "0.2.0"
+description = "pin fixture v2"
+
+[[agent_types]]
+id = "demo-agent"
+name = "Demo Agent v2"
+adapter = "generic-command"
+command = "demo2"
+detect_commands = ["demo2"]
+modes = ["interactive", "oneshot"]
