@@ -228,6 +228,16 @@ impl Git {
 
     // ---------- worktree 管理(卡片墙/驾驶舱用) ----------
 
+    /// worktree 统一根:`<仓库根>/../.worktrees`(所有 mf 派生 worktree
+    /// 都必须位于其下,清理前据此校验路径)。
+    pub fn worktree_root(&self) -> Result<PathBuf> {
+        let root = self.root();
+        let parent = root
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("仓库根没有父目录"))?;
+        Ok(parent.join(".worktrees"))
+    }
+
     /// 列出全部 worktree (name, 绝对路径)
     pub fn worktree_list(&self) -> Result<Vec<(String, PathBuf)>> {
         let mut out = Vec::new();

@@ -18,8 +18,10 @@ aes-gcm.workspace = true
 rand.workspace = true
 keyring.workspace = true
 rusqlite.workspace = true
+git2.workspace = true
 mf-agent = { path = "../mf-agent" }
 mf-skills = { path = "../mf-skills" }
+mf-vcs = { path = "../mf-vcs" }
 log.workspace = true
 
 [dev-dependencies]
