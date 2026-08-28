@@ -181,4 +181,10 @@ pub trait RuntimeHost: Send + Sync {
     fn kill_ad_hoc(&self, project: &str, session_id: i64);
     /// 回答 Agent 的提问(阻塞等待中的 HTTP Runtime)。
     fn answer_question(&self, project: &str, run_id: i64, answer: &str);
+    /// 宿主是否能确认会话仍存活(重启恢复用)。
+    /// 默认 false(无法确认 = 未知状态,绝不推断为失败)。
+    fn is_session_alive(&self, project: &str, session_id: i64) -> bool {
+        let _ = (project, session_id);
+        false
+    }
 }

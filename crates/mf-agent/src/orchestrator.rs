@@ -119,8 +119,13 @@ impl Orchestrator {
         pipe_name: String,
         directory: Arc<dyn ExecutionDirectoryProvider>,
     ) -> Result<Arc<Orchestrator>> {
-        // 异常退出恢复:未结算 Agent Run → interrupted,Task → needs-you
-        let recovered = store.recover_interrupted()?;
+        // 异常退出恢复(设计 §13):宿主确认存活的会话重连;
+        // 未知状态 → interrupted + awaiting-outcome(不判失败)
+        let root_str_for_probe = root.to_string_lossy().to_string();
+        let host_for_probe = host.clone();
+        let recovered = store.recover_interrupted_with(&|session_id| {
+            host_for_probe.is_session_alive(&root_str_for_probe, session_id)
+        })?;
         let orphan_steps = store.repair_orphan_steps()?;
         if !orphan_steps.is_empty() {
             log::warn!(
@@ -277,6 +282,7 @@ impl Orchestrator {
     }
 
     /// 释放 run 持有的执行租约(终态结算/取消;未知状态不调用)。
+    /// 重启恢复后的 run 不在进程内映射中,按数据库兜底查找。
     fn release_lease_of_run(&self, run_id: i64) {
         if let Some(lease) = self.held_leases.lock().remove(&run_id) {
             if let Err(e) = self.directory.release(&lease) {
@@ -284,6 +290,23 @@ impl Orchestrator {
             }
             let _ = self.store.release_execution_lease(&lease.id);
             self.step_leases.lock().retain(|_, l| l.id != lease.id);
+            return;
+        }
+        if let Ok(Some(row)) = self.store.held_lease_of_run(run_id) {
+            let lease = ExecutionLease {
+                id: row.lease_key.clone(),
+                path: PathBuf::from(&row.path),
+                isolated: row.isolated,
+                provider: row.provider.clone(),
+                metadata: row
+                    .metadata_json
+                    .and_then(|json| serde_json::from_str(&json).ok())
+                    .unwrap_or(serde_json::Value::Null),
+            };
+            if let Err(e) = self.directory.release(&lease) {
+                log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
+            }
+            let _ = self.store.release_execution_lease(&row.lease_key);
         }
     }
 

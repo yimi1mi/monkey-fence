@@ -1051,14 +1051,15 @@ impl Store {
         })
     }
 
-    /// 孤儿 step 修复:非终态但没有任何活动 run 的 step(崩溃窗口遗留)→ 标记失败,
+    /// 孤儿 step 修复:非终态但没有任何活动 run 的 step(崩溃窗口遗留)→ 标记失败;
+    /// awaiting-outcome 不算孤儿(重启恢复的合法等待确认状态),
     /// 对应任务进入 needs-you,避免永久卡死。
     pub fn repair_orphan_steps(&self) -> Result<Vec<i64>> {
         let ts = now();
         self.with_tx(|tx| {
             let mut stmt = tx.prepare(
                 "SELECT s.id, s.task_id FROM steps s
-                 WHERE s.status IN ('running','awaiting-outcome','needs-input')
+                 WHERE s.status IN ('running','needs-input')
                    AND NOT EXISTS (
                      SELECT 1 FROM agent_runs r
                      WHERE r.step_id = s.id AND r.status IN ('running','awaiting-outcome')
@@ -1131,14 +1132,19 @@ impl Store {
                 })
                 .map_err(anyhow::Error::from);
             }
-            if !matches!(run.status, RunStatus::Running | RunStatus::AwaitingOutcome) {
+            // interrupted(重启后未知状态)允许人工结算(设计 §13)
+            if !matches!(
+                run.status,
+                RunStatus::Running | RunStatus::AwaitingOutcome | RunStatus::Interrupted
+            ) {
                 return Err(SettleError::RunNotActive(run.status)).map_err(anyhow::Error::from);
             }
             let ts = now();
             // 条件更新:outcome 仍为空才写入;0 行受影响 = 并发已结算 → 重读判定幂等/冲突
             let applied = tx.execute(
                 "UPDATE agent_runs SET status = ?2, outcome = ?3, outcome_payload = ?4, ended_at = ?5
-                 WHERE id = ?1 AND outcome IS NULL AND status IN ('running','awaiting-outcome')",
+                 WHERE id = ?1 AND outcome IS NULL
+                   AND status IN ('running','awaiting-outcome','interrupted')",
                 params![
                     run.id,
                     settlement.result_status().as_str(),
@@ -1230,29 +1236,62 @@ impl Store {
     /// 正常启动(非崩溃)时没有 running 记录,本方法为 no-op。
     /// done/idle 会话是合法终态,不判死(否则 reuse 策略重启后无法复用)。
     pub fn recover_interrupted(&self) -> Result<Vec<RunView>> {
+        self.recover_interrupted_with(&|_session_id| false)
+    }
+
+    /// 重启恢复(设计 §13):
+    /// - 宿主确认存活的会话 → run/step/task 状态原样保留(重连);
+    /// - awaiting-outcome(已退出未结算)→ 原样保留,等待人工确认;
+    /// - 其余(进程状态未知)→ run = interrupted、step = awaiting-outcome
+    ///   (未知不是失败)、task = needs-you;执行租约保持 held。
+    /// 返回受影响(未重连)的 run 列表。
+    pub fn recover_interrupted_with(
+        &self,
+        session_alive: &dyn Fn(i64) -> bool,
+    ) -> Result<Vec<RunView>> {
         let ts = now();
         self.with_tx(|tx| {
-            let affected_ids: Vec<i64> = {
+            let rows: Vec<(i64, Option<i64>, String)> = {
                 let mut stmt = tx.prepare(
-                    "SELECT id FROM agent_runs WHERE status IN ('running','awaiting-outcome')",
+                    "SELECT id, session_id, status FROM agent_runs
+                     WHERE status IN ('running','awaiting-outcome')",
                 )?;
                 let ids = stmt
-                    .query_map([], |r| r.get(0))?
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                     .collect::<std::result::Result<_, _>>()?;
                 drop(stmt);
                 ids
             };
-            if affected_ids.is_empty() {
+            if rows.is_empty() {
                 return Ok(Vec::new());
             }
-            // 逐个参数化更新,避免字符串拼接 SQL
-            for id in &affected_ids {
+            let mut interrupted_ids = Vec::new();
+            for (id, session_id, status) in &rows {
+                let reattach = match session_id {
+                    Some(sid) if status == "running" => session_alive(*sid),
+                    _ => false,
+                };
+                if reattach {
+                    continue; // 宿主确认存活:重连,状态原样
+                }
+                if status == "awaiting-outcome" {
+                    // 已退出未结算:等待人工确认,状态原样,任务提示
+                    tx.execute(
+                        "UPDATE agent_tasks SET status = 'needs-you', unread = 1, updated_at = ?2
+                         WHERE id = (SELECT task_id FROM agent_runs WHERE id = ?1)
+                           AND status NOT IN ('succeeded','failed','cancelled','archived')",
+                        params![id, ts],
+                    )?;
+                    continue;
+                }
+                // 进程状态未知:interrupted + awaiting-outcome(不判失败)
+                interrupted_ids.push(*id);
                 tx.execute(
                     "UPDATE agent_runs SET status = 'interrupted', ended_at = ?2 WHERE id = ?1",
                     params![id, ts],
                 )?;
                 tx.execute(
-                    "UPDATE steps SET status = 'failed', ended_at = ?2, updated_at = ?2
+                    "UPDATE steps SET status = 'awaiting-outcome', updated_at = ?2
                      WHERE id = (SELECT step_id FROM agent_runs WHERE id = ?1)
                        AND status NOT IN ('succeeded','failed','skipped','cancelled')",
                     params![id, ts],
@@ -1271,7 +1310,7 @@ impl Store {
                 params![ts],
             )?;
             let mut out = Vec::new();
-            for id in &affected_ids {
+            for id in &interrupted_ids {
                 if let Some(r) = Self::run_view_by_id_tx(tx, *id)? {
                     out.push(r);
                 }
@@ -1598,6 +1637,36 @@ impl Store {
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    /// run 当前持有的租约(重启恢复后释放用)。
+    pub fn held_lease_of_run(&self, run_id: i64) -> Result<Option<ExecutionLeaseRow>> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT lease_key, run_id, step_id, task_id, provider, path, isolated,
+                        metadata_json, status, created_at, released_at
+                 FROM execution_leases WHERE run_id = ?1 AND status = 'held'
+                 ORDER BY id DESC LIMIT 1",
+                params![run_id],
+                |r| {
+                    Ok(ExecutionLeaseRow {
+                        lease_key: r.get(0)?,
+                        run_id: r.get(1)?,
+                        step_id: r.get(2)?,
+                        task_id: r.get(3)?,
+                        provider: r.get(4)?,
+                        path: r.get(5)?,
+                        isolated: r.get::<_, i64>(6)? != 0,
+                        metadata_json: r.get(7)?,
+                        status: r.get(8)?,
+                        created_at: r.get(9)?,
+                        released_at: r.get(10)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
         })
     }
 
