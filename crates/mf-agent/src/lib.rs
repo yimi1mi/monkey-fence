@@ -10,6 +10,7 @@
 //! - `provider`:OpenAI 兼容 / Anthropic / mock 提供方
 //! - `tools`:worker 工具沙箱
 
+pub mod agent_adapter;
 pub mod agent_instance;
 pub mod catalog_store;
 pub mod config;
@@ -22,6 +23,11 @@ pub mod schema;
 pub mod secrets;
 pub mod store;
 
+pub use agent_adapter::{
+    AgentAdapter, CompletionDetector, CompletionMode, CompletionObservation, ExecutionContract,
+    HandoffDraft, InputInjection, InputMode, LaunchContext, LaunchPlan, ProcessObservation,
+    TempFileSpec,
+};
 pub use agent_instance::{
     AgentInstance, AgentInstanceDraft, AgentInstanceOverrides, AgentInstanceSnapshot,
     AgentInstanceVersion,
@@ -37,7 +43,10 @@ pub use model::{
 };
 pub use orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
 pub use pipeline::{PipelineDraft, ProfileIndex, SessionPolicy, StepDraft};
-pub use runtime::{AgentProfileSpec, HookSpec, LaunchSpec, RuntimeEvent, RuntimeHost, RuntimeKind};
+pub use runtime::{
+    AgentProfileSpec, AgentTypeDescriptor, HookSpec, LaunchSpec, RuntimeEvent, RuntimeHost,
+    RuntimeKind,
+};
 pub use schema::{
     catalog_db_path, project_db_path, CATALOG_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION,
 };

@@ -57,6 +57,7 @@ impl std::fmt::Debug for SecretLease {
 
 /// 永不泄露内值的包装:Debug/Display 只输出 `<redacted>`。
 /// 启动进程等需要真实值的调用方用 `get`/`into_inner` 显式取出。
+#[derive(Clone)]
 pub struct Redacted<T>(T);
 
 impl<T> Redacted<T> {

@@ -4,8 +4,10 @@
 //! v2 清单只声明 Agent Type 契约(adapter/检测/运行模式);
 //! 内置 profile 的完整命令/参数/钩子由 `profile_spec_from_builtin` 直接合成。
 
+use crate::generic_command_adapter::GenericCommandAdapter;
 use crate::manifest::{AgentTypeContribution, Capabilities, ManifestHeader, PluginManifest};
-use mf_agent::runtime::{AgentProfileSpec, HookSpec, RuntimeKind};
+use mf_agent::agent_adapter::AgentAdapter;
+use mf_agent::runtime::{AgentProfileSpec, AgentTypeDescriptor, HookSpec, RuntimeKind};
 use std::path::PathBuf;
 
 pub struct BuiltinAgent {
@@ -193,6 +195,29 @@ fn adapter_of(profile_id: &str) -> &'static str {
         "claude" => "claude-code",
         "codex" => "codex",
         _ => "generic-command",
+    }
+}
+
+/// 按适配器契约标识构造内置 Agent Adapter。
+/// claude-code / codex 适配器随隔离配置里程碑提供;当前未接线类型
+/// 显式报错,不做静默回退。
+pub fn adapter_for(adapter: &str) -> Option<Box<dyn AgentAdapter>> {
+    match adapter {
+        "generic-command" => Some(Box::new(GenericCommandAdapter::new())),
+        _ => None,
+    }
+}
+
+/// AgentTypeContribution → 内核侧 AgentTypeDescriptor(启动所有权归 Adapter)。
+pub fn type_descriptor_from_contribution(a: &AgentTypeContribution) -> AgentTypeDescriptor {
+    AgentTypeDescriptor {
+        id: a.id.clone(),
+        name: a.name.clone(),
+        adapter: a.adapter.clone(),
+        command: a.command.clone(),
+        detect_commands: a.detect_commands.clone(),
+        modes: a.modes.clone(),
+        supports_isolated_config: a.supports_isolated_config,
     }
 }
 

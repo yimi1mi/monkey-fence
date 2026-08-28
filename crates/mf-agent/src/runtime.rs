@@ -59,6 +59,30 @@ pub struct HookSpec {
     pub command_template: String,
 }
 
+/// Agent Type 描述:插件贡献的 CLI 执行类型的内核投影。
+/// 与 `AgentProfileSpec` 的区别:Profile 面向旧调度路径的完整启动规格,
+/// Descriptor 只声明类型契约 —— 启动所有权在 Agent Adapter +
+/// `AgentInstanceSnapshot` 编译出的 LaunchPlan(设计 §6.1)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentTypeDescriptor {
+    pub id: String,
+    pub name: String,
+    /// 适配器契约标识(claude-code / codex / generic-command / http / plugin-worker)。
+    pub adapter: String,
+    /// 类型默认命令(创建实例时的初始 executable)。
+    #[serde(default)]
+    pub command: String,
+    #[serde(default)]
+    pub detect_commands: Vec<String>,
+    /// 支持的运行模式(oneshot / interactive)。
+    #[serde(default)]
+    pub modes: Vec<String>,
+    /// 是否支持进程级隔离配置(不支持时禁止请求 config 注入,
+    /// 防止静默改写真实 CLI 全局配置)。
+    #[serde(default)]
+    pub supports_isolated_config: bool,
+}
+
 /// 一次 Agent Run 的启动规格。
 #[derive(Debug, Clone)]
 pub struct LaunchSpec {

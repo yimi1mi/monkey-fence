@@ -11,6 +11,7 @@
 pub mod builtin;
 pub mod builtin_secret_store;
 pub mod contribution_registry;
+pub mod generic_command_adapter;
 pub mod hooks;
 pub mod host;
 pub mod install;
