@@ -41,7 +41,8 @@ pub fn parse_unified_diff(text: &str) -> UnifiedDiff {
     for raw in text.lines() {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
         if line.starts_with("+++ ") || line.starts_with("--- ") {
-            out.files.push(line[4..].split('\t').next().unwrap_or("").to_string());
+            out.files
+                .push(line[4..].split('\t').next().unwrap_or("").to_string());
             out.lines.push(DiffLine {
                 kind: DiffLineKind::Header,
                 text: line.to_string(),
@@ -86,7 +87,10 @@ pub fn parse_unified_diff(text: &str) -> UnifiedDiff {
             });
             old_no += 1;
             new_no += 1;
-        } else if line.starts_with("diff ") || line.starts_with("index ") || line.starts_with("==== ") {
+        } else if line.starts_with("diff ")
+            || line.starts_with("index ")
+            || line.starts_with("==== ")
+        {
             out.lines.push(DiffLine {
                 kind: DiffLineKind::Header,
                 text: line.to_string(),
@@ -142,11 +146,24 @@ mod tests {
         assert_eq!(d.deleted, 1);
         assert_eq!(d.files, vec!["a/foo.rs", "b/foo.rs"]);
         // 行号推进正确
-        let add_line = d.lines.iter().find(|l| l.kind == DiffLineKind::Add).unwrap();
+        let add_line = d
+            .lines
+            .iter()
+            .find(|l| l.kind == DiffLineKind::Add)
+            .unwrap();
         assert_eq!(add_line.new_no, Some(2));
-        let del_line = d.lines.iter().find(|l| l.kind == DiffLineKind::Delete).unwrap();
+        let del_line = d
+            .lines
+            .iter()
+            .find(|l| l.kind == DiffLineKind::Delete)
+            .unwrap();
         assert_eq!(del_line.old_no, Some(2));
-        let ctx_after = d.lines.iter().filter(|l| l.kind == DiffLineKind::Context).last().unwrap();
+        let ctx_after = d
+            .lines
+            .iter()
+            .filter(|l| l.kind == DiffLineKind::Context)
+            .last()
+            .unwrap();
         assert_eq!(ctx_after.old_no, Some(3));
         assert_eq!(ctx_after.new_no, Some(4));
     }

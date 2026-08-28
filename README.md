@@ -1,147 +1,186 @@
 # MonkeyFence 🐒
 
-**AI 变更交付工作台 · 原生编辑 · 人工审阅 · P4/Git 交付**
+**多项目 Agent 工作台 · 插件化智能体 · 可编辑 DAG 流水线 · 原生编辑 · 人工审阅**
 
-MonkeyFence 是一个面向 Windows 游戏研发团队的原生 AI 变更交付工作台。所有界面围绕一个“工作项”组织，让需求从隔离执行、人工决策、Diff 审阅一直走到 P4 Shelve/Submit 或 Git Commit。
-
-- **工作项主线**——一个用户目标绑定一个隔离工作区、Agent 执行、变更集与最终交付。
-- **原生编辑体验**——基于 GPUI（Zed 的 UI 框架、Windows DirectX 后端）渲染，后台并行扫描项目并即时快速打开。
-- **可控 Agent**——内置任务 DAG、持久化邮箱、失败熔断和人在环问答；内部步骤默认不打扰普通工作流。
-- **P4/Git 闭环**——内置变更列表、Diff、审阅、提交、还原、搁置、同步与历史。
+MonkeyFence 是一个面向 Windows 研发团队的原生 AI Agent 工作台:同时打开多个项目,每个项目内创建与版本控制完全解耦的任务(ADR 0001),通过插件贡献的本地 CLI Agent、API Agent 与 mock Agent 混合执行可编辑的 DAG 流水线(ADR 0002)。
 
 ```
-┌────────────────────────────────────────────────────────┐
-│ 活动栏 │ 代码 / 工作项 / 版控 │ 编辑器·执行概览 │ Agent │
-└────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ 活动栏 │ 任务(按项目分组) │ 编辑器 / Agents 看板 / Pipeline │ 版控 │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ## 快速开始
 
 ```bash
-cargo run -p mf --release -- [项目路径]
+cargo run [项目路径]        # 默认二进制是 monkeyfence(default-members)
+cargo run --release -- [项目路径]
 ```
 
-无参数启动后 `Ctrl+Shift+O` 打开文件夹。
+- `Ctrl+Shift+O` 打开文件夹(**可重复打开多个项目**,互不干扰)
+- `Ctrl+Shift+W` 任务侧边栏(按项目分组:新建 / 选择 / 归档)
+- `Ctrl+Shift+/` Agent 工作区(`Agents` 看板 / `Pipeline` 视图)
+- `Ctrl+,` 设置(智能体 / 插件 / Provider / 引擎 / 编辑器)
 
-### 无 GUI 自测(验证 agent 任务流转)
+### 无 GUI 自测(v2 冒烟:验证流水线状态机端到端)
 
 ```bash
-cargo run -p mf -- --agent-smoke .
+cargo run -- --agent-smoke .
 ```
 
-输出规划 → 派发 → 工具调用 → 收敛的完整事件流,并在 `.mf-agent/` 下生成任务产出。
+冒烟覆盖:CLI Agent PATH 检测表 → 手工 DAG → 自动派发 → mock 结构化结算 → 下游解锁 → 失败进入「需要你」→ 能力令牌断言(错误拒绝 / 幂等 / 冲突拒绝)→ 人工跳过 → 收敛,并在 `.mf-agent/` 留下产物与历史。
 
-## 快捷键
+## 领域模型(见 `CONTEXT.md` 与 `docs/adr/`)
 
-| 键 | 功能 |
+| 概念 | 说明 |
 |---|---|
-| `Ctrl+Shift+O` | 打开文件夹 |
-| `Ctrl+P` | 快速打开文件(模糊匹配) |
-| `Ctrl+Shift+P` | 命令面板 |
-| `Ctrl+B` | 切换左侧面板 |
-| `Ctrl+`` | 切换控制台分屏(底部终端 dock) |
-| `Ctrl+,` | 打开设置 |
-| `Ctrl+W` / `Ctrl+Tab` | 关闭 / 切换标签页 |
-| `Ctrl+S` / `Ctrl+Z` / `Ctrl+Y` | 保存 / 撤销 / 重做 |
-| `Ctrl+A` / `Ctrl+C` / `Ctrl+V` / `Ctrl+X` | 全选 / 复制 / 粘贴 / 剪切 |
-| `Ctrl+←/→` `Ctrl+Backspace` | 按词移动 / 删词 |
-| `Alt+↑/↓` `Ctrl+D` | 移动行 / 复制行 |
-| `Tab` / `Shift+Tab` | 缩进 / 反缩进(支持选区) |
+| **Project** | 同时打开的一个目录;独立的任务数据库 / 调度器 / 会话注册表 |
+| **Task** | 项目内一级目标(不绑定 Git/P4/worktree/分支/变更集) |
+| **Pipeline Revision** | Task 的不可变 DAG 版本;编辑产生新 Revision |
+| **Step** | DAG 节点:工作说明 + 依赖 + Agent 指派 + 会话策略 |
+| **Agent Profile** | 插件贡献的可配置执行器(pty / http / plugin-worker) |
+| **Agent Session** | 后台 Session Registry 拥有的 CLI/API 会话,可复用 |
+| **Agent Run** | Step 的一次执行尝试,持有一次性能力令牌 |
+| **Settlement** | 显式结算(`mfctl step complete/fail` 或结构化 Runtime),唯一成功依据 |
 
-## 控制台分屏(终端 dock)
+状态机:
+- Task:`draft → ready → running → needs-you ⇄ running → succeeded/failed/cancelled`(另有 `archived`)
+- Step:`pending → ready → running →(awaiting-outcome|needs-input)→ succeeded/failed/blocked/skipped/cancelled`
+- 调度规则:依赖全部成功或显式跳过后 Step 就绪并**自动派发**;失败只阻塞后代,独立分支继续;`done` / `tui-idle` **不能**自动结算;默认全局并发 4、每项目 2(设置可改);运行中修改 DAG 必须先暂停,且只允许修改尚未启动的 Step。
 
-`Ctrl+`` 或状态栏「⌨ 终端」打开底部终端 dock,每个窗格是一个真实 shell(ConPTY,默认 `cmd.exe`),**内置完整 VT 终端模拟器,可运行彩色输出与全屏 TUI 应用**(PowerShell / claude-code 类 CLI 等):
+## Agent 工作区
 
-- 工具栏:**新窗格 / 右分屏 / 下分屏 / 关闭窗格**,窗格可任意嵌套拆分(树形布局,单子分叉自动折叠);底部 orca 式状态条显示 `N panes` 与快捷键
-- 每格独立:tab 头(运行状态点 + **OSC 0/2 动态标题**——CLI 设置的终端标题会显示在窗格头 + 网格尺寸)、悬停 ✕ 单独关闭;点击窗格即激活(顶部高亮边)
-- **VT 渲染**(`term.rs`,19 项单测):UTF-8(跨包)、SGR 全色彩(16 色 / 256 色 / 真彩 / 加粗 / 下划线 / 反显)、光标移动与定位、清屏清行(ED/EL/ECH)、行内插删(ICH/DCH/IL/DL)、滚动区(DECSTBM/SU/SD)、**交替屏幕(?1049,支持 vim 类全屏 TUI)**、光标显隐(?25)与光标块渲染、DECSC/DECRC
-- 键盘直通:方向键 / Home / End / PageUp / Delete / Insert、**F1-F12**、修饰组合(S/C/A+方向,转 xterm `CSI 1;{mod}` 序列)、Ctrl+C/D/L/Z/A/E/K/U/W
-- 关闭最后一个窗格自动收起整个 dock
+### Agents 视图(Orca 风格四列看板)
 
-## 设置
+- 四列:**需要你**(失败/阻塞/等待输入/未结算)· **工作中** · **已完成**(成功未确认)· **空闲**(可复用会话)
+- 默认汇总**所有打开项目**,支持按项目循环切换与文本过滤(Agent/任务/指令/回复)
+- 卡片:Agent 图标名称 · 会话名 · 最近用户指令 · 最后回复(PTY 为终端尾部)· 项目与任务 · 状态 · 未读标记
+- 点击卡片打开近全屏终端(键盘直通,重新挂载恢复当前屏幕)或 API transcript
+- 「需要你」卡片 / 详情:判定成功 · 判定失败 · 继续发送提示;已完成可确认;空闲可隐藏(历史保留)或终止
 
-`Ctrl+,` 或状态栏「⚙」打开设置弹窗,修改保存到 `~/.monkeyfence/config.toml`:
+### Pipeline 视图(左到右拓扑列)
 
-- **角色 → 提供方**:planner / worker / reviewer 各自指定提供方名称;点选角色后编辑其提供方的类型(mock / openai 兼容 / anthropic)、base_url、api_key、model(新名称会自动建同名提供方并迁移旧配置)
-- **引擎**:并行 worker 数、工具循环轮数、失败熔断次数(下次打开项目生效)
-- **编辑器**:字体、字号(保存后立即应用到所有打开的编辑器)
+- 每列一个依赖层级;节点显示标题 · Agent · 状态 · 尝试次数 · 依赖
+- 选中节点编辑器:标题 · 工作说明 · Agent Profile · session policy(fresh / reuse:key)· 前置步骤
+- 工具栏:从模板创建 · AI 生成(Planner 草案,**不得绕过用户确认**)· 添加 Step · 校验 · 保存修改 · 确认并运行 · 暂停 / 继续 · 取消
+- 失败节点:重试 · 跳过(必须人工确认)· 替换 Agent(产生新 Revision)
 
-## Agent 编排(核心)
+## 插件系统(`mf-plugins`)
 
-输入目标后:
+统一扩展缝隙:Agent、流水线模板、技能、工具都由插件贡献;内置内容以**合成插件**暴露,与第三方走同一权限模型。
 
-1. **规划者**(planner)把目标分解为任务 DAG(依赖用 `deps` 声明)。
-2. **工作者池**(worker pool)原子认领就绪任务(`pending → ready → dispatched`),带 LLM 工具循环执行:
-   `fs_read / fs_write / fs_patch / fs_list / run_cmd / spawn_subtask / send_message / ask_human / complete_task / report_failure`
-3. 任务完成自动**提升依赖者**;失败计数跨重试累计,**3 次熔断**(面板可手动重置)。
-4. 全部任务终结后**收敛**收尾。
-5. 关键决策可 `ask_human` 阻塞等待你的回答(Agent 面板出现问答卡片)。
-
-所有状态(运行/任务/派发/邮箱/问题)持久化在 `<项目>/.mf-agent/orchestration.db`,**崩溃可恢复**;agent 修改过的打开中文件会自动重载。
-
-### 接入真实 LLM
-
-编辑 `~/.monkeyfence/config.toml`(首次运行自动生成模板):
+插件根清单 `monkeyfence-plugin.toml` 示例:
 
 ```toml
-[providers.glm]
-kind = "openai"                       # OpenAI 兼容端点
-base_url = "https://open.bigmodel.cn/api/paas/v4"
-api_key = "your-key"
-model = "glm-4.6"
+[manifest]
+version = 1
+publisher = "zhipu"
+id = "demo-agent"
+name = "Demo Agent"
+version_str = "0.1.0"
+min_app_version = "0.1.0"
+description = "演示插件"
+homepage = "https://example.com"
 
-[roles]
-planner = "glm"
-worker = "glm"
+[capabilities]
+fs_read = false
+fs_write = false
+net = true
+spawn = false
+hooks = false
+
+# 可选后台 worker(独立进程 + NDJSON 协议)
+# [worker]
+# command = "worker.exe"
+
+[[agents]]
+id = "demo"
+name = "Demo"
+runtime = "pty"                 # pty | http | plugin-worker
+command = "demo-cli"
+args = []
+permission_args = ["--yes"]
+
+[[pipelines]]
+id = "default"
+name = "默认流水线"
+file = "pipelines/default.json"  # PipelineDraft JSON
+
+[[skills]]
+path = "skills/demo"
 ```
 
-也支持 `kind = "anthropic"`。默认 `mock` 提供方无需网络即可演示完整任务流转。
+- 安装来源:`bundled` / 本地目录 / Git URL / marketplace(首版前三种)
+- 安装流程:复制或 clone 到 staging → 校验清单与路径(拒绝 `..`、绝对路径、符号链接逃逸)→ 内容 SHA-256 → 原子发布到 `~/.monkeyfence/plugins/` → 锁文件 `plugins.lock.json` 记录来源/版本/commit/哈希/授权指纹
+- **新插件默认禁用**;用户审查权限后启用;worker、钩子、能力或说明内容变化改变指纹,需要**重新授权**;插件代码授权前不运行;禁用/未授权插件的 worker 不得启动
+- ⚠ 权限只约束 MonkeyFence 宿主接口;worker 进程与 CLI 始终以当前 Windows 用户权限运行
 
-## 技能(Skills)
+### 内置智能体(设置 → 智能体)
 
-自有技能体系(非 orca 协议):一个技能 = 一个目录,含 `skill.toml`(触发词 + 工具白名单)与 `INSTRUCTIONS.md`(注入正文)。
+- **CLI**(只检测 PATH,不自动安装,不复制凭据/配置目录):Codex · Claude · OpenCode · Cursor · Kimi;未检测到时一键打开官方安装页
+- **API**:OpenAI 兼容 · Anthropic · mock(来自 `~/.monkeyfence/config.toml` 的 providers)
+- **空白终端**;默认智能体(Auto / 指定);权限模式 Yolo / Manual;状态钩子总开关(命名空间内写入 + 备份 + 可逆移除);自动生成标签标题;Agent 工作时保持唤醒
+- Agent 详情可配置:Command · Arguments · Environment · Permission arguments · Hook 安装状态 · 插件来源/版本
 
-- 项目级 `<项目>/.monkeyfence/skills/` 覆盖全局 `~/.monkeyfence/skills/`
-- 任务说明命中触发词 → 说明注入工作者系统提示,工具白名单取交集
-- 内置技能:先读后写纪律、Rust 红绿重构、P4 安全提交(可自由编辑)
+## mfctl 显式结算
 
-## P4 / Git 面板
+Agent Run 启动时获得一次性能力令牌(环境变量 `MF_RUN_TOKEN` / `MF_PIPE` 自动注入 Agent shell),MonkeyFence 通过本地命名管道 `\\.\pipe\monkeyfence-mfctl-<pid>` 接收:
 
-自动检测:工作区位于 Perforce client root 下 → P4 模式;否则 Git 模式。
+```bash
+mfctl step complete --summary "一句话总结"   # 相同结算重复提交幂等
+mfctl step fail --reason "失败原因"
+mfctl agent-state <working|waiting|blocked|done>
+mfctl pipeline propose --file draft.json     # Planner 提案,须用户确认
+```
 
-- **P4**:待提交变更(default + 编号 CL)、文件勾选、双击看 diff(`p4 diff -du` 着色渲染)、提交(`submit -d`)、还原、搁置(自动建编号 CL → reopen → shelve)、同步、提交历史(`p4 changes`,按 stream 过滤);状态栏显示 client@server。
-- **Git**:状态/暂存/取消暂存/提交/历史/单文件 diff(git2)。
+冲突结算被拒绝;`done` 无显式结算 → Step 进入 `awaiting-outcome`、看板进入「需要你」;用户可手工判定成功/失败或继续发送提示。
+
+## 多项目与数据
+
+- 每项目 `<project>/.mf-agent/orchestration.db`(带 `schema_migrations` 正式迁移)
+- 迁移:旧 `runs→Task`、`tasks→Step`、`dispatches→Agent Run`;旧表与消息/问题历史保留为只读;`work-items.json` 兼容导入一次(忽略 `vcs_ref`,原文件保留)
+- 崩溃恢复:重开时未结算 Agent Run → `interrupted`,对应 Task → `needs-you`
+- 前台只显示一个项目的文件树/编辑上下文;其他项目的任务与 Agent 后台继续运行;关闭含活动 Agent Run 的项目必须先确认停止
+
+## P4 / Git 面板(独立)
+
+自动检测:Perforce client root 下 → P4 模式;否则 Git。变更集、Diff 审阅(Alt+Y/Z hunk 级)、提交/搁置/同步/历史照旧,与 Task 生命周期完全解耦。
 
 ## 架构
 
 ```
 crates/
-  mf-core     Buffer(ropey + 事务式 undo)、tree-sitter 高亮(8 语言,自有 scope 表)
-  mf          GPUI 应用:编辑器(自定义 Element 逐行 shaping)、文件树、
-              快速打开(nucleo 模糊)、命令面板、Agent/P4/Git 面板、diff 视图
-  mf-agent    编排引擎:SQLite 任务 DAG + 派发认领 + 邮箱 + 问答;
-              提供方层(OpenAI 兼容 / Anthropic / Mock),工具沙箱(路径越界拦截)
-  mf-vcs      p4 CLI 封装(-ztag 解析,真实 2024.1 输出校验)、git2、统一 diff 解析
+  mf-core     Buffer(ropey + 事务式 undo)、tree-sitter 高亮
+  mf          GPUI 应用:多项目 Workspace、任务侧边栏、Agents 看板、
+              Pipeline 视图、Agent 终端/transcript、设置(智能体/插件)、
+              SessionRegistry(PTY/HTTP/PluginWorker)、mfctl 管道服务
+  mf-agent    v2 编排:Store 迁移 + Task/Revision/Step/Session/Run、
+              DAG 校验、Orchestrator 调度器、显式结算、崩溃恢复;
+              提供方层(OpenAI 兼容 / Anthropic / mock)
+  mf-plugins  插件系统:清单、安装/锁文件/权限指纹、内置 Agent、
+              状态钩子写入器、NDJSON worker
+  mf-vcs      p4 CLI 封装、git2、统一 diff 解析
   mf-skills   技能加载/匹配/注入
+  mfctl       显式结算 / 状态上报 / 流水线提案(命名管道客户端)
 ```
 
 ## 测试
 
 ```bash
-cargo test --workspace   # 31 项:buffer/undo 往返、DAG 状态机、熔断、问答、端到端 mock 运行、
-                         # ztag 解析(真实样本)、diff 解析、git 往返、
-                         # 终端 ANSI/OSC 剥离与 \r 覆盖写、配置序列化往返
+cargo test --workspace   # 100+ 项:迁移/回滚/数据保留、两项目隔离、DAG 校验、
+                         # 并发/串行化/失败阻塞、暂停编辑规则、结算令牌、
+                         # interrupted 恢复、插件逃逸/禁用/重授权、钩子不破坏用户配置、
+                         # PATH 检测、mfctl 管道往返、work-items 导入、
+                         # 两项目 E2E、终端模拟器、配置往返
 ```
 
-> 注:mf-bin 的单元测试集中在 `main.rs`(rustc 对超大 gpui 模块内联 `#[test]` 的宏展开深度有计数怪癖)。
+## 已知限制(首版)
 
-## 已知限制(v1)
-
-- 多光标、编辑器分栏、软换行未实现(终端 dock 支持任意嵌套分屏)
-- 终端网格为固定 26×120(窗格尺寸自适应 resize 待做);鼠标选择/复制待做
-- 中文输入走系统 IME(基础支持,组合窗口位置未定制)
-- 任务 result 摘要在个别路径下显示为“(无总结)”
-- Windows 优先(其他平台依赖 GPUI 后端可用性)
+- 仅 Windows 本地运行;WSL/SSH/远程主机未支持(设置页明确标注)
+- 第三方插件不能注入任意 GPUI 界面;plugin-worker Runtime 已定义协议但未接入调度
+- AI 生成草案当前由 mock Planner 演示;真实 provider 的结构化规划待接入
+- Agent 命令/参数覆盖为会话级(未持久化);agent 修改后的打开文件在重新聚焦标签时重载
+- 编辑器多光标/分栏/软换行、终端鼠标选择未实现(终端 dock 支持任意嵌套分屏)
 
 ## 许可
 

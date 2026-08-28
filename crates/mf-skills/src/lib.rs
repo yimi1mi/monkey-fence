@@ -119,7 +119,9 @@ pub fn seed_builtin_skills(project_root: Option<&Path>) -> Result<()> {
         (
             "read-before-edit",
             "先读后写纪律",
-            &["修改", "编辑", "重构", "edit", "refactor", "modify", "patch"],
+            &[
+                "修改", "编辑", "重构", "edit", "refactor", "modify", "patch",
+            ],
             r#"# 先读后写
 
 修改任何文件之前,必须先用 fs_read 读过当前内容。
@@ -208,8 +210,16 @@ mod tests {
     fn write_skill(dir: &Path, id: &str, triggers: &[&str], tools: &[&str], body: &str) {
         let d = dir.join(id);
         std::fs::create_dir_all(&d).unwrap();
-        let tr = triggers.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", ");
-        let tl = tools.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", ");
+        let tr = triggers
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let tl = tools
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         std::fs::write(
             d.join("skill.toml"),
             format!("id = \"{id}\"\ntitle = \"t\"\ntriggers = [{tr}]\ntools_allow = [{tl}]\n"),
@@ -222,10 +232,21 @@ mod tests {
     fn load_and_match() {
         let tmp = tempfile::tempdir().unwrap();
         let skills_dir = tmp.path().join(".monkeyfence").join("skills");
-        write_skill(&skills_dir, "s1", &["refactor", "重构"], &[], "# 技能一\n内容");
+        write_skill(
+            &skills_dir,
+            "s1",
+            &["refactor", "重构"],
+            &[],
+            "# 技能一\n内容",
+        );
         write_skill(&skills_dir, "s2", &["测试"], &["fs_read"], "# 技能二\n内容");
         let skills = load_skills(Some(tmp.path()));
-        assert_eq!(skills.len(), 2, "loaded: {:?}", skills.iter().map(|s| &s.meta.id).collect::<Vec<_>>());
+        assert_eq!(
+            skills.len(),
+            2,
+            "loaded: {:?}",
+            skills.iter().map(|s| &s.meta.id).collect::<Vec<_>>()
+        );
 
         let hits = match_skills(&skills, "请重构这段代码");
         assert_eq!(hits.len(), 1);

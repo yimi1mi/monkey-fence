@@ -56,12 +56,12 @@ impl Git {
     pub fn branch(&self) -> Result<String> {
         let head = self.repo.head().context("读取 HEAD")?;
         if head.is_branch() {
-            Ok(head
-                .shorthand()
-                .unwrap_or("HEAD")
-                .to_string())
+            Ok(head.shorthand().unwrap_or("HEAD").to_string())
         } else {
-            Ok(head.target().map(|t| t.to_string()[..8.min(8)].to_string()).unwrap_or_default())
+            Ok(head
+                .target()
+                .map(|t| t.to_string()[..8.min(8)].to_string())
+                .unwrap_or_default())
         }
     }
 
@@ -73,15 +73,25 @@ impl Git {
         for e in statuses.iter() {
             let s = e.status();
             let path = e.path().map(PathBuf::from);
-            let (Some(path), kind) = (path, s) else { continue };
+            let (Some(path), kind) = (path, s) else {
+                continue;
+            };
             let entry_status = if s.is_index_new() {
-                GitStatus::Staged { kind: Box::new(GitStatus::New) }
+                GitStatus::Staged {
+                    kind: Box::new(GitStatus::New),
+                }
             } else if s.is_index_deleted() {
-                GitStatus::Staged { kind: Box::new(GitStatus::Deleted) }
+                GitStatus::Staged {
+                    kind: Box::new(GitStatus::Deleted),
+                }
             } else if s.is_index_renamed() {
-                GitStatus::Staged { kind: Box::new(GitStatus::Renamed) }
+                GitStatus::Staged {
+                    kind: Box::new(GitStatus::Renamed),
+                }
             } else if s.is_index_modified() {
-                GitStatus::Staged { kind: Box::new(GitStatus::Modified) }
+                GitStatus::Staged {
+                    kind: Box::new(GitStatus::Modified),
+                }
             } else if s.is_wt_new() {
                 GitStatus::New
             } else if s.is_wt_deleted() {
@@ -102,7 +112,9 @@ impl Git {
     pub fn stage(&self, paths: &[PathBuf]) -> Result<()> {
         let mut index = self.repo.index()?;
         for p in paths {
-            index.add_path(p).with_context(|| format!("暂存 {}", p.display()))?;
+            index
+                .add_path(p)
+                .with_context(|| format!("暂存 {}", p.display()))?;
         }
         index.write()?;
         Ok(())
@@ -147,9 +159,10 @@ impl Git {
     }
 
     pub fn commit(&self, message: &str) -> Result<String> {
-        let sig = self.repo.signature().or_else(|_| {
-            git2::Signature::now("MonkeyFence", "monkeyfence@local")
-        })?;
+        let sig = self
+            .repo
+            .signature()
+            .or_else(|_| git2::Signature::now("MonkeyFence", "monkeyfence@local"))?;
         let mut index = self.repo.index()?;
         let tree_id = index.write_tree()?;
         let tree = self.repo.find_tree(tree_id)?;
@@ -188,10 +201,9 @@ impl Git {
         diff_opts
             .pathspec(rel_path.to_string_lossy().into_owned())
             .context_lines(3);
-        let diff = self.repo.diff_tree_to_workdir_with_index(
-            head_tree.as_ref(),
-            Some(&mut diff_opts),
-        )?;
+        let diff = self
+            .repo
+            .diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut diff_opts))?;
         let mut text = String::new();
         diff.print(git2::DiffFormat::Patch, |_d, _h, line| {
             match line.origin() {
@@ -208,7 +220,10 @@ impl Git {
     }
 
     pub fn root(&self) -> PathBuf {
-        self.repo.workdir().unwrap_or_else(|| Path::new(".")).to_path_buf()
+        self.repo
+            .workdir()
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
     }
 
     // ---------- worktree 管理(卡片墙/驾驶舱用) ----------
@@ -239,7 +254,9 @@ impl Git {
         let head = self.repo.head()?.peel_to_commit()?;
         let branch_ref = format!("refs/heads/{}", name);
         let mut opts = git2::WorktreeAddOptions::new();
-        let reference = self.repo.reference(&branch_ref, head.id(), false, "mf worktree create")
+        let reference = self
+            .repo
+            .reference(&branch_ref, head.id(), false, "mf worktree create")
             .with_context(|| format!("创建分支失败: {}", branch_ref))?;
         opts.reference(Some(&reference));
         let wt = self.repo.worktree(name, &dir, Some(&opts))?;
@@ -261,7 +278,10 @@ impl Git {
         let mut prune = git2::WorktreePruneOptions::new();
         prune.valid(true).working_tree(true);
         wt.prune(Some(&mut prune)).context("prune worktree")?;
-        let _ = self.repo.find_reference(&format!("refs/heads/{}", name)).and_then(|mut r| r.delete());
+        let _ = self
+            .repo
+            .find_reference(&format!("refs/heads/{}", name))
+            .and_then(|mut r| r.delete());
         Ok(())
     }
 }
@@ -337,6 +357,9 @@ mod tests {
 
         git.worktree_remove("demo-wt").unwrap();
         let list = git.worktree_list().unwrap();
-        assert!(!list.iter().any(|(n, _)| n == "demo-wt"), "remove 后不应残留: {list:?}");
+        assert!(
+            !list.iter().any(|(n, _)| n == "demo-wt"),
+            "remove 后不应残留: {list:?}"
+        );
     }
 }

@@ -104,17 +104,19 @@ pub fn highlight(text: &str, lang: &LangConfig) -> Vec<Span> {
 
 /// 把字节区间片段切分为逐行片段,便于按行渲染
 /// line_starts: 每行行首字节偏移(升序)
-pub fn spans_by_line(spans: &[Span], line_starts: &[usize]) -> Vec<Vec<(usize, usize, HighlightTag)>> {
+pub fn spans_by_line(
+    spans: &[Span],
+    line_starts: &[usize],
+) -> Vec<Vec<(usize, usize, HighlightTag)>> {
     let mut out: Vec<Vec<(usize, usize, HighlightTag)>> = vec![Vec::new(); line_starts.len()];
     for s in spans {
         // 找到起始行
-        let mut row = line_starts.partition_point(|&ls| ls <= s.start).saturating_sub(1);
+        let mut row = line_starts
+            .partition_point(|&ls| ls <= s.start)
+            .saturating_sub(1);
         let mut pos = s.start;
         while pos < s.end && row < line_starts.len() {
-            let line_end = line_starts
-                .get(row + 1)
-                .copied()
-                .unwrap_or(usize::MAX);
+            let line_end = line_starts.get(row + 1).copied().unwrap_or(usize::MAX);
             let seg_end = s.end.min(line_end);
             if seg_end > pos {
                 out[row].push((pos - line_starts[row], seg_end - line_starts[row], s.tag));

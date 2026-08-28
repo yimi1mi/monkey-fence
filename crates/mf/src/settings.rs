@@ -2,7 +2,6 @@ use gpui::prelude::*;
 use gpui::*;
 use mf_agent::{Config, ProviderConfig, ProviderKind};
 
-
 pub struct Saved(pub Config);
 pub struct Dismissed;
 
@@ -15,11 +14,28 @@ pub enum Page {
     Providers,
     Roles,
     Engine,
+    Agents,
+    Plugins,
 }
 
 pub struct SettingsView {
     draft: Config,
     page: Page,
+    /// 应用上下文(插件注册表/检测);测试与无 GUI 场景可为 None
+    app: Option<std::sync::Arc<crate::app_ctx::AppCtx>>,
+    /// 智能体页:当前展开详情的 profile id
+    agent_expanded: Option<String>,
+    /// 智能体页:命令/参数覆盖缓冲
+    agent_cmd_s: String,
+    agent_args_s: String,
+    agent_perm_args_s: String,
+    agent_env_s: String,
+    /// 插件页:等待用户确认重新授权的插件 id(两步式,不做一键自动重授权)
+    pending_reauth: Option<String>,
+    /// 插件页:本地目录 / Git URL 安装输入
+    plugin_local_s: String,
+    plugin_git_s: String,
+    plugin_status: SharedString,
     /// Provider 管理页当前选中的提供方名
     selected_provider_name: String,
     test_status: SharedString,
@@ -32,6 +48,8 @@ pub struct SettingsView {
     font_size_s: String,
     status: SharedString,
     focus_handle: FocusHandle,
+    /// 所有轻量输入共用窗口焦点；该字段负责把键盘输入路由到实际点击的输入框。
+    active_field: Option<Field>,
 }
 
 actions!(settings, [Dismiss]);
@@ -50,6 +68,12 @@ enum Field {
     FontFamily,
     FontSize,
     TerminalCommand,
+    AgentCommand,
+    AgentArgs,
+    AgentPermArgs,
+    AgentEnv,
+    PluginLocal,
+    PluginGit,
 }
 
 impl SettingsView {
@@ -68,6 +92,16 @@ impl SettingsView {
         Self {
             draft,
             page: Page::Appearance,
+            app: None,
+            agent_expanded: None,
+            agent_cmd_s: String::new(),
+            agent_args_s: String::new(),
+            agent_perm_args_s: String::new(),
+            agent_env_s: String::new(),
+            pending_reauth: None,
+            plugin_local_s: String::new(),
+            plugin_git_s: String::new(),
+            plugin_status: "".into(),
             selected_provider_name,
             test_status: "".into(),
             selected_role: "planner".into(),
@@ -77,7 +111,17 @@ impl SettingsView {
             font_size_s,
             status: "".into(),
             focus_handle: cx.focus_handle(),
+            active_field: None,
         }
+    }
+
+    pub fn new_with_app(
+        app: std::sync::Arc<crate::app_ctx::AppCtx>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut view = Self::new(cx);
+        view.app = Some(app);
+        view
     }
 
     /// 选中角色的提供方配置(不存在时按需创建,便于新名字直接生效)
@@ -107,12 +151,16 @@ impl SettingsView {
             .get(self.selected_role.as_ref())
             .cloned()
             .unwrap_or_else(|| "mock".into());
-        self.draft.providers.get(&name).cloned().unwrap_or(ProviderConfig {
-            kind: ProviderKind::Mock,
-            base_url: String::new(),
-            api_key: String::new(),
-            model: String::new(),
-        })
+        self.draft
+            .providers
+            .get(&name)
+            .cloned()
+            .unwrap_or(ProviderConfig {
+                kind: ProviderKind::Mock,
+                base_url: String::new(),
+                api_key: String::new(),
+                model: String::new(),
+            })
     }
 
     fn field_text(&self, f: Field) -> String {
@@ -132,6 +180,12 @@ impl SettingsView {
             Field::FontFamily => self.draft.editor.font_family.clone(),
             Field::FontSize => self.font_size_s.clone(),
             Field::TerminalCommand => self.draft.terminal.command.clone().unwrap_or_default(),
+            Field::AgentCommand => self.agent_cmd_s.clone(),
+            Field::AgentArgs => self.agent_args_s.clone(),
+            Field::AgentPermArgs => self.agent_perm_args_s.clone(),
+            Field::AgentEnv => self.agent_env_s.clone(),
+            Field::PluginLocal => self.plugin_local_s.clone(),
+            Field::PluginGit => self.plugin_git_s.clone(),
         }
     }
 
@@ -148,6 +202,9 @@ impl SettingsView {
         match self.draft.save() {
             Ok(()) => {
                 self.status = "已保存".into();
+                if let Some(app) = &self.app {
+                    app.refresh_catalog();
+                }
                 cx.emit(Saved(self.draft.clone()));
             }
             Err(e) => self.status = format!("保存失败: {e}").into(),
@@ -162,6 +219,7 @@ impl SettingsView {
         self.max_failures_s = self.draft.engine.max_failures.to_string();
         self.font_size_s = format!("{:.1}", self.draft.editor.font_size);
         self.status = "已恢复默认(未保存)".into();
+        self.active_field = None;
         cx.notify();
     }
 
@@ -175,6 +233,7 @@ impl SettingsView {
 
     fn select_role(&mut self, role: &str, cx: &mut Context<Self>) {
         self.selected_role = role.into();
+        self.active_field = None;
         cx.notify();
     }
 
@@ -210,6 +269,7 @@ impl SettingsView {
     fn select_provider(&mut self, name: &str, cx: &mut Context<Self>) {
         self.selected_provider_name = name.to_string();
         self.test_status = "".into();
+        self.active_field = None;
         cx.notify();
     }
     fn new_provider(&mut self, cx: &mut Context<Self>) {
@@ -220,10 +280,16 @@ impl SettingsView {
         let name = format!("provider-{i}");
         self.draft.providers.insert(
             name.clone(),
-            ProviderConfig { kind: ProviderKind::Openai, base_url: String::new(), api_key: String::new(), model: String::new() },
+            ProviderConfig {
+                kind: ProviderKind::Openai,
+                base_url: String::new(),
+                api_key: String::new(),
+                model: String::new(),
+            },
         );
         self.selected_provider_name = name;
         self.test_status = "".into();
+        self.active_field = None;
         cx.notify();
     }
     fn delete_provider(&mut self, cx: &mut Context<Self>) {
@@ -242,6 +308,7 @@ impl SettingsView {
             .cloned()
             .unwrap_or_else(|| "mock".into());
         self.test_status = format!("已删除 {name}").into();
+        self.active_field = None;
         cx.notify();
     }
     fn test_conn(&mut self, cx: &mut Context<Self>) {
@@ -266,7 +333,12 @@ impl SettingsView {
     }
     fn apply_theme(&mut self, light: bool, cx: &mut Context<Self>) {
         crate::theme::set_theme(light);
-        self.status = if light { "已切换浅色主题(即时生效)" } else { "已切换深色主题(即时生效)" }.into();
+        self.status = if light {
+            "已切换浅色主题(即时生效)"
+        } else {
+            "已切换深色主题(即时生效)"
+        }
+        .into();
         cx.notify();
     }
 }
@@ -296,9 +368,37 @@ impl Render for SettingsView {
             .justify_center()
             .pt(px(60.))
             .track_focus(&self.focus_handle)
-            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
-                cx.emit(Dismissed);
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|_, _, _, cx| {
+                    cx.emit(Dismissed);
+                }),
+            )
+            .on_key_down(
+                cx.listener(|s: &mut SettingsView, e: &KeyDownEvent, window, cx| {
+                    // 所有轻量输入共用窗口焦点;active_field 决定字符去向(用户既有模式)
+                    let Some(field) = s.active_field else { return };
+                    if !s.focus_handle.is_focused(window) {
+                        return;
+                    }
+                    match e.keystroke.key.as_str() {
+                        "backspace" => s.pop_field(field, cx),
+                        "enter" | "escape" => {
+                            s.active_field = None;
+                        }
+                        _ => {
+                            if let Some(chars) = e.keystroke.key_char.clone() {
+                                let printable: String =
+                                    chars.chars().filter(|c| !c.is_control()).collect();
+                                if !printable.is_empty() {
+                                    s.push_field(field, &printable, cx);
+                                }
+                            }
+                        }
+                    }
+                    cx.notify();
+                }),
+            )
             .on_action(cx.listener(Self::act_dismiss))
             .child(self.render_card(window, cx))
     }
@@ -320,7 +420,7 @@ impl SettingsView {
 
         div()
             .id("settings-card")
-            .on_mouse_down(MouseButton::Left, |_, _, _| {})
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .w(px(760.))
             .max_h(px(640.))
             .flex()
@@ -370,18 +470,20 @@ impl SettingsView {
     /// 左侧两级导航:通用[外观/编辑器与终端] · Agent 与模型[Provider 管理/角色绑定] · 引擎
     fn render_nav(&self, cx: &Context<Self>) -> AnyElement {
         let general = [Page::Appearance, Page::EditorTerm];
-        let agent = [Page::Providers, Page::Roles];
+        let agent = [Page::Agents, Page::Providers, Page::Roles, Page::Plugins];
         let engine = [Page::Engine];
         let groups: Vec<(&str, &[Page])> = vec![
             ("通用", &general),
             ("Agent 与模型", &agent),
-            ("", &engine),
+            ("引擎", &engine),
         ];
         let page_name = |p: Page| match p {
             Page::Appearance => "外观",
             Page::EditorTerm => "编辑器与终端",
+            Page::Agents => "智能体",
             Page::Providers => "Provider 管理",
             Page::Roles => "角色绑定",
+            Page::Plugins => "插件",
             Page::Engine => "引擎",
         };
         let mut items: Vec<AnyElement> = Vec::new();
@@ -421,6 +523,7 @@ impl SettingsView {
                         .child(page_name(pg))
                         .on_click(cx.listener(move |s, _, _, cx| {
                             s.page = pg;
+                            s.active_field = None;
                             cx.notify();
                         }))
                         .into_any_element(),
@@ -449,10 +552,16 @@ impl SettingsView {
             Page::Providers => self.render_providers_page(window, cx),
             Page::Roles => self.render_roles_page(window, cx),
             Page::Engine => self.render_engine_section(window, cx),
+            Page::Agents => self.render_agents_page(window, cx),
+            Page::Plugins => self.render_plugins_page(window, cx),
         }
     }
 
-    fn render_appearance_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_appearance_section(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let light = crate::theme::is_light();
         div()
             .id("appearance-fields")
@@ -461,12 +570,23 @@ impl SettingsView {
             .gap_2()
             .child(section("外观"))
             .child(
-                div().flex().items_center().gap_2()
-                    .child(div().text_size(px(12.)).text_color(rgb(crate::theme::Theme::fg_dim())).child("主题"))
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .child("主题"),
+                    )
                     .child(theme_btn("深色", !light, false, cx))
                     .child(theme_btn("浅色", light, true, cx)),
             )
-            .child(field_row("字号(px)", self.text_input(Field::FontSize, window, cx)))
+            .child(field_row(
+                "字号(px)",
+                self.text_input(Field::FontSize, window, cx),
+            ))
             .into_any_element()
     }
 
@@ -479,9 +599,15 @@ impl SettingsView {
             .gap_3()
             .child(self.render_roles_section(cx))
             .child(
-                div().flex().flex_col().gap_2()
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
                     .child(section("绑定提供方(输入名字,新名字会自动创建)"))
-                    .child(field_row("提供方名称", self.text_input(Field::RoleProvider, window, cx))),
+                    .child(field_row(
+                        "提供方名称",
+                        self.text_input(Field::RoleProvider, window, cx),
+                    )),
             )
             .into_any_element()
     }
@@ -517,10 +643,20 @@ impl SettingsView {
                             s.select_provider(&nm, cx);
                         })
                     })
-                    .child(div().text_size(px(12.)).text_color(rgb(crate::theme::Theme::fg())).child(name.clone()))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(rgb(crate::theme::Theme::fg()))
+                            .child(name.clone()),
+                    )
                     .child(kind_badge(p.kind.kind_str()))
                     .child(div().flex_1())
-                    .child(div().text_size(px(10.5)).text_color(rgb(crate::theme::Theme::fg_faint())).child(p.model.clone()))
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(rgb(crate::theme::Theme::fg_faint()))
+                            .child(p.model.clone()),
+                    )
                     .into_any_element(),
             );
         }
@@ -531,22 +667,66 @@ impl SettingsView {
             .gap_3()
             .children(list_rows)
             .child(
-                div().flex().gap_2()
-                    .child(small_btn("＋ 新建", "prov-new", cx, cx.listener(|s, _, _, cx| { s.new_provider(cx); })))
-                    .child(small_btn("🗑 删除", "prov-del", cx, cx.listener(|s, _, _, cx| { s.delete_provider(cx); })))
-                    .child(small_btn("⚡ 测试连接", "prov-test", cx, cx.listener(|s, _, _, cx| { s.test_conn(cx); })))
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(small_btn(
+                        "＋ 新建",
+                        "prov-new",
+                        cx,
+                        cx.listener(|s, _, _, cx| {
+                            s.new_provider(cx);
+                        }),
+                    ))
+                    .child(small_btn(
+                        "🗑 删除",
+                        "prov-del",
+                        cx,
+                        cx.listener(|s, _, _, cx| {
+                            s.delete_provider(cx);
+                        }),
+                    ))
+                    .child(small_btn(
+                        "⚡ 测试连接",
+                        "prov-test",
+                        cx,
+                        cx.listener(|s, _, _, cx| {
+                            s.test_conn(cx);
+                        }),
+                    ))
                     .child(div().flex_1())
                     .when(!self.test_status.is_empty(), |d| {
-                        d.child(div().text_size(px(11.)).text_color(rgb(if self.test_status.starts_with('✓') { crate::theme::Theme::success() } else { crate::theme::Theme::danger() })).child(self.test_status.clone()))
+                        d.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(if self.test_status.starts_with('✓') {
+                                    crate::theme::Theme::success()
+                                } else {
+                                    crate::theme::Theme::danger()
+                                }))
+                                .child(self.test_status.clone()),
+                        )
                     }),
             )
             .child(
-                div().flex().flex_col().gap_2()
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
                     .child(section(format!("编辑 [{}]", sel)))
                     .child(field_row_kind("类型", self.cur_provider().kind, cx))
-                    .child(field_row("base_url", self.text_input(Field::BaseUrl, window, cx)))
-                    .child(field_row("api_key", self.text_input(Field::ApiKey, window, cx)))
-                    .child(field_row("model", self.text_input(Field::Model, window, cx))),
+                    .child(field_row(
+                        "base_url",
+                        self.text_input(Field::BaseUrl, window, cx),
+                    ))
+                    .child(field_row(
+                        "api_key",
+                        self.text_input(Field::ApiKey, window, cx),
+                    ))
+                    .child(field_row(
+                        "model",
+                        self.text_input(Field::Model, window, cx),
+                    )),
             )
             .into_any_element()
     }
@@ -588,7 +768,13 @@ impl SettingsView {
                     .into_any_element(),
             );
         }
-        div().id("role-rows").flex().flex_col().gap_1().children(rows).into_any_element()
+        div()
+            .id("role-rows")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(rows)
+            .into_any_element()
     }
 
     fn role_label(&self, role: &str, selected: bool) -> Div {
@@ -619,9 +805,18 @@ impl SettingsView {
             .flex_col()
             .gap_2()
             .child(section("引擎"))
-            .child(field_row("并行 worker 数", self.text_input(Field::Workers, window, cx)))
-            .child(field_row("工具循环轮数", self.text_input(Field::MaxIters, window, cx)))
-            .child(field_row("失败熔断次数", self.text_input(Field::MaxFailures, window, cx)))
+            .child(field_row(
+                "并行 worker 数",
+                self.text_input(Field::Workers, window, cx),
+            ))
+            .child(field_row(
+                "工具循环轮数",
+                self.text_input(Field::MaxIters, window, cx),
+            ))
+            .child(field_row(
+                "失败熔断次数",
+                self.text_input(Field::MaxFailures, window, cx),
+            ))
             .into_any_element()
     }
 
@@ -632,9 +827,18 @@ impl SettingsView {
             .flex_col()
             .gap_2()
             .child(section("编辑器"))
-            .child(field_row("字体", self.text_input(Field::FontFamily, window, cx)))
-            .child(field_row("字号(px)", self.text_input(Field::FontSize, window, cx)))
-            .child(field_row("终端命令(空=cmd;可填 codex 等 CLI)", self.text_input(Field::TerminalCommand, window, cx)))
+            .child(field_row(
+                "字体",
+                self.text_input(Field::FontFamily, window, cx),
+            ))
+            .child(field_row(
+                "字号(px)",
+                self.text_input(Field::FontSize, window, cx),
+            ))
+            .child(field_row(
+                "终端命令(空=cmd;可填 codex 等 CLI)",
+                self.text_input(Field::TerminalCommand, window, cx),
+            ))
             .into_any_element()
     }
 
@@ -665,10 +869,18 @@ impl SettingsView {
 
 impl SettingsView {
     /// 单行文本输入(点击聚焦后直接键入,与 VCS 提交描述一致的轻量输入)
-    fn text_input(&self, field: Field, window: &mut Window, cx: &Context<Self>) -> impl IntoElement {
+    fn text_input(
+        &self,
+        field: Field,
+        window: &mut Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let text = self.field_text(field);
+        let is_active = self.active_field == Some(field) && self.focus_handle.is_focused(window);
         div()
-            .id(ElementId::Name(format!("settings-input-{:?}", field).into()))
+            .id(ElementId::Name(
+                format!("settings-input-{:?}", field).into(),
+            ))
             .flex_1()
             .h(px(24.))
             .px_2()
@@ -676,22 +888,17 @@ impl SettingsView {
             .border_1()
             .border_color(rgb(crate::theme::Theme::border()))
             .bg(rgb(crate::theme::Theme::bg()))
-            .track_focus(&self.focus_handle)
-            .when(self.focus_handle.is_focused(window), |d| {
+            .when(is_active, |d| {
                 d.border_color(rgb(crate::theme::Theme::accent()))
             })
             .text_size(px(12.))
             .text_color(rgb(crate::theme::Theme::fg()))
             .overflow_hidden()
-            .on_key_down(cx.listener(move |s, e: &KeyDownEvent, _w, cx| {
-                if let Some(chars) = e.keystroke.key_char.clone() {
-                    let printable: String = chars.chars().filter(|c| !c.is_control()).collect();
-                    if !printable.is_empty() {
-                        s.push_field(field, &printable, cx);
-                    }
-                } else if e.keystroke.key == "backspace" {
-                    s.pop_field(field, cx);
-                }
+            .on_click(cx.listener(move |s, _, window, cx| {
+                s.active_field = Some(field);
+                let focus_handle = s.focus_handle.clone();
+                window.focus(&focus_handle, cx);
+                cx.notify();
             }))
             .child(if text.is_empty() {
                 SharedString::from("输入…")
@@ -722,13 +929,18 @@ impl SettingsView {
             Field::MaxFailures => self.max_failures_s.push_str(text),
             Field::FontFamily => self.draft.editor.font_family.push_str(text),
             Field::FontSize => self.font_size_s.push_str(text),
-            Field::TerminalCommand => {
-                self.draft
-                    .terminal
-                    .command
-                    .get_or_insert_with(String::new)
-                    .push_str(text)
-            }
+            Field::TerminalCommand => self
+                .draft
+                .terminal
+                .command
+                .get_or_insert_with(String::new)
+                .push_str(text),
+            Field::AgentCommand => self.agent_cmd_s.push_str(text),
+            Field::AgentArgs => self.agent_args_s.push_str(text),
+            Field::AgentPermArgs => self.agent_perm_args_s.push_str(text),
+            Field::AgentEnv => self.agent_env_s.push_str(text),
+            Field::PluginLocal => self.plugin_local_s.push_str(text),
+            Field::PluginGit => self.plugin_git_s.push_str(text),
         }
         cx.notify();
     }
@@ -769,7 +981,25 @@ impl SettingsView {
                     c.pop();
                 }
             }
-        };
+            Field::AgentCommand => {
+                self.agent_cmd_s.pop();
+            }
+            Field::AgentArgs => {
+                self.agent_args_s.pop();
+            }
+            Field::AgentPermArgs => {
+                self.agent_perm_args_s.pop();
+            }
+            Field::AgentEnv => {
+                self.agent_env_s.pop();
+            }
+            Field::PluginLocal => {
+                self.plugin_local_s.pop();
+            }
+            Field::PluginGit => {
+                self.plugin_git_s.pop();
+            }
+        }
         cx.notify();
     }
 }
@@ -787,7 +1017,13 @@ fn field_row(label: &str, input: impl IntoElement) -> Div {
         .flex()
         .items_center()
         .gap_2()
-        .child(div().w(px(110.)).text_size(px(12.)).text_color(rgb(crate::theme::Theme::fg_dim())).child(label.to_string()))
+        .child(
+            div()
+                .w(px(110.))
+                .text_size(px(12.))
+                .text_color(rgb(crate::theme::Theme::fg_dim()))
+                .child(label.to_string()),
+        )
         .child(input)
 }
 
@@ -796,10 +1032,31 @@ fn field_row_kind(label: &str, current: ProviderKind, cx: &Context<SettingsView>
         .flex()
         .items_center()
         .gap_2()
-        .child(div().w(px(110.)).text_size(px(12.)).text_color(rgb(crate::theme::Theme::fg_dim())).child(label.to_string()))
-        .child(kind_btn("mock", current == ProviderKind::Mock, ProviderKind::Mock, cx))
-        .child(kind_btn("openai", current == ProviderKind::Openai, ProviderKind::Openai, cx))
-        .child(kind_btn("anthropic", current == ProviderKind::Anthropic, ProviderKind::Anthropic, cx))
+        .child(
+            div()
+                .w(px(110.))
+                .text_size(px(12.))
+                .text_color(rgb(crate::theme::Theme::fg_dim()))
+                .child(label.to_string()),
+        )
+        .child(kind_btn(
+            "mock",
+            current == ProviderKind::Mock,
+            ProviderKind::Mock,
+            cx,
+        ))
+        .child(kind_btn(
+            "openai",
+            current == ProviderKind::Openai,
+            ProviderKind::Openai,
+            cx,
+        ))
+        .child(kind_btn(
+            "anthropic",
+            current == ProviderKind::Anthropic,
+            ProviderKind::Anthropic,
+            cx,
+        ))
 }
 
 fn kind_btn(
@@ -834,7 +1091,10 @@ fn kind_btn(
         }))
 }
 
-fn primary_btn(label: &str, listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> impl IntoElement {
+fn primary_btn(
+    label: &str,
+    listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     div()
         .id(ElementId::Name(format!("settings-btn-{}", label).into()))
         .px_3()
@@ -850,7 +1110,10 @@ fn primary_btn(label: &str, listener: impl Fn(&ClickEvent, &mut Window, &mut App
         .on_click(move |e, w, cx| listener(e, w, cx))
 }
 
-fn secondary_btn(label: &str, listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> impl IntoElement {
+fn secondary_btn(
+    label: &str,
+    listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     div()
         .id(ElementId::Name(format!("settings-btn-{}", label).into()))
         .px_3()
@@ -871,7 +1134,12 @@ fn kind_badge(kind: &str) -> SharedString {
     format!("[{}]", kind).into()
 }
 
-fn small_btn(label: &str, id: &str, _cx: &Context<SettingsView>, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> impl IntoElement {
+fn small_btn(
+    label: &str,
+    id: &str,
+    _cx: &Context<SettingsView>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     let _ = _cx;
     div()
         .id(ElementId::Name(id.into()))
@@ -888,7 +1156,12 @@ fn small_btn(label: &str, id: &str, _cx: &Context<SettingsView>, on_click: impl 
         .on_click(move |e, w, cx| on_click(e, w, cx))
 }
 
-fn theme_btn(label: &str, active: bool, light: bool, cx: &Context<SettingsView>) -> impl IntoElement {
+fn theme_btn(
+    label: &str,
+    active: bool,
+    light: bool,
+    cx: &Context<SettingsView>,
+) -> impl IntoElement {
     let label = label.to_string();
     div()
         .id(ElementId::Name(format!("theme-{}", label).into()))
@@ -898,11 +1171,831 @@ fn theme_btn(label: &str, active: bool, light: bool, cx: &Context<SettingsView>)
         .border_1()
         .cursor_pointer()
         .text_size(px(11.))
-        .border_color(rgb(if active { crate::theme::Theme::accent() } else { crate::theme::Theme::border() }))
-        .text_color(rgb(if active { crate::theme::Theme::accent() } else { crate::theme::Theme::fg_dim() }))
+        .border_color(rgb(if active {
+            crate::theme::Theme::accent()
+        } else {
+            crate::theme::Theme::border()
+        }))
+        .text_color(rgb(if active {
+            crate::theme::Theme::accent()
+        } else {
+            crate::theme::Theme::fg_dim()
+        }))
         .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
         .child(label)
         .on_click(cx.listener(move |s, _, _, cx| {
             s.apply_theme(light, cx);
         }))
+}
+
+// ---------- 智能体设置页 / 插件管理页 ----------
+
+impl SettingsView {
+    fn render_agents_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(app) = self.app.clone() else {
+            return div()
+                .p_3()
+                .text_size(px(12.))
+                .child("此页面需要应用上下文")
+                .into_any_element();
+        };
+        let profiles = app.plugins.agent_profiles();
+        let summaries = app.plugins.summaries();
+        let default_agent = self.draft.agents.default_agent.clone();
+
+        let mut col = div().flex().flex_col().gap_2().child(section("默认智能体"));
+        // 默认:Auto / 空白终端 / 已启用且检测到的 Agent
+        for (id, label) in [("", "Auto(按 Step 指派)"), ("blank-terminal", "空白终端")] {
+            let selected = default_agent == id;
+            col = col.child(toggle_row(cx, format!("default-{id}"), label, selected, {
+                let id = id.to_string();
+                move |s: &mut SettingsView, _, _, cx| {
+                    s.draft.agents.default_agent = id.clone();
+                    cx.notify();
+                }
+            }));
+        }
+        for p in profiles.iter().filter(|p| p.id != "blank-terminal") {
+            let detected = mf_plugins::builtin::detect_on_path(&p.command).is_some()
+                || p.runtime != mf_agent::RuntimeKind::Pty;
+            if !detected {
+                continue;
+            }
+            let selected = default_agent == p.id;
+            let id = p.id.clone();
+            col = col.child(toggle_row(
+                cx,
+                format!("default-{id}"),
+                &format!("{}({id})", p.display_name),
+                selected,
+                move |s: &mut SettingsView, _, _, cx| {
+                    s.draft.agents.default_agent = id.clone();
+                    cx.notify();
+                },
+            ));
+        }
+
+        // Runtime 行 + 全局开关
+        col = col
+            .child(section("Runtime"))
+            .child(field_row("平台", label_value("Windows · 可用")))
+            .child(field_row("WSL", label_value("未支持(首版仅本地 Windows)")))
+            .child(section("行为"))
+            .child(toggle_row(cx, "hooks-master", "状态钩子总开关(写入本地 Agent 配置)", self.draft.agents.hooks_enabled, |s: &mut SettingsView, _, _, cx| {
+                s.draft.agents.hooks_enabled.toggle();
+                cx.notify();
+            }))
+            .child(toggle_row(cx, "auto-title", "自动生成标签(会话)标题", self.draft.agents.auto_title, |s: &mut SettingsView, _, _, cx| {
+                s.draft.agents.auto_title.toggle();
+                cx.notify();
+            }))
+            .child(toggle_row(cx, "keep-awake", "Agent 工作时保持唤醒", self.draft.agents.keep_awake, |s: &mut SettingsView, _, _, cx| {
+                s.draft.agents.keep_awake.toggle();
+                cx.notify();
+            }))
+            .child(section("权限模式"))
+            .child(toggle_row(cx, "perm-yolo", "Yolo(自动附加 permission args,自动批准)", self.draft.agents.permission_mode != "manual", |s: &mut SettingsView, _, _, cx| {
+                s.draft.agents.permission_mode = "yolo".into();
+                cx.notify();
+            }))
+            .child(toggle_row(cx, "perm-manual", "Manual(不附加,在终端里手动批准)", self.draft.agents.permission_mode == "manual", |s: &mut SettingsView, _, _, cx| {
+                s.draft.agents.permission_mode = "manual".into();
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(rgb(crate::theme::Theme::warning()))
+                    .child("⚠ 权限模式只约束 MonkeyFence 传给 Agent 的参数;worker 进程与 CLI 仍以当前 Windows 用户权限运行。"),
+            );
+
+        // 已安装/已检测列表 + 可安装列表
+        col = col.child(section("已安装 / 已检测"));
+        for p in &profiles {
+            let detected = mf_plugins::builtin::detect_on_path(&p.command).is_some()
+                || p.runtime != mf_agent::RuntimeKind::Pty;
+            let plugin = summaries.iter().find(|s| s.agents.contains(&p.id));
+            let expanded = self.agent_expanded.as_deref() == Some(p.id.as_str());
+            let pid = p.id.clone();
+            let pid2 = p.id.clone();
+            let pid3 = p.id.clone();
+            let homepage = p.homepage.clone().unwrap_or_default();
+            let has_hook = p.hook.is_some();
+            let hook_cfg = p.hook.clone();
+            col = col.child(
+                div()
+                    .id(ElementId::Name(format!("agent-row-{pid}").into()))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(if detected {
+                        crate::theme::Theme::border()
+                    } else {
+                        crate::theme::Theme::danger()
+                    }))
+                    .px_2()
+                    .py_1p5()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .child(p.icon.clone().unwrap_or_default()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(p.display_name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(rgb(if detected {
+                                        crate::theme::Theme::success()
+                                    } else {
+                                        crate::theme::Theme::fg_faint()
+                                    }))
+                                    .child(if detected {
+                                        if p.runtime == mf_agent::RuntimeKind::Pty {
+                                            "● 已检测(在 PATH)".to_string()
+                                        } else {
+                                            "● API".to_string()
+                                        }
+                                    } else {
+                                        "○ 未检测到(PATH)".to_string()
+                                    }),
+                            )
+                            .child(div().flex_1())
+                            .when(!homepage.is_empty(), |d| {
+                                d.child(link_btn(
+                                    cx,
+                                    format!("agent-home-{pid}"),
+                                    "官方主页",
+                                    homepage.clone(),
+                                ))
+                            })
+                            .child(mini_btn(
+                                cx,
+                                format!("agent-default-{pid}"),
+                                "设为默认",
+                                crate::theme::Theme::accent(),
+                                move |s: &mut SettingsView, _, _, cx| {
+                                    s.draft.agents.default_agent = pid2.clone();
+                                    cx.notify();
+                                },
+                            ))
+                            .child(mini_btn(
+                                cx,
+                                format!("agent-expand-{pid}"),
+                                if expanded { "收起" } else { "详情" },
+                                0x8a8a8a,
+                                move |s: &mut SettingsView, _, _, cx| {
+                                    let pid = pid3.clone();
+                                    if s.agent_expanded.as_deref() == Some(pid.as_str()) {
+                                        s.agent_expanded = None;
+                                    } else {
+                                        s.agent_expanded = Some(pid.clone());
+                                        // 载入当前覆盖缓冲
+                                        if let Some(app) = &s.app {
+                                            if let Some(spec) = app
+                                                .plugins
+                                                .agent_profiles()
+                                                .into_iter()
+                                                .find(|x| x.id == pid)
+                                            {
+                                                s.agent_cmd_s = spec.command.clone();
+                                                s.agent_args_s = spec.args.join(" ");
+                                                s.agent_perm_args_s =
+                                                    spec.permission_args.join(" ");
+                                                s.agent_env_s = spec
+                                                    .env
+                                                    .iter()
+                                                    .map(|(k, v)| format!("{k}={v}"))
+                                                    .collect::<Vec<_>>()
+                                                    .join(";");
+                                            }
+                                        }
+                                    }
+                                    cx.notify();
+                                },
+                            )),
+                    )
+                    .when(expanded, |d| {
+                        d.child(
+                            div()
+                                .id(ElementId::Name(format!("agent-detail-{pid}").into()))
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(field_row(
+                                    "Command",
+                                    self.text_input(Field::AgentCommand, window, cx),
+                                ))
+                                .child(field_row(
+                                    "Arguments",
+                                    self.text_input(Field::AgentArgs, window, cx),
+                                ))
+                                .child(field_row(
+                                    "Environment(KEY=V;…)",
+                                    self.text_input(Field::AgentEnv, window, cx),
+                                ))
+                                .child(field_row(
+                                    "Permission arguments",
+                                    self.text_input(Field::AgentPermArgs, window, cx),
+                                ))
+                                .child(field_row(
+                                    "Hook 安装状态",
+                                    label_value(if has_hook {
+                                        if self.draft.agents.hooks_enabled {
+                                            "可安装(总开关开启;命名空间内写入,备份可恢复)"
+                                        } else {
+                                            "总开关已关闭"
+                                        }
+                                    } else {
+                                        "此 Agent 无钩子配置"
+                                    }),
+                                ))
+                                .child(field_row(
+                                    "插件来源",
+                                    label_value(&format!(
+                                        "{} v{}",
+                                        plugin.map(|s| s.source_kind.as_str()).unwrap_or("builtin"),
+                                        plugin.map(|s| s.version.as_str()).unwrap_or("?")
+                                    )),
+                                ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_1()
+                                        .child({
+                                            let pid_apply = pid.clone();
+                                            mini_btn(
+                                                cx,
+                                                format!("agent-apply-{pid}"),
+                                                "应用覆盖",
+                                                crate::theme::Theme::accent(),
+                                                move |s: &mut SettingsView, _, _, cx| {
+                                                    let pid = pid_apply.clone();
+                                                    let cmd = s.agent_cmd_s.trim().to_string();
+                                                    let args = s
+                                                        .agent_args_s
+                                                        .split_whitespace()
+                                                        .map(str::to_string)
+                                                        .collect();
+                                                    let perm = s
+                                                        .agent_perm_args_s
+                                                        .split_whitespace()
+                                                        .map(str::to_string)
+                                                        .collect();
+                                                    let env = s
+                                                        .agent_env_s
+                                                        .split(';')
+                                                        .filter_map(|kv| {
+                                                            kv.split_once('=').map(|(k, v)| {
+                                                                (
+                                                                    k.trim().to_string(),
+                                                                    v.trim().to_string(),
+                                                                )
+                                                            })
+                                                        })
+                                                        .collect();
+                                                    if let Some(app) = &s.app {
+                                                        if let Some(mut spec) = app
+                                                            .plugins
+                                                            .agent_profiles()
+                                                            .into_iter()
+                                                            .find(|x| x.id == pid)
+                                                        {
+                                                            spec.command = cmd;
+                                                            spec.args = args;
+                                                            spec.permission_args = perm;
+                                                            spec.env = env;
+                                                            app.plugins.set_agent_override(spec);
+                                                            app.refresh_catalog();
+                                                            s.status = "已应用(会话内生效)".into();
+                                                        }
+                                                    }
+                                                    cx.notify();
+                                                },
+                                            )
+                                        })
+                                        .when_some(hook_cfg.clone(), |d, hook| {
+                                            let hk = hook.clone();
+                                            let hk2 = hook.clone();
+                                            d.child(mini_btn(
+                                                cx,
+                                                format!("hook-install-{pid}"),
+                                                "安装状态钩子",
+                                                crate::theme::Theme::warning(),
+                                                move |s: &mut SettingsView, _, _, cx| {
+                                                    if !s.draft.agents.hooks_enabled {
+                                                        s.status = "请先开启状态钩子总开关".into();
+                                                        cx.notify();
+                                                        return;
+                                                    }
+                                                    match mf_plugins::hooks::install_hook(
+                                                        &hk.config_path,
+                                                        &hk.namespace,
+                                                        &hk.command_template,
+                                                    ) {
+                                                        Ok(backup) => {
+                                                            s.status = format!(
+                                                                "钩子已写入(备份: {})",
+                                                                backup.display()
+                                                            )
+                                                            .into();
+                                                        }
+                                                        Err(e) => {
+                                                            s.status = format!("{e:#}").into()
+                                                        }
+                                                    }
+                                                    cx.notify();
+                                                },
+                                            ))
+                                            .child(
+                                                mini_btn(
+                                                    cx,
+                                                    format!("hook-remove-{pid}"),
+                                                    "移除钩子",
+                                                    0x8a8a8a,
+                                                    move |s: &mut SettingsView, _, _, cx| {
+                                                        match mf_plugins::hooks::remove_hook(
+                                                            &hk2.config_path,
+                                                            &hk2.namespace,
+                                                        ) {
+                                                            Ok(()) => {
+                                                                s.status =
+                                                                    "钩子已移除(用户配置保留)"
+                                                                        .into()
+                                                            }
+                                                            Err(e) => {
+                                                                s.status = format!("{e:#}").into()
+                                                            }
+                                                        }
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            )
+                                        }),
+                                ),
+                        )
+                    }),
+            );
+        }
+
+        // 可安装(未检测到的 CLI)
+        let installable: Vec<_> = profiles
+            .iter()
+            .filter(|p| {
+                p.runtime == mf_agent::RuntimeKind::Pty
+                    && p.id != "blank-terminal"
+                    && mf_plugins::builtin::detect_on_path(&p.command).is_none()
+            })
+            .collect();
+        if !installable.is_empty() {
+            col = col.child(section("可安装 Agent 插件(仅检测 PATH,不自动安装)"));
+            for p in installable {
+                let homepage = p.homepage.clone().unwrap_or_default();
+                col = col.child(
+                    div()
+                        .id(ElementId::Name(format!("installable-{}", p.id).into()))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .py_1()
+                        .child(div().text_size(px(11.5)).child(p.display_name.clone()))
+                        .child(
+                            div()
+                                .text_size(px(9.5))
+                                .text_color(rgb(crate::theme::Theme::fg_faint()))
+                                .child(format!("`{}`", p.command)),
+                        )
+                        .child(div().flex_1())
+                        .when(!homepage.is_empty(), |d| {
+                            d.child(link_btn(
+                                cx,
+                                format!("install-open-{}", p.id),
+                                "打开官方安装页",
+                                homepage,
+                            ))
+                        }),
+                );
+            }
+        }
+        col = col.child(div().id("agents-refresh").child(mini_btn(
+            cx,
+            "agents-refresh",
+            "刷新检测",
+            crate::theme::Theme::accent(),
+            move |s: &mut SettingsView, _, _, cx| {
+                if let Some(app) = &s.app {
+                    app.refresh_catalog();
+                    s.status = "已刷新检测".into();
+                }
+                cx.notify();
+            },
+        )));
+        col.into_any_element()
+    }
+
+    fn render_plugins_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(app) = self.app.clone() else {
+            return div()
+                .p_3()
+                .text_size(px(12.))
+                .child("此页面需要应用上下文")
+                .into_any_element();
+        };
+        let summaries = app.plugins.summaries();
+        let mut col = div().flex().flex_col().gap_2().child(section("已安装插件"));
+        if summaries.is_empty() {
+            col = col.child(label_value("暂无插件"));
+        }
+        for s in &summaries {
+            let full_id = s.full_id.clone();
+            let enabled = s.enabled;
+            let is_builtin = s.builtin;
+            col = col.child(
+                div()
+                    .id(ElementId::Name(format!("plugin-{full_id}").into()))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(if enabled {
+                        crate::theme::Theme::border()
+                    } else {
+                        crate::theme::Theme::danger()
+                    }))
+                    .px_2()
+                    .py_1p5()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(s.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(rgb(crate::theme::Theme::fg_faint()))
+                                    .child(format!(
+                                        "v{} · {} · {}",
+                                        s.version, s.source_kind, full_id
+                                    )),
+                            )
+                            .when(s.has_worker, |d| {
+                                d.child(
+                                    div()
+                                        .text_size(px(9.))
+                                        .px_1()
+                                        .rounded_sm()
+                                        .bg(rgb(crate::theme::Theme::bg_active()))
+                                        .child("worker"),
+                                )
+                            })
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(rgb(if enabled {
+                                        crate::theme::Theme::success()
+                                    } else {
+                                        crate::theme::Theme::fg_faint()
+                                    }))
+                                    .child(if enabled { "已启用" } else { "已禁用" }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .child(if s.description.is_empty() {
+                                "—".to_string()
+                            } else {
+                                s.description.clone()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(rgb(crate::theme::Theme::fg_faint()))
+                            .child(format!(
+                                "权限: fs_read={} fs_write={} net={} spawn={} hooks={} · 授权:{}",
+                                s.capabilities.fs_read,
+                                s.capabilities.fs_write,
+                                s.capabilities.net,
+                                s.capabilities.spawn,
+                                s.capabilities.hooks,
+                                s.authorized_at.as_deref().map(|_| "是").unwrap_or("否"),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child({
+                                let fid_enable = full_id.clone();
+                                mini_btn(
+                                    cx,
+                                    format!("plugin-enable-{full_id}"),
+                                    "启用/授权",
+                                    crate::theme::Theme::success(),
+                                    move |s2: &mut SettingsView, _, _, cx| {
+                                        let app = s2.app.clone();
+                                        if let Some(app) = app {
+                                            // 只做常规启用;需要重新授权时置为待确认,
+                                            // 绝不在同一次点击里自动重授权
+                                            match app.plugins.enable(&fid_enable, false) {
+                                                Ok(()) => {
+                                                    s2.pending_reauth = None;
+                                                    s2.plugin_status = "已启用".into();
+                                                }
+                                                Err(e) => {
+                                                    if format!("{e}").contains("重新授权") {
+                                                        s2.pending_reauth = Some(fid_enable.clone());
+                                                        s2.plugin_status = format!(
+                                                            "权限/内容发生变化({e});请核对权限与 worker/钩子声明后点击「确认重新授权」"
+                                                        )
+                                                        .into();
+                                                    } else {
+                                                        s2.plugin_status = format!("{e}").into();
+                                                    }
+                                                }
+                                            }
+                                            app.refresh_catalog();
+                                        }
+                                        cx.notify();
+                                    },
+                                )
+                            })
+                            .child({
+                                let fid_disable = full_id.clone();
+                                mini_btn(
+                                    cx,
+                                    format!("plugin-disable-{full_id}"),
+                                    "禁用",
+                                    0x8a8a8a,
+                                    move |s2: &mut SettingsView, _, _, cx| {
+                                        let app = s2.app.clone();
+                                        if let Some(app) = app {
+                                            s2.plugin_status =
+                                                match app.plugins.disable(&fid_disable) {
+                                                    Ok(()) => "已禁用".into(),
+                                                    Err(e) => format!("{e}").into(),
+                                                };
+                                            app.refresh_catalog();
+                                        }
+                                        cx.notify();
+                                    },
+                                )
+                            })
+                            .when(!is_builtin, |d| {
+                                let fid = full_id.clone();
+                                d.child(mini_btn(
+                                    cx,
+                                    format!("plugin-uninstall-{full_id}"),
+                                    "删除",
+                                    crate::theme::Theme::danger(),
+                                    move |s2: &mut SettingsView, _, _, cx| {
+                                        s2.plugin_status =
+                                            match mf_plugins::install::uninstall(&fid) {
+                                                Ok(()) => "已删除(重载后生效)".into(),
+                                                Err(e) => format!("{e:#}").into(),
+                                            };
+                                        cx.notify();
+                                    },
+                                ))
+                            })
+                            .when(
+                                self.pending_reauth
+                                    .as_deref()
+                                    .is_some_and(|id| id == full_id.as_str()),
+                                |d| {
+                                    let fid_reauth = full_id.clone();
+                                    d.child(
+                                        div()
+                                            .id("plugin-reauth-row")
+                                            .mt_1()
+                                            .p_1p5()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(rgb(crate::theme::Theme::warning()))
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div()
+                                                    .flex_1()
+                                                    .text_size(px(10.))
+                                                    .text_color(rgb(crate::theme::Theme::warning()))
+                                                    .child("重新授权将接受该插件当前的能力声明、worker 命令与钩子配置。"),
+                                            )
+                                            .child(mini_btn(
+                                                cx,
+                                                format!("plugin-reauth-{full_id}"),
+                                                "确认重新授权",
+                                                crate::theme::Theme::danger(),
+                                                move |s2: &mut SettingsView, _, _, cx| {
+                                                    let app = s2.app.clone();
+                                                    if let Some(app) = app {
+                                                        let fid = fid_reauth.clone();
+                                                        s2.plugin_status =
+                                                            match app.plugins.enable(&fid, true) {
+                                                                Ok(()) => "已重新授权并启用".into(),
+                                                                Err(e) => format!("{e}").into(),
+                                                            };
+                                                        s2.pending_reauth = None;
+                                                        app.refresh_catalog();
+                                                    }
+                                                    cx.notify();
+                                                },
+                                            )),
+                                    )
+                                },
+                            ),
+                    ),
+            );
+        }
+
+        // 安装来源:本地目录 / Git URL
+        col = col
+            .child(section("安装插件"))
+            .child(field_row("本地目录", self.text_input(Field::PluginLocal, window, cx)))
+            .child(
+                div()
+                    .id("plugin-install-local")
+                    .child(mini_btn(cx, "plugin-install-local", "从本地目录安装(复制→校验→哈希→原子发布)", crate::theme::Theme::accent(), move |s: &mut SettingsView, _, _, cx| {
+                        let path = s.plugin_local_s.trim().to_string();
+                        if path.is_empty() {
+                            s.plugin_status = "请输入插件目录路径".into();
+                            cx.notify();
+                            return;
+                        }
+                        let source = mf_plugins::install::InstallSource::Local { path: path.clone() };
+                        s.plugin_status = match mf_plugins::install::install_from_dir(std::path::Path::new(&path), source) {
+                            Ok(e) => format!("已安装 {}(默认禁用,需审查权限后启用)", e.full_id).into(),
+                            Err(e) => format!("{e:#}").into(),
+                        };
+                        if let Some(app) = &s.app {
+                            app.refresh_catalog();
+                        }
+                        cx.notify();
+                    })),
+            )
+            .child(field_row("Git URL", self.text_input(Field::PluginGit, window, cx)))
+            .child(
+                div()
+                    .id("plugin-install-git")
+                    .child(mini_btn(cx, "plugin-install-git", "从 Git URL 安装(git clone → 校验)", crate::theme::Theme::accent(), move |s: &mut SettingsView, _, _, cx| {
+                        let url = s.plugin_git_s.trim().to_string();
+                        if url.is_empty() {
+                            s.plugin_status = "请输入 Git URL".into();
+                            cx.notify();
+                            return;
+                        }
+                        s.plugin_status = match mf_plugins::install::install_from_git(&url) {
+                            Ok(e) => format!("已安装 {}(默认禁用)", e.full_id).into(),
+                            Err(e) => format!("{e:#}").into(),
+                        };
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(rgb(crate::theme::Theme::warning()))
+                    .child("⚠ 插件权限只约束其与 MonkeyFence 宿主接口的交互;worker 进程与 CLI 仍以当前 Windows 用户权限运行。"),
+            )
+            .child(
+                div()
+                    .id("plugin-status-line")
+                    .text_size(px(10.5))
+                    .text_color(rgb(crate::theme::Theme::fg_dim()))
+                    .child(self.plugin_status.clone()),
+            );
+        col.into_any_element()
+    }
+}
+
+trait Toggle {
+    fn toggle(&mut self);
+}
+impl Toggle for bool {
+    fn toggle(&mut self) {
+        *self = !*self;
+    }
+}
+
+fn label_value(text: &str) -> impl IntoElement {
+    div()
+        .text_size(px(11.5))
+        .text_color(rgb(crate::theme::Theme::fg()))
+        .child(text.to_string())
+}
+
+fn toggle_row(
+    cx: &Context<SettingsView>,
+    id: impl Into<gpui::ElementId>,
+    label: &str,
+    on: bool,
+    handler: impl Fn(&mut SettingsView, &gpui::ClickEvent, &mut Window, &mut Context<SettingsView>)
+        + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_2()
+        .py_0p5()
+        .cursor_pointer()
+        .child(
+            div()
+                .w(px(30.))
+                .h(px(16.))
+                .rounded_full()
+                .bg(rgb(if on {
+                    crate::theme::Theme::accent()
+                } else {
+                    crate::theme::Theme::bg_active()
+                }))
+                .relative()
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(2.))
+                        .left(px(if on { 16. } else { 2. }))
+                        .size(px(12.))
+                        .rounded_full()
+                        .bg(rgb(crate::theme::Theme::bg_elevated())),
+                ),
+        )
+        .child(div().text_size(px(11.5)).child(label.to_string()))
+        .on_click(cx.listener(handler))
+}
+
+fn mini_btn(
+    cx: &Context<SettingsView>,
+    id: impl Into<gpui::ElementId>,
+    label: &str,
+    color: u32,
+    handler: impl Fn(&mut SettingsView, &gpui::ClickEvent, &mut Window, &mut Context<SettingsView>)
+        + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .px_2()
+        .h(px(18.))
+        .flex()
+        .items_center()
+        .rounded_md()
+        .border_1()
+        .border_color(rgb(color))
+        .text_size(px(9.5))
+        .text_color(rgb(color))
+        .cursor_pointer()
+        .hover(move |d| d.bg(rgb(color)).text_color(rgb(crate::theme::Theme::bg())))
+        .child(label.to_string())
+        .on_click(cx.listener(handler))
+}
+
+fn link_btn(
+    _cx: &Context<SettingsView>,
+    id: impl Into<gpui::ElementId>,
+    label: &str,
+    url: String,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .px_2()
+        .h(px(18.))
+        .flex()
+        .items_center()
+        .rounded_md()
+        .text_size(px(9.5))
+        .text_color(rgb(crate::theme::Theme::accent()))
+        .cursor_pointer()
+        .hover(|d| d.underline())
+        .child(label.to_string())
+        .on_click(move |_, _, _| {
+            let _ = std::process::Command::new(if cfg!(windows) {
+                "explorer"
+            } else {
+                "xdg-open"
+            })
+            .arg(&url)
+            .spawn();
+        })
 }

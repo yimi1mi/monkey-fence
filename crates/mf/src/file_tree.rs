@@ -1,5 +1,5 @@
-use gpui::*;
 use gpui::prelude::*;
+use gpui::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -75,9 +75,7 @@ impl FileTree {
     }
 
     pub fn refresh_dir(&mut self, dir: &Path) {
-        self.children
-            .borrow_mut()
-            .remove(dir);
+        self.children.borrow_mut().remove(dir);
         self.rebuild();
     }
 
@@ -157,86 +155,73 @@ impl Render for FileTree {
             .map(|r| (r.entry.clone(), r.depth))
             .collect();
         let selected = self.selected.clone();
-        div()
-            .id("file-tree")
-            .size_full()
-            .flex()
-            .flex_col()
-            .child(
-                uniform_list(
-                    "file-tree-list",
-                    rows.len(),
-                    cx.processor(move |this, range, _window, cx| {
-                        let mut out = Vec::new();
-                        for ix in range {
-                            let Some((entry, depth)) = rows
-                                .get(ix)
-                                .map(|(e, d): &(TreeEntry, usize)| (e.clone(), *d))
-                            else {
-                                continue;
-                            };
-                            let is_selected = selected
-                                .as_ref()
-                                .map(|s| *s == entry.path)
-                                .unwrap_or(false);
-                            let name_color = if entry.is_dir {
-                                crate::theme::Theme::fg()
+        div().id("file-tree").size_full().flex().flex_col().child(
+            uniform_list(
+                "file-tree-list",
+                rows.len(),
+                cx.processor(move |this, range, _window, cx| {
+                    let mut out = Vec::new();
+                    for ix in range {
+                        let Some((entry, depth)) = rows
+                            .get(ix)
+                            .map(|(e, d): &(TreeEntry, usize)| (e.clone(), *d))
+                        else {
+                            continue;
+                        };
+                        let is_selected =
+                            selected.as_ref().map(|s| *s == entry.path).unwrap_or(false);
+                        let name_color = if entry.is_dir {
+                            crate::theme::Theme::fg()
+                        } else {
+                            crate::theme::Theme::fg_dim()
+                        };
+                        let arrow = if entry.is_dir {
+                            if this.expanded.contains(&entry.path) {
+                                "▾"
                             } else {
-                                crate::theme::Theme::fg_dim()
-                            };
-                            let arrow = if entry.is_dir {
-                                if this.expanded.contains(&entry.path) {
-                                    "▾"
-                                } else {
-                                    "▸"
-                                }
-                            } else {
-                                " "
-                            };
-                            out.push(
-                                div()
-                                    .id(ElementId::Name(
-                                        format!("tree-{}", entry.path.display()).into(),
-                                    ))
-                                    .h(px(24.))
-                                    .flex()
-                                    .items_center()
-                                    .pl(px((depth as f32 * 12.0 + 8.0) as f32))
-                                    .pr_2()
-                                    .when(is_selected, |d| {
-                                        d.bg(rgb(crate::theme::Theme::bg_active()))
+                                "▸"
+                            }
+                        } else {
+                            " "
+                        };
+                        out.push(
+                            div()
+                                .id(ElementId::Name(
+                                    format!("tree-{}", entry.path.display()).into(),
+                                ))
+                                .h(px(24.))
+                                .flex()
+                                .items_center()
+                                .pl(px((depth as f32 * 12.0 + 8.0) as f32))
+                                .pr_2()
+                                .when(is_selected, |d| d.bg(rgb(crate::theme::Theme::bg_active())))
+                                .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                                .cursor_pointer()
+                                .text_size(px(13.))
+                                .child(
+                                    div()
+                                        .w(px(14.))
+                                        .text_color(rgb(crate::theme::Theme::fg_faint()))
+                                        .child(arrow),
+                                )
+                                .child(div().text_color(rgb(name_color)).child(entry.name.clone()))
+                                .on_click({
+                                    let entry = entry.clone();
+                                    cx.listener(move |this: &mut FileTree, _, window, cx| {
+                                        if entry.is_dir {
+                                            this.toggle(&entry.path, cx);
+                                        } else {
+                                            this.click_row(&entry.path, false, window, cx);
+                                        }
                                     })
-                                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
-                                    .cursor_pointer()
-                                    .text_size(px(13.))
-                                    .child(
-                                        div()
-                                            .w(px(14.))
-                                            .text_color(rgb(crate::theme::Theme::fg_faint()))
-                                            .child(arrow),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_color(rgb(name_color))
-                                            .child(entry.name.clone()),
-                                    )
-                                    .on_click({
-                                        let entry = entry.clone();
-                                        cx.listener(move |this: &mut FileTree, _, window, cx| {
-                                            if entry.is_dir {
-                                                this.toggle(&entry.path, cx);
-                                            } else {
-                                                this.click_row(&entry.path, false, window, cx);
-                                            }
-                                        })
-                                    }),
-                            );
-                        }
-                        out
-                    }),
-                )
-                .track_scroll(&self.scroll_handle)
-                .flex_1(),
+                                }),
+                        );
+                    }
+                    out
+                }),
             )
+            .track_scroll(&self.scroll_handle)
+            .flex_1(),
+        )
     }
 }

@@ -1,0 +1,20 @@
+[package]
+name = "mfctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MonkeyFence 辅助程序:Agent 显式结算与流水线提案(命名管道客户端)"
+
+[[bin]]
+name = "mfctl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+mf-agent = { path = "../mf-agent" }
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_System_Pipes", "Win32_System_IO"] }
+
+[dev-dependencies]
+tempfile = "3"

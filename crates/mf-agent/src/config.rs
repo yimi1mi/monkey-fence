@@ -42,6 +42,12 @@ pub struct EngineConfig {
     /// 连续失败几次后熔断
     #[serde(default = "default_max_failures")]
     pub max_failures: i32,
+    /// 全局(跨项目)Agent 并发上限
+    #[serde(default = "default_global_concurrency")]
+    pub global_concurrency: usize,
+    /// 单项目 Agent 并发上限
+    #[serde(default = "default_per_project_concurrency")]
+    pub per_project_concurrency: usize,
 }
 
 fn default_workers() -> usize {
@@ -53,6 +59,12 @@ fn default_max_iters() -> usize {
 fn default_max_failures() -> i32 {
     3
 }
+fn default_global_concurrency() -> usize {
+    4
+}
+fn default_per_project_concurrency() -> usize {
+    2
+}
 
 impl Default for EngineConfig {
     fn default() -> Self {
@@ -60,6 +72,8 @@ impl Default for EngineConfig {
             workers: default_workers(),
             max_iterations: default_max_iters(),
             max_failures: default_max_failures(),
+            global_concurrency: default_global_concurrency(),
+            per_project_concurrency: default_per_project_concurrency(),
         }
     }
 }
@@ -103,6 +117,45 @@ impl Default for TerminalConfig {
     }
 }
 
+/// 智能体设置页对应的全局开关。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AgentsConfig {
+    /// yolo = 附加 permission_args(自动批准);manual = 不附加,由用户在终端里手动批准
+    #[serde(default = "default_permission_mode")]
+    pub permission_mode: String,
+    /// 状态钩子总开关(关闭时不写入任何本地 Agent 配置)
+    #[serde(default = "default_true")]
+    pub hooks_enabled: bool,
+    /// 自动生成标签(会话)标题
+    #[serde(default = "default_true")]
+    pub auto_title: bool,
+    /// Agent 工作时保持唤醒(SetThreadExecutionState)
+    #[serde(default = "default_true")]
+    pub keep_awake: bool,
+    /// 默认智能体:Auto / blank-terminal / 已启用且检测到的 profile id
+    #[serde(default)]
+    pub default_agent: String,
+}
+
+fn default_permission_mode() -> String {
+    "yolo".into()
+}
+fn default_true() -> bool {
+    true
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            permission_mode: default_permission_mode(),
+            hooks_enabled: true,
+            auto_title: true,
+            keep_awake: true,
+            default_agent: String::new(), // 空 = Auto
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -116,6 +169,8 @@ pub struct Config {
     pub editor: EditorConfig,
     #[serde(default)]
     pub terminal: TerminalConfig,
+    #[serde(default)]
+    pub agents: AgentsConfig,
 }
 
 impl Default for Config {
@@ -140,6 +195,7 @@ impl Default for Config {
             engine: EngineConfig::default(),
             editor: EditorConfig::default(),
             terminal: TerminalConfig::default(),
+            agents: AgentsConfig::default(),
         }
     }
 }
@@ -162,8 +218,8 @@ impl Config {
             cfg.save_example()?;
             return Ok(cfg);
         }
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         let cfg: Config = toml::from_str(&text).with_context(|| "parse config.toml")?;
         Ok(cfg)
     }

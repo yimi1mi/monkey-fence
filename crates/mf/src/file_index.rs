@@ -44,20 +44,18 @@ impl FileIndex {
                 walker.run(|| {
                     let queue = queue.clone();
                     let mut batch = Vec::new();
-                    Box::new(move |entry| {
-                        match entry {
-                            Ok(e) => {
-                                if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
-                                    batch.push(e.into_path());
-                                }
-                                if batch.len() >= 500 {
-                                    let mut q = queue.lock();
-                                    q.adds.append(&mut batch);
-                                }
-                                ignore::WalkState::Continue
+                    Box::new(move |entry| match entry {
+                        Ok(e) => {
+                            if e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                                batch.push(e.into_path());
                             }
-                            Err(_) => ignore::WalkState::Continue,
+                            if batch.len() >= 500 {
+                                let mut q = queue.lock();
+                                q.adds.append(&mut batch);
+                            }
+                            ignore::WalkState::Continue
                         }
+                        Err(_) => ignore::WalkState::Continue,
                     })
                 });
                 let _ = &mut batch;
@@ -76,7 +74,10 @@ impl FileIndex {
                     Ok(w) => w,
                     Err(_) => return,
                 };
-                if watcher.watch(&root, notify::RecursiveMode::Recursive).is_err() {
+                if watcher
+                    .watch(&root, notify::RecursiveMode::Recursive)
+                    .is_err()
+                {
                     return;
                 }
                 while !stop.load(Ordering::Relaxed) {
@@ -127,31 +128,29 @@ impl FileIndex {
 
     fn start_drain(&self, cx: &mut Context<Self>) {
         let queue = self.queue.clone();
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(250))
-                    .await;
-                let (adds, removes) = {
-                    let mut q = queue.lock();
-                    (std::mem::take(&mut q.adds), std::mem::take(&mut q.removes))
-                };
-                if adds.is_empty() && removes.is_empty() {
-                    continue;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(250))
+                .await;
+            let (adds, removes) = {
+                let mut q = queue.lock();
+                (std::mem::take(&mut q.adds), std::mem::take(&mut q.removes))
+            };
+            if adds.is_empty() && removes.is_empty() {
+                continue;
+            }
+            let n = this.update(cx, |idx, cx| {
+                for p in adds {
+                    idx.files.insert(p);
                 }
-                let n = this.update(cx, |idx, cx| {
-                    for p in adds {
-                        idx.files.insert(p);
-                    }
-                    for p in removes {
-                        idx.files.remove(&p);
-                    }
-                    cx.notify();
-                    idx.files.len()
-                });
-                if n.is_err() {
-                    break;
+                for p in removes {
+                    idx.files.remove(&p);
                 }
+                cx.notify();
+                idx.files.len()
+            });
+            if n.is_err() {
+                break;
             }
         })
         .detach();

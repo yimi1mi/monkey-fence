@@ -13,9 +13,15 @@ pub struct Color {
 }
 
 impl Color {
-    pub const DEF: Color = Color { rgb: [0, 0, 0], default: true };
+    pub const DEF: Color = Color {
+        rgb: [0, 0, 0],
+        default: true,
+    };
     pub fn rgb(r: u8, g: u8, b: u8) -> Color {
-        Color { rgb: [r, g, b], default: false }
+        Color {
+            rgb: [r, g, b],
+            default: false,
+        }
     }
 }
 
@@ -44,12 +50,28 @@ impl Cell {
 /// 16 色调色板(xterm 系)
 pub fn palette(i: u8) -> Color {
     const T: [(u8, u8, u8); 16] = [
-        (0x00, 0x00, 0x00), (0xcd, 0x3a, 0x3a), (0x0e, 0xb0, 0x5c), (0xc9, 0x51, 0x00),
-        (0x0f, 0x5f, 0xff), (0xab, 0x5a, 0xff), (0x0e, 0xb0, 0xb0), (0xe6, 0xe6, 0xe6),
-        (0x4d, 0x4d, 0x4d), (0xff, 0x6e, 0x6e), (0x3c, 0xf7, 0x6a), (0xff, 0xa5, 0x4f),
-        (0x69, 0xbe, 0xff), (0xd3, 0x8a, 0xff), (0x3c, 0xf7, 0xf7), (0xff, 0xff, 0xff),
+        (0x00, 0x00, 0x00),
+        (0xcd, 0x3a, 0x3a),
+        (0x0e, 0xb0, 0x5c),
+        (0xc9, 0x51, 0x00),
+        (0x0f, 0x5f, 0xff),
+        (0xab, 0x5a, 0xff),
+        (0x0e, 0xb0, 0xb0),
+        (0xe6, 0xe6, 0xe6),
+        (0x4d, 0x4d, 0x4d),
+        (0xff, 0x6e, 0x6e),
+        (0x3c, 0xf7, 0x6a),
+        (0xff, 0xa5, 0x4f),
+        (0x69, 0xbe, 0xff),
+        (0xd3, 0x8a, 0xff),
+        (0x3c, 0xf7, 0xf7),
+        (0xff, 0xff, 0xff),
     ];
-    Color::rgb(T[i as usize % 16].0, T[i as usize % 16].1, T[i as usize % 16].2)
+    Color::rgb(
+        T[i as usize % 16].0,
+        T[i as usize % 16].1,
+        T[i as usize % 16].2,
+    )
 }
 
 /// 256 色立方体/灰度
@@ -80,7 +102,13 @@ struct Pen {
 
 impl Default for Pen {
     fn default() -> Self {
-        Pen { fg: Color::DEF, bg: Color::DEF, bold: false, underline: false, reverse: false }
+        Pen {
+            fg: Color::DEF,
+            bg: Color::DEF,
+            bold: false,
+            underline: false,
+            reverse: false,
+        }
     }
 }
 
@@ -171,15 +199,28 @@ impl Screen {
     }
 
     fn grid(&self) -> &Vec<Vec<Cell>> {
-        if self.alt_active { &self.alt } else { &self.main }
+        if self.alt_active {
+            &self.alt
+        } else {
+            &self.main
+        }
     }
 
     fn grid_mut(&mut self) -> &mut Vec<Vec<Cell>> {
-        if self.alt_active { &mut self.alt } else { &mut self.main }
+        if self.alt_active {
+            &mut self.alt
+        } else {
+            &mut self.main
+        }
     }
 
     pub fn cell(&self, row: usize, col: usize) -> Cell {
-        let mut c = self.grid().get(row).and_then(|r| r.get(col)).copied().unwrap_or(Cell::BLANK);
+        let mut c = self
+            .grid()
+            .get(row)
+            .and_then(|r| r.get(col))
+            .copied()
+            .unwrap_or(Cell::BLANK);
         if c.reverse {
             std::mem::swap(&mut c.fg, &mut c.bg);
         }
@@ -372,7 +413,9 @@ impl Screen {
                             self.utf8_buf.push(b);
                             if self.utf8_buf.len() == self.utf8_need {
                                 let s = std::str::from_utf8(&self.utf8_buf);
-                                let ch = s.ok().and_then(|s| s.chars().next())
+                                let ch = s
+                                    .ok()
+                                    .and_then(|s| s.chars().next())
                                     .unwrap_or(char::REPLACEMENT_CHARACTER);
                                 self.utf8_need = 0;
                                 self.put_char(ch);
@@ -392,7 +435,14 @@ impl Screen {
         let (r, c) = self.cursor;
         let pen = self.pen;
         let cols = self.cols;
-        let cell = Cell { ch, fg: pen.fg, bg: pen.bg, bold: pen.bold, underline: pen.underline, reverse: pen.reverse };
+        let cell = Cell {
+            ch,
+            fg: pen.fg,
+            bg: pen.bg,
+            bold: pen.bold,
+            underline: pen.underline,
+            reverse: pen.reverse,
+        };
         {
             let grid = self.grid_mut();
             if let Some(row) = grid.get_mut(r) {
@@ -445,7 +495,14 @@ impl Screen {
 
     fn csi_dispatch(&mut self) {
         let p = |i: usize| -> u32 { self.params.get(i).copied().unwrap_or(0) };
-        let p1 = |i: usize| -> u32 { let v = self.params.get(i).copied().unwrap_or(0); if v == 0 { 1 } else { v } };
+        let p1 = |i: usize| -> u32 {
+            let v = self.params.get(i).copied().unwrap_or(0);
+            if v == 0 {
+                1
+            } else {
+                v
+            }
+        };
         match (self.prefix, self.final_byte) {
             (0, b'm') => self.sgr(),
             (0, b'A') => self.cursor.0 = self.cursor.0.saturating_sub(p1(0) as usize),
@@ -507,7 +564,11 @@ impl Screen {
                 let grid = self.grid_mut();
                 if let Some(row) = grid.get_mut(r) {
                     for i in c..cols {
-                        row[i] = if i + n < cols { row[i + n] } else { Cell::BLANK };
+                        row[i] = if i + n < cols {
+                            row[i + n]
+                        } else {
+                            Cell::BLANK
+                        };
                     }
                 }
             }
@@ -711,7 +772,9 @@ impl Screen {
 
     fn sgr_ext_color(&self, idx: usize) -> Option<Color> {
         match self.params.get(idx).copied().unwrap_or(0) {
-            5 => Some(palette256(self.params.get(idx + 1).copied().unwrap_or(0) as u8)),
+            5 => Some(palette256(
+                self.params.get(idx + 1).copied().unwrap_or(0) as u8
+            )),
             2 => Some(Color::rgb(
                 self.params.get(idx + 1).copied().unwrap_or(0) as u8,
                 self.params.get(idx + 2).copied().unwrap_or(0) as u8,
@@ -748,7 +811,11 @@ mod tests {
     }
 
     fn text_line(s: &Screen, r: usize) -> String {
-        (0..s.cols).map(|c| cell_at(s, r, c).ch).collect::<String>().trim_end().to_string()
+        (0..s.cols)
+            .map(|c| cell_at(s, r, c).ch)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
     }
 
     #[test]

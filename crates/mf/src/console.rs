@@ -53,11 +53,7 @@ pub struct ConsolePane {
 }
 
 impl ConsolePane {
-    pub fn new(
-        id: usize,
-        shell: &str,
-        cx: &mut Context<Self>,
-    ) -> Result<Self, anyhow::Error> {
+    pub fn new(id: usize, shell: &str, cx: &mut Context<Self>) -> Result<Self, anyhow::Error> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
         Self::new_in(id, shell, &cwd, cx)
     }
@@ -145,35 +141,33 @@ impl ConsolePane {
     }
 
     fn start_drain(&self, rx: crossbeam_channel::Receiver<TermMsg>, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(40))
-                    .await;
-                let mut data: Vec<u8> = Vec::new();
-                let mut exited = false;
-                while let Ok(msg) = rx.try_recv() {
-                    match msg {
-                        TermMsg::Data(d) => data.extend_from_slice(&d),
-                        TermMsg::Exit => exited = true,
-                    }
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(40))
+                .await;
+            let mut data: Vec<u8> = Vec::new();
+            let mut exited = false;
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    TermMsg::Data(d) => data.extend_from_slice(&d),
+                    TermMsg::Exit => exited = true,
                 }
-                if !data.is_empty() || exited {
-                    let alive = this
-                        .update(cx, |p, cx| {
-                            if !data.is_empty() {
-                                p.screen.feed(&data);
-                            }
-                            if exited {
-                                p.dead = true;
-                                p.writer = None;
-                            }
-                            cx.notify();
-                        })
-                        .is_ok();
-                    if !alive || exited {
-                        break;
-                    }
+            }
+            if !data.is_empty() || exited {
+                let alive = this
+                    .update(cx, |p, cx| {
+                        if !data.is_empty() {
+                            p.screen.feed(&data);
+                        }
+                        if exited {
+                            p.dead = true;
+                            p.writer = None;
+                        }
+                        cx.notify();
+                    })
+                    .is_ok();
+                if !alive || exited {
+                    break;
                 }
             }
         })
@@ -245,9 +239,8 @@ impl ConsolePane {
                 "1"
             };
             let key = k.key.as_str();
-            let csi_mod = |letter: char| -> Vec<u8> {
-                format!("\x1b[1;{}{}", mod_code, letter).into_bytes()
-            };
+            let csi_mod =
+                |letter: char| -> Vec<u8> { format!("\x1b[1;{}{}", mod_code, letter).into_bytes() };
             match key {
                 "enter" => b"\r".to_vec(),
                 "backspace" => vec![0x7f],
@@ -693,18 +686,30 @@ impl Render for ConsoleDock {
                         .text_color(rgb(crate::theme::Theme::fg_faint()))
                         .child("终端"),
                 )
-                .child(dock_btn("＋ 新窗格", cx.listener(|d: &mut ConsoleDock, _, _, cx| {
-                    d.append_pane(cx);
-                })))
-                .child(dock_btn("⬒ 右分屏", cx.listener(|d: &mut ConsoleDock, _, _, cx| {
-                    d.split_active(false, cx);
-                })))
-                .child(dock_btn("⬓ 下分屏", cx.listener(|d: &mut ConsoleDock, _, _, cx| {
-                    d.split_active(true, cx);
-                })))
-                .child(dock_btn("✕ 关闭窗格", cx.listener(|d: &mut ConsoleDock, _, _, cx| {
-                    d.close_active(cx);
-                }))),
+                .child(dock_btn(
+                    "＋ 新窗格",
+                    cx.listener(|d: &mut ConsoleDock, _, _, cx| {
+                        d.append_pane(cx);
+                    }),
+                ))
+                .child(dock_btn(
+                    "⬒ 右分屏",
+                    cx.listener(|d: &mut ConsoleDock, _, _, cx| {
+                        d.split_active(false, cx);
+                    }),
+                ))
+                .child(dock_btn(
+                    "⬓ 下分屏",
+                    cx.listener(|d: &mut ConsoleDock, _, _, cx| {
+                        d.split_active(true, cx);
+                    }),
+                ))
+                .child(dock_btn(
+                    "✕ 关闭窗格",
+                    cx.listener(|d: &mut ConsoleDock, _, _, cx| {
+                        d.close_active(cx);
+                    }),
+                )),
         );
 
         let tree = self.tree.clone();
@@ -769,7 +774,11 @@ fn dock_btn(
         .on_click(move |e, window, cx| (listener)(e, window, cx))
 }
 
-fn render_node(node: &SplitNode, active_id: usize, weak: &gpui::WeakEntity<ConsoleDock>) -> AnyElement {
+fn render_node(
+    node: &SplitNode,
+    active_id: usize,
+    weak: &gpui::WeakEntity<ConsoleDock>,
+) -> AnyElement {
     match node {
         SplitNode::Leaf(l) => {
             let leaf = l.clone();
@@ -799,13 +808,16 @@ fn render_node(node: &SplitNode, active_id: usize, weak: &gpui::WeakEntity<Conso
                 })
                 // orca 风格:激活窗格顶部亮边
                 .when(is_active, |d| {
-                    d.border_t_2().border_color(rgb(crate::theme::Theme::accent()))
+                    d.border_t_2()
+                        .border_color(rgb(crate::theme::Theme::accent()))
                 })
                 .child(div().flex_1().min_h_0().child(leaf.pane.clone()))
                 // 悬浮关闭按钮(每格独立关闭)
                 .child(
                     div()
-                        .id(ElementId::Name(format!("leaf-close-{}", close_leaf.id).into()))
+                        .id(ElementId::Name(
+                            format!("leaf-close-{}", close_leaf.id).into(),
+                        ))
                         .absolute()
                         .top_1()
                         .right_1()
@@ -823,10 +835,11 @@ fn render_node(node: &SplitNode, active_id: usize, weak: &gpui::WeakEntity<Conso
                         })
                         .child("✕")
                         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                            weak_close.update(cx, |dock, cx| {
-                                dock.close_pane(close_leaf.id, cx);
-                            })
-                            .ok();
+                            weak_close
+                                .update(cx, |dock, cx| {
+                                    dock.close_pane(close_leaf.id, cx);
+                                })
+                                .ok();
                         }),
                 )
                 .into_any_element()
@@ -838,7 +851,11 @@ fn render_node(node: &SplitNode, active_id: usize, weak: &gpui::WeakEntity<Conso
                 .min_w_0()
                 .min_h_0()
                 .flex();
-            el = if *vertical { el.flex_col() } else { el.flex_row() };
+            el = if *vertical {
+                el.flex_col()
+            } else {
+                el.flex_row()
+            };
             for (i, c) in children.iter().enumerate() {
                 let child_el = render_node(c, active_id, weak);
                 el = el.child(
@@ -849,9 +866,11 @@ fn render_node(node: &SplitNode, active_id: usize, weak: &gpui::WeakEntity<Conso
                         .min_h_0()
                         .when(i > 0, |d| {
                             if *vertical {
-                                d.border_t_1().border_color(rgb(crate::theme::Theme::border()))
+                                d.border_t_1()
+                                    .border_color(rgb(crate::theme::Theme::border()))
                             } else {
-                                d.border_l_1().border_color(rgb(crate::theme::Theme::border()))
+                                d.border_l_1()
+                                    .border_color(rgb(crate::theme::Theme::border()))
                             }
                         })
                         .child(child_el),

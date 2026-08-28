@@ -186,7 +186,11 @@ fn openai_complete(
                 .unwrap_or("{}")
                 .to_string();
             if !name.is_empty() {
-                blocks.push(AssistantBlock::ToolUse(ToolCall { id, name, arguments: args }));
+                blocks.push(AssistantBlock::ToolUse(ToolCall {
+                    id,
+                    name,
+                    arguments: args,
+                }));
             }
         }
     }
@@ -283,8 +287,16 @@ fn anthropic_complete(
                 }
             }
             Some("tool_use") => {
-                let id = b.get("id").and_then(|v| v.as_str()).unwrap_or("t").to_string();
-                let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let id = b
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("t")
+                    .to_string();
+                let name = b
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let input = b.get("input").cloned().unwrap_or_default();
                 blocks.push(AssistantBlock::ToolUse(ToolCall {
                     id,
@@ -339,9 +351,7 @@ fn http_post_json(url: &str, api_key: &str, body: &impl Serialize) -> Result<ser
         .send_json(serde_json::to_value(body)?)
         .map_err(|e| anyhow!("http: {}", e))?;
     let status = resp.status();
-    let text = resp
-        .into_string()
-        .context("read response body")?;
+    let text = resp.into_string().context("read response body")?;
     if !(200..300).contains(&status) {
         // 尽量提取错误信息
         let detail = serde_json::from_str::<serde_json::Value>(&text)
@@ -351,12 +361,17 @@ fn http_post_json(url: &str, api_key: &str, body: &impl Serialize) -> Result<ser
                     .and_then(|e| e.get("message"))
                     .and_then(|m| m.as_str())
                     .map(|s| s.to_string())
-                    .or_else(|| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()))
+                    .or_else(|| {
+                        v.get("message")
+                            .and_then(|m| m.as_str())
+                            .map(|s| s.to_string())
+                    })
             })
             .unwrap_or_else(|| text.chars().take(300).collect());
         anyhow::bail!("HTTP {}: {}", status, detail);
     }
-    serde_json::from_str(&text).with_context(|| format!("parse json: {}", &text[..text.len().min(200)]))
+    serde_json::from_str(&text)
+        .with_context(|| format!("parse json: {}", &text[..text.len().min(200)]))
 }
 
 // ---------- Mock(无网络,演示任务流转) ----------
@@ -369,7 +384,12 @@ fn mock_complete(messages: &[ChatMessage]) -> Result<Vec<AssistantBlock>> {
         .filter_map(|m| {
             messages
                 .iter()
-                .find(|x| x.role == "assistant" && x.tool_calls.iter().any(|c| Some(&c.id) == m.tool_call_id.as_ref()))
+                .find(|x| {
+                    x.role == "assistant"
+                        && x.tool_calls
+                            .iter()
+                            .any(|c| Some(&c.id) == m.tool_call_id.as_ref())
+                })
                 .and_then(|a| a.tool_calls.first().map(|c| c.name.as_str()))
         })
         .collect();

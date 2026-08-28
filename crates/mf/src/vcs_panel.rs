@@ -68,7 +68,10 @@ impl VcsPanel {
         panel
     }
 
-    pub fn set_on_open_diff(&mut self, cb: impl Fn(String, PathBuf, &mut Window, &mut App) + 'static) {
+    pub fn set_on_open_diff(
+        &mut self,
+        cb: impl Fn(String, PathBuf, &mut Window, &mut App) + 'static,
+    ) {
         self.on_open_diff = Some(Box::new(cb));
     }
 
@@ -138,7 +141,12 @@ impl VcsPanel {
         .detach();
     }
 
-    fn run_op(&mut self, label: &str, op: impl FnOnce() -> anyhow::Result<String> + Send + 'static, cx: &mut Context<Self>) {
+    fn run_op(
+        &mut self,
+        label: &str,
+        op: impl FnOnce() -> anyhow::Result<String> + Send + 'static,
+        cx: &mut Context<Self>,
+    ) {
         let label = label.to_string();
         self.notice = Some(format!("{}…", label));
         cx.spawn(async move |this, cx| {
@@ -173,7 +181,10 @@ impl VcsPanel {
             VcsKind::Git => self
                 .git_status
                 .iter()
-                .filter(|g| self.selected.contains(&g.path.to_string_lossy().into_owned()))
+                .filter(|g| {
+                    self.selected
+                        .contains(&g.path.to_string_lossy().into_owned())
+                })
                 .map(|g| self.root.join(&g.path))
                 .collect(),
         }
@@ -198,7 +209,10 @@ impl VcsPanel {
                 let sel: Vec<PathBuf> = self
                     .git_status
                     .iter()
-                    .filter(|g| self.selected.contains(&g.path.to_string_lossy().into_owned()))
+                    .filter(|g| {
+                        self.selected
+                            .contains(&g.path.to_string_lossy().into_owned())
+                    })
                     .map(|g| g.path.clone())
                     .collect();
                 let desc2 = desc.clone();
@@ -236,7 +250,10 @@ impl VcsPanel {
                 let rels: Vec<String> = self
                     .git_status
                     .iter()
-                    .filter(|g| self.selected.contains(&g.path.to_string_lossy().into_owned()))
+                    .filter(|g| {
+                        self.selected
+                            .contains(&g.path.to_string_lossy().into_owned())
+                    })
                     .map(|g| g.path.to_string_lossy().into_owned())
                     .collect();
                 self.run_op(
@@ -297,7 +314,10 @@ impl VcsPanel {
         let sel: Vec<PathBuf> = self
             .git_status
             .iter()
-            .filter(|g| self.selected.contains(&g.path.to_string_lossy().into_owned()))
+            .filter(|g| {
+                self.selected
+                    .contains(&g.path.to_string_lossy().into_owned())
+            })
             .map(|g| g.path.clone())
             .collect();
         if sel.is_empty() {
@@ -321,7 +341,10 @@ impl VcsPanel {
         let sel: Vec<PathBuf> = self
             .git_status
             .iter()
-            .filter(|g| self.selected.contains(&g.path.to_string_lossy().into_owned()))
+            .filter(|g| {
+                self.selected
+                    .contains(&g.path.to_string_lossy().into_owned())
+            })
             .map(|g| g.path.clone())
             .collect();
         self.run_op(
@@ -452,16 +475,18 @@ impl Render for VcsPanel {
                 .px_2()
                 .border_b_1()
                 .border_color(rgb(crate::theme::Theme::border()))
-                .child(tool_btn("刷新", cx.listener(|p: &mut VcsPanel, _, _, cx| p.refresh(cx))))
                 .child(tool_btn(
-                    "同步",
-                    cx.listener(Self::act_sync),
+                    "刷新",
+                    cx.listener(|p: &mut VcsPanel, _, _, cx| p.refresh(cx)),
                 ))
-                .child(
-                    div().flex_1(),
-                )
+                .child(tool_btn("同步", cx.listener(Self::act_sync)))
+                .child(div().flex_1())
                 .child(tool_btn(
-                    if self.show_history { "历史 ✓" } else { "历史" },
+                    if self.show_history {
+                        "历史 ✓"
+                    } else {
+                        "历史"
+                    },
                     cx.listener(Self::toggle_history),
                 )),
         );
@@ -481,10 +506,7 @@ impl Render for VcsPanel {
         let mut list = div().flex_1().flex().flex_col().overflow_hidden();
         match self.kind {
             VcsKind::P4 => {
-                list = list.child(section_header(format!(
-                    "待提交变更({})",
-                    self.opened.len()
-                )));
+                list = list.child(section_header(format!("待提交变更({})", self.opened.len())));
                 let default_files: Vec<(usize, OpenedFile)> = self
                     .opened
                     .iter()
@@ -619,18 +641,20 @@ impl Render for VcsPanel {
                             .cursor_pointer()
                             .on_click({
                                 let path_str = path_str.clone();
-                                cx.listener(move |p: &mut VcsPanel, e: &gpui::ClickEvent, window, cx| {
-                                    if e.click_count() == 2 {
-                                        p.open_file_diff(idx, window, cx);
-                                        return;
-                                    }
-                                    if p.selected.contains(&path_str) {
-                                        p.selected.remove(&path_str);
-                                    } else {
-                                        p.selected.insert(path_str.clone());
-                                    }
-                                    cx.notify();
-                                })
+                                cx.listener(
+                                    move |p: &mut VcsPanel, e: &gpui::ClickEvent, window, cx| {
+                                        if e.click_count() == 2 {
+                                            p.open_file_diff(idx, window, cx);
+                                            return;
+                                        }
+                                        if p.selected.contains(&path_str) {
+                                            p.selected.remove(&path_str);
+                                        } else {
+                                            p.selected.insert(path_str.clone());
+                                        }
+                                        cx.notify();
+                                    },
+                                )
                             })
                             .child(div().w(px(12.)).child(if checked { "☑" } else { "☐" }))
                             .child(div().w(px(28.)).text_color(rgb(color)).child(label))
@@ -773,12 +797,7 @@ impl VcsPanel {
                 })
             })
             .child(div().w(px(12.)).child(if checked { "☑" } else { "☐" }))
-            .child(
-                div()
-                    .w(px(34.))
-                    .text_color(rgb(color))
-                    .child(action),
-            )
+            .child(div().w(px(34.)).text_color(rgb(color)).child(action))
             .child(div().text_color(rgb(crate::theme::Theme::fg())).child(name))
             .child(
                 div()

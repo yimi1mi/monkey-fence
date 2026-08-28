@@ -25,7 +25,11 @@ enum Row {
 impl DiffView {
     pub fn new(title: impl Into<SharedString>, diff_text: &str, cx: &mut Context<Self>) -> Self {
         let diff = parse_unified_diff(diff_text);
-        let n_hunks = diff.lines.iter().filter(|l| l.kind == DiffLineKind::HunkMeta).count();
+        let n_hunks = diff
+            .lines
+            .iter()
+            .filter(|l| l.kind == DiffLineKind::HunkMeta)
+            .count();
         Self {
             title: title.into(),
             diff,
@@ -176,15 +180,31 @@ impl Render for DiffView {
                     .border_color(rgb(crate::theme::Theme::border()))
                     .bg(rgb(crate::theme::Theme::bg_panel()))
                     .text_size(px(12.))
-                    .child(div().text_color(rgb(crate::theme::Theme::fg())).child(self.title.clone()))
-                    .child(div().text_color(rgb(crate::theme::Theme::success())).child(format!("+{}", added)))
-                    .child(div().text_color(rgb(crate::theme::Theme::danger())).child(format!("-{}", deleted)))
+                    .child(
+                        div()
+                            .text_color(rgb(crate::theme::Theme::fg()))
+                            .child(self.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(crate::theme::Theme::success()))
+                            .child(format!("+{}", added)),
+                    )
+                    .child(
+                        div()
+                            .text_color(rgb(crate::theme::Theme::danger()))
+                            .child(format!("-{}", deleted)),
+                    )
                     .when(reviewing, |d| {
                         d.child(div().flex_1())
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(rgb(if pending > 0 { crate::theme::Theme::warning() } else { crate::theme::Theme::success() }))
+                                    .text_color(rgb(if pending > 0 {
+                                        crate::theme::Theme::warning()
+                                    } else {
+                                        crate::theme::Theme::success()
+                                    }))
                                     .child(format!("{} 个 hunk · {} 待审阅", total_hunks, pending)),
                             )
                             .child(
@@ -222,7 +242,9 @@ impl Render for DiffView {
                                     })),
                             )
                             .child(
-                                div().text_size(px(10.)).text_color(rgb(crate::theme::Theme::fg_faint()))
+                                div()
+                                    .text_size(px(10.))
+                                    .text_color(rgb(crate::theme::Theme::fg_faint()))
                                     .child("Alt+Y/Z"),
                             )
                     }),
@@ -265,36 +287,56 @@ impl Render for DiffView {
                                             .border_color(rgb(crate::theme::Theme::border()))
                                             .bg(rgb(crate::theme::Theme::bg_elevated()))
                                             .text_size(px(10.5))
-                                            .child(div().text_color(rgb(color)).child(format!("HUNK #{} · {}", hi + 1, label)))
+                                            .child(div().text_color(rgb(color)).child(format!(
+                                                "HUNK #{} · {}",
+                                                hi + 1,
+                                                label
+                                            )))
                                             .child(div().flex_1())
                                             .when(reviewing && state.is_none(), |d| {
                                                 d.child(
                                                     div()
-                                                        .id(ElementId::Name(format!("dhb-y-{}", hi).into()))
+                                                        .id(ElementId::Name(
+                                                            format!("dhb-y-{}", hi).into(),
+                                                        ))
                                                         .px_1p5()
                                                         .rounded_sm()
                                                         .border_1()
-                                                        .border_color(rgb(crate::theme::Theme::success()))
-                                                        .text_color(rgb(crate::theme::Theme::success()))
+                                                        .border_color(rgb(
+                                                            crate::theme::Theme::success(),
+                                                        ))
+                                                        .text_color(rgb(
+                                                            crate::theme::Theme::success(),
+                                                        ))
                                                         .cursor_pointer()
                                                         .child("✓ 保留")
-                                                        .on_click(cx.listener(move |this, _, w, cx| {
-                                                            this.verdict(hi, true, w, cx);
-                                                        })),
+                                                        .on_click(cx.listener(
+                                                            move |this, _, w, cx| {
+                                                                this.verdict(hi, true, w, cx);
+                                                            },
+                                                        )),
                                                 )
                                                 .child(
                                                     div()
-                                                        .id(ElementId::Name(format!("dhb-z-{}", hi).into()))
+                                                        .id(ElementId::Name(
+                                                            format!("dhb-z-{}", hi).into(),
+                                                        ))
                                                         .px_1p5()
                                                         .rounded_sm()
                                                         .border_1()
-                                                        .border_color(rgb(crate::theme::Theme::danger()))
-                                                        .text_color(rgb(crate::theme::Theme::danger()))
+                                                        .border_color(rgb(
+                                                            crate::theme::Theme::danger(),
+                                                        ))
+                                                        .text_color(rgb(
+                                                            crate::theme::Theme::danger(),
+                                                        ))
                                                         .cursor_pointer()
                                                         .child("✕ 拒绝")
-                                                        .on_click(cx.listener(move |this, _, w, cx| {
-                                                            this.verdict(hi, false, w, cx);
-                                                        })),
+                                                        .on_click(cx.listener(
+                                                            move |this, _, w, cx| {
+                                                                this.verdict(hi, false, w, cx);
+                                                            },
+                                                        )),
                                                 )
                                             })
                                             .into_any_element(),
@@ -305,10 +347,18 @@ impl Render for DiffView {
                                     let (kind, text, old_no, new_no) = (l.0, l.1.clone(), l.2, l.3);
                                     let (fg, prefix) = match kind {
                                         DiffLineKind::Add => (crate::theme::Theme::success(), "+"),
-                                        DiffLineKind::Delete => (crate::theme::Theme::danger(), "-"),
-                                        DiffLineKind::HunkMeta => (crate::theme::Theme::accent(), "@"),
-                                        DiffLineKind::Header => (crate::theme::Theme::fg_dim(), " "),
-                                        DiffLineKind::Context => (crate::theme::Theme::fg_dim(), " "),
+                                        DiffLineKind::Delete => {
+                                            (crate::theme::Theme::danger(), "-")
+                                        }
+                                        DiffLineKind::HunkMeta => {
+                                            (crate::theme::Theme::accent(), "@")
+                                        }
+                                        DiffLineKind::Header => {
+                                            (crate::theme::Theme::fg_dim(), " ")
+                                        }
+                                        DiffLineKind::Context => {
+                                            (crate::theme::Theme::fg_dim(), " ")
+                                        }
                                     };
                                     let gutter = format!(
                                         "{:>4} {:>4} ",
@@ -316,8 +366,12 @@ impl Render for DiffView {
                                         new_no.map(|n| n.to_string()).unwrap_or_default(),
                                     );
                                     let row_bg = match kind {
-                                        DiffLineKind::Add => gpui::hsla(140. / 360., 0.5, 0.25, 0.18),
-                                        DiffLineKind::Delete => gpui::hsla(0. / 360., 0.6, 0.45, 0.15),
+                                        DiffLineKind::Add => {
+                                            gpui::hsla(140. / 360., 0.5, 0.25, 0.18)
+                                        }
+                                        DiffLineKind::Delete => {
+                                            gpui::hsla(0. / 360., 0.6, 0.45, 0.15)
+                                        }
                                         _ => gpui::hsla(0., 0., 0., 0.),
                                     };
                                     out.push(
@@ -332,11 +386,20 @@ impl Render for DiffView {
                                             .text_size(px(12.))
                                             .child(
                                                 div()
-                                                    .text_color(rgb(crate::theme::Theme::fg_faint()))
+                                                    .text_color(
+                                                        rgb(crate::theme::Theme::fg_faint()),
+                                                    )
                                                     .child(gutter),
                                             )
-                                            .child(div().w(px(10.)).text_color(rgb(fg)).child(prefix))
-                                            .child(div().text_color(rgb(fg)).overflow_hidden().child(text))
+                                            .child(
+                                                div().w(px(10.)).text_color(rgb(fg)).child(prefix),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_color(rgb(fg))
+                                                    .overflow_hidden()
+                                                    .child(text),
+                                            )
                                             .into_any_element(),
                                     );
                                 }
@@ -348,7 +411,10 @@ impl Render for DiffView {
                                     .p_2()
                                     .text_size(px(11.))
                                     .text_color(rgb(crate::theme::Theme::fg_faint()))
-                                    .child(format!("… 其余 {} 行未渲染(超大 diff)", rows.len() - max_rows))
+                                    .child(format!(
+                                        "… 其余 {} 行未渲染(超大 diff)",
+                                        rows.len() - max_rows
+                                    ))
                                     .into_any_element(),
                             );
                         }

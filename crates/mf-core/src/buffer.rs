@@ -369,9 +369,19 @@ mod tests {
     #[test]
     fn edit_insert_delete() {
         let mut b = buf("hello world");
-        b.apply(vec![Edit { start: 5, end: 5, text: ",".into() }]).unwrap();
+        b.apply(vec![Edit {
+            start: 5,
+            end: 5,
+            text: ",".into(),
+        }])
+        .unwrap();
         assert_eq!(b.text(), "hello, world");
-        b.apply(vec![Edit { start: 5, end: 6, text: "".into() }]).unwrap();
+        b.apply(vec![Edit {
+            start: 5,
+            end: 6,
+            text: "".into(),
+        }])
+        .unwrap();
         assert_eq!(b.text(), "hello world");
     }
 
@@ -397,9 +407,21 @@ mod tests {
     fn multi_edit_transaction_undo() {
         let mut b = buf("one two three");
         b.apply(vec![
-            Edit { start: 0, end: 3, text: "1".into() },
-            Edit { start: 4, end: 7, text: "2".into() },
-            Edit { start: 8, end: 13, text: "3".into() },
+            Edit {
+                start: 0,
+                end: 3,
+                text: "1".into(),
+            },
+            Edit {
+                start: 4,
+                end: 7,
+                text: "2".into(),
+            },
+            Edit {
+                start: 8,
+                end: 13,
+                text: "3".into(),
+            },
         ])
         .unwrap();
         assert_eq!(b.text(), "1 2 3");
@@ -434,8 +456,16 @@ mod tests {
         let mut b = buf("abcdef");
         assert!(b
             .apply(vec![
-                Edit { start: 0, end: 3, text: "x".into() },
-                Edit { start: 2, end: 4, text: "y".into() },
+                Edit {
+                    start: 0,
+                    end: 3,
+                    text: "x".into()
+                },
+                Edit {
+                    start: 2,
+                    end: 4,
+                    text: "y".into()
+                },
             ])
             .is_err());
     }

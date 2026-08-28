@@ -1,8 +1,8 @@
 use gpui::*;
-use std::ops::Range;
 use mf_core::buffer::Buffer;
 use mf_core::highlight::{self, HighlightTag};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 use unicode_segmentation::UnicodeSegmentation;
@@ -353,7 +353,11 @@ impl Editor {
                 continue;
             }
             if is_ws {
-                boundary = win.grapheme_indices(true).find(|(bi, _)| *bi >= idx).map(|(bi, _)| bi).unwrap_or(win.len());
+                boundary = win
+                    .grapheme_indices(true)
+                    .find(|(bi, _)| *bi >= idx)
+                    .map(|(bi, _)| bi)
+                    .unwrap_or(win.len());
                 return offset + boundary;
             }
             if Some(is_word) != mode_word {
@@ -652,15 +656,8 @@ impl Editor {
         let has_nl_lower = lower + 1 < len_lines;
         let new_row = if dir == -1 { row - 1 } else { row + 1 };
         self.buffer.update(cx, |b, _| {
-            let lower_seg = format!(
-                "{}{}",
-                text_upper,
-                if has_nl_lower { "\n" } else { "" }
-            );
-            let upper_seg = format!(
-                "{}\n",
-                text_lower
-            );
+            let lower_seg = format!("{}{}", text_upper, if has_nl_lower { "\n" } else { "" });
+            let upper_seg = format!("{}\n", text_lower);
             let _ = b.apply(vec![
                 mf_core::buffer::Edit {
                     start: start_upper,
@@ -789,8 +786,7 @@ fn build_highlight(path: Option<&Path>, text: &str) -> Arc<HighlightState> {
             line_starts.push(i + 1);
         }
     }
-    let empty: Vec<Vec<(usize, usize, HighlightTag)>> =
-        vec![Vec::new(); line_starts.len()];
+    let empty: Vec<Vec<(usize, usize, HighlightTag)>> = vec![Vec::new(); line_starts.len()];
     let Some(cfg) = path.and_then(highlight::config_for_path) else {
         return Arc::new(HighlightState { lines: empty });
     };
@@ -958,10 +954,9 @@ impl Element for EditorElement {
 
         let total_lines = buffer.len_lines();
         let scroll_top = ed.scroll_top.min(total_lines.saturating_sub(1));
-        let viewport_rows = ((bounds.size.height.as_f32() / line_height.max(px(1.)).as_f32())
-            .ceil() as usize)
-            .max(1)
-            + 1;
+        let viewport_rows = ((bounds.size.height.as_f32() / line_height.max(px(1.)).as_f32()).ceil()
+            as usize)
+            .max(1) + 1;
 
         // 行号槽宽度
         let digits = total_lines.to_string().len();
@@ -1076,9 +1071,7 @@ impl Element for EditorElement {
                 let sel_end_col = selection.end.min(next_line_start) - line_start;
                 let x0 = shaped
                     .as_ref()
-                    .map(|s| {
-                        s.x_for_index(map_disp(&layout.orig_to_disp, sel_start_col))
-                    })
+                    .map(|s| s.x_for_index(map_disp(&layout.orig_to_disp, sel_start_col)))
                     .unwrap_or(px(0.));
                 let x1 = shaped
                     .as_ref()
@@ -1182,10 +1175,7 @@ impl Element for EditorElement {
                 .shape_line(num, font_size, &[num_run], None);
             num_line
                 .paint(
-                    point(
-                        bounds.left() + gutter_width - px(16.) - num_line.width,
-                        y,
-                    ),
+                    point(bounds.left() + gutter_width - px(16.) - num_line.width, y),
                     line_height,
                     TextAlign::Left,
                     None,

@@ -1,5 +1,5 @@
-use gpui::*;
 use gpui::prelude::*;
+use gpui::*;
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32String};
 use std::path::PathBuf;
@@ -14,7 +14,10 @@ actions!(
 #[derive(Clone, Debug)]
 pub enum QuickItem {
     File(PathBuf),
-    Command { id: SharedString, label: SharedString },
+    Command {
+        id: SharedString,
+        label: SharedString,
+    },
 }
 
 pub struct QuickOpen {
@@ -30,10 +33,7 @@ pub struct QuickOpen {
 }
 
 impl QuickOpen {
-    pub fn files(
-        file_index: gpui::Entity<FileIndex>,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn files(file_index: gpui::Entity<FileIndex>, cx: &mut Context<Self>) -> Self {
         let mut q = Self::base(cx);
         q.mode_files = true;
         q.file_index = Some(file_index);
@@ -170,7 +170,9 @@ fn fuzzy_rank(candidates: &[String], query: &str) -> Vec<(u32, usize)> {
         .enumerate()
         .filter_map(|(i, c)| {
             let haystack = Utf32String::from(c.as_str());
-            pattern.score(haystack.slice(..), &mut matcher).map(|s| (s as u32, i))
+            pattern
+                .score(haystack.slice(..), &mut matcher)
+                .map(|s| (s as u32, i))
         })
         .collect();
     scored.sort_by(|a, b| b.0.cmp(&a.0));
@@ -280,7 +282,9 @@ impl Render for QuickOpen {
                                                 .map(|n| n.to_string_lossy().into_owned())
                                                 .unwrap_or_default(),
                                         ),
-                                        QuickItem::Command { label, .. } => ("⌘", label.to_string()),
+                                        QuickItem::Command { label, .. } => {
+                                            ("⌘", label.to_string())
+                                        }
                                     };
                                     let dir_hint = match item {
                                         QuickItem::File(p) => p
@@ -309,7 +313,9 @@ impl Render for QuickOpen {
                                             .child(
                                                 div()
                                                     .text_size(px(12.))
-                                                    .text_color(rgb(crate::theme::Theme::fg_faint()))
+                                                    .text_color(
+                                                        rgb(crate::theme::Theme::fg_faint()),
+                                                    )
                                                     .child(icon),
                                             )
                                             .child(

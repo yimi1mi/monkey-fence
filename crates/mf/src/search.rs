@@ -99,9 +99,9 @@ impl ProjectSearch {
         let word = self.whole_word;
         let regex = self.use_regex;
         cx.spawn(async move |this, cx| {
-            let res = cx.background_executor().spawn(async move {
-                scan_project(&root, &q, case, word, regex)
-            });
+            let res = cx
+                .background_executor()
+                .spawn(async move { scan_project(&root, &q, case, word, regex) });
             let (groups, total) = res.await;
             this.update(cx, |s, cx| {
                 s.searching = false;
@@ -116,7 +116,13 @@ impl ProjectSearch {
     }
 }
 
-fn scan_project(root: &Path, query: &str, case: bool, word: bool, regex: bool) -> (Vec<SearchGroup>, usize) {
+fn scan_project(
+    root: &Path,
+    query: &str,
+    case: bool,
+    word: bool,
+    regex: bool,
+) -> (Vec<SearchGroup>, usize) {
     let mut groups: Vec<SearchGroup> = Vec::new();
     let mut total = 0usize;
     let re = if regex {
@@ -127,13 +133,20 @@ fn scan_project(root: &Path, query: &str, case: bool, word: bool, regex: bool) -
     } else {
         None
     };
-    let needle = if case { query.to_string() } else { query.to_lowercase() };
+    let needle = if case {
+        query.to_string()
+    } else {
+        query.to_lowercase()
+    };
 
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
-            !matches!(name.as_ref(), ".git" | "target" | ".mf-agent" | "node_modules" | ".worktrees")
+            !matches!(
+                name.as_ref(),
+                ".git" | "target" | ".mf-agent" | "node_modules" | ".worktrees"
+            )
         })
         .build();
     for entry in walker.flatten() {
@@ -144,53 +157,94 @@ fn scan_project(root: &Path, query: &str, case: bool, word: bool, regex: bool) -
             break;
         }
         let path = entry.path();
-        let ext_ok = path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| {
-                matches!(
-                    e.to_ascii_lowercase().as_str(),
-                    "rs" | "toml" | "md" | "json" | "yml" | "yaml" | "txt" | "js" | "ts" | "py"
-                        | "c" | "h" | "cpp" | "cs" | "go" | "java" | "lua" | "ts" | "css" | "html" | "sh" | "ps1"
-                )
-            });
+        let ext_ok = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "rs" | "toml"
+                    | "md"
+                    | "json"
+                    | "yml"
+                    | "yaml"
+                    | "txt"
+                    | "js"
+                    | "ts"
+                    | "py"
+                    | "c"
+                    | "h"
+                    | "cpp"
+                    | "cs"
+                    | "go"
+                    | "java"
+                    | "lua"
+                    | "ts"
+                    | "css"
+                    | "html"
+                    | "sh"
+                    | "ps1"
+            )
+        });
         if !ext_ok {
             continue;
         }
-        let Ok(meta) = std::fs::metadata(path) else { continue };
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
         if meta.len() > 2_000_000 {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(path) else { continue };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
         let mut hits = Vec::new();
         for (i, line) in text.lines().enumerate() {
             if hits.len() >= MAX_HITS_PER_FILE {
                 break;
             }
             let (col, len) = if let Some(re) = &re {
-                re.find(line).map(|m| (m.start(), m.end() - m.start())).unwrap_or((0, 0))
+                re.find(line)
+                    .map(|m| (m.start(), m.end() - m.start()))
+                    .unwrap_or((0, 0))
             } else {
-                let hay = if case { line.to_string() } else { line.to_lowercase() };
-                hay.find(&needle).map(|c| {
-                    let l = if word {
-                        let is_w = |ch: char| ch.is_alphanumeric() || ch == '_';
-                        let before_ok = c == 0 || !is_w(hay.as_bytes()[c - 1] as char);
-                        let after = c + needle.len();
-                        let after_ok = after >= hay.len() || !is_w(hay.as_bytes()[after] as char);
-                        if before_ok && after_ok { needle.len() } else { 0 }
-                    } else {
-                        needle.len()
-                    };
-                    (c, l)
-                }).unwrap_or((0, 0))
+                let hay = if case {
+                    line.to_string()
+                } else {
+                    line.to_lowercase()
+                };
+                hay.find(&needle)
+                    .map(|c| {
+                        let l = if word {
+                            let is_w = |ch: char| ch.is_alphanumeric() || ch == '_';
+                            let before_ok = c == 0 || !is_w(hay.as_bytes()[c - 1] as char);
+                            let after = c + needle.len();
+                            let after_ok =
+                                after >= hay.len() || !is_w(hay.as_bytes()[after] as char);
+                            if before_ok && after_ok {
+                                needle.len()
+                            } else {
+                                0
+                            }
+                        } else {
+                            needle.len()
+                        };
+                        (c, l)
+                    })
+                    .unwrap_or((0, 0))
             };
             if len > 0 || (re.is_some() && col > 0) {
-                hits.push(Hit { row: i + 1, text: line.trim().chars().take(120).collect(), col, len });
+                hits.push(Hit {
+                    row: i + 1,
+                    text: line.trim().chars().take(120).collect(),
+                    col,
+                    len,
+                });
             }
         }
         if !hits.is_empty() {
             total += hits.len();
-            groups.push(SearchGroup { path: path.to_path_buf(), hits });
+            groups.push(SearchGroup {
+                path: path.to_path_buf(),
+                hits,
+            });
         }
     }
     (groups, total)
@@ -212,9 +266,12 @@ impl Render for ProjectSearch {
                     .left_0()
                     .bg(gpui::black().opacity(0.4))
                     .justify_center()
-                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| {
-                        cx.emit(Dismissed);
-                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, cx| {
+                            cx.emit(Dismissed);
+                        }),
+                    )
             })
             .when(embedded, |d| d.bg(rgb(Theme::bg_panel())))
             .child(
@@ -315,7 +372,9 @@ impl Render for ProjectSearch {
                                         let path = g.path.clone();
                                         let row = h.row;
                                         div()
-                                            .id(ElementId::Name(format!("ps-hit-{}-{}", fname, row).into()))
+                                            .id(ElementId::Name(
+                                                format!("ps-hit-{}-{}", fname, row).into(),
+                                            ))
                                             .pl_3()
                                             .py_0p5()
                                             .rounded_sm()
@@ -335,11 +394,23 @@ impl Render for ProjectSearch {
                                                     .gap_2()
                                                     .text_size(px(11.))
                                                     .font_family("Consolas")
-                                                    .child(div().w(px(30.)).text_color(rgb(Theme::fg_faint())).child(h.row.to_string()))
                                                     .child(
-                                                        div().flex().text_color(rgb(Theme::fg_dim()))
+                                                        div()
+                                                            .w(px(30.))
+                                                            .text_color(rgb(Theme::fg_faint()))
+                                                            .child(h.row.to_string()),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .text_color(rgb(Theme::fg_dim()))
                                                             .child(div().child(pre.clone()))
-                                                            .child(div().bg(rgb(Theme::accent_dim())).text_color(rgb(Theme::fg())).child(matched.clone()))
+                                                            .child(
+                                                                div()
+                                                                    .bg(rgb(Theme::accent_dim()))
+                                                                    .text_color(rgb(Theme::fg()))
+                                                                    .child(matched.clone()),
+                                                            )
                                                             .child(div().child(post.clone())),
                                                     ),
                                             )
@@ -376,7 +447,11 @@ fn toggle_btn(which: u8, label: &str, on: bool, cx: &Context<ProjectSearch>) -> 
         .cursor_pointer()
         .text_size(px(11.))
         .border_color(rgb(if on { Theme::accent() } else { Theme::border() }))
-        .text_color(rgb(if on { Theme::accent() } else { Theme::fg_faint() }))
+        .text_color(rgb(if on {
+            Theme::accent()
+        } else {
+            Theme::fg_faint()
+        }))
         .hover(|d| d.bg(rgb(Theme::bg_hover())))
         .child(label)
         .on_click(cx.listener(move |s, _, _, cx| {

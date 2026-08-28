@@ -141,7 +141,15 @@ impl P4 {
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
             // 有些错误信息在 stdout(ztag 模式)
-            anyhow::bail!("p4 {} 失败: {}", args.first().unwrap_or(&""), if stderr.is_empty() { stdout.trim().to_string() } else { stderr.trim().to_string() });
+            anyhow::bail!(
+                "p4 {} 失败: {}",
+                args.first().unwrap_or(&""),
+                if stderr.is_empty() {
+                    stdout.trim().to_string()
+                } else {
+                    stderr.trim().to_string()
+                }
+            );
         }
         Ok(stdout)
     }
@@ -169,7 +177,15 @@ impl P4 {
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-            anyhow::bail!("p4 {} 失败: {}", args.first().unwrap_or(&""), if stderr.is_empty() { stdout.trim().to_string() } else { stderr.trim().to_string() });
+            anyhow::bail!(
+                "p4 {} 失败: {}",
+                args.first().unwrap_or(&""),
+                if stderr.is_empty() {
+                    stdout.trim().to_string()
+                } else {
+                    stderr.trim().to_string()
+                }
+            );
         }
         Ok(stdout)
     }
@@ -227,7 +243,8 @@ impl P4 {
         } else {
             format!("{}/...", stream_path.trim_end_matches('/'))
         };
-        let recs = self.run_ztag(&["changes", "-s", "submitted", "-m", &max.to_string(), &range])?;
+        let recs =
+            self.run_ztag(&["changes", "-s", "submitted", "-m", &max.to_string(), &range])?;
         Ok(recs
             .iter()
             .map(|r| Change {
@@ -280,7 +297,12 @@ impl P4 {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0),
                 rev: rev.to_string(),
-                action: r.get_all("action").get(i).copied().unwrap_or("").to_string(),
+                action: r
+                    .get_all("action")
+                    .get(i)
+                    .copied()
+                    .unwrap_or("")
+                    .to_string(),
                 user: r.get_all("user").get(i).copied().unwrap_or("").to_string(),
                 date: r.get_all("date").get(i).copied().unwrap_or("").to_string(),
                 desc: r.get_all("desc").get(i).copied().unwrap_or("").to_string(),
@@ -354,7 +376,10 @@ impl P4 {
 
     /// 创建新的编号变更列表,返回 id
     pub fn new_changelist(&self, description: &str) -> Result<i64> {
-        let spec = format!("Change: new\nDescription:\n\t{}\n", description.replace('\n', "\n\t"));
+        let spec = format!(
+            "Change: new\nDescription:\n\t{}\n",
+            description.replace('\n', "\n\t")
+        );
         let out = self.run_stdin(&["change", "-i"], &spec)?;
         // 输出形如 "Change 123 created."
         let id = out

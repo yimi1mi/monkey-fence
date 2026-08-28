@@ -3282,6 +3282,7 @@ dependencies = [
  "log",
  "mf-agent",
  "mf-core",
+ "mf-plugins",
  "mf-skills",
  "mf-vcs",
  "notify",
@@ -3292,8 +3293,10 @@ dependencies = [
  "ropey",
  "serde",
  "serde_json",
+ "tempfile",
  "toml 0.8.23",
  "unicode-segmentation",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3311,6 +3314,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.20",
  "toml 0.8.23",
  "ureq",
 ]
@@ -3331,6 +3335,24 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-rust",
  "tree-sitter-typescript",
+]
+
+[[package]]
+name = "mf-plugins"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs 5.0.1",
+ "log",
+ "mf-agent",
+ "mf-skills",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "toml 0.8.23",
 ]
 
 [[package]]
@@ -3355,6 +3377,18 @@ dependencies = [
  "parking_lot",
  "serde",
  "tempfile",
+]
+
+[[package]]
+name = "mfctl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mf-agent",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

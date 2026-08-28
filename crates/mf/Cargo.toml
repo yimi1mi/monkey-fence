@@ -16,6 +16,7 @@ mf-core.workspace = true
 mf-agent.workspace = true
 mf-vcs.workspace = true
 mf-skills.workspace = true
+mf-plugins.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 anyhow.workspace = true
@@ -29,7 +30,9 @@ ignore.workspace = true
 regex.workspace = true
 crossbeam-channel.workspace = true
 portable-pty = "0.8"
+windows-sys = { version = "0.59", features = ["Win32_System_Power", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Foundation", "Win32_System_IO"] }
 notify.workspace = true
 
 [dev-dependencies]
 toml.workspace = true
+tempfile = "3"

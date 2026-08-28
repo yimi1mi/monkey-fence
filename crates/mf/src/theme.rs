@@ -123,25 +123,62 @@ pub struct Theme;
 
 #[allow(non_snake_case)]
 impl Theme {
-    pub fn bg() -> u32 { p().bg }
-    pub fn bg_panel() -> u32 { p().bg_panel }
-    pub fn bg_elevated() -> u32 { p().bg_elevated }
-    pub fn bg_hover() -> u32 { p().bg_hover }
-    pub fn bg_active() -> u32 { p().bg_active }
-    pub fn border() -> u32 { p().border }
-    pub fn fg() -> u32 { p().fg }
-    pub fn fg_dim() -> u32 { p().fg_dim }
-    pub fn fg_faint() -> u32 { p().fg_faint }
-    pub fn accent() -> u32 { p().accent }
-    pub fn accent_dim() -> u32 { p().accent_dim }
-    pub fn success() -> u32 { p().success }
-    pub fn warning() -> u32 { p().warning }
-    pub fn danger() -> u32 { p().danger }
-    pub fn gutter_fg() -> u32 { p().gutter_fg }
-    pub fn cursor() -> u32 { p().cursor }
+    pub fn bg() -> u32 {
+        p().bg
+    }
+    pub fn bg_panel() -> u32 {
+        p().bg_panel
+    }
+    pub fn bg_elevated() -> u32 {
+        p().bg_elevated
+    }
+    pub fn bg_hover() -> u32 {
+        p().bg_hover
+    }
+    pub fn bg_active() -> u32 {
+        p().bg_active
+    }
+    pub fn border() -> u32 {
+        p().border
+    }
+    pub fn fg() -> u32 {
+        p().fg
+    }
+    pub fn fg_dim() -> u32 {
+        p().fg_dim
+    }
+    pub fn fg_faint() -> u32 {
+        p().fg_faint
+    }
+    pub fn accent() -> u32 {
+        p().accent
+    }
+    pub fn accent_dim() -> u32 {
+        p().accent_dim
+    }
+    pub fn success() -> u32 {
+        p().success
+    }
+    pub fn warning() -> u32 {
+        p().warning
+    }
+    pub fn danger() -> u32 {
+        p().danger
+    }
+    pub fn gutter_fg() -> u32 {
+        p().gutter_fg
+    }
+    pub fn cursor() -> u32 {
+        p().cursor
+    }
 
     pub fn selection() -> Hsla {
-        Hsla { h: 220. / 360., s: 0.65, l: if is_light() { 0.75 } else { 0.4 }, a: 0.35 }
+        Hsla {
+            h: 220. / 360.,
+            s: 0.65,
+            l: if is_light() { 0.75 } else { 0.4 },
+            a: 0.35,
+        }
     }
 
     /// 语法高亮标签 → 颜色(随主题切换)

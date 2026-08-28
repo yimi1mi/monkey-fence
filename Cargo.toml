@@ -6,6 +6,18 @@ members = [
     "crates/mf-agent",
     "crates/mf-vcs",
     "crates/mf-skills",
+    "crates/mf-plugins",
+    "crates/mfctl",
+]
+# 裸命令(cargo run / build / test)的默认目标:主程序而非 mfctl 辅助程序。
+# 显式 --workspace 仍然覆盖全部成员(mfctl 无测试,构建由 --workspace 兜底)。
+default-members = [
+    "crates/mf",
+    "crates/mf-core",
+    "crates/mf-agent",
+    "crates/mf-vcs",
+    "crates/mf-skills",
+    "crates/mf-plugins",
 ]
 
 [workspace.package]
@@ -18,6 +30,7 @@ mf-core = { path = "crates/mf-core" }
 mf-agent = { path = "crates/mf-agent" }
 mf-vcs = { path = "crates/mf-vcs" }
 mf-skills = { path = "crates/mf-skills" }
+mf-plugins = { path = "crates/mf-plugins" }
 
 # Zed 同源依赖(本地 checkout,保证 Windows DirectX 后端可用)
 gpui = { path = "D:/workspace/zed/crates/gpui" }
