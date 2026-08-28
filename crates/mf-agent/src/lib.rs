@@ -19,6 +19,7 @@ pub mod pipeline;
 pub mod provider;
 pub mod runtime;
 pub mod schema;
+pub mod secrets;
 pub mod store;
 
 pub use agent_instance::{

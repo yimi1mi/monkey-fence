@@ -1,0 +1,137 @@
+//! Secret Store 契约:AES-256-GCM 加密、密文/日志/Debug 全链路脱敏、
+//! 租约 drop 即 zeroize(设计 §6.4 / §8)。
+//!
+//! 测试只注入确定性密钥([7u8; 32] 等),绝不访问真实 OS keyring;
+//! keyring 主密钥路径由 `BuiltinSecretStore::open` 在运行时使用。
+
+use mf_agent::catalog_store::CatalogStore;
+use mf_agent::secrets::{Redacted, SecretLease, SecretStore};
+use mf_plugins::builtin_secret_store::{BuiltinSecretStore, InMemorySecretStore};
+
+const SECRET: &[u8] = b"secret-value";
+
+#[test]
+fn ciphertext_and_debug_never_contain_secret() {
+    let store = InMemorySecretStore::new([7u8; 32]);
+    let id = store.seal("api-key", b"secret-value").unwrap();
+    assert!(!store.ciphertext(&id).contains("secret-value"));
+    assert!(!format!("{:?}", store.describe(&id).unwrap()).contains("secret-value"));
+}
+
+#[test]
+fn seal_unseal_roundtrip() {
+    let store = InMemorySecretStore::new([7u8; 32]);
+    let id = store.seal("api-key", SECRET).unwrap();
+    let lease = store.unseal_for_run("tok", &id).unwrap();
+    assert_eq!(lease.as_slice(), SECRET);
+    assert_eq!(lease.id(), id.as_str());
+}
+
+#[test]
+fn wrong_key_cannot_unseal() {
+    let catalog = CatalogStore::memory().unwrap();
+    let a = BuiltinSecretStore::with_master_key(catalog.clone(), [1u8; 32]).unwrap();
+    let id = a.seal("api-key", SECRET).unwrap();
+    // 同一目录库、不同主密钥:AES-GCM 认证必须失败
+    let b = BuiltinSecretStore::with_master_key(catalog, [2u8; 32]).unwrap();
+    assert!(b.unseal_for_run("tok", &id).is_err());
+}
+
+#[test]
+fn tampered_ciphertext_is_rejected() {
+    let store = InMemorySecretStore::new([7u8; 32]);
+    let id = store.seal("api-key", SECRET).unwrap();
+    assert!(store.tamper(&id));
+    assert!(store.unseal_for_run("tok", &id).is_err());
+}
+
+#[test]
+fn delete_removes_secret() {
+    let store = InMemorySecretStore::new([7u8; 32]);
+    let id = store.seal("api-key", SECRET).unwrap();
+    assert!(store.delete(&id).unwrap());
+    assert!(store.unseal_for_run("tok", &id).is_err());
+    assert!(store.describe(&id).is_err());
+    // 幂等:再删返回 false
+    assert!(!store.delete(&id).unwrap());
+}
+
+#[test]
+fn unknown_secret_errors() {
+    let store = InMemorySecretStore::new([7u8; 32]);
+    assert!(store.unseal_for_run("tok", "nope").is_err());
+    assert!(store.describe("nope").is_err());
+}
+
+#[test]
+fn lease_and_redacted_never_leak_in_debug() {
+    let lease = SecretLease::new("sec_x", SECRET.to_vec());
+    let debug = format!("{lease:?}");
+    assert!(
+        !debug.contains("secret-value"),
+        "lease Debug 泄露明文: {debug}"
+    );
+    assert!(
+        debug.contains("SecretLease"),
+        "lease Debug 应可识别: {debug}"
+    );
+
+    let redacted = Redacted::new("secret-value".to_string());
+    assert_eq!(format!("{redacted:?}"), "<redacted>");
+    assert_eq!(format!("{redacted}"), "<redacted>");
+    // 内部仍可读(启动进程需要真实值)
+    assert_eq!(redacted.get(), "secret-value");
+    assert_eq!(redacted.into_inner(), "secret-value");
+}
+
+#[test]
+fn builtin_store_persists_ciphertext_in_catalog() {
+    let catalog = CatalogStore::memory().unwrap();
+    let store = BuiltinSecretStore::with_master_key(catalog.clone(), [9u8; 32]).unwrap();
+    let id = store.seal("api-key", SECRET).unwrap();
+    // 目录库里只有密文,没有明文
+    let raw: String = catalog
+        .with_conn(|c| {
+            Ok(c.query_row(
+                "SELECT LOWER(HEX(ciphertext)) FROM sealed_secrets WHERE secret_key = ?1",
+                rusqlite::params!["api-key"],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert!(!raw.contains("secret-value"), "目录库出现明文: {raw}");
+    assert!(!raw.is_empty());
+
+    // 重开同一目录库(同一主密钥)→ 仍可解封
+    let reopened = BuiltinSecretStore::with_master_key(catalog, [9u8; 32]).unwrap();
+    let lease = reopened.unseal_for_run("tok", &id).unwrap();
+    assert_eq!(lease.as_slice(), SECRET);
+
+    assert!(reopened.delete(&id).unwrap());
+    assert!(reopened.unseal_for_run("tok", &id).is_err());
+}
+
+#[test]
+fn describe_reports_metadata_without_plaintext() {
+    let store = InMemorySecretStore::new([7u8; 32]);
+    let id = store.seal("api-key", SECRET).unwrap();
+    let d = store.describe(&id).unwrap();
+    assert_eq!(d.id, id);
+    assert_eq!(d.name, "api-key");
+    // byte_len 是密文负载长度(明文 + 16 字节 GCM 认证标签),不暴露明文本身
+    assert_eq!(d.byte_len, SECRET.len() + 16);
+    let text = format!("{d:?}");
+    assert!(!text.contains("secret-value"));
+    assert!(text.contains("api-key"));
+}
+
+#[test]
+fn same_name_reseal_replaces() {
+    let catalog = CatalogStore::memory().unwrap();
+    let store = BuiltinSecretStore::with_master_key(catalog, [3u8; 32]).unwrap();
+    let first = store.seal("api-key", b"old").unwrap();
+    store.delete(&first).unwrap();
+    let second = store.seal("api-key", b"new").unwrap();
+    let lease = store.unseal_for_run("tok", &second).unwrap();
+    assert_eq!(lease.as_slice(), b"new");
+}

@@ -9,6 +9,7 @@
 //! - 类型化贡献查找:`contribution_registry`
 
 pub mod builtin;
+pub mod builtin_secret_store;
 pub mod contribution_registry;
 pub mod hooks;
 pub mod host;
