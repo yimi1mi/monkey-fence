@@ -35,6 +35,11 @@ mod theme;
 mod vcs_panel;
 #[allow(dead_code)]
 mod work_items;
+mod workflow_canvas;
+mod workflow_editor;
+#[cfg(test)]
+mod workflow_editor_tests;
+mod workflow_node_inspector;
 mod workspace;
 #[cfg(test)]
 mod workspace_interaction_tests;
