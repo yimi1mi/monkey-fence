@@ -4,6 +4,8 @@
 //! v2 清单只声明 Agent Type 契约(adapter/检测/运行模式);
 //! 内置 profile 的完整命令/参数/钩子由 `profile_spec_from_builtin` 直接合成。
 
+use crate::claude_adapter::ClaudeCodeAdapter;
+use crate::codex_adapter::CodexAdapter;
 use crate::generic_command_adapter::GenericCommandAdapter;
 use crate::manifest::{AgentTypeContribution, Capabilities, ManifestHeader, PluginManifest};
 use mf_agent::agent_adapter::AgentAdapter;
@@ -199,11 +201,12 @@ fn adapter_of(profile_id: &str) -> &'static str {
 }
 
 /// 按适配器契约标识构造内置 Agent Adapter。
-/// claude-code / codex 适配器随隔离配置里程碑提供;当前未接线类型
-/// 显式报错,不做静默回退。
+/// claude-code / codex 提供 run-temp 隔离配置;其余 CLI 走通用命令适配器。
 pub fn adapter_for(adapter: &str) -> Option<Box<dyn AgentAdapter>> {
     match adapter {
         "generic-command" => Some(Box::new(GenericCommandAdapter::new())),
+        "claude-code" => Some(Box::new(ClaudeCodeAdapter::new())),
+        "codex" => Some(Box::new(CodexAdapter::new())),
         _ => None,
     }
 }

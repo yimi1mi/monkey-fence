@@ -10,6 +10,8 @@
 
 pub mod builtin;
 pub mod builtin_secret_store;
+pub mod claude_adapter;
+pub mod codex_adapter;
 pub mod contribution_registry;
 pub mod generic_command_adapter;
 pub mod hooks;
