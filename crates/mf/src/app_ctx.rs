@@ -19,6 +19,20 @@ pub struct ProjectHandle {
     pub orchestrator: Arc<Orchestrator>,
 }
 
+/// 上次会话的打开项目(持久化到 ~/.monkeyfence/session.json)。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SessionState {
+    pub projects: Vec<PathBuf>,
+    pub foreground: Option<PathBuf>,
+}
+
+fn session_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".monkeyfence")
+        .join("session.json")
+}
+
 pub struct AppCtx {
     pub registry: Arc<SessionRegistry>,
     pub plugins: Arc<PluginRegistry>,
@@ -151,6 +165,48 @@ impl AppCtx {
             h.orchestrator.stop();
         }
         self.sync_pipe_routing();
+    }
+
+    /// 持久化当前打开项目与前台项目(原子写)。
+    pub fn save_session(&self, foreground: Option<&PathBuf>) {
+        let projects: Vec<PathBuf> = self
+            .projects
+            .lock()
+            .iter()
+            .map(|p| p.root.clone())
+            .collect();
+        Self::save_session_at(
+            &session_path(),
+            &SessionState {
+                projects,
+                foreground: foreground.cloned(),
+            },
+        );
+    }
+
+    /// 读取上次会话(文件缺失/损坏 → 空状态,不阻塞启动)。
+    pub fn load_session() -> SessionState {
+        Self::load_session_at(&session_path())
+    }
+
+    pub(crate) fn save_session_at(path: &PathBuf, state: &SessionState) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let tmp = path.with_extension("json.tmp");
+        let write = serde_json::to_string_pretty(state)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+            .and_then(|text| std::fs::write(&tmp, text));
+        if write.and_then(|_| std::fs::rename(&tmp, path)).is_err() {
+            log::warn!("会话保存失败: {}", path.display());
+        }
+    }
+
+    pub(crate) fn load_session_at(path: &PathBuf) -> SessionState {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
     }
 
     pub fn orchestrator_of(&self, root: &PathBuf) -> Option<Arc<Orchestrator>> {

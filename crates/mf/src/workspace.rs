@@ -112,7 +112,7 @@ impl Workspace {
         let app = AppCtx::new();
         let task_sidebar = cx.new(|cx| TaskSidebar::new(app.clone(), cx));
         let agent_workspace = cx.new(|cx| AgentWorkspace::new(app.clone(), cx));
-        Self {
+        let mut ws = Self {
             app,
             foreground_root: None,
             file_tree: None,
@@ -132,11 +132,38 @@ impl Workspace {
             focus_editor_next: false,
             pending_focus: None,
             editor_font: mf_agent::EditorConfig::default(),
-        }
+        };
+        ws.restore_session(cx);
+        ws
     }
 
     pub fn focus_handle(&self) -> FocusHandle {
         self.focus_handle.clone()
+    }
+
+    /// 恢复上次会话打开的项目(存在性过滤;按保存顺序打开,最后切到保存的前台)。
+    fn restore_session(&mut self, cx: &mut Context<Self>) {
+        let session = AppCtx::load_session();
+        let projects: Vec<PathBuf> = session
+            .projects
+            .iter()
+            .filter(|p| p.is_dir())
+            .cloned()
+            .collect();
+        for root in &projects {
+            self.open_folder(root.clone(), cx);
+        }
+        if let Some(fg) = session.foreground {
+            if fg.is_dir() && projects.contains(&fg) && self.app.orchestrator_of(&fg).is_some() {
+                self.set_foreground_project(&fg, cx);
+                self.status_message = format!("已恢复 {} 个项目", projects.len()).into();
+            }
+        }
+    }
+
+    /// 项目列表/前台变化后持久化会话。
+    fn persist_session(&self) {
+        self.app.save_session(self.foreground_root.as_ref());
     }
 
     /// 前台项目根;用于终端 cwd、快速打开、搜索与标签归属。
@@ -171,6 +198,7 @@ impl Workspace {
                 self.set_foreground_project(&path, cx);
                 self.status_message =
                     format!("已打开 {}({} 个项目)", path.display(), self.project_count()).into();
+                self.persist_session();
             }
             Err(e) => {
                 self.status_message = format!("打开项目失败: {e:#}").into();
@@ -205,6 +233,7 @@ impl Workspace {
             });
         });
         self.vcs_panel = Some(vcs);
+        self.persist_session();
         // 打开项目时刷新插件目录(项目级技能等)
         self.app.refresh_catalog();
         // 关闭孤儿编辑器之外不动 tabs(标签携带项目标识,跨项目保留)
@@ -251,6 +280,7 @@ impl Workspace {
             }
         }
         self.status_message = "项目已关闭".into();
+        self.persist_session();
         cx.notify();
     }
 

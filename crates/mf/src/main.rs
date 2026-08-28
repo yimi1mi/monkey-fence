@@ -683,6 +683,30 @@ mod v2_tests {
         orch.stop();
     }
 
+    /// 会话持久化:保存 → 读取往返;损坏文件回退空状态;不存在的目录由调用方过滤。
+    #[test]
+    fn session_roundtrip_and_corrupt_fallback() {
+        use crate::app_ctx::{AppCtx, SessionState};
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.json");
+        let state = SessionState {
+            projects: vec!["D:/a".into(), "D:/b".into()],
+            foreground: Some("D:/b".into()),
+        };
+        AppCtx::save_session_at(&path, &state);
+        let back = AppCtx::load_session_at(&path);
+        assert_eq!(back.projects.len(), 2);
+        assert_eq!(
+            back.foreground.as_deref(),
+            Some(std::path::Path::new("D:/b"))
+        );
+        // 原子写不留 tmp 残留
+        assert!(!path.with_extension("json.tmp").exists());
+        // 损坏 → 空状态
+        std::fs::write(&path, "{broken").unwrap();
+        assert!(AppCtx::load_session_at(&path).projects.is_empty());
+    }
+
     /// mfctl 命名管道客户端(测试内嵌副本,协议与 mfctl 一致)。
     fn pipe_request(
         name: &str,

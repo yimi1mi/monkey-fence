@@ -117,7 +117,7 @@ path = "skills/demo"
 
 ### 内置智能体(设置 → 智能体)
 
-- **CLI**(只检测 PATH,不自动安装,不复制凭据/配置目录):Codex · Claude · OpenCode · Cursor · Kimi;未检测到时一键打开官方安装页
+- **CLI**(只检测 PATH,不复制凭据/配置目录):Codex · Claude · OpenCode · Cursor · Kimi · Gemini CLI · GitHub Copilot · Qwen Code · iFlow CLI · Aider · Amp;「可安装」区常驻,用户自行选择安装——codex/claude/opencode/gemini/copilot/qwen/iflow(官方 npm 包,已逐一核实仓库归属)与 aider(官方 PyPI)支持一键安装,cursor/kimi/amp 为官方独立安装器(跳官方页,npm 同名包非官方不自动执行)
 - **API**:OpenAI 兼容 · Anthropic · mock(来自 `~/.monkeyfence/config.toml` 的 providers)
 - **空白终端**;默认智能体(Auto / 指定);权限模式 Yolo / Manual;状态钩子总开关(命名空间内写入 + 备份 + 可逆移除);自动生成标签标题;Agent 工作时保持唤醒
 - Agent 详情可配置:Command · Arguments · Environment · Permission arguments · Hook 安装状态 · 插件来源/版本
@@ -141,6 +141,7 @@ mfctl pipeline propose --file draft.json     # Planner 提案,须用户确认
 - 迁移:旧 `runs→Task`、`tasks→Step`、`dispatches→Agent Run`;旧表与消息/问题历史保留为只读;`work-items.json` 兼容导入一次(忽略 `vcs_ref`,原文件保留)
 - 崩溃恢复:重开时未结算 Agent Run → `interrupted`,对应 Task → `needs-you`
 - 前台只显示一个项目的文件树/编辑上下文;其他项目的任务与 Agent 后台继续运行;关闭含活动 Agent Run 的项目必须先确认停止
+- 打开的项目列表与前台项目持久化到 `~/.monkeyfence/session.json`(原子写),重启应用自动恢复
 
 ## P4 / Git 面板(独立)
 

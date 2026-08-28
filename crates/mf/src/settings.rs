@@ -32,6 +32,8 @@ pub struct SettingsView {
     agent_env_s: String,
     /// 插件页:等待用户确认重新授权的插件 id(两步式,不做一键自动重授权)
     pending_reauth: Option<String>,
+    /// 智能体页:一键安装进行中
+    installing: bool,
     /// 插件页:本地目录 / Git URL 安装输入
     plugin_local_s: String,
     plugin_git_s: String,
@@ -99,6 +101,7 @@ impl SettingsView {
             agent_perm_args_s: String::new(),
             agent_env_s: String::new(),
             pending_reauth: None,
+            installing: false,
             plugin_local_s: String::new(),
             plugin_git_s: String::new(),
             plugin_status: "".into(),
@@ -1549,44 +1552,102 @@ impl SettingsView {
             );
         }
 
-        // 可安装(未检测到的 CLI)
-        let installable: Vec<_> = profiles
+        // 可安装区:始终显示;未检测到的内置 CLI Agent 逐个列出。
+        // 官方 npm 包已核实的一键安装(codex/claude/opencode);
+        // cursor/kimi 走官方安装页(npm 同名包非官方,不做自动执行)。
+        let all_cli = mf_plugins::builtin::builtin_cli_agents();
+        let installable: Vec<_> = all_cli
             .iter()
-            .filter(|p| {
-                p.runtime == mf_agent::RuntimeKind::Pty
-                    && p.id != "blank-terminal"
-                    && mf_plugins::builtin::detect_on_path(&p.command).is_none()
-            })
+            .filter(|a| mf_plugins::builtin::detect_on_path(&a.command).is_none())
             .collect();
-        if !installable.is_empty() {
-            col = col.child(section("可安装 Agent 插件(仅检测 PATH,不自动安装)"));
-            for p in installable {
-                let homepage = p.homepage.clone().unwrap_or_default();
-                col = col.child(
-                    div()
-                        .id(ElementId::Name(format!("installable-{}", p.id).into()))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .py_1()
-                        .child(div().text_size(px(11.5)).child(p.display_name.clone()))
-                        .child(
+        col = col.child(section("可安装 Agent 插件"));
+        if installable.is_empty() {
+            col = col.child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgb(crate::theme::Theme::fg_faint()))
+                    .child("全部内置 Agent 均已检测到(在 PATH)。"),
+            );
+        }
+        for a in installable {
+            let homepage = a.homepage.clone();
+            let spec = mf_plugins::builtin::install_spec_of(&a.profile_id);
+            // 按安装器程序检测可用性(npm / python 各自检查 PATH)
+            let can_auto = spec
+                .as_ref()
+                .is_some_and(|sp| mf_plugins::builtin::detect_on_path(&sp.program).is_some());
+            let missing_tool = match &spec {
+                Some(sp) if !can_auto => Some(sp.program.clone()),
+                _ => None,
+            };
+            let aid = a.profile_id.clone();
+            col = col.child(
+                div()
+                    .id(ElementId::Name(
+                        format!("installable-{}", a.profile_id).into(),
+                    ))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_1()
+                    .flex_wrap()
+                    .child(div().text_size(px(11.5)).child(a.name.clone()))
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(rgb(crate::theme::Theme::fg_faint()))
+                            .child(format!("`{}`", a.command)),
+                    )
+                    .when_some(spec.clone(), |d, sp| {
+                        d.child(
+                            div()
+                                .text_size(px(9.))
+                                .px_1()
+                                .rounded_sm()
+                                .bg(rgb(crate::theme::Theme::bg_active()))
+                                .text_color(rgb(crate::theme::Theme::fg_faint()))
+                                .child(sp.display.clone()),
+                        )
+                    })
+                    .child(div().flex_1())
+                    .when_some(missing_tool, |d, tool| {
+                        d.child(
                             div()
                                 .text_size(px(9.5))
-                                .text_color(rgb(crate::theme::Theme::fg_faint()))
-                                .child(format!("`{}`", p.command)),
+                                .text_color(rgb(crate::theme::Theme::warning()))
+                                .child(format!("缺少 {tool}")),
                         )
-                        .child(div().flex_1())
-                        .when(!homepage.is_empty(), |d| {
-                            d.child(link_btn(
-                                cx,
-                                format!("install-open-{}", p.id),
-                                "打开官方安装页",
-                                homepage,
-                            ))
-                        }),
-                );
-            }
+                    })
+                    .when(can_auto, |d| {
+                        let sp = spec.clone().unwrap();
+                        let aid_btn = aid.clone();
+                        d.child(mini_btn(
+                            cx,
+                            format!("install-run-{aid}"),
+                            "一键安装",
+                            crate::theme::Theme::success(),
+                            move |s: &mut SettingsView, _, _, cx| {
+                                s.run_agent_install(&sp.program, &sp.args, &aid_btn, cx);
+                            },
+                        ))
+                    })
+                    .when(spec.is_none(), |d| {
+                        d.child(
+                            div()
+                                .text_size(px(9.))
+                                .text_color(rgb(crate::theme::Theme::fg_faint()))
+                                .child("官方独立安装器"),
+                        )
+                    })
+                    .when(!homepage.is_empty(), |d| {
+                        d.child(link_btn(
+                            cx,
+                            format!("install-open-{aid}"),
+                            "官方安装页",
+                            homepage,
+                        ))
+                    }),
+            );
         }
         col = col.child(div().id("agents-refresh").child(mini_btn(
             cx,
@@ -1602,6 +1663,83 @@ impl SettingsView {
             },
         )));
         col.into_any_element()
+    }
+
+    /// 一键安装 CLI Agent:后台运行官方包管理器命令,输出尾部回显,完成后刷新检测。
+    fn run_agent_install(
+        &mut self,
+        program: &str,
+        args: &[String],
+        agent_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.installing {
+            self.plugin_status = "已有安装任务进行中…".into();
+            cx.notify();
+            return;
+        }
+        self.installing = true;
+        self.plugin_status = format!("正在安装 {agent_id}…").into();
+        let program = program.to_string();
+        let args = args.to_vec();
+        let agent_id = agent_id.to_string();
+        cx.spawn(async move |this, cx| {
+            let out = cx
+                .background_executor()
+                .spawn(async move {
+                    // Windows 下 npm 是 npm.cmd,经 cmd /c 调用;5 分钟超时
+                    let mut cmd = if cfg!(windows) {
+                        let mut c = std::process::Command::new("cmd");
+                        c.arg("/c").arg(&program).args(&args);
+                        c
+                    } else {
+                        let mut c = std::process::Command::new(&program);
+                        c.args(&args);
+                        c
+                    };
+                    if let Some(home) = dirs::home_dir() {
+                        cmd.current_dir(home);
+                    }
+                    match cmd.output() {
+                        Ok(o) => {
+                            let ok = o.status.success();
+                            let tail = |b: &[u8]| -> String {
+                                let text = String::from_utf8_lossy(b);
+                                text.lines()
+                                    .rev()
+                                    .take(3)
+                                    .collect::<Vec<_>>()
+                                    .into_iter()
+                                    .rev()
+                                    .collect::<Vec<_>>()
+                                    .join(" | ")
+                            };
+                            (ok, tail(&o.stdout), tail(&o.stderr))
+                        }
+                        Err(e) => (false, String::new(), e.to_string()),
+                    }
+                })
+                .await;
+            this.update(cx, move |s: &mut SettingsView, cx| {
+                s.installing = false;
+                let (ok, out_tail, err_tail) = out;
+                if ok {
+                    s.plugin_status = format!("{agent_id} 安装完成:{out_tail}").into();
+                } else {
+                    s.plugin_status = format!(
+                        "{agent_id} 安装失败:{err_tail} {out_tail}(可从官方安装页手动安装)"
+                    )
+                    .into();
+                }
+                if let Some(app) = &s.app {
+                    app.refresh_catalog();
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
     }
 
     fn render_plugins_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
