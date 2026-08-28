@@ -24,6 +24,7 @@ pub mod schema;
 pub mod secrets;
 pub mod store;
 pub mod workflow;
+pub mod workflow_compiler;
 
 /// 适配器构造 Handoff 时使用的别名:规范类型是 `handoff::Handoff`。
 pub use crate::handoff::Handoff as HandoffDraft;
@@ -55,3 +56,4 @@ pub use schema::{
     catalog_db_path, project_db_path, CATALOG_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION,
 };
 pub use store::Store;
+pub use workflow_compiler::{CompileError, CompileInput, WorkflowCompiler};
