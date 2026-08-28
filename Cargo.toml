@@ -34,7 +34,8 @@ mf-plugins = { path = "crates/mf-plugins" }
 
 # Zed 同源依赖(本地 checkout,保证 Windows DirectX 后端可用)
 gpui = { path = "D:/workspace/zed/crates/gpui" }
-gpui_platform = { path = "D:/workspace/zed/crates/gpui_platform" }
+# 平台引导 vendored 副本(gpui_windows 带 IME 补丁);gpui 核心仍只读引用 zed
+gpui_platform = { path = "vendor/gpui_platform" }
 
 anyhow = "1"
 log = "0.4"

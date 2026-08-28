@@ -11,10 +11,24 @@ use std::sync::Arc;
 pub struct FileIndex {
     root: PathBuf,
     files: BTreeSet<PathBuf>,
+    /// 相对路径缓存:drain 时增量维护,避免每次查询全量分配。
+    rel_cache: Arc<Vec<String>>,
     scanning: bool,
     queue: Arc<Mutex<FileQueue>>,
     stop: Arc<AtomicBool>,
 }
+
+/// 快速打开不需要的生成物目录(P4/非 git 工程没有 .gitignore 兜底,
+/// Unity 的 Library/Temp 会有几十万文件)。
+fn is_junk_dir(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "library" | "temp" | "logs" | "obj" | "bin" | "node_modules" | "target"
+    )
+}
+
+/// 单个 drain 周期在主线程插入的上限:防止首批几十万条一次性卡死 UI。
+const DRAIN_BATCH_MAX: usize = 4000;
 
 #[derive(Default)]
 struct FileQueue {
@@ -38,6 +52,14 @@ impl FileIndex {
                     .git_global(true)
                     .git_exclude(true)
                     .parents(true)
+                    .filter_entry(|entry| {
+                        entry
+                            .file_type()
+                            .map(|t| {
+                                !t.is_dir() || !is_junk_dir(&entry.file_name().to_string_lossy())
+                            })
+                            .unwrap_or(true)
+                    })
                     .threads(4)
                     .build_parallel();
                 let mut batch = Vec::new();
@@ -118,6 +140,7 @@ impl FileIndex {
         let idx = Self {
             root,
             files: BTreeSet::new(),
+            rel_cache: Arc::new(Vec::new()),
             scanning: true,
             queue,
             stop,
@@ -132,20 +155,24 @@ impl FileIndex {
             cx.background_executor()
                 .timer(std::time::Duration::from_millis(250))
                 .await;
+            // 有界取批:超出的留给下一轮,主线程每轮最多插入 DRAIN_BATCH_MAX 条
+            let take_batch = |v: &mut Vec<PathBuf>| -> Vec<PathBuf> {
+                if v.len() > DRAIN_BATCH_MAX {
+                    let tail = v.split_off(DRAIN_BATCH_MAX);
+                    std::mem::replace(v, tail)
+                } else {
+                    std::mem::take(v)
+                }
+            };
             let (adds, removes) = {
                 let mut q = queue.lock();
-                (std::mem::take(&mut q.adds), std::mem::take(&mut q.removes))
+                (take_batch(&mut q.adds), take_batch(&mut q.removes))
             };
             if adds.is_empty() && removes.is_empty() {
                 continue;
             }
             let n = this.update(cx, |idx, cx| {
-                for p in adds {
-                    idx.files.insert(p);
-                }
-                for p in removes {
-                    idx.files.remove(&p);
-                }
+                idx.apply_updates(adds, &removes);
                 cx.notify();
                 idx.files.len()
             });
@@ -168,18 +195,44 @@ impl FileIndex {
         self.files.is_empty()
     }
 
-    /// 相对 root 的路径列表(快速打开用)
-    pub fn relative_paths(&self) -> Vec<String> {
-        self.files
-            .iter()
-            .map(|p| {
-                p.strip_prefix(&self.root)
-                    .unwrap_or(p)
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            })
-            .collect()
+    /// 应用一批增量:纯新增走增量缓存;有删除则全量重建(低频)。
+    fn apply_updates(&mut self, adds: Vec<PathBuf>, removes: &[PathBuf]) {
+        if !removes.is_empty() {
+            for p in removes {
+                self.files.remove(p);
+            }
+            for p in &adds {
+                self.files.insert(p.clone());
+            }
+            let root = &self.root;
+            self.rel_cache = Arc::new(
+                self.files
+                    .iter()
+                    .map(|p| rel_string(root, p))
+                    .collect::<Vec<_>>(),
+            );
+        } else {
+            let root = &self.root;
+            let cache = Arc::make_mut(&mut self.rel_cache);
+            for p in adds {
+                if self.files.insert(p.clone()) {
+                    cache.push(rel_string(root, &p));
+                }
+            }
+        }
     }
+
+    /// 相对路径快照(Arc 共享,后台模糊匹配直接用它,不再每次全量分配)。
+    pub fn relative_paths_arc(&self) -> Arc<Vec<String>> {
+        self.rel_cache.clone()
+    }
+}
+
+fn rel_string(root: &Path, p: &Path) -> String {
+    p.strip_prefix(root)
+        .unwrap_or(p)
+        .to_string_lossy()
+        .replace('\\', "/")
 }
 
 impl Drop for FileIndex {

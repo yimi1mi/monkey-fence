@@ -149,6 +149,8 @@ struct ProjectSurfaceState {
     tabs: Vec<Tab>,
     active_tab: usize,
     console_dock: Option<Entity<ConsoleDock>>,
+    /// 每项目一份文件索引:重复 Ctrl+P 不再重扫,关闭项目时随 surface 释放。
+    file_index: Option<Entity<FileIndex>>,
 }
 
 impl Default for ProjectSurfaceState {
@@ -157,6 +159,7 @@ impl Default for ProjectSurfaceState {
             tabs: Vec::new(),
             active_tab: 0,
             console_dock: None,
+            file_index: None,
         }
     }
 }
@@ -987,7 +990,17 @@ impl Workspace {
             cx.notify();
             return;
         };
-        let index = cx.new(|cx| FileIndex::new(root, cx));
+        let index = {
+            let surface = self.surfaces.entry(root.clone()).or_default();
+            match surface.file_index.clone() {
+                Some(idx) => idx,
+                None => {
+                    let idx = cx.new(|cx| FileIndex::new(root.clone(), cx));
+                    surface.file_index = Some(idx.clone());
+                    idx
+                }
+            }
+        };
         let qo = cx.new(|cx| QuickOpen::files(index, cx));
         self.wire_quick_open(qo, cx);
     }
@@ -1099,6 +1112,10 @@ impl Workspace {
             ws.dismiss_quick_open(cx);
         })
         .detach();
+        // QuickOpen 是独立的文本输入客户端。仅把实体挂进渲染树并不会
+        // 自动转移焦点；若不显式排队，Workspace 的焦点兜底会继续接收
+        // 所有按键，导致英文、中文和退格都无法到达输入框。
+        self.pending_focus = Some(qo.read(cx).focus_handle(cx));
         self.quick_open = Some(qo.clone());
         cx.notify();
     }
@@ -2270,7 +2287,12 @@ impl Workspace {
             )
     }
 
-    fn on_panel_drag_move(&mut self, e: &MouseMoveEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_panel_drag_move(
+        &mut self,
+        e: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(drag) = self.panel_drag else {
             return;
         };
@@ -2282,7 +2304,8 @@ impl Workspace {
         }
         match drag {
             PanelDrag::Left { start_x, start_w } => {
-                let w = (start_w + e.position.x.as_f32() - start_x).clamp(LEFT_PANEL_MIN, LEFT_PANEL_MAX);
+                let w = (start_w + e.position.x.as_f32() - start_x)
+                    .clamp(LEFT_PANEL_MIN, LEFT_PANEL_MAX);
                 if (w - self.left_panel_width.as_f32()).abs() > 0.5 {
                     self.left_panel_width = px(w);
                     cx.notify();
@@ -2510,8 +2533,10 @@ fn activity_button(
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut assigned_focus_this_frame = false;
         if let Some(handle) = self.pending_focus.take() {
             window.focus(&handle, cx);
+            assigned_focus_this_frame = true;
         } else if self.focus_editor_next {
             self.focus_editor_next = false;
             if let Some(Tab::Editor(ed)) = self
@@ -2521,12 +2546,19 @@ impl Render for Workspace {
             {
                 let handle = ed.read(cx).focus_handle(cx);
                 window.focus(&handle, cx);
+                assigned_focus_this_frame = true;
             }
         }
         // 焦点兜底:窗口内没有任何焦点时(欢迎页、会话恢复无标签、关掉
         // 最后一个标签、浮层关闭后),按键会退化到 dispatch 树根,匹配不到
         // "Workspace" 上下文的绑定。把焦点收回工作区根,快捷键保持可达。
-        if !self.focus_handle.contains_focused(window, cx) {
+        // 新浮层在当前帧才会加入 dispatch tree，contains_focused 仍基于上一帧，
+        // 此时不能立刻用工作区根覆盖刚刚应用的 pending_focus。
+        let modal_owns_focus = self.quick_open.is_some() || self.settings_open.is_some();
+        if !assigned_focus_this_frame
+            && !modal_owns_focus
+            && !self.focus_handle.contains_focused(window, cx)
+        {
             window.focus(&self.focus_handle, cx);
         }
         let has_tabs = self
@@ -2633,9 +2665,10 @@ impl Render for Workspace {
             .flex_col()
             .bg(rgb(crate::theme::Theme::bg()))
             .text_color(rgb(crate::theme::Theme::fg()))
-            .when(matches!(self.panel_drag, Some(PanelDrag::Left { .. })), |d| {
-                d.cursor_col_resize()
-            })
+            .when(
+                matches!(self.panel_drag, Some(PanelDrag::Left { .. })),
+                |d| d.cursor_col_resize(),
+            )
             .when(
                 matches!(self.panel_drag, Some(PanelDrag::Bottom { .. })),
                 |d| d.cursor_row_resize(),

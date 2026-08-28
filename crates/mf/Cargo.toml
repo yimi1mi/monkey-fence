@@ -37,6 +37,7 @@ notify.workspace = true
 [dev-dependencies]
 toml.workspace = true
 tempfile = "3"
+gpui = { workspace = true, features = ["test-support"] }
 
 [build-dependencies]
 embed-resource = "3"

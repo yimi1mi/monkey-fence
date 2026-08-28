@@ -14,6 +14,8 @@ mod project_overview;
 #[cfg(test)]
 mod project_overview_tests;
 mod quick_open;
+#[cfg(test)]
+mod quick_open_input_tests;
 mod runtime_host;
 mod search;
 #[cfg(test)]
