@@ -32,6 +32,7 @@ enum WorkspaceView {
     Pipeline,
     Instances,
     Workflow,
+    Runs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +121,7 @@ pub struct AgentWorkspace {
     instances_page: gpui::Entity<crate::agent_instances_view::AgentInstancesPage>,
     /// 工作流编辑器页(独立实体;设计 §11.2)。
     workflow_page: gpui::Entity<crate::workflow_canvas::WorkflowCanvas>,
+    runs_page: gpui::Entity<crate::run_monitor::RunMonitor>,
 }
 
 impl AgentWorkspace {
@@ -155,7 +157,8 @@ impl AgentWorkspace {
                 crate::agent_instances_view::AgentInstancesPage::new(app_for_pages.clone(), cx)
             }),
             workflow_page: cx
-                .new(|cx| crate::workflow_canvas::WorkflowCanvas::new(app_for_pages, cx)),
+                .new(|cx| crate::workflow_canvas::WorkflowCanvas::new(app_for_pages.clone(), cx)),
+            runs_page: cx.new(|cx| crate::run_monitor::RunMonitor::new(app_for_pages, cx)),
         };
         ws
     }
@@ -170,6 +173,9 @@ impl AgentWorkspace {
         if !self.dirty {
             self.refresh_pipeline_state();
         }
+        // 后台事件到达:运行监控同步刷新投影
+        self.runs_page
+            .update(cx, |page, cx| page.refresh_snapshot(cx));
         cx.notify();
     }
 
@@ -177,6 +183,7 @@ impl AgentWorkspace {
         self.view = match tab {
             crate::workspace::AgentTab::Agents => WorkspaceView::Agents,
             crate::workspace::AgentTab::Pipeline => WorkspaceView::Pipeline,
+            crate::workspace::AgentTab::Runs => WorkspaceView::Runs,
         };
         cx.notify();
     }
@@ -188,7 +195,9 @@ impl AgentWorkspace {
             self.instances_page
                 .update(cx, |page, cx| page.set_selected_task(sel.clone(), cx));
             self.workflow_page
-                .update(cx, |page, cx| page.set_selected_task(sel, cx));
+                .update(cx, |page, cx| page.set_selected_task(sel.clone(), cx));
+            // 运行监控跟随任务选择
+            self.runs_page.update(cx, |page, cx| page.set_task(sel, cx));
             self.dirty = false;
             self.draft.clear();
             self.loaded_revision = None;
@@ -2085,12 +2094,14 @@ impl Render for AgentWorkspace {
             .child(tab_btn(cx, WorkspaceView::Agents, "Agents", self.view))
             .child(tab_btn(cx, WorkspaceView::Pipeline, "Pipeline", self.view))
             .child(tab_btn(cx, WorkspaceView::Instances, "实例", self.view))
-            .child(tab_btn(cx, WorkspaceView::Workflow, "工作流", self.view));
+            .child(tab_btn(cx, WorkspaceView::Workflow, "工作流", self.view))
+            .child(tab_btn(cx, WorkspaceView::Runs, "运行监控", self.view));
         let body = match self.view {
             WorkspaceView::Agents => self.render_agents_view(cx, window),
             WorkspaceView::Pipeline => self.render_pipeline_view(cx, window),
             WorkspaceView::Instances => self.instances_page.clone().into_any_element(),
             WorkspaceView::Workflow => self.workflow_page.clone().into_any_element(),
+            WorkspaceView::Runs => self.runs_page.clone().into_any_element(),
         };
         div()
             .id("agent-workspace")

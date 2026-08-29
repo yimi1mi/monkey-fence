@@ -669,6 +669,43 @@ impl Orchestrator {
         self.step_leases.lock().retain(|_, l| l.id != lease.id);
     }
 
+    /// 终止单个 Agent Run(完整动作):请求宿主停止进程、结算为
+    /// cancelled、释放并发槽与执行租约。幂等;未知 run 报错。
+    pub fn cancel_run(&self, run_id: i64) -> Result<RunView> {
+        let run = self
+            .store
+            .run_view(run_id)?
+            .ok_or_else(|| anyhow::anyhow!("Run {run_id} 不存在"))?;
+        if matches!(
+            run.status,
+            RunStatus::Succeeded | RunStatus::Failed | RunStatus::Cancelled
+        ) {
+            return Ok(run); // 终态幂等
+        }
+        self.host.stop_run(&self.root_str, run.id);
+        if let Some(session_id) = run.session_id {
+            if !matches!(run.status, RunStatus::Interrupted) {
+                // 存活会话的进程由 stop_run 停止;此处只解除展示层活性
+                let _ =
+                    self.store
+                        .update_session(session_id, Some(SessionStatus::Idle), None, None);
+            }
+        }
+        let cancelled = self
+            .store
+            .set_run_status(run.id, RunStatus::Cancelled)?
+            .ok_or_else(|| anyhow::anyhow!("Run {run_id} 状态写入失败"))?;
+        self.release_slot(run.id);
+        self.release_lease_of_run(run.id);
+        // run 级取消不改写 Step/Task 状态(由重试/跳过/终止任务决定),
+        // 但 awaiting-outcome 的注意力语义需要重新评估收敛
+        if let Some(step) = self.store.step_view(run.step_id).ok().flatten() {
+            self.emit(SchedulerEvent::StepUpdated(step));
+        }
+        self.emit(SchedulerEvent::RunUpdated(cancelled.clone()));
+        Ok(cancelled)
+    }
+
     /// 失败节点操作:重试。`RetryMode::ContinueSession` 只对存活会话合法,
     /// 其余场景必须显式 `FreshSession`(设计 §9.6)。
     pub fn retry_step(&self, step_id: i64, mode: RetryMode) -> Result<StepView> {

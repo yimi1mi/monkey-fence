@@ -1336,6 +1336,7 @@ fn surface_cwd(root: &Path) -> PathBuf {
 pub enum AgentTab {
     Agents,
     Pipeline,
+    Runs,
 }
 
 // ---------- 渲染 ----------

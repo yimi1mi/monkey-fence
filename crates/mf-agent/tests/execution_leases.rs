@@ -85,6 +85,7 @@ impl ExecutionDirectoryProvider for RecordingProvider {
 struct MockHost {
     launches: Mutex<Vec<LaunchSpec>>,
     senders: Mutex<HashMap<String, Sender<(i64, RuntimeEvent)>>>,
+    stopped: Mutex<Vec<i64>>,
 }
 
 impl RuntimeHost for MockHost {
@@ -108,7 +109,9 @@ impl RuntimeHost for MockHost {
         Ok(())
     }
     fn send_prompt(&self, _p: &str, _r: i64, _s: i64, _t: &str) {}
-    fn stop_run(&self, _p: &str, _r: i64) {}
+    fn stop_run(&self, _p: &str, r: i64) {
+        self.stopped.lock().push(r);
+    }
     fn kill_session(&self, _p: &str, _s: i64) {}
     fn kill_ad_hoc(&self, _p: &str, _s: i64) {}
     fn answer_question(&self, _p: &str, _r: i64, _a: &str) {}
@@ -171,6 +174,10 @@ impl Fixture {
                 .all(|s| matches!(s.status, StepStatus::Running))
         });
         assert!(ok, "等待步骤进入 running 超时");
+    }
+
+    fn host_stopped(&self) -> Vec<i64> {
+        self.host.stopped.lock().clone()
     }
 
     fn token_of_only_step(&self) -> String {
@@ -401,4 +408,35 @@ fn project_directory_provider_defaults_to_project_root() {
         MergeOutcome::NotRequired
     ));
     provider.release(&lease).unwrap();
+}
+
+// ---------- RunMonitor 取消动作:终止进程 + 释放租约(完整链) ----------
+
+#[test]
+fn cancel_run_stops_process_and_releases_lease() {
+    let provider = RecordingProvider::shared(true);
+    let fx = Fixture::with(provider.clone());
+    let task_id = fx.run_task();
+    let run = fx
+        .orch
+        .store
+        .list_runs_of_task(task_id)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.status == mf_agent::model::RunStatus::Running)
+        .unwrap();
+
+    fx.orch.cancel_run(run.id).unwrap();
+
+    let after = fx.orch.store.run_view(run.id).unwrap().unwrap();
+    assert_eq!(after.status, mf_agent::model::RunStatus::Cancelled);
+    // 进程已请求停止(完整 Orchestrator 动作,不是只改 DB 状态)
+    assert!(
+        fx.host_stopped().contains(&run.id),
+        "取消必须终止进程: {:?}",
+        fx.host_stopped()
+    );
+    // 隔离租约随取消释放
+    assert!(!provider.released_ids().is_empty(), "取消必须释放执行租约");
+    fx.orch.stop();
 }
