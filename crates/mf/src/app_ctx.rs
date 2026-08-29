@@ -516,6 +516,30 @@ impl AppCtx {
         Ok(rev.id)
     }
 
+    /// 任务本地工作流(项目 Store 草稿):只编译校验,不写库。
+    pub fn compile_task_local_workflow(
+        &self,
+        root: &Path,
+        task_id: i64,
+    ) -> Result<mf_agent::workflow::WorkflowSnapshot> {
+        let orch = self
+            .orchestrator_of(root)
+            .ok_or_else(|| anyhow::anyhow!("项目未打开: {}", root.display()))?;
+        let index = adapter_launch::workflow_plugin_index(&self.plugins);
+        orch.compile_task_local_workflow(task_id, &index)
+    }
+
+    /// 任务本地工作流(项目 Store 草稿):编译 + pin + 冻结 Revision。
+    /// unsafe-parallel 开关取草稿的持久化值(非 Git 根的显式风险接受)。
+    pub fn assign_task_local_workflow(&self, root: &Path, task_id: i64) -> Result<i64> {
+        let orch = self
+            .orchestrator_of(root)
+            .ok_or_else(|| anyhow::anyhow!("项目未打开: {}", root.display()))?;
+        let index = adapter_launch::workflow_plugin_index(&self.plugins);
+        let rev = orch.assign_task_local_workflow(task_id, &index)?;
+        Ok(rev.id)
+    }
+
     /// ---------- Secret 管理(设计 §8:明文只在 Secret Store 内) ----------
 
     fn secret_store(&self) -> Result<mf_plugins::builtin_secret_store::BuiltinSecretStore> {
@@ -617,7 +641,7 @@ mod agent_launch_selection_tests {
             }],
         };
         orch.store
-            .save_task_workflow(&root.path().to_string_lossy(), task.id, &draft)
+            .save_task_workflow(&root.path().to_string_lossy(), task.id, &draft, false)
             .unwrap();
         // 重新打开同一项目:草稿仍在(项目 Store 持久化)
         let reloaded = orch

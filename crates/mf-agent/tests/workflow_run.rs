@@ -1080,3 +1080,97 @@ fn transitive_ancestor_output_report_path_resolves_in_prompt() {
     );
     fx.orch.stop();
 }
+
+// ---------- 任务本地工作流:项目 Store 草稿直接冻结 + unsafe-parallel 持久化 ----------
+
+#[test]
+fn task_local_workflow_assigns_from_project_store_draft() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    fx.pins.resolve_ok(true);
+    let task = fx.orch.create_task("任务本地", "g").unwrap();
+    let draft = mf_agent::workflow::WorkflowTemplateDraft {
+        key: format!("task-{}", task.id),
+        name: "任务工作流".into(),
+        task_local: true,
+        nodes: vec![node("a", &[], "做 A", &fx.instance_id)],
+    };
+    fx.orch
+        .store
+        .save_task_workflow(&tmp.path().to_string_lossy(), task.id, &draft, false)
+        .unwrap();
+
+    // 编译检查(不写库):无 Revision 产生
+    let snapshot = fx
+        .orch
+        .compile_task_local_workflow(task.id, &plugin_index())
+        .unwrap();
+    assert_eq!(snapshot.nodes.len(), 1);
+    assert!(fx.orch.store.list_revision_ids(task.id).unwrap().is_empty());
+
+    // 分配:直接冻结项目 Store 草稿
+    let rev = fx
+        .orch
+        .assign_task_local_workflow(task.id, &plugin_index())
+        .unwrap();
+    let steps = fx.orch.store.revision_steps(rev.id).unwrap();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].step_key, "a");
+    assert!(
+        fx.pins
+            .pinned
+            .lock()
+            .iter()
+            .any(|(k, _)| *k
+                == mf_agent::orchestrator::workflow_pin_key(tmp.path(), task.id, rev.id)),
+        "任务本地分配同样按 Revision pin"
+    );
+    fx.orch.stop();
+}
+
+#[test]
+fn task_local_unsafe_parallel_flag_is_persisted_and_honored() {
+    let tmp = tempfile::tempdir().unwrap();
+    // ScriptedDirectory 关闭隔离能力 → 模拟非 Git 共享目录
+    let fx = Fixture::new(tmp.path());
+    fx.directory.set_isolates(false);
+    fx.pins.resolve_ok(true);
+    let task = fx.orch.create_task("并行任务", "g").unwrap();
+    let draft = mf_agent::workflow::WorkflowTemplateDraft {
+        key: format!("task-{}", task.id),
+        name: "任务工作流".into(),
+        task_local: true,
+        nodes: vec![
+            node("a", &[], "做 A", &fx.instance_id),
+            node("b", &[], "做 B", &fx.instance_id),
+        ],
+    };
+    // 开关关闭(默认):并行编译被拒
+    fx.orch
+        .store
+        .save_task_workflow(&tmp.path().to_string_lossy(), task.id, &draft, false)
+        .unwrap();
+    let err = fx
+        .orch
+        .assign_task_local_workflow(task.id, &plugin_index())
+        .unwrap_err();
+    assert!(err.to_string().contains("unsafe-parallel"), "{err:#}");
+    assert!(fx.orch.store.list_revision_ids(task.id).unwrap().is_empty());
+
+    // 开关持久化后:同一草稿可分配(用户显式接受风险)
+    fx.orch
+        .store
+        .save_task_workflow(&tmp.path().to_string_lossy(), task.id, &draft, true)
+        .unwrap();
+    assert!(fx
+        .orch
+        .store
+        .task_workflow_unsafe_parallel(&tmp.path().to_string_lossy(), task.id)
+        .unwrap());
+    let rev = fx
+        .orch
+        .assign_task_local_workflow(task.id, &plugin_index())
+        .unwrap();
+    assert_eq!(fx.orch.store.revision_steps(rev.id).unwrap().len(), 2);
+    fx.orch.stop();
+}

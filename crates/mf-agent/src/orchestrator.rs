@@ -331,6 +331,17 @@ impl Orchestrator {
         Ok(t)
     }
 
+    /// 丢弃任务(Composer 分配失败的回滚):无活动 Run 才允许,
+    /// 连带清理 Revision/Step/待决汇合;成功后发 TaskRemoved。
+    pub fn discard_task(&self, task_id: i64) -> Result<()> {
+        if self.store.delete_task_if_unused(task_id)? {
+            self.emit(SchedulerEvent::TaskRemoved(task_id));
+            Ok(())
+        } else {
+            anyhow::bail!("任务 {task_id} 已有 Agent Run,不能丢弃");
+        }
+    }
+
     pub fn archive_task(&self, task_id: i64) -> Result<()> {
         if self.task_has_active_runs(task_id)? {
             anyhow::bail!("任务仍有活动 Agent Run,请先停止");
@@ -546,6 +557,37 @@ impl Orchestrator {
 
     // ---------- 工作流分配(模板 → 编译 → 冻结 Revision) ----------
 
+    /// 运行 Workflow Compiler(纯函数;错误格式化为用户可读列表)。
+    fn compile_version(
+        &self,
+        version: &WorkflowTemplateVersion,
+        agent_type_plugins: &HashMap<String, PluginSourcePin>,
+        allow_unsafe_shared_directory: bool,
+    ) -> std::result::Result<crate::workflow::WorkflowSnapshot, anyhow::Error> {
+        crate::workflow_compiler::WorkflowCompiler::new()
+            .compile(crate::workflow_compiler::CompileInput {
+                template: version,
+                directory_provider_isolates: self.directory.isolates(),
+                allow_unsafe_shared_directory,
+                agent_type_plugins,
+                resolve_instance: &|id| self.workflow.catalog.snapshot_agent_instance(id, None),
+            })
+            .map_err(|errors| {
+                anyhow::anyhow!(
+                    "工作流编译失败:
+{}",
+                    errors
+                        .iter()
+                        .map(|e| format!("- [{}] {}: {}", e.code, e.node, e.message))
+                        .collect::<Vec<_>>()
+                        .join(
+                            "
+"
+                        )
+                )
+            })
+    }
+
     /// 把工作流模板版本分配给任务:运行 Workflow Compiler 全量校验,
     /// 冻结实例快照与插件 pin,原子写入 Revision(快照 + Step 投影)。
     /// `agent_type_plugins` 是当前可用插件贡献的 Agent Type → 插件包身份。
@@ -626,6 +668,49 @@ impl Orchestrator {
             self.emit(SchedulerEvent::TaskUpdated(t));
         }
         Ok(rev)
+    }
+
+    /// 编译任务本地工作流(项目 Store 草稿;只校验,不写库)。
+    /// 返回冻结快照;错误信息含全部编译错误(格式化列表)。
+    pub fn compile_task_local_workflow(
+        &self,
+        task_id: i64,
+        agent_type_plugins: &HashMap<String, PluginSourcePin>,
+    ) -> Result<crate::workflow::WorkflowSnapshot> {
+        let version = self.task_local_version(task_id)?;
+        let unsafe_parallel = self
+            .store
+            .task_workflow_unsafe_parallel(&self.root_str, task_id)?;
+        self.compile_version(&version, agent_type_plugins, unsafe_parallel)
+    }
+
+    /// 把任务本地工作流(项目 Store 草稿)分配冻结为 Revision:
+    /// 草稿 + 持久化的 unsafe-parallel 开关作为编译输入,直接冻结存储的
+    /// 草稿(不是 UI 瞬时状态)。
+    pub fn assign_task_local_workflow(
+        &self,
+        task_id: i64,
+        agent_type_plugins: &HashMap<String, PluginSourcePin>,
+    ) -> Result<RevisionView> {
+        let version = self.task_local_version(task_id)?;
+        let unsafe_parallel = self
+            .store
+            .task_workflow_unsafe_parallel(&self.root_str, task_id)?;
+        self.assign_workflow(task_id, &version, agent_type_plugins, unsafe_parallel)
+    }
+
+    /// 项目 Store 里的任务本地草稿 → 模板版本形态(无草稿报错)。
+    fn task_local_version(&self, task_id: i64) -> Result<WorkflowTemplateVersion> {
+        let Some(draft) = self.store.load_task_workflow(&self.root_str, task_id)? else {
+            anyhow::bail!("任务 {task_id} 没有本地工作流草稿;先在画布保存");
+        };
+        Ok(WorkflowTemplateVersion {
+            version_id: 0,
+            template_key: draft.key,
+            version: 1,
+            nodes: draft.nodes,
+            created_at: String::new(),
+        })
     }
 
     /// 用户解决汇合冲突后重试:以持久化行为源整批重新汇合(批量预检 +

@@ -146,7 +146,16 @@ impl TaskSidebar {
                     .into_iter()
                     .next_back()
                     .ok_or_else(|| anyhow::anyhow!("模板 {key} 不存在"))?;
-                assign_app.assign_workflow(root, task_id, version.version_id, false)?;
+                // 非 Git 根的并行风险开关读取该任务持久化的选择(默认拒绝)
+                let unsafe_parallel = assign_app
+                    .orchestrator_of(root)
+                    .and_then(|orch| {
+                        orch.store
+                            .task_workflow_unsafe_parallel(&root.to_string_lossy(), task_id)
+                            .ok()
+                    })
+                    .unwrap_or(false);
+                assign_app.assign_workflow(root, task_id, version.version_id, unsafe_parallel)?;
                 Ok(())
             };
         match state.submit_with_workflow(move |root| app.orchestrator_of(root), assign) {

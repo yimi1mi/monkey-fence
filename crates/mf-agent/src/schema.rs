@@ -169,6 +169,7 @@ CREATE TABLE IF NOT EXISTS task_workflows (
     project_key TEXT NOT NULL,
     task_id INTEGER NOT NULL,
     graph_json TEXT NOT NULL,
+    allow_unsafe_parallel INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (project_key, task_id)
 );

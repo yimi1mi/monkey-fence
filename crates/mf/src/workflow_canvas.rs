@@ -37,6 +37,8 @@ pub struct WorkflowCanvas {
     pub status: String,
     /// 当前任务(保存草稿的任务本地模板归属)。
     pub selected_task: Option<(std::path::PathBuf, i64)>,
+    /// 非 Git 根的"共享目录并行"风险开关(持久化到项目 Store)。
+    pub unsafe_parallel: bool,
     focus_handle: FocusHandle,
 }
 
@@ -51,6 +53,7 @@ impl WorkflowCanvas {
             inspector: None,
             status: String::new(),
             selected_task: None,
+            unsafe_parallel: false,
             focus_handle: cx.focus_handle(),
         };
         canvas.refresh_library();
@@ -76,6 +79,10 @@ impl WorkflowCanvas {
         // 跨项目同 task id 互不串扰)
         if let Some((root, task_id)) = task {
             if let Some(orch) = self.app.orchestrator_of(&root) {
+                self.unsafe_parallel = orch
+                    .store
+                    .task_workflow_unsafe_parallel(&root.to_string_lossy(), task_id)
+                    .unwrap_or(false);
                 match orch
                     .store
                     .load_task_workflow(&root.to_string_lossy(), task_id)
@@ -107,22 +114,9 @@ impl WorkflowCanvas {
         cx.notify();
     }
 
-    /// 保存草稿:写入项目 Store 的任务本地工作流(默认私有)。
-    pub fn save_draft(&mut self, cx: &mut Context<Self>) {
-        let Some(_) = self.selected_task.clone() else {
-            self.status = "请先选择一个任务(草稿保存为该任务的工作流)".into();
-            cx.notify();
-            return;
-        };
-        if self.editor.nodes().is_empty() {
-            self.status = "空工作流无法保存".into();
-            cx.notify();
-            return;
-        }
-        let Some((root, task_id)) = self.selected_task.clone() else {
-            unreachable!("上方已检查 selected_task");
-        };
-        let draft = mf_agent::workflow::WorkflowTemplateDraft {
+    /// 由编辑器状态构建任务本地草稿。
+    fn current_draft(&self, task_id: i64) -> mf_agent::workflow::WorkflowTemplateDraft {
+        mf_agent::workflow::WorkflowTemplateDraft {
             key: format!("task-{task_id}"),
             name: format!("任务 {task_id} 工作流"),
             task_local: true,
@@ -138,6 +132,24 @@ impl WorkflowCanvas {
                     deps: n.deps.clone(),
                 })
                 .collect(),
+        }
+    }
+
+    /// 保存草稿:写入项目 Store 的任务本地工作流(默认私有),
+    /// 连同"共享目录并行"风险开关一起持久化。
+    pub fn save_draft(&mut self, cx: &mut Context<Self>) {
+        if self.selected_task.is_none() {
+            self.status = "请先选择一个任务(草稿保存为该任务的工作流)".into();
+            cx.notify();
+            return;
+        }
+        if self.editor.nodes().is_empty() {
+            self.status = "空工作流无法保存".into();
+            cx.notify();
+            return;
+        }
+        let Some((root, task_id)) = self.selected_task.clone() else {
+            unreachable!("上方已检查 selected_task");
         };
         // 任务本地草稿存项目 Store(project+task 双键,不进全局目录库)
         let Some(orch) = self.app.orchestrator_of(&root) else {
@@ -145,14 +157,115 @@ impl WorkflowCanvas {
             cx.notify();
             return;
         };
-        match orch
-            .store
-            .save_task_workflow(&root.to_string_lossy(), task_id, &draft)
-        {
+        let draft = self.current_draft(task_id);
+        let unsafe_parallel = self.unsafe_parallel;
+        match orch.store.save_task_workflow(
+            &root.to_string_lossy(),
+            task_id,
+            &draft,
+            unsafe_parallel,
+        ) {
             Ok(()) => {
                 self.status = format!("已保存任务 {task_id} 本地草稿(项目内;可另存为全局模板)");
             }
             Err(e) => self.status = format!("保存失败: {e:#}"),
+        }
+        cx.notify();
+    }
+
+    /// 切换"共享目录并行"风险开关(立即持久化;非 Git 根并行需要它)。
+    pub fn toggle_unsafe_parallel(&mut self, cx: &mut Context<Self>) {
+        self.unsafe_parallel = !self.unsafe_parallel;
+        if let Some((root, task_id)) = self.selected_task.clone() {
+            if !self.editor.nodes().is_empty() {
+                if let Some(orch) = self.app.orchestrator_of(&root) {
+                    let draft = self.current_draft(task_id);
+                    let flag = self.unsafe_parallel;
+                    let _ = orch.store.save_task_workflow(
+                        &root.to_string_lossy(),
+                        task_id,
+                        &draft,
+                        flag,
+                    );
+                }
+            }
+        }
+        self.status = if self.unsafe_parallel {
+            "已开启共享目录并行(自担冲突风险;Git 项目无需开启)".into()
+        } else {
+            "已关闭共享目录并行".into()
+        };
+        cx.notify();
+    }
+
+    /// 编译检查:按项目 Store 草稿干跑 Workflow Compiler(不写库)。
+    pub fn compile_task_local(&mut self, cx: &mut Context<Self>) {
+        let Some((root, task_id)) = self.selected_task.clone() else {
+            self.status = "请先选择一个任务".into();
+            cx.notify();
+            return;
+        };
+        // 先保存当前编辑状态:编译检查的就是即将冻结的内容
+        self.save_draft(cx);
+        match self.app.compile_task_local_workflow(&root, task_id) {
+            Ok(snapshot) => {
+                self.status = format!("编译通过:{} 个节点已可冻结", snapshot.nodes.len());
+            }
+            Err(e) => self.status = format!("{e:#}"),
+        }
+        cx.notify();
+    }
+
+    /// 分配:冻结项目 Store 草稿为 Revision(编译 + 插件 pin + Step 投影)。
+    pub fn assign_task_local(&mut self, cx: &mut Context<Self>) {
+        let Some((root, task_id)) = self.selected_task.clone() else {
+            self.status = "请先选择一个任务".into();
+            cx.notify();
+            return;
+        };
+        self.save_draft(cx);
+        match self.app.assign_task_local_workflow(&root, task_id) {
+            Ok(rev) => {
+                self.status =
+                    format!("已冻结任务 {task_id} 工作流(Revision #{rev});确认运行后开始调度");
+            }
+            Err(e) => self.status = format!("{e:#}"),
+        }
+        cx.notify();
+    }
+
+    /// 确认运行:冻结项目 Store 草稿并立即开始调度(显式用户动作)。
+    pub fn confirm_and_run_task_local(&mut self, cx: &mut Context<Self>) {
+        let Some((root, task_id)) = self.selected_task.clone() else {
+            self.status = "请先选择一个任务".into();
+            cx.notify();
+            return;
+        };
+        let Some(orch) = self.app.orchestrator_of(&root) else {
+            self.status = "项目未打开".into();
+            cx.notify();
+            return;
+        };
+        // 无活动 Revision 时先冻结草稿(幂等:已分配则直接确认)
+        if orch
+            .store
+            .active_revision(task_id)
+            .unwrap_or(None)
+            .is_none()
+        {
+            self.save_draft(cx);
+            match self.app.assign_task_local_workflow(&root, task_id) {
+                Ok(_) => {}
+                Err(e) => {
+                    self.status = format!("{e:#}");
+                    cx.notify();
+                    return;
+                }
+            }
+        }
+        match orch.confirm_and_run(task_id) {
+            Ok(t) => self.status = format!("任务 {} 已开始运行({:?})", t.id, t.status),
+            Err(e) => self.status = format!("{e:#}"),
         }
         cx.notify();
     }
@@ -673,6 +786,90 @@ impl Render for WorkflowCanvas {
                             .child("保存草稿(任务本地)")
                             .on_click(cx.listener(|canvas: &mut WorkflowCanvas, _ev, _w, cx| {
                                 canvas.save_draft(cx);
+                            })),
+                    )
+                    .child(
+                        gpui::div()
+                            .id("wf-compile-local")
+                            .px_2()
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(crate::theme::Theme::border()))
+                            .text_size(px(9.))
+                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .cursor_pointer()
+                            .child("编译检查")
+                            .on_click(cx.listener(|canvas: &mut WorkflowCanvas, _ev, _w, cx| {
+                                canvas.compile_task_local(cx);
+                            })),
+                    )
+                    .child(
+                        gpui::div()
+                            .id("wf-assign-local")
+                            .px_2()
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(crate::theme::Theme::accent_dim()))
+                            .text_size(px(9.))
+                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .cursor_pointer()
+                            .child("分配(冻结 Revision)")
+                            .on_click(cx.listener(|canvas: &mut WorkflowCanvas, _ev, _w, cx| {
+                                canvas.assign_task_local(cx);
+                            })),
+                    )
+                    .child(
+                        gpui::div()
+                            .id("wf-confirm-local")
+                            .px_2()
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(crate::theme::Theme::accent()))
+                            .text_size(px(9.))
+                            .text_color(rgb(crate::theme::Theme::accent()))
+                            .cursor_pointer()
+                            .child("确认运行")
+                            .on_click(cx.listener(|canvas: &mut WorkflowCanvas, _ev, _w, cx| {
+                                canvas.confirm_and_run_task_local(cx);
+                            })),
+                    )
+                    .child(
+                        gpui::div()
+                            .id("wf-unsafe-parallel")
+                            .px_2()
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(if self.unsafe_parallel {
+                                crate::theme::Theme::warning()
+                            } else {
+                                crate::theme::Theme::border()
+                            }))
+                            .text_size(px(9.))
+                            .text_color(rgb(if self.unsafe_parallel {
+                                crate::theme::Theme::warning()
+                            } else {
+                                crate::theme::Theme::fg_faint()
+                            }))
+                            .cursor_pointer()
+                            .child(if self.unsafe_parallel {
+                                "共享目录并行:已开启(风险)"
+                            } else {
+                                "共享目录并行:关闭"
+                            })
+                            .on_click(cx.listener(|canvas: &mut WorkflowCanvas, _ev, _w, cx| {
+                                canvas.toggle_unsafe_parallel(cx);
                             })),
                     )
                     .children(diagnostics.iter().map(|d| {

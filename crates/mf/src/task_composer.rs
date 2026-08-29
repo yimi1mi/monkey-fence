@@ -206,15 +206,20 @@ impl TaskComposerState {
         let orch =
             resolve(root).ok_or_else(|| anyhow::anyhow!("项目未打开: {}", root.display()))?;
         let task = orch.create_task(title, goal)?;
+        // 模板分配失败 → 回滚:删除刚建的任务,不留无人认领的 Draft
+        if let WorkflowChoice::Template(_) = &self.workflow_choice {
+            if let Err(e) = assign(root, task.id, &self.workflow_choice) {
+                if let Err(discard_err) = orch.discard_task(task.id) {
+                    log::warn!("分配失败后清理 Draft 任务失败: {discard_err:#}");
+                }
+                return Err(e);
+            }
+        }
         let (pid, _) = normalize_project_path(root);
-        let target = ActivationTarget::Task {
+        Ok(ActivationTarget::Task {
             project: pid,
             task_id: task.id,
-        };
-        if let WorkflowChoice::Template(_) = &self.workflow_choice {
-            assign(root, task.id, &self.workflow_choice)?;
-        }
-        Ok(target)
+        })
     }
 }
 

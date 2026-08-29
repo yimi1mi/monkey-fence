@@ -320,7 +320,12 @@ fn task_workflow_roundtrips_per_project_and_task() {
     }];
 
     store
-        .save_task_workflow("proj-alpha", 7, &draft_with_nodes("task-7", nodes.clone()))
+        .save_task_workflow(
+            "proj-alpha",
+            7,
+            &draft_with_nodes("task-7", nodes.clone()),
+            false,
+        )
         .unwrap();
     // 同一 task id 在不同项目互不覆盖
     store
@@ -337,6 +342,7 @@ fn task_workflow_roundtrips_per_project_and_task() {
                     deps: vec![],
                 }],
             ),
+            false,
         )
         .unwrap();
 
@@ -350,7 +356,12 @@ fn task_workflow_roundtrips_per_project_and_task() {
 
     // 覆盖保存(编辑后)
     store
-        .save_task_workflow("proj-alpha", 7, &draft_with_nodes("task-7", nodes.clone()))
+        .save_task_workflow(
+            "proj-alpha",
+            7,
+            &draft_with_nodes("task-7", nodes.clone()),
+            false,
+        )
         .unwrap();
     assert_eq!(
         store

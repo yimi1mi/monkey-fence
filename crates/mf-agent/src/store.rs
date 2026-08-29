@@ -103,6 +103,21 @@ impl Store {
             }
         }
         {
+            // 任务本地工作流的"共享目录并行"风险开关(非 Git 根的显式接受)
+            let mut stmt = conn.prepare("PRAGMA table_info(task_workflows)")?;
+            let has_unsafe = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .any(|c| c.map(|c| c == "allow_unsafe_parallel").unwrap_or(false));
+            drop(stmt);
+            if !has_unsafe {
+                conn.execute(
+                    "ALTER TABLE task_workflows ADD COLUMN allow_unsafe_parallel INTEGER NOT NULL DEFAULT 0",
+                    [],
+                )
+                .context("补齐 task_workflows.allow_unsafe_parallel 列失败")?;
+            }
+        }
+        {
             let mut stmt = conn.prepare("PRAGMA table_info(pipeline_revisions)")?;
             let has_snapshot = stmt
                 .query_map([], |r| r.get::<_, String>(1))?
@@ -1686,6 +1701,41 @@ impl Store {
         })
     }
 
+    /// 删除任务(Composer 分配失败的回滚):无任何 Agent Run 时才允许;
+    /// 连带删除 Revision/Step/待决汇合行。返回是否删除。
+    pub fn delete_task_if_unused(&self, task_id: i64) -> Result<bool> {
+        self.with_tx(|c| {
+            let runs: i64 = c.query_row(
+                "SELECT COUNT(*) FROM agent_runs WHERE task_id = ?1",
+                params![task_id],
+                |r| r.get(0),
+            )?;
+            if runs > 0 {
+                return Ok(false);
+            }
+            c.execute(
+                "DELETE FROM step_deps WHERE step_id IN
+                   (SELECT id FROM steps WHERE task_id = ?1)",
+                params![task_id],
+            )?;
+            c.execute("DELETE FROM steps WHERE task_id = ?1", params![task_id])?;
+            c.execute(
+                "DELETE FROM pipeline_revisions WHERE task_id = ?1",
+                params![task_id],
+            )?;
+            c.execute(
+                "DELETE FROM pending_merges WHERE task_id = ?1",
+                params![task_id],
+            )?;
+            c.execute(
+                "DELETE FROM step_questions WHERE task_id = ?1",
+                params![task_id],
+            )?;
+            let deleted = c.execute("DELETE FROM agent_tasks WHERE id = ?1", params![task_id])?;
+            Ok(deleted == 1)
+        })
+    }
+
     /// 删除尚未激活的 draft Revision(pin 失败回滚用;连带删除投影 Step)。
     /// 非 draft(已激活/已废弃)拒绝删除。
     pub fn delete_draft_revision(&self, revision_id: i64) -> Result<()> {
@@ -1772,26 +1822,47 @@ impl Store {
     // ---------- 任务本地工作流(项目 Store,按 project+task 键) ----------
 
     /// 保存任务本地工作流草稿(同键覆盖;跨项目同 task id 互不影响)。
+    /// `allow_unsafe_parallel`:非隔离目录提供器下并行的显式风险接受
+    /// (持久化;分配时作为编译器输入,不是临时 UI 状态)。
     pub fn save_task_workflow(
         &self,
         project_key: &str,
         task_id: i64,
         draft: &crate::workflow::WorkflowTemplateDraft,
+        allow_unsafe_parallel: bool,
     ) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
-                "INSERT INTO task_workflows (project_key, task_id, graph_json, updated_at)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO task_workflows (project_key, task_id, graph_json, allow_unsafe_parallel, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(project_key, task_id) DO UPDATE SET
-                    graph_json = excluded.graph_json, updated_at = excluded.updated_at",
+                    graph_json = excluded.graph_json,
+                    allow_unsafe_parallel = excluded.allow_unsafe_parallel,
+                    updated_at = excluded.updated_at",
                 params![
                     project_key,
                     task_id,
                     serde_json::to_string(&draft.nodes)?,
+                    allow_unsafe_parallel as i64,
                     now()
                 ],
             )?;
             Ok(())
+        })
+    }
+
+    /// 任务本地草稿的"共享目录并行"风险开关(无草稿为 false)。
+    pub fn task_workflow_unsafe_parallel(&self, project_key: &str, task_id: i64) -> Result<bool> {
+        self.with_conn(|c| {
+            let flag: Option<i64> = c
+                .query_row(
+                    "SELECT allow_unsafe_parallel FROM task_workflows
+                     WHERE project_key = ?1 AND task_id = ?2",
+                    params![project_key, task_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(flag.unwrap_or(0) != 0)
         })
     }
 

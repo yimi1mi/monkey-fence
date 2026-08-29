@@ -368,3 +368,27 @@ fn submit_with_task_local_choice_skips_assignment() {
     .unwrap();
     assert_eq!(assigned, 0, "任务本地选择不触发模板分配");
 }
+
+#[test]
+fn composer_assign_failure_leaves_no_draft_task() {
+    // 预编译/分配失败 → 回滚:项目库不得留下无人认领的 Draft 任务
+    let dir = scratch("rollback");
+    let orch = start_orch(&dir);
+    let mut c = TaskComposerState::new(vec![(dir.clone(), "scratch".into())], Some(&dir));
+    c.set_title("会失败的任务");
+    c.set_templates(vec![("ghost-template".into(), "不存在的模板".into())]);
+    c.select_workflow("ghost-template");
+
+    let err = c
+        .submit_with_workflow(
+            |root| (root == &dir).then(|| orch.clone()),
+            |_root, _task, _choice| anyhow::bail!("模板不存在(注入失败)"),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("注入失败"), "{err:#}");
+    assert!(
+        orch.tasks().unwrap().is_empty(),
+        "分配失败不得留下 Draft 任务"
+    );
+    orch.stop();
+}
