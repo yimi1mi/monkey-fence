@@ -191,6 +191,11 @@ impl RunMonitor {
         cx.notify();
     }
 
+    /// 投影节点数(测试/诊断)。
+    pub fn snapshot_node_count(&self) -> usize {
+        self.snapshot.node_details().len()
+    }
+
     /// 概览事件到达时刷新(后台运行持续可见)。
     pub fn refresh_snapshot(&mut self, cx: &mut Context<Self>) {
         self.refresh();

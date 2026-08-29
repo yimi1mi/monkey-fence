@@ -1498,6 +1498,8 @@ pub struct RuntimeHostImpl {
 pub struct WorkflowLauncher {
     pub plugins: Arc<mf_plugins::PluginRegistry>,
     pub catalog: Arc<mf_agent::CatalogStore>,
+    /// Secret 主密钥覆盖(None = OS keyring;测试注入)。
+    pub secret_master_key: Option<[u8; 32]>,
 }
 
 impl RuntimeHostImpl {
@@ -1548,6 +1550,7 @@ impl RuntimeHost for RuntimeHostImpl {
             Some(spec.prompt.clone()),
             &run_token,
             false,
+            launcher.secret_master_key,
         )?;
         launch_workflow_pty(&self.registry, &spec, &plan, events)
     }

@@ -338,7 +338,7 @@ fn task_color(status: TaskStatus) -> u32 {
 
 impl TaskSidebar {
     /// 构建 `+` 菜单条目(插件类型 + 目录实例;设计 §10)。
-    fn build_menu(&self) -> Vec<crate::task_cli_menu::MenuEntry> {
+    pub(crate) fn build_menu(&self) -> Vec<crate::task_cli_menu::MenuEntry> {
         let contributions = self.app.plugins.contributions();
         let types: Vec<crate::agent_instance_editor::AgentTypeInfo> = contributions
             .agent_types()

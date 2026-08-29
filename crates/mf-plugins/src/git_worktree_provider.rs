@@ -134,15 +134,30 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
             return Ok(MergeOutcome::NeedsUser { conflicts });
         }
 
-        // 2. 第二遍:无重叠时按确定顺序把变更应用到项目工作目录
+        let _ = &main_repo;
+        // 2. 第二遍:无重叠时按确定顺序把变更复制回项目工作目录。
+        //    不用 git apply:工作区 diff 里的 untracked 新文件没有 blob 内容,
+        //    apply 无法重建;文件级复制对已跟踪修改与新建文件同样成立。
         for lease in &worktree_leases {
-            let wt_repo = git2::Repository::open(&lease.path)
-                .with_context(|| format!("打开 worktree 失败: {}", lease.path.display()))?;
-            let base_tree = wt_repo.find_tree(head_tree_id)?;
-            let mut diff = wt_repo.diff_tree_to_workdir_with_index(Some(&base_tree), None)?;
-            main_repo
-                .apply(&mut diff, git2::ApplyLocation::WorkDir, None)
-                .with_context(|| format!("合并 worktree 变更失败: {}", lease.path.display()))?;
+            let files = changed_files_with_status(&lease.path, head_tree_id)?;
+            for (path, deleted) in files {
+                let src = lease.path.join(&path);
+                let dst = self.repo_root.join(&path);
+                if deleted {
+                    if dst.is_file() {
+                        std::fs::remove_file(&dst)
+                            .with_context(|| format!("合并删除失败: {}", dst.display()))?;
+                    }
+                } else {
+                    if let Some(parent) = dst.parent() {
+                        std::fs::create_dir_all(parent)
+                            .with_context(|| format!("合并建目录失败: {}", parent.display()))?;
+                    }
+                    std::fs::copy(&src, &dst).with_context(|| {
+                        format!("合并复制失败: {} -> {}", src.display(), dst.display())
+                    })?;
+                }
+            }
         }
         Ok(MergeOutcome::Merged)
     }
@@ -181,12 +196,43 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
 
 use std::path::PathBuf;
 
+/// worktree 相对基线的变更:(路径, 是否删除)。
+fn changed_files_with_status(
+    worktree: &std::path::Path,
+    base_tree_id: git2::Oid,
+) -> Result<Vec<(String, bool)>> {
+    let repo = git2::Repository::open(worktree)
+        .with_context(|| format!("打开 worktree 失败: {}", worktree.display()))?;
+    let base_tree = repo.find_tree(base_tree_id)?;
+    let mut options = git2::DiffOptions::new();
+    options.include_untracked(true).recurse_untracked_dirs(true);
+    let diff = repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut options))?;
+    let mut out = Vec::new();
+    for delta in diff.deltas() {
+        let deleted = delta.status() == git2::Delta::Deleted;
+        let path = delta
+            .new_file()
+            .path()
+            .or_else(|| delta.old_file().path())
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_default();
+        if !path.is_empty() {
+            out.push((path, deleted));
+        }
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 /// worktree 相对基线的变更文件集(正斜杠规范化)。
 fn changed_files(worktree: &std::path::Path, base_tree_id: git2::Oid) -> Result<HashSet<String>> {
     let repo = git2::Repository::open(worktree)
         .with_context(|| format!("打开 worktree 失败: {}", worktree.display()))?;
     let base_tree = repo.find_tree(base_tree_id)?;
-    let diff = repo.diff_tree_to_workdir_with_index(Some(&base_tree), None)?;
+    let mut options = git2::DiffOptions::new();
+    options.include_untracked(true).recurse_untracked_dirs(true);
+    let diff = repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut options))?;
     Ok(diff
         .deltas()
         .map(|d| {

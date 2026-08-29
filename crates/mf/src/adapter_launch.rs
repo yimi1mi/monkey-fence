@@ -75,6 +75,7 @@ pub fn compile_instance_launch(
     prompt: Option<String>,
     run_token: &str,
     external_config: bool,
+    secret_master_key: Option<[u8; 32]>,
 ) -> Result<LaunchPlan> {
     let (resolved, adapter) = resolve_adapter(plugins, &instance.agent_type)?;
     let validation_errors = adapter.validate(instance);
@@ -86,8 +87,13 @@ pub fn compile_instance_launch(
     launch_ctx.external_config = external_config;
     launch_ctx.grants_shell = grants_shell(plugins, resolved.as_ref().map(|(src, _)| src));
     if !instance.sealed_secret_ids.is_empty() {
-        let secret_store =
-            mf_plugins::builtin_secret_store::BuiltinSecretStore::open(catalog.clone())?;
+        let secret_store = match secret_master_key {
+            Some(key) => mf_plugins::builtin_secret_store::BuiltinSecretStore::with_master_key(
+                catalog.clone(),
+                key,
+            )?,
+            None => mf_plugins::builtin_secret_store::BuiltinSecretStore::open(catalog.clone())?,
+        };
         for secret_id in &instance.sealed_secret_ids {
             let lease = secret_store.unseal_for_run(run_token, secret_id)?;
             launch_ctx

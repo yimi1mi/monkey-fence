@@ -157,7 +157,13 @@ pub struct BuiltinSecretStore {
 
 impl BuiltinSecretStore {
     /// 运行时入口:加载(不存在则生成并保存)keyring 主密钥。
+    /// 首次创建经进程内互斥:并行组件同时发现 NoEntry 会各自生成
+    /// 不同密钥并互相覆盖,导致先密封的密文永远无法解密。
     pub fn open(catalog: std::sync::Arc<mf_agent::CatalogStore>) -> Result<BuiltinSecretStore> {
+        static KEYRING_INIT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = KEYRING_INIT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
             .context("创建 keyring 条目失败")?;
         let key: [u8; 32] = match entry.get_password() {

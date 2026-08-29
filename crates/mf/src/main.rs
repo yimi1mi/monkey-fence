@@ -25,6 +25,7 @@ mod project_overview_tests;
 mod quick_open;
 #[cfg(test)]
 mod quick_open_input_tests;
+mod review_e2e_tests;
 mod run_monitor;
 #[cfg(test)]
 mod run_monitor_tests;

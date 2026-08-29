@@ -247,8 +247,14 @@ impl AppCtx {
     /// 不碰用户真实 ~/.monkeyfence)。
     pub fn with_catalog_for_tests(catalog: Arc<CatalogStore>) -> Arc<AppCtx> {
         let ctx = Self::with_parts_opt(mf_agent::Config::default(), catalog, false);
-        *ctx.secret_master_key.lock() = Some([7u8; 32]);
+        ctx.set_secret_master_key_for_tests([7u8; 32]);
         ctx
+    }
+
+    /// 注入确定性 Secret 主密钥(seal/unseal/工作流派发编译共用;
+    /// 生产不调用,走 OS keyring)。必须在 open_project 之前调用。
+    pub fn set_secret_master_key_for_tests(&self, key: [u8; 32]) {
+        *self.secret_master_key.lock() = Some(key);
     }
 
     /// 打开的项目数。
@@ -310,6 +316,7 @@ impl AppCtx {
             WorkflowLauncher {
                 plugins: self.plugins.clone(),
                 catalog: self.catalog_store.clone(),
+                secret_master_key: *self.secret_master_key.lock(),
             },
         );
         // 目录提供器:Git 仓库 → worktree 隔离(插件贡献解析);
@@ -483,6 +490,7 @@ impl AppCtx {
             prompt,
             &run_token,
             external_config,
+            *self.secret_master_key.lock(),
         )?;
         orch.create_ad_hoc_session(task_id, instance_snapshot, launch_mode, run_temp, plan)
     }
