@@ -63,6 +63,21 @@ pub struct PluginSummary {
     pub agents: Vec<String>,
     pub has_worker: bool,
     pub capabilities: manifest::Capabilities,
+    /// 包内容哈希(内置合成插件为空串)。
+    pub content_hash: String,
+    /// min_app_version 兼容性(计算值,不是常量)。
+    pub compatible: bool,
+    /// 当前活动 pin 数(任务冻结引用;0 = 可清理)。
+    pub active_pins: usize,
+    /// 全部贡献计数(按类型)。
+    pub agent_types_count: usize,
+    pub node_types_count: usize,
+    pub ui_schemas_count: usize,
+    pub execution_directories_count: usize,
+    pub secret_stores_count: usize,
+    pub workflow_templates_count: usize,
+    pub skills_count: usize,
+    pub tools_count: usize,
 }
 
 /// 把插件条目的选择状态(启用/授权/指纹)持久化到指定根的锁文件。

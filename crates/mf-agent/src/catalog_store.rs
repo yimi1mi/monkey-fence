@@ -158,6 +158,19 @@ impl CatalogStore {
         Ok(rows)
     }
 
+    /// 指定插件包(full_id + content_hash)的活动 pin 数。
+    /// 内置合成插件(content_hash 为空)按 full_id + 空哈希精确计数。
+    pub fn plugin_pin_count_of_plugin(&self, full_id: &str, content_hash: &str) -> Result<usize> {
+        self.with_conn(|conn| {
+            let count = conn.query_row(
+                "SELECT COUNT(*) FROM plugin_pins WHERE full_id = ?1 AND content_hash = ?2",
+                params![full_id, content_hash],
+                |row| row.get::<_, i64>(0),
+            )?;
+            Ok(count.max(0) as usize)
+        })
+    }
+
     pub fn plugin_pin_count(&self, content_hash: &str) -> Result<usize> {
         self.with_conn(|conn| {
             let count = conn.query_row(

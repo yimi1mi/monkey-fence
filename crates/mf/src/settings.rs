@@ -1856,6 +1856,37 @@ impl SettingsView {
                             )
                         },
                     )
+                    .when(
+                        contribution_rows
+                            .iter()
+                            .find(|r| r.full_id == full_id)
+                            .map(|r| !r.compatible || r.active_pins > 0)
+                            .unwrap_or(false),
+                        |d| {
+                            let row = contribution_rows
+                                .iter()
+                                .find(|r| r.full_id == full_id)
+                                .unwrap();
+                            d.child(
+                                div()
+                                    .text_size(px(9.))
+                                    .text_color(rgb(if row.compatible {
+                                        crate::theme::Theme::fg_dim()
+                                    } else {
+                                        crate::theme::Theme::warning()
+                                    }))
+                                    .child(format!(
+                                        "{}· 活动 pin: {}",
+                                        if row.compatible {
+                                            String::new()
+                                        } else {
+                                            "⚠ 与当前版本不兼容 ".to_string()
+                                        },
+                                        row.active_pins
+                                    )),
+                            )
+                        },
+                    )
                     .child(
                         div()
                             .text_size(px(10.))

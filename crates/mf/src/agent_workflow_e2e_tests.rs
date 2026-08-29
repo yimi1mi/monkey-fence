@@ -21,6 +21,7 @@ fn summary_fixture() -> Vec<PluginContributionSummary> {
             ],
             requested_permissions: vec!["net".into(), "hooks".into()],
             compatible: true,
+            active_pins: 1,
         },
         PluginContributionSummary {
             full_id: "monkeyfence.git".into(),
@@ -32,6 +33,7 @@ fn summary_fixture() -> Vec<PluginContributionSummary> {
             contribution_counts: vec![("execution_directory_providers".into(), 1)],
             requested_permissions: vec!["vcs".into()],
             compatible: true,
+            active_pins: 0,
         },
     ]
 }
@@ -110,4 +112,42 @@ fn two_claude_instances_compile_without_global_config_writes() {
         seen_dirs.insert(config_dir);
     }
     assert_eq!(seen_dirs.len(), 2, "两个实例的隔离目录互不重叠");
+}
+
+#[test]
+fn registry_summaries_carry_real_hash_counts_and_pins() {
+    // 真实注册表(内置合成插件):计数非 0 占位、兼容性为计算值
+    let host = mf_plugins::PluginHost::load_at_with_catalog(
+        std::env::temp_dir().join("mf-pcv-test"),
+        mf_agent::CatalogStore::memory().unwrap(),
+        &mf_agent::Config::default(),
+        &[],
+    );
+    let rows = crate::plugin_contribution_view::summaries_from_registry(&host);
+    let claude = rows
+        .iter()
+        .find(|r| r.full_id == "monkeyfence.claude")
+        .expect("内置 claude");
+    assert!(
+        claude
+            .contribution_counts
+            .iter()
+            .any(|(k, c)| k == "agent_types" && *c == 1),
+        "agent_types 计数必须真实: {:?}",
+        claude.contribution_counts
+    );
+    assert!(claude.compatible);
+    assert_eq!(claude.active_pins, 0);
+    // 内置目录提供器插件贡献 execution_directories
+    let dirs = rows
+        .iter()
+        .find(|r| r.full_id == "monkeyfence.directories")
+        .expect("目录提供器合成插件");
+    assert!(
+        dirs.contribution_counts
+            .iter()
+            .any(|(k, c)| k == "execution_directories" && *c == 2),
+        "project-dir + worktree 两个贡献: {:?}",
+        dirs.contribution_counts
+    );
 }

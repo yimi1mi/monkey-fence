@@ -483,6 +483,22 @@ impl PluginHost {
                     .collect(),
                 has_worker: p.manifest.worker.is_some(),
                 capabilities: p.manifest.capabilities.clone(),
+                content_hash: p.content_hash.clone(),
+                compatible: crate::manifest::compatible_with_app(
+                    &p.manifest.manifest.min_app_version,
+                ),
+                active_pins: self
+                    .catalog
+                    .plugin_pin_count_of_plugin(&p.full_id, &p.content_hash)
+                    .unwrap_or(0),
+                agent_types_count: p.manifest.agent_types.len(),
+                node_types_count: p.manifest.node_types.len(),
+                ui_schemas_count: p.manifest.ui_schemas.len(),
+                execution_directories_count: p.manifest.execution_directory_providers.len(),
+                secret_stores_count: p.manifest.secret_stores.len(),
+                workflow_templates_count: p.manifest.workflow_templates.len(),
+                skills_count: p.manifest.skills.len(),
+                tools_count: p.manifest.tools.len(),
             })
             .collect()
     }

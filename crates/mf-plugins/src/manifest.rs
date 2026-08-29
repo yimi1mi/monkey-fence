@@ -320,6 +320,11 @@ impl PluginManifest {
     }
 }
 
+/// min_app_version 兼容性(空要求 = 兼容;供摘要/插件页使用)。
+pub fn compatible_with_app(min_app_version: &str) -> bool {
+    min_app_version.is_empty() || version_gte(&env_version(), min_app_version)
+}
+
 fn env_version() -> String {
     option_env!("CARGO_PKG_VERSION")
         .unwrap_or("0.1.0")

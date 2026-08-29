@@ -16,6 +16,8 @@ pub struct PluginContributionSummary {
     /// 权限位字符串(net/vcs/shell/…)。
     pub requested_permissions: Vec<String>,
     pub compatible: bool,
+    /// 活动任务 pin 数(>0 = 有冻结运行引用,不可清理)。
+    pub active_pins: usize,
 }
 
 /// 汇总为人类可读文本(设置页/诊断用;面向普通用户)。
@@ -64,70 +66,73 @@ pub fn unsafe_parallel_allowed(directory_isolates: bool, user_opt_in: bool) -> b
     directory_isolates || user_opt_in
 }
 
-/// 从插件注册表构建汇总行。
+/// 从插件注册表构建汇总行(真实包哈希/兼容性/全量贡献计数/活动 pin)。
 pub fn summaries_from_registry(
     registry: &mf_plugins::PluginRegistry,
 ) -> Vec<PluginContributionSummary> {
     registry
         .summaries()
         .into_iter()
-        .map(|s| PluginContributionSummary {
-            full_id: s.full_id.clone(),
-            name: s.name.clone(),
-            version: s.version.clone(),
-            content_hash: s
-                .capabilities
-                .fingerprint_part()
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_string(),
-            enabled: s.enabled,
-            authorized_at: s.authorized_at,
-            contribution_counts: {
-                let mut counts: Vec<(String, usize)> = vec![
-                    ("agent_types".into(), s.agents.len()),
-                    (
-                        "ui_schemas".into(),
-                        0, // 由清单详情补全;汇总先以 0 占位
-                    ),
-                ];
-                counts.retain(|(_, c)| *c > 0);
-                counts
-            },
-            requested_permissions: {
-                let cap = &s.capabilities;
-                let mut perms = Vec::new();
-                if cap.net {
-                    perms.push("net".into());
-                }
-                if cap.fs_read {
-                    perms.push("fs_read".into());
-                }
-                if cap.fs_write {
-                    perms.push("fs_write".into());
-                }
-                if cap.spawn {
-                    perms.push("spawn".into());
-                }
-                if cap.shell {
-                    perms.push("shell".into());
-                }
-                if cap.secrets {
-                    perms.push("secrets".into());
-                }
-                if cap.vcs {
-                    perms.push("vcs".into());
-                }
-                if cap.background_worker {
-                    perms.push("background_worker".into());
-                }
-                if cap.hooks {
-                    perms.push("hooks".into());
-                }
-                perms
-            },
-            compatible: true,
+        .map(|s| {
+            let mut counts: Vec<(String, usize)> = vec![
+                ("agent_types".into(), s.agent_types_count),
+                ("node_types".into(), s.node_types_count),
+                ("ui_schemas".into(), s.ui_schemas_count),
+                (
+                    "execution_directories".into(),
+                    s.execution_directories_count,
+                ),
+                ("secret_stores".into(), s.secret_stores_count),
+                ("workflow_templates".into(), s.workflow_templates_count),
+                ("skills".into(), s.skills_count),
+                ("tools".into(), s.tools_count),
+            ];
+            counts.retain(|(_, c)| *c > 0);
+            PluginContributionSummary {
+                full_id: s.full_id.clone(),
+                name: s.name.clone(),
+                version: s.version.clone(),
+                // 真实包内容哈希(内置合成插件为空)
+                content_hash: s.content_hash.clone(),
+                enabled: s.enabled,
+                authorized_at: s.authorized_at,
+                contribution_counts: counts,
+                requested_permissions: {
+                    let cap = &s.capabilities;
+                    let mut perms = Vec::new();
+                    if cap.net {
+                        perms.push("net".into());
+                    }
+                    if cap.fs_read {
+                        perms.push("fs_read".into());
+                    }
+                    if cap.fs_write {
+                        perms.push("fs_write".into());
+                    }
+                    if cap.spawn {
+                        perms.push("spawn".into());
+                    }
+                    if cap.shell {
+                        perms.push("shell".into());
+                    }
+                    if cap.secrets {
+                        perms.push("secrets".into());
+                    }
+                    if cap.vcs {
+                        perms.push("vcs".into());
+                    }
+                    if cap.background_worker {
+                        perms.push("background_worker".into());
+                    }
+                    if cap.hooks {
+                        perms.push("hooks".into());
+                    }
+                    perms
+                },
+                // min_app_version 计算值
+                compatible: s.compatible,
+                active_pins: s.active_pins,
+            }
         })
         .collect()
 }

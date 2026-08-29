@@ -236,3 +236,37 @@ fn source_pin_for_packaged_plugin_requires_resolvable_hash() {
         .pin_source_for_run("run-k", "test.demo", "1.0.0", "sha256:deadbeef")
         .is_err());
 }
+
+// ---------- 复审阻塞项 14:摘要携带真实哈希/兼容性/计数/活动 pin ----------
+
+#[test]
+fn summaries_expose_real_hash_compatibility_counts_and_pins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = PluginHost::load_at_with_catalog(
+        tmp.path().to_path_buf(),
+        CatalogStore::memory().unwrap(),
+        &mf_agent::Config::default(),
+        &[],
+    );
+    let summaries = host.summaries();
+    assert!(!summaries.is_empty(), "内置合成插件应在列");
+    let claude = summaries
+        .iter()
+        .find(|s| s.full_id == "monkeyfence.claude")
+        .expect("内置 claude 插件");
+    // 真实贡献计数(不是 0 占位)
+    assert_eq!(claude.agent_types_count, 1);
+    // 兼容性是计算值(内置插件 min_app_version 为空 → 兼容)
+    assert!(claude.compatible);
+    // 内置合成插件哈希为空,活动 pin 计数来自目录库源 pin
+    assert_eq!(claude.active_pins, 0);
+    // pin 后活动计数上升
+    host.pin_source_for_run("run-k", "monkeyfence.claude", "0.1.0", "")
+        .unwrap();
+    let after = host
+        .summaries()
+        .into_iter()
+        .find(|s| s.full_id == "monkeyfence.claude")
+        .unwrap();
+    assert_eq!(after.active_pins, 1, "pin 后摘要必须反映活动引用");
+}
