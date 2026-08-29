@@ -166,12 +166,25 @@ pub fn compile_instance_launch(
             )?,
             None => mf_plugins::builtin_secret_store::BuiltinSecretStore::open(catalog.clone())?,
         };
-        for secret_id in &instance.sealed_secret_ids {
-            let lease = secret_store.unseal_for_run(run_token, secret_id)?;
-            launch_ctx
-                .secrets
-                .insert(secret_id.clone(), Arc::new(lease));
-        }
+        // run token 授权:本次 run 只能解封其实例声明的 Secret;
+        // 解封(或出错)后立即撤销,不留长期有效凭据
+        let declared: Vec<&str> = instance
+            .sealed_secret_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+        mf_plugins::builtin_secret_store::authorize_run_secrets(run_token, &declared);
+        let unsealed = (|| -> Result<()> {
+            for secret_id in &instance.sealed_secret_ids {
+                let lease = secret_store.unseal_for_run(run_token, secret_id)?;
+                launch_ctx
+                    .secrets
+                    .insert(secret_id.clone(), Arc::new(lease));
+            }
+            Ok(())
+        })();
+        mf_plugins::builtin_secret_store::revoke_run_secrets(run_token);
+        unsealed?;
     }
     adapter.compile_launch(instance, &launch_ctx)
 }
@@ -210,16 +223,15 @@ fn builtin_config_schema_fields(agent_type: &str) -> Vec<crate::declarative_form
         options: options.into_iter().map(str::to_string).collect(),
     };
     match agent_type {
-        "claude" | "claude-code" => vec![
-            f(
-                "permission_mode",
-                "权限模式",
-                "select",
-                false,
-                vec!["default", "acceptEdits", "plan", "bypassPermissions"],
-            ),
-            f("secret_env", "Secret 环境变量", "text", false, vec![]),
-        ],
+        "claude" | "claude-code" => vec![f(
+            "permission_mode",
+            "权限模式",
+            "select",
+            false,
+            vec!["default", "acceptEdits", "plan", "bypassPermissions"],
+        )],
+        // secret_env 不再是自由文本字段:编辑器以结构化 ENV→SecretRef
+        // 行管理(见 AgentInstanceEditorState::secret_env_map)
         "codex" => vec![f("model", "模型", "text", false, vec![])],
         _ => Vec::new(),
     }

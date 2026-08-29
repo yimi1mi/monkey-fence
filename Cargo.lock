@@ -2465,6 +2465,7 @@ dependencies = [
  "toml 0.8.23",
  "unicode-segmentation",
  "windows-sys 0.59.0",
+ "zeroize",
 ]
 
 [[package]]

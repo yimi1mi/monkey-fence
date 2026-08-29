@@ -6,7 +6,14 @@
 
 use mf_agent::catalog_store::CatalogStore;
 use mf_agent::secrets::{Redacted, SecretLease, SecretStore};
-use mf_plugins::builtin_secret_store::{BuiltinSecretStore, InMemorySecretStore};
+use mf_plugins::builtin_secret_store::{
+    authorize_run_secrets, revoke_run_secrets, BuiltinSecretStore, InMemorySecretStore,
+};
+
+/// 测试内解封一律先为令牌授权(Runtime 编译 LaunchPlan 的等价动作)。
+fn grant(token: &str, ids: &[&str]) {
+    authorize_run_secrets(token, ids);
+}
 
 const SECRET: &[u8] = b"secret-value";
 
@@ -22,6 +29,7 @@ fn ciphertext_and_debug_never_contain_secret() {
 fn seal_unseal_roundtrip() {
     let store = InMemorySecretStore::new([7u8; 32]);
     let id = store.seal("api-key", SECRET).unwrap();
+    grant("tok", &[&id]);
     let lease = store.unseal_for_run("tok", &id).unwrap();
     assert_eq!(lease.as_slice(), SECRET);
     assert_eq!(lease.id(), id.as_str());
@@ -34,6 +42,7 @@ fn wrong_key_cannot_unseal() {
     let id = a.seal("api-key", SECRET).unwrap();
     // 同一目录库、不同主密钥:AES-GCM 认证必须失败
     let b = BuiltinSecretStore::with_master_key(catalog, [2u8; 32]).unwrap();
+    grant("tok", &[&id]);
     assert!(b.unseal_for_run("tok", &id).is_err());
 }
 
@@ -42,6 +51,7 @@ fn tampered_ciphertext_is_rejected() {
     let store = InMemorySecretStore::new([7u8; 32]);
     let id = store.seal("api-key", SECRET).unwrap();
     assert!(store.tamper(&id));
+    grant("tok", &[&id]);
     assert!(store.unseal_for_run("tok", &id).is_err());
 }
 
@@ -49,6 +59,7 @@ fn tampered_ciphertext_is_rejected() {
 fn delete_removes_secret() {
     let store = InMemorySecretStore::new([7u8; 32]);
     let id = store.seal("api-key", SECRET).unwrap();
+    grant("tok", &[&id]);
     assert!(store.delete(&id).unwrap());
     assert!(store.unseal_for_run("tok", &id).is_err());
     assert!(store.describe(&id).is_err());
@@ -103,6 +114,7 @@ fn builtin_store_persists_ciphertext_in_catalog() {
 
     // 重开同一目录库(同一主密钥)→ 仍可解封
     let reopened = BuiltinSecretStore::with_master_key(catalog, [9u8; 32]).unwrap();
+    grant("tok", &[&id]);
     let lease = reopened.unseal_for_run("tok", &id).unwrap();
     assert_eq!(lease.as_slice(), SECRET);
 
@@ -131,6 +143,29 @@ fn same_name_reseal_replaces() {
     let first = store.seal("api-key", b"old").unwrap();
     store.delete(&first).unwrap();
     let second = store.seal("api-key", b"new").unwrap();
+    grant("tok", &[&second]);
     let lease = store.unseal_for_run("tok", &second).unwrap();
     assert_eq!(lease.as_slice(), b"new");
+}
+
+// ---------- run token 授权(无凭据/未授权/撤销后一律拒绝)----------
+
+#[test]
+fn unseal_requires_token_authorization() {
+    let store = InMemorySecretStore::new([7u8; 32]);
+    let id = store.seal("api-key", SECRET).unwrap();
+    // 空令牌拒绝
+    assert!(store.unseal_for_run("", &id).is_err());
+    // 未授权令牌拒绝
+    assert!(store.unseal_for_run("run-token-a", &id).is_err());
+    // 授权后放行
+    authorize_run_secrets("run-token-a", &[&id]);
+    let lease = store.unseal_for_run("run-token-a", &id).unwrap();
+    assert_eq!(lease.as_slice(), SECRET);
+    // 令牌只对自己授权的 Secret 有效
+    let other = store.seal("api-key-2", b"other").unwrap();
+    assert!(store.unseal_for_run("run-token-a", &other).is_err());
+    // 撤销后拒绝(spawn 完成)
+    revoke_run_secrets("run-token-a");
+    assert!(store.unseal_for_run("run-token-a", &id).is_err());
 }

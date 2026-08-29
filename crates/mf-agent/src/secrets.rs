@@ -114,9 +114,9 @@ pub trait SecretStore: Send + Sync {
 
 /// 流式 Secret 脱敏器:CLI 输出进入 screen/output_tail 前逐块脱敏。
 ///
-/// 匹配支持跨 read chunk 的部分前缀(可能横跨两次 `read` 的 Secret
-/// 也会被整体替换);未确认的原始尾部保留在 carry 缓冲中,
-/// 缓冲与内部 Secret 表在 drop 时 zeroize(应用侧不留明文副本)。
+/// 明文只以 zeroizing 租约的共享引用存在(`from_leases` 不复制副本);
+/// 匹配支持跨 read chunk 的部分前缀;流结束(`finish`)立即释放
+/// 明文表 —— 不随会话长期驻留。缓冲与 Secret 表 drop 时 zeroize。
 pub struct StreamingRedactor {
     secrets: Vec<Zeroizing<Vec<u8>>>,
     max_len: usize,
@@ -124,7 +124,7 @@ pub struct StreamingRedactor {
 }
 
 impl StreamingRedactor {
-    /// 用 Secret 明文构造(启动期调用;值来自 zeroizing 租约)。
+    /// 用 Secret 明文构造(测试与遗留路径;生产应使用 `from_leases`)。
     pub fn new(secret_values: Vec<Vec<u8>>) -> StreamingRedactor {
         let secrets: Vec<Zeroizing<Vec<u8>>> = secret_values
             .into_iter()
@@ -137,6 +137,17 @@ impl StreamingRedactor {
             max_len,
             carry: Vec::new(),
         }
+    }
+
+    /// 从 zeroizing 租约构造(Runtime 启动期;共享引用,不再复制明文)。
+    pub fn from_leases(leases: Vec<std::sync::Arc<SecretLease>>) -> StreamingRedactor {
+        Self::new(
+            leases
+                .iter()
+                .filter(|lease| !lease.is_empty())
+                .map(|lease| lease.as_slice().to_vec())
+                .collect(),
+        )
     }
 
     pub fn is_noop(&self) -> bool {
@@ -177,7 +188,8 @@ impl StreamingRedactor {
         out
     }
 
-    /// 流结束:冲出 carry(carry 不可能包含完整 Secret,仍再扫一遍兜底)。
+    /// 流结束:冲出 carry(carry 不可能包含完整 Secret,仍再扫一遍兜底),
+    /// 并立即释放明文表 —— 进程退出后不再长期持有任何明文。
     pub fn finish(&mut self) -> Vec<u8> {
         let carry = std::mem::take(&mut self.carry);
         if self.secrets.is_empty() {
@@ -194,6 +206,7 @@ impl StreamingRedactor {
                 i += 1;
             }
         }
+        self.secrets.clear(); // 释放 zeroizing 明文(最后一个共享引用归零即擦除)
         out
     }
 }
@@ -311,5 +324,25 @@ mod carry_bound_tests {
         );
         assert!(text.contains("***"), "完整 Secret 应被替换: {text}");
         assert!(text.ends_with(" tail"), "普通明文应放行: {text}");
+    }
+}
+
+#[cfg(test)]
+mod lease_redactor_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn from_leases_redacts_and_finish_releases_plaintext() {
+        let lease = Arc::new(SecretLease::new("sec", b"tok-42".to_vec()));
+        let mut redactor = StreamingRedactor::from_leases(vec![lease.clone()]);
+        let a = redactor.redact_chunk(b"echo tok-42 ");
+        let b = redactor.finish();
+        let text = String::from_utf8_lossy(&[a, b].concat()).into_owned();
+        assert!(text.contains("***"), "租约明文必须被替换: {text}");
+        assert!(!text.contains("tok-42"), "不得泄露: {text}");
+        // 流结束后明文表已释放:后续块直接放行(is_noop)
+        assert!(redactor.is_noop(), "finish 后不得再持有明文表");
+        assert_eq!(redactor.redact_chunk(b"tok-42"), b"tok-42".to_vec());
     }
 }

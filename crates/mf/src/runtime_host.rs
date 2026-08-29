@@ -655,16 +655,15 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
     for (k, v) in &spec.plan.env {
         cmd.env(k, v);
     }
-    // Secret 值只进入 spawn 调用的环境块;不写日志、不进任何持久化
-    let mut redactor = {
-        let secret_values = spec
-            .plan
+    // Secret 值只进入 spawn 调用的环境块;脱敏器共享 zeroizing 租约
+    // (不复制明文副本),流结束即释放 —— 不随会话长期持明文
+    let mut redactor = mf_agent::secrets::StreamingRedactor::from_leases(
+        spec.plan
             .secret_env
             .iter()
-            .map(|(_, lease)| lease.as_slice().to_vec())
-            .collect();
-        mf_agent::secrets::StreamingRedactor::new(secret_values)
-    };
+            .map(|(_, l)| l.clone())
+            .collect(),
+    );
     for (key, lease) in &spec.plan.secret_env {
         let value = std::str::from_utf8(lease.as_slice()).with_context(|| {
             format!(
@@ -891,15 +890,11 @@ fn launch_workflow_pty(
     for (k, v) in &plan.env {
         cmd.env(k, v);
     }
-    // Secret 值只进入 spawn 调用的环境块;不写日志、不进任何持久化
-    let mut redactor = {
-        let secret_values = plan
-            .secret_env
-            .iter()
-            .map(|(_, lease)| lease.as_slice().to_vec())
-            .collect();
-        mf_agent::secrets::StreamingRedactor::new(secret_values)
-    };
+    // Secret 值只进入 spawn 调用的环境块;脱敏器共享 zeroizing 租约
+    // (不复制明文副本),流结束即释放 —— 不随会话长期持明文
+    let mut redactor = mf_agent::secrets::StreamingRedactor::from_leases(
+        plan.secret_env.iter().map(|(_, l)| l.clone()).collect(),
+    );
     for (key, lease) in &plan.secret_env {
         let value = std::str::from_utf8(lease.as_slice()).with_context(|| {
             format!(

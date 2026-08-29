@@ -10,6 +10,7 @@ name = "monkeyfence"
 path = "src/main.rs"
 
 [dependencies]
+zeroize.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 mf-core.workspace = true

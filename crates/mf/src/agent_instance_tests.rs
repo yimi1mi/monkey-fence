@@ -358,3 +358,78 @@ mod pinned_adapter_tests {
         assert_eq!(adapter.id(), "claude-code");
     }
 }
+
+// ---------- 完整贡献 ID + 结构化 secret_env(I5/I6)----------
+
+#[test]
+fn new_references_use_full_contribution_id() {
+    let mut state = AgentInstanceEditorState::new(detected_type());
+    state.set_name("审查");
+    let draft = state.to_draft();
+    assert_eq!(
+        draft.agent_type, "monkeyfence.generic-command",
+        "新建引用必须使用完整贡献 ID(短 id 仅兼容旧实例)"
+    );
+    let snapshot = state.to_launch_snapshot("tmp-key");
+    assert_eq!(snapshot.agent_type, "monkeyfence.generic-command");
+}
+
+#[test]
+fn secret_env_map_roundtrips_as_structured_object() {
+    let mut state = AgentInstanceEditorState::new(detected_type());
+    state.set_name("带密钥");
+    state.add_secret_ref("sk-prod");
+    state.add_secret_ref("sk-stage");
+    state.set_secret_env("ANTHROPIC_API_KEY", "sk-prod");
+    state.set_secret_env("STAGE_TOKEN", "sk-stage");
+    // 覆盖同一 ENV
+    state.set_secret_env("STAGE_TOKEN", "sk-prod");
+    assert_eq!(
+        state.secret_env_display(),
+        vec![
+            "ANTHROPIC_API_KEY → sk-prod".to_string(),
+            "STAGE_TOKEN → sk-prod".to_string(),
+        ]
+    );
+    let draft = state.to_draft();
+    let mapping = draft.config["secret_env"].as_object().unwrap();
+    assert_eq!(mapping.len(), 2, "ENV→SecretRef map 结构: {mapping:?}");
+    assert_eq!(mapping["ANTHROPIC_API_KEY"], "sk-prod");
+    assert_eq!(mapping["STAGE_TOKEN"], "sk-prod");
+
+    // 回填:从快照 config.secret_env 还原结构化行
+    let mut reloaded = AgentInstanceEditorState::new(detected_type());
+    reloaded.secret_refs = draft.sealed_secret_ids.clone();
+    reloaded.secret_env_map = Vec::new();
+    let snapshot = state.to_launch_snapshot("k");
+    if let Some(mapping) = snapshot
+        .config
+        .get("secret_env")
+        .and_then(|v| v.as_object())
+    {
+        reloaded.secret_env_map = mapping
+            .iter()
+            .filter_map(|(env, id)| id.as_str().map(|id| (env.clone(), id.to_string())))
+            .collect();
+    }
+    assert_eq!(reloaded.secret_env_map.len(), 2);
+}
+
+#[test]
+fn secret_env_referencing_undeclared_secret_is_rejected() {
+    let mut state = AgentInstanceEditorState::new(detected_type());
+    state.set_name("x");
+    state.set_secret_env("MY_TOKEN", "sk-not-declared");
+    let errors = state.validation();
+    assert!(
+        errors.iter().any(|e| e.code == "secret-env"),
+        "未声明引用必须被校验拒绝: {errors:?}"
+    );
+    assert!(!state.can_save());
+    // 声明后通过
+    state.add_secret_ref("sk-not-declared");
+    assert!(state.can_save(), "{:?}", state.validation());
+    // 移除引用时连带清理映射行
+    state.remove_secret_ref("sk-not-declared");
+    assert!(state.secret_env_map.is_empty());
+}

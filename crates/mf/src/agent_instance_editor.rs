@@ -53,6 +53,9 @@ pub struct AgentInstanceEditorState {
     pub env_text: String,
     /// Secret 引用(id 列表;明文由 Secret Store 管理,不进编辑器)。
     pub secret_refs: Vec<String>,
+    /// 结构化 Secret 环境变量:ENV 名 → Secret 引用 id(map 语义;
+    /// 导出为 config.secret_env 对象,运行期经 resolve_secret_env 解封注入)。
+    pub secret_env_map: Vec<(String, String)>,
     pub run_mode: RunMode,
     /// 作用域(User/Project)与项目键(Project 必填)。
     pub scope: InstanceScope,
@@ -80,6 +83,7 @@ impl AgentInstanceEditorState {
             argv_text: String::new(),
             env_text: String::new(),
             secret_refs: Vec::new(),
+            secret_env_map: Vec::new(),
             config_form,
             editing_instance_id: None,
         }
@@ -105,6 +109,18 @@ impl AgentInstanceEditorState {
             .collect::<Vec<_>>()
             .join("\n");
         state.secret_refs = snapshot.sealed_secret_ids.clone();
+        // 结构化 secret_env(ENV → SecretRef)回填;非对象形态忽略
+        if let Some(mapping) = snapshot
+            .config
+            .get("secret_env")
+            .and_then(|v| v.as_object())
+        {
+            state.secret_env_map = mapping
+                .iter()
+                .filter_map(|(env, id)| id.as_str().map(|id| (env.clone(), id.to_string())))
+                .collect();
+            state.secret_env_map.sort();
+        }
         state.run_mode = snapshot.run_mode;
         state.scope = scope;
         state.project_key = project_key.unwrap_or_default().to_string();
@@ -190,6 +206,32 @@ impl AgentInstanceEditorState {
 
     pub fn remove_secret_ref(&mut self, secret_id: &str) {
         self.secret_refs.retain(|s| s != secret_id);
+        self.secret_env_map.retain(|(_, id)| id != secret_id);
+    }
+
+    /// 添加/更新结构化 secret_env 行(ENV 名 → 已声明的 Secret 引用)。
+    pub fn set_secret_env(&mut self, env_name: &str, secret_id: &str) {
+        let env = env_name.trim().to_string();
+        if env.is_empty() {
+            return;
+        }
+        match self.secret_env_map.iter_mut().find(|(e, _)| *e == env) {
+            Some(entry) => entry.1 = secret_id.to_string(),
+            None => self.secret_env_map.push((env, secret_id.to_string())),
+        }
+        self.secret_env_map.sort();
+    }
+
+    pub fn remove_secret_env(&mut self, env_name: &str) {
+        self.secret_env_map.retain(|(e, _)| e != env_name);
+    }
+
+    /// 结构化 secret_env 展示行(无明文)。
+    pub fn secret_env_display(&self) -> Vec<String> {
+        self.secret_env_map
+            .iter()
+            .map(|(env, id)| format!("{env} → {id}"))
+            .collect()
     }
 
     /// Secret 展示:引用 id + 掩码(无明文)。
@@ -239,6 +281,18 @@ impl AgentInstanceEditorState {
         for message in self.config_form.validation() {
             errors.push(err("config-schema", message));
         }
+        // 结构化 secret_env:ENV 名唯一且引用必须先声明
+        for (env, id) in &self.secret_env_map {
+            if env.trim().is_empty() {
+                errors.push(err("secret-env", "secret_env 的环境变量名不能为空"));
+            }
+            if !self.secret_refs.iter().any(|s| s == id) {
+                errors.push(err(
+                    "secret-env",
+                    format!("secret_env.{env} 引用的 Secret {id} 未在实例中声明"),
+                ));
+            }
+        }
         errors
     }
 
@@ -254,7 +308,9 @@ impl AgentInstanceEditorState {
         };
         AgentInstanceDraft {
             name: self.name.trim().to_string(),
-            agent_type: self.info.id.clone(),
+            // 新引用一律使用完整贡献 ID(publisher.plugin.agent_type):
+            // pin 解析/插件索引按完整 ID 匹配;旧实例的短 id 仍可运行
+            agent_type: self.info.full_contribution_id.clone(),
             scope: self.scope,
             project_key,
             enabled: self.enabled,
@@ -269,7 +325,17 @@ impl AgentInstanceEditorState {
                 .into_iter()
                 .filter_map(|(_bad, kv)| kv.ok().flatten())
                 .collect(),
-            config: self.config_form.to_json(),
+            config: {
+                let mut config = self.config_form.to_json();
+                if !self.secret_env_map.is_empty() {
+                    let mut mapping = serde_json::Map::new();
+                    for (env, id) in &self.secret_env_map {
+                        mapping.insert(env.clone(), serde_json::Value::String(id.clone()));
+                    }
+                    config["secret_env"] = serde_json::Value::Object(mapping);
+                }
+                config
+            },
             execution_contract: serde_json::json!({
                 "input": "argv",
                 "completion": if self.run_mode == RunMode::OneShot { "process-exit" } else { "manual" },

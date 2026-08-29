@@ -14,12 +14,58 @@ use anyhow::{Context as _, Result};
 use mf_agent::secrets::{SecretDescription, SecretLease, SecretStore};
 use parking_lot::Mutex;
 use rand::RngCore;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, OnceLock};
 
 const NONCE_LEN: usize = 12;
 const KEYRING_SERVICE: &str = "MonkeyFence";
 const KEYRING_ACCOUNT: &str = "agent-instance-master-key";
 const STORE_ID: &str = "default";
+
+// ---------------- run token 授权注册表 ----------------
+
+/// run token → 已授权解封的 secret 集合(进程内)。
+/// Runtime 在编译 LaunchPlan 时为本次 run 授权其实例声明的 secret,
+/// 解封完成后撤销 —— `unseal_for_run` 无凭据/未授权一律拒绝(设计 §8)。
+fn grants() -> &'static Mutex<HashMap<String, HashSet<String>>> {
+    static GRANTS: OnceLock<Mutex<HashMap<String, HashSet<String>>>> = OnceLock::new();
+    GRANTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 为一次运行授权解封指定的 Secret(编译 LaunchPlan 前调用)。
+pub fn authorize_run_secrets(run_token: &str, secret_ids: &[&str]) {
+    if run_token.trim().is_empty() {
+        return;
+    }
+    let mut table = grants().lock();
+    table
+        .entry(run_token.to_string())
+        .or_default()
+        .extend(secret_ids.iter().map(|id| id.to_string()));
+}
+
+/// 撤销一次运行的全部解封授权(spawn 完成后调用;幂等)。
+pub fn revoke_run_secrets(run_token: &str) {
+    grants().lock().remove(run_token);
+}
+
+/// 解封前的授权校验:令牌非空且已为该 secret 授权。
+fn ensure_authorized(run_token: &str, secret_id: &str) -> Result<()> {
+    anyhow::ensure!(
+        !run_token.trim().is_empty(),
+        "拒绝无令牌解封 Secret `{secret_id}`(run token 授权必需)"
+    );
+    let table = grants().lock();
+    let allowed = table
+        .get(run_token)
+        .map(|set| set.contains(secret_id))
+        .unwrap_or(false);
+    anyhow::ensure!(
+        allowed,
+        "run token 未获授权解封 Secret `{secret_id}`(令牌只对本 run 声明的 Secret 有效)"
+    );
+    Ok(())
+}
 
 /// AES-256-GCM 核心:相同明文每次产生不同密文(随机 nonce)。
 struct AesGcmSealer {
@@ -117,7 +163,8 @@ impl SecretStore for InMemorySecretStore {
         Ok(name.to_string())
     }
 
-    fn unseal_for_run(&self, _run_token: &str, secret_id: &str) -> Result<SecretLease> {
+    fn unseal_for_run(&self, run_token: &str, secret_id: &str) -> Result<SecretLease> {
+        ensure_authorized(run_token, secret_id)?;
         let sealed = {
             let entries = self.entries.lock();
             entries
@@ -211,7 +258,8 @@ impl SecretStore for BuiltinSecretStore {
         Ok(name.to_string())
     }
 
-    fn unseal_for_run(&self, _run_token: &str, secret_id: &str) -> Result<SecretLease> {
+    fn unseal_for_run(&self, run_token: &str, secret_id: &str) -> Result<SecretLease> {
+        ensure_authorized(run_token, secret_id)?;
         let sealed: Vec<u8> = self.catalog.with_conn(|c| {
             use rusqlite::OptionalExtension;
             c.query_row(

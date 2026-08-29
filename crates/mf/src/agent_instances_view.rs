@@ -150,6 +150,8 @@ enum PageField {
     ConfigField(usize),
     SecretName,
     SecretValue,
+    /// 结构化 secret_env 行的 ENV 名编辑(行索引)。
+    SecretEnvName(usize),
 }
 
 /// Agent 实例页(独立 GPUI 实体,模式同 TaskComposer):
@@ -165,10 +167,10 @@ pub struct AgentInstancesPage {
     pub status: String,
     /// 当前选中任务(默认 CLI 启动的离散会话挂载点)。
     pub selected_task: Option<(std::path::PathBuf, i64)>,
-    /// Secret 管理:新 Secret 名称/值输入(值只在按键时短暂存在,
-    /// seal 后立即清空,不进任何持久化)。
+    /// Secret 管理:新 Secret 名称输入与值缓冲。值缓冲是 Zeroizing:
+    /// 按键间短暂存在,seal 后清零,drop 时擦除(明文不驻留内存)。
     secret_name_input: String,
-    secret_value_input: String,
+    secret_value_input: zeroize::Zeroizing<String>,
 }
 
 impl AgentInstancesPage {
@@ -186,7 +188,7 @@ impl AgentInstancesPage {
             status: String::new(),
             selected_task: None,
             secret_name_input: String::new(),
-            secret_value_input: String::new(),
+            secret_value_input: zeroize::Zeroizing::new(String::new()),
         };
         page.refresh();
         page
@@ -428,8 +430,9 @@ impl AgentInstancesPage {
             }
             Err(e) => self.status = format!("密封失败: {e:#}"),
         }
-        // 无论成败都立即清空值缓冲(不长期持有明文)
-        self.secret_value_input.clear();
+        // 无论成败都立即清零值缓冲(Zeroizing:clear 后逐字节擦除)
+        use zeroize::Zeroize;
+        self.secret_value_input.zeroize();
         self.field = PageField::None;
         cx.notify();
     }
@@ -493,7 +496,34 @@ impl AgentInstancesPage {
             cx.notify();
             return;
         }
-        // Secret 管理输入(页面层缓冲;seal 后立即清空)
+        // 结构化 secret_env 行:ENV 名内联编辑(编辑器状态内)
+        if let PageField::SecretEnvName(row) = self.field {
+            if let Some(state) = self.editor.as_mut() {
+                match key {
+                    "escape" => self.field = PageField::None,
+                    "enter" => self.field = PageField::None,
+                    "backspace" => {
+                        if let Some((env, id)) = state.secret_env_map.get(row).cloned() {
+                            let mut text = env;
+                            text.pop();
+                            state.set_secret_env(&text, &id);
+                        }
+                    }
+                    _ => {
+                        if let Some(ch) = ev.keystroke.key_char.as_ref() {
+                            if let Some((env, id)) = state.secret_env_map.get(row).cloned() {
+                                let mut text = env.clone();
+                                text.push_str(ch);
+                                state.set_secret_env(&text, &id);
+                            }
+                        }
+                    }
+                }
+            }
+            cx.notify();
+            return;
+        }
+        // Secret 管理输入(页面层缓冲;seal 后清零)
         match self.field {
             PageField::SecretName | PageField::SecretValue => {
                 let buffer = if self.field == PageField::SecretName {
@@ -562,6 +592,7 @@ fn field_text(
             .fields()
             .get(i)
             .map(|f| state.config_form().masked_value(&f.id)),
+        PageField::SecretEnvName(row) => state.secret_env_map.get(row).map(|(env, _)| env.clone()),
         // Secret 输入在页面层(非编辑器状态)
         PageField::SecretName | PageField::SecretValue | PageField::None | PageField::Filter => {
             None
@@ -1293,6 +1324,164 @@ impl Render for AgentInstancesPage {
                                             },
                                         ))
                                     }).collect::<Vec<_>>()),
+                            )
+                            // 结构化 secret_env:ENV 名 → Secret 引用行
+                            .child(
+                                gpui::div()
+                                    .id("inst-secret-env")
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        gpui::div()
+                                            .text_size(px(10.))
+                                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                            .child("Secret 环境变量(ENV → 引用)"),
+                                    )
+                                    .children(
+                                        (0..state.secret_env_map.len()).map(|row| {
+                                            let (env, ref_id) = state.secret_env_map[row].clone();
+                                            gpui::div()
+                                                .id(gpui::ElementId::Name(
+                                                    format!("inst-secret-env-{row}").into(),
+                                                ))
+                                                .flex()
+                                                .gap_1()
+                                                .items_center()
+                                                .child(
+                                                    gpui::div()
+                                                        .id(gpui::ElementId::Name(
+                                                            format!("inst-secret-env-name-{row}").into(),
+                                                        ))
+                                                        .px_2()
+                                                        .py_1()
+                                                        .rounded_md()
+                                                        .border_1()
+                                                        .border_color(rgb(
+                                                            if self.field == PageField::SecretEnvName(row) {
+                                                                crate::theme::Theme::accent()
+                                                            } else {
+                                                                crate::theme::Theme::border()
+                                                            },
+                                                        ))
+                                                        .text_size(px(9.))
+                                                        .cursor_pointer()
+                                                        .child(if env.is_empty() {
+                                                            "ENV_NAME…".to_string()
+                                                        } else {
+                                                            env.clone()
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |page: &mut AgentInstancesPage,
+                                                                  _ev,
+                                                                  _w,
+                                                                  cx| {
+                                                                page.field =
+                                                                    PageField::SecretEnvName(row);
+                                                                cx.notify();
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    gpui::div()
+                                                        .text_size(px(9.))
+                                                        .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                                        .child(format!("→ {ref_id}")),
+                                                )
+                                                .child(
+                                                    action_chip(
+                                                        gpui::ElementId::Name(
+                                                            format!("inst-secret-env-cycle-{row}").into(),
+                                                        ),
+                                                        "换引用",
+                                                        crate::theme::Theme::accent_dim(),
+                                                        !state.secret_refs.is_empty(),
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        move |page: &mut AgentInstancesPage,
+                                                              _ev,
+                                                              _w,
+                                                              cx| {
+                                                            if let Some(state) = page.editor.as_mut() {
+                                                                if let Some((env, cur)) =
+                                                                    state.secret_env_map.get(row).cloned()
+                                                                {
+                                                                    let next = state
+                                                                        .secret_refs
+                                                                        .iter()
+                                                                        .cycle()
+                                                                        .skip(
+                                                                            state
+                                                                                .secret_refs
+                                                                                .iter()
+                                                                                .position(|r| *r == cur)
+                                                                                .map(|p| p + 1)
+                                                                                .unwrap_or(0),
+                                                                        )
+                                                                        .next()
+                                                                        .cloned();
+                                                                    if let Some(next) = next {
+                                                                        state.set_secret_env(&env, &next);
+                                                                    }
+                                                                }
+                                                            }
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                                )
+                                                .child(
+                                                    action_chip(
+                                                        gpui::ElementId::Name(
+                                                            format!("inst-secret-env-del-{row}").into(),
+                                                        ),
+                                                        "移除",
+                                                        crate::theme::Theme::danger(),
+                                                        true,
+                                                    )
+                                                    .on_click(cx.listener(
+                                                        move |page: &mut AgentInstancesPage,
+                                                              _ev,
+                                                              _w,
+                                                              cx| {
+                                                            if let Some(state) = page.editor.as_mut() {
+                                                                if let Some((env, _)) =
+                                                                    state.secret_env_map.get(row).cloned()
+                                                                {
+                                                                    state.remove_secret_env(&env);
+                                                                }
+                                                            }
+                                                            cx.notify();
+                                                        },
+                                                    )),
+                                                )
+                                        }),
+                                    )
+                                    .when(!state.secret_refs.is_empty(), |d| {
+                                        d.child(
+                                            action_chip(
+                                                gpui::ElementId::Name("inst-secret-env-add".into()),
+                                                "添加 ENV 映射",
+                                                crate::theme::Theme::accent_dim(),
+                                                true,
+                                            )
+                                            .on_click(cx.listener(
+                                                |page: &mut AgentInstancesPage, _ev, _w, cx| {
+                                                    if let Some(state) = page.editor.as_mut() {
+                                                        if let Some(first) =
+                                                            state.secret_refs.first().cloned()
+                                                        {
+                                                            let n = state.secret_env_map.len() + 1;
+                                                            state.set_secret_env(
+                                                                &format!("SECRET_ENV_{n}"),
+                                                                &first,
+                                                            );
+                                                        }
+                                                    }
+                                                    cx.notify();
+                                                },
+                                            )),
+                                        )
+                                    }),
                             )
                             .child(
                                 gpui::div()
