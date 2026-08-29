@@ -13,6 +13,7 @@ mod tests {
     #[test]
     fn inspector_captures_node_identity_and_collapses() {
         let node = EditorNode {
+            instructions: String::new(),
             key: "step-1".into(),
             title: "审查".into(),
             instance_id: "inst_a".into(),

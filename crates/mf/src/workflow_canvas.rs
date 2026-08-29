@@ -71,13 +71,45 @@ impl WorkflowCanvas {
         task: Option<(std::path::PathBuf, i64)>,
         cx: &mut Context<Self>,
     ) {
-        self.selected_task = task;
+        self.selected_task = task.clone();
+        // 加载该任务在该项目下的本地工作流草稿(project+task 双键,
+        // 跨项目同 task id 互不串扰)
+        if let Some((root, task_id)) = task {
+            if let Some(orch) = self.app.orchestrator_of(&root) {
+                match orch
+                    .store
+                    .load_task_workflow(&root.to_string_lossy(), task_id)
+                {
+                    Ok(Some(draft)) => {
+                        self.editor.load_nodes(
+                            draft
+                                .nodes
+                                .iter()
+                                .map(|n| crate::workflow_editor::EditorNode {
+                                    key: n.key.clone(),
+                                    title: n.title.clone(),
+                                    instance_id: n.agent_instance_id.clone(),
+                                    deps: n.deps.clone(),
+                                    instructions: n.instructions.clone(),
+                                })
+                                .collect(),
+                        );
+                        self.status = format!("已加载任务 {task_id} 的本地工作流草稿");
+                    }
+                    Ok(None) => {
+                        self.editor.load_nodes(Vec::new());
+                        self.status = format!("任务 {task_id} 暂无本地草稿(空白画布)");
+                    }
+                    Err(e) => self.status = format!("读取草稿失败: {e:#}"),
+                }
+            }
+        }
         cx.notify();
     }
 
-    /// 保存草稿:写入任务本地模板(task-local,默认私有)。
+    /// 保存草稿:写入项目 Store 的任务本地工作流(默认私有)。
     pub fn save_draft(&mut self, cx: &mut Context<Self>) {
-        let Some((_root, task_id)) = self.selected_task.clone() else {
+        let Some(_) = self.selected_task.clone() else {
             self.status = "请先选择一个任务(草稿保存为该任务的工作流)".into();
             cx.notify();
             return;
@@ -87,6 +119,9 @@ impl WorkflowCanvas {
             cx.notify();
             return;
         }
+        let Some((root, task_id)) = self.selected_task.clone() else {
+            unreachable!("上方已检查 selected_task");
+        };
         let draft = mf_agent::workflow::WorkflowTemplateDraft {
             key: format!("task-{task_id}"),
             name: format!("任务 {task_id} 工作流"),
@@ -98,7 +133,54 @@ impl WorkflowCanvas {
                 .map(|n| mf_agent::workflow::WorkflowNodeDraft {
                     key: n.key.clone(),
                     title: n.title.clone(),
-                    instructions: String::new(),
+                    instructions: n.instructions.clone(),
+                    agent_instance_id: n.instance_id.clone(),
+                    deps: n.deps.clone(),
+                })
+                .collect(),
+        };
+        // 任务本地草稿存项目 Store(project+task 双键,不进全局目录库)
+        let Some(orch) = self.app.orchestrator_of(&root) else {
+            self.status = "项目未打开,无法保存草稿".into();
+            cx.notify();
+            return;
+        };
+        match orch
+            .store
+            .save_task_workflow(&root.to_string_lossy(), task_id, &draft)
+        {
+            Ok(()) => {
+                self.status = format!("已保存任务 {task_id} 本地草稿(项目内;可另存为全局模板)");
+            }
+            Err(e) => self.status = format!("保存失败: {e:#}"),
+        }
+        cx.notify();
+    }
+
+    /// 另存为全局模板(提升到用户目录库,进入可分配列表)。
+    pub fn save_as_template(&mut self, cx: &mut Context<Self>) {
+        let Some((_root, task_id)) = self.selected_task.clone() else {
+            self.status = "请先选择一个任务".into();
+            cx.notify();
+            return;
+        };
+        if self.editor.nodes().is_empty() {
+            self.status = "空工作流无法另存为模板".into();
+            cx.notify();
+            return;
+        }
+        let draft = mf_agent::workflow::WorkflowTemplateDraft {
+            key: format!("task-{task_id}-template"),
+            name: format!("任务 {task_id} 工作流(模板)"),
+            task_local: false,
+            nodes: self
+                .editor
+                .nodes()
+                .iter()
+                .map(|n| mf_agent::workflow::WorkflowNodeDraft {
+                    key: n.key.clone(),
+                    title: n.title.clone(),
+                    instructions: n.instructions.clone(),
                     agent_instance_id: n.instance_id.clone(),
                     deps: n.deps.clone(),
                 })
@@ -106,12 +188,9 @@ impl WorkflowCanvas {
         };
         match self.app.catalog_store.save_template(&draft) {
             Ok(version) => {
-                self.status = format!(
-                    "已保存任务本地草稿(版本 {};不进全局模板,可另存为模板)",
-                    version.version
-                );
+                self.status = format!("已另存为全局模板(版本 {})", version.version);
             }
-            Err(e) => self.status = format!("保存失败: {e:#}"),
+            Err(e) => self.status = format!("另存失败: {e:#}"),
         }
         cx.notify();
     }
@@ -559,6 +638,24 @@ impl Render for WorkflowCanvas {
                                     cx.notify();
                                 },
                             )),
+                    )
+                    .child(
+                        gpui::div()
+                            .id("wf-save-template")
+                            .px_2()
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(crate::theme::Theme::border()))
+                            .text_size(px(9.))
+                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .cursor_pointer()
+                            .child("另存为全局模板")
+                            .on_click(cx.listener(|canvas: &mut WorkflowCanvas, _ev, _w, cx| {
+                                canvas.save_as_template(cx);
+                            })),
                     )
                     .child(
                         gpui::div()

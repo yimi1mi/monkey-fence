@@ -1684,6 +1684,61 @@ impl Store {
         })
     }
 
+    // ---------- 任务本地工作流(项目 Store,按 project+task 键) ----------
+
+    /// 保存任务本地工作流草稿(同键覆盖;跨项目同 task id 互不影响)。
+    pub fn save_task_workflow(
+        &self,
+        project_key: &str,
+        task_id: i64,
+        draft: &crate::workflow::WorkflowTemplateDraft,
+    ) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO task_workflows (project_key, task_id, graph_json, updated_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(project_key, task_id) DO UPDATE SET
+                    graph_json = excluded.graph_json, updated_at = excluded.updated_at",
+                params![
+                    project_key,
+                    task_id,
+                    serde_json::to_string(&draft.nodes)?,
+                    now()
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// 读取任务本地工作流草稿(无草稿为 None)。
+    pub fn load_task_workflow(
+        &self,
+        project_key: &str,
+        task_id: i64,
+    ) -> Result<Option<crate::workflow::WorkflowTemplateDraft>> {
+        self.with_conn(|c| {
+            let json: Option<String> = c
+                .query_row(
+                    "SELECT graph_json FROM task_workflows
+                     WHERE project_key = ?1 AND task_id = ?2",
+                    params![project_key, task_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(json) = json else {
+                return Ok(None);
+            };
+            let nodes: Vec<crate::workflow::WorkflowNodeDraft> = serde_json::from_str(&json)
+                .with_context(|| format!("任务 {task_id} 工作流草稿损坏"))?;
+            Ok(Some(crate::workflow::WorkflowTemplateDraft {
+                key: format!("task-{task_id}"),
+                name: format!("任务 {task_id} 工作流"),
+                task_local: true,
+                nodes,
+            }))
+        })
+    }
+
     // ---------- Execution Lease ----------
 
     /// 派发前持久化租约(崩溃后仍可审计/清理)。

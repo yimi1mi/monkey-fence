@@ -91,6 +91,8 @@ pub struct EditorNode {
     pub title: String,
     pub instance_id: String,
     pub deps: Vec<String>,
+    /// 节点工作说明(保存草稿时随图持久化)。
+    pub instructions: String,
 }
 
 /// 编辑器状态(纯逻辑)。
@@ -118,6 +120,13 @@ impl WorkflowEditorState {
     pub fn set_layout(&mut self, layout: WorkflowLayout, prefs: &mut dyn EditorPrefs) {
         self.layout = layout;
         prefs.save_layout(layout);
+    }
+
+    /// 整体替换节点(任务切换时加载草稿);计数器重置为节点数。
+    pub fn load_nodes(&mut self, nodes: Vec<EditorNode>) {
+        self.counter = nodes.len();
+        self.selected = None;
+        self.nodes = nodes;
     }
 
     pub fn nodes(&self) -> &[EditorNode] {
@@ -151,6 +160,7 @@ impl WorkflowEditorState {
     pub fn drag_from_library(&mut self, instance_id: &str) {
         self.counter += 1;
         self.nodes.push(EditorNode {
+            instructions: String::new(),
             key: format!("step-{}", self.counter),
             title: format!("步骤 {}", self.counter),
             instance_id: instance_id.to_string(),

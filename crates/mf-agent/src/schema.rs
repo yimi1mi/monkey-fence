@@ -165,6 +165,14 @@ CREATE TABLE IF NOT EXISTS ad_hoc_sessions (
     ended_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_ad_hoc_task ON ad_hoc_sessions(task_id);
+CREATE TABLE IF NOT EXISTS task_workflows (
+    project_key TEXT NOT NULL,
+    task_id INTEGER NOT NULL,
+    graph_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (project_key, task_id)
+);
+CREATE INDEX IF NOT EXISTS idx_task_workflows_task ON task_workflows(task_id);
 CREATE TABLE IF NOT EXISTS handoffs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id INTEGER NOT NULL REFERENCES agent_tasks(id),

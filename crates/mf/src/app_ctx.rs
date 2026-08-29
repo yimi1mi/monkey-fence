@@ -590,6 +590,48 @@ mod agent_launch_selection_tests {
     use super::*;
 
     #[test]
+    fn task_workflow_drafts_persist_per_project_in_project_store() {
+        let ctx = AppCtx::with_catalog_for_tests(mf_agent::CatalogStore::memory().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let orch = ctx.open_project(root.path().to_path_buf()).unwrap();
+        let task = orch.create_task("t", "g").unwrap();
+        let draft = mf_agent::workflow::WorkflowTemplateDraft {
+            key: format!("task-{}", task.id),
+            name: "任务工作流".into(),
+            task_local: true,
+            nodes: vec![mf_agent::workflow::WorkflowNodeDraft {
+                key: "a".into(),
+                title: "A".into(),
+                instructions: "做 A".into(),
+                agent_instance_id: "inst_x".into(),
+                deps: vec![],
+            }],
+        };
+        orch.store
+            .save_task_workflow(&root.path().to_string_lossy(), task.id, &draft)
+            .unwrap();
+        // 重新打开同一项目:草稿仍在(项目 Store 持久化)
+        let reloaded = orch
+            .store
+            .load_task_workflow(&root.path().to_string_lossy(), task.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reloaded.nodes[0].instructions, "做 A");
+        // 另一项目同 task id 不串扰
+        let other = tempfile::tempdir().unwrap();
+        let orch2 = ctx.open_project(other.path().to_path_buf()).unwrap();
+        assert!(orch2
+            .store
+            .load_task_workflow(&other.path().to_string_lossy(), task.id)
+            .unwrap()
+            .is_none());
+        orch.stop();
+        orch2.stop();
+        ctx.close_project(&root.path().to_path_buf());
+        ctx.close_project(&other.path().to_path_buf());
+    }
+
+    #[test]
     fn directory_provider_prefers_worktree_for_git_repos() {
         let git_root = tempfile::tempdir().unwrap();
         mf_vcs::git::Git::init(git_root.path()).unwrap();

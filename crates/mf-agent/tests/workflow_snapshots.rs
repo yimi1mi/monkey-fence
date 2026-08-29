@@ -295,3 +295,70 @@ fn handoff_persists_with_run_reference() {
     assert_eq!(list.len(), 1);
     assert_eq!(list[0].1.summary, "done");
 }
+
+// ---------- 任务本地工作流存项目 Store(按 project+task 键) ----------
+
+fn draft_with_nodes(key: &str, nodes: Vec<WorkflowNodeDraft>) -> WorkflowTemplateDraft {
+    WorkflowTemplateDraft {
+        key: key.into(),
+        name: format!("模板 {key}"),
+        task_local: true,
+        nodes,
+    }
+}
+
+#[test]
+fn task_workflow_roundtrips_per_project_and_task() {
+    let store = Store::memory().unwrap();
+    let fixture = Fixture::with_instance("review");
+    let nodes = vec![WorkflowNodeDraft {
+        key: "a".into(),
+        title: "节点 A".into(),
+        instructions: "做 A".into(),
+        agent_instance_id: fixture.instance_id.clone(),
+        deps: vec![],
+    }];
+
+    store
+        .save_task_workflow("proj-alpha", 7, &draft_with_nodes("task-7", nodes.clone()))
+        .unwrap();
+    // 同一 task id 在不同项目互不覆盖
+    store
+        .save_task_workflow(
+            "proj-beta",
+            7,
+            &draft_with_nodes(
+                "task-7",
+                vec![WorkflowNodeDraft {
+                    key: "b".into(),
+                    title: "B 项目节点".into(),
+                    instructions: String::new(),
+                    agent_instance_id: fixture.instance_id.clone(),
+                    deps: vec![],
+                }],
+            ),
+        )
+        .unwrap();
+
+    let alpha = store.load_task_workflow("proj-alpha", 7).unwrap().unwrap();
+    assert_eq!(alpha.nodes.len(), 1);
+    assert_eq!(alpha.nodes[0].key, "a");
+    assert_eq!(alpha.nodes[0].instructions, "做 A");
+    let beta = store.load_task_workflow("proj-beta", 7).unwrap().unwrap();
+    assert_eq!(beta.nodes[0].key, "b");
+    assert!(store.load_task_workflow("proj-alpha", 8).unwrap().is_none());
+
+    // 覆盖保存(编辑后)
+    store
+        .save_task_workflow("proj-alpha", 7, &draft_with_nodes("task-7", nodes.clone()))
+        .unwrap();
+    assert_eq!(
+        store
+            .load_task_workflow("proj-alpha", 7)
+            .unwrap()
+            .unwrap()
+            .nodes
+            .len(),
+        1
+    );
+}

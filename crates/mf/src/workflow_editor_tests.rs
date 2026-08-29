@@ -11,6 +11,7 @@ fn node(key: &str, deps: &[&str]) -> EditorNode {
         title: key.into(),
         instance_id: "inst_a".into(),
         deps: deps.iter().map(|s| s.to_string()).collect(),
+        instructions: String::new(),
     }
 }
 
