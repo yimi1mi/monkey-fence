@@ -223,6 +223,9 @@ fn dispatch(
                         .and_then(|s| s.as_str())
                         .unwrap_or("")
                         .to_string(),
+                    // 结构化输出(mfctl --output-json):进入 Handoff.output,
+                    // 下游按 ${nodes.<key>.output.<path>} 精确引用
+                    output: params.get("output").cloned().unwrap_or_default(),
                 }
             } else {
                 Settlement::Fail {

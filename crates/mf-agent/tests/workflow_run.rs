@@ -538,6 +538,7 @@ fn two_node_workflow_dispatches_frozen_instance_end_to_end() {
             &token_a,
             Settlement::Complete {
                 summary: "A 的检查结论全部通过".into(),
+                output: Default::default(),
             },
         )
         .unwrap();
@@ -572,6 +573,7 @@ fn two_node_workflow_dispatches_frozen_instance_end_to_end() {
             &token_b,
             Settlement::Complete {
                 summary: "B 完成".into(),
+                output: Default::default(),
             },
         )
         .unwrap();
@@ -697,6 +699,7 @@ fn isolated_merge_conflict_moves_task_to_needs_you_then_release() {
             &token,
             Settlement::Complete {
                 summary: "A 完成".into(),
+                output: Default::default(),
             },
         )
         .unwrap();
@@ -747,6 +750,7 @@ fn merge_conflicts_persist_across_restart_and_resolve() {
             &token,
             Settlement::Complete {
                 summary: "A 完成".into(),
+                output: Default::default(),
             },
         )
         .unwrap();
@@ -971,6 +975,108 @@ fn archive_task_releases_all_revision_pins() {
             )),
         "归档必须释放 Revision pin:{:?}",
         fx.pins.released.lock()
+    );
+    fx.orch.stop();
+}
+
+// ---------- 全部祖先 Handoff + output.report_path 精确替换 ----------
+
+#[test]
+fn transitive_ancestor_output_report_path_resolves_in_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    fx.pins.resolve_ok(true);
+    let version = fx.template(
+        "chain",
+        vec![
+            node("a", &[], "产出报告", &fx.instance_id),
+            node("b", &["a"], "阅读 ${nodes.a.output}", &fx.instance_id),
+            node(
+                "c",
+                &["b"],
+                // a 是传递祖先(非直接依赖):引用必须可解析
+                "按 ${nodes.a.output.report_path} 归档,摘要 ${nodes.a.output.summary_note}",
+                &fx.instance_id,
+            ),
+        ],
+    );
+    let task = fx.orch.create_task("链式", "g").unwrap();
+    fx.assign_and_run(task.id, &version);
+
+    // a 结算:结构化 output 精确写入 Handoff
+    assert!(wait_until(Duration::from_secs(5), || fx
+        .host
+        .workflow
+        .lock()
+        .len()
+        == 1));
+    let token_a = { fx.host.workflow.lock()[0].0.capability_token.clone() };
+    fx.orch
+        .settle_by_token(
+            &token_a,
+            Settlement::complete_with_output(
+                "A 完成",
+                serde_json::json!({
+                    "report_path": "reports/a.md",
+                    "summary_note": "全部检查通过"
+                }),
+            ),
+        )
+        .unwrap();
+    // Handoff 完整性:output 原样落库,raw_log_ref 指向 run
+    {
+        let rows = fx.orch.store.list_handoff_rows(task.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        let handoff = &rows[0].handoff;
+        assert_eq!(handoff.output["report_path"], "reports/a.md");
+        assert_eq!(handoff.output["summary_note"], "全部检查通过");
+        assert!(
+            handoff
+                .raw_log_ref
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("agent-run:"),
+            "raw_log_ref 必须引用 run: {:?}",
+            handoff.raw_log_ref
+        );
+    }
+
+    // b 结算后 c 派发:提示中 a 的传递引用被精确替换
+    assert!(wait_until(Duration::from_secs(5), || fx
+        .host
+        .workflow
+        .lock()
+        .len()
+        == 2));
+    let token_b = { fx.host.workflow.lock()[1].0.capability_token.clone() };
+    fx.orch
+        .settle_by_token(&token_b, Settlement::complete("B 完成"))
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || fx
+        .host
+        .workflow
+        .lock()
+        .len()
+        == 3));
+    let prompt_c = {
+        let guard = fx.host.workflow.lock();
+        guard
+            .iter()
+            .find(|(spec, _)| spec.node_key == "c")
+            .map(|(spec, _)| spec.prompt.clone())
+            .expect("c 未派发")
+    };
+    assert!(
+        prompt_c.contains("reports/a.md"),
+        "传递祖先 output.report_path 必须精确替换: {prompt_c}"
+    );
+    assert!(
+        prompt_c.contains("全部检查通过"),
+        "嵌套 output 键必须精确替换: {prompt_c}"
+    );
+    assert!(
+        !prompt_c.contains("${nodes.a.output"),
+        "不得残留未替换变量: {prompt_c}"
     );
     fx.orch.stop();
 }

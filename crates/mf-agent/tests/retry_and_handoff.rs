@@ -215,6 +215,7 @@ impl Fixture {
             key,
             Settlement::Complete {
                 summary: summary.into(),
+                output: Default::default(),
             },
         );
     }
@@ -290,6 +291,7 @@ fn downstream_unlocks_only_after_settlement_and_handoff() {
             &token,
             Settlement::Complete {
                 summary: "重试成功".into(),
+                output: Default::default(),
             },
         )
         .unwrap();

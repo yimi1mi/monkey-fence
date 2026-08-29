@@ -257,7 +257,8 @@ fn settlement_token_lifecycle() {
         store.settle_run_by_token(
             "mft_wrong",
             Settlement::Complete {
-                summary: "x".into()
+                summary: "x".into(),
+                output: Default::default(),
             }
         ),
         Err(SettleError::UnknownToken)
@@ -267,6 +268,7 @@ fn settlement_token_lifecycle() {
         &run.capability_token,
         Settlement::Complete {
             summary: "done".into(),
+            output: Default::default(),
         },
     );
     assert!(matches!(ok, Ok((_, SettleOutcome::Applied))));
@@ -275,6 +277,7 @@ fn settlement_token_lifecycle() {
         &run.capability_token,
         Settlement::Complete {
             summary: "done again".into(),
+            output: Default::default(),
         },
     );
     assert!(matches!(dup, Ok((_, SettleOutcome::AlreadyApplied))));
@@ -308,7 +311,8 @@ fn settlement_rejected_for_inactive_run() {
         store.settle_run_by_token(
             &run.capability_token,
             Settlement::Complete {
-                summary: "x".into()
+                summary: "x".into(),
+                output: Default::default(),
             }
         ),
         Err(SettleError::RunNotActive(_))
@@ -421,6 +425,7 @@ fn dispatch_and_settlement_unlocks_downstream() {
         &host.spec_of(0).capability_token,
         Settlement::Complete {
             summary: "a done".into(),
+            output: Default::default(),
         },
     )
     .unwrap();
@@ -431,6 +436,7 @@ fn dispatch_and_settlement_unlocks_downstream() {
         host.run_id_of(1),
         Settlement::Complete {
             summary: "b done".into(),
+            output: Default::default(),
         },
     )
     .unwrap();
@@ -480,6 +486,7 @@ fn done_without_settlement_goes_needs_you_not_success() {
         run_id,
         Settlement::Complete {
             summary: "人工判定".into(),
+            output: Default::default(),
         },
     )
     .unwrap();
@@ -539,6 +546,7 @@ fn failure_blocks_only_descendants() {
         c_run,
         Settlement::Complete {
             summary: "c ok".into(),
+            output: Default::default(),
         },
     )
     .unwrap();
@@ -584,7 +592,10 @@ fn parallel_branches_run_concurrently() {
     // 释放一个 → 再派发一个
     orch.settle_by_token(
         &host.spec_of(0).capability_token,
-        Settlement::Complete { summary: "".into() },
+        Settlement::Complete {
+            summary: "".into(),
+            output: Default::default(),
+        },
     )
     .unwrap();
     assert!(wait_until(Duration::from_secs(5), || host.launch_count() == 3));
@@ -630,7 +641,10 @@ fn same_session_key_serialized() {
     // s1 结算 → s2 才派发(天然串行)
     orch.settle_by_token(
         &host.spec_of(0).capability_token,
-        Settlement::Complete { summary: "".into() },
+        Settlement::Complete {
+            summary: "".into(),
+            output: Default::default(),
+        },
     )
     .unwrap();
     assert!(wait_until(Duration::from_secs(5), || host.launch_count() == 2));
@@ -745,6 +759,7 @@ fn http_runtime_settles_directly() {
         run_id,
         RuntimeEvent::Settled(Settlement::Complete {
             summary: "api done".into(),
+            output: Default::default(),
         }),
     );
     assert!(wait_until(Duration::from_secs(5), || {
@@ -877,6 +892,7 @@ fn two_projects_end_to_end() {
         a1_run,
         Settlement::Complete {
             summary: "人工判定".into(),
+            output: Default::default(),
         },
     )
     .unwrap();
@@ -892,6 +908,7 @@ fn two_projects_end_to_end() {
         a2_run,
         Settlement::Complete {
             summary: "a2".into(),
+            output: Default::default(),
         },
     )
     .unwrap();
@@ -914,6 +931,7 @@ fn two_projects_end_to_end() {
             .capability_token,
         Settlement::Complete {
             summary: "b1".into(),
+            output: Default::default(),
         },
     )
     .unwrap();
@@ -929,6 +947,7 @@ fn two_projects_end_to_end() {
         b2_run,
         Settlement::Complete {
             summary: "b2".into(),
+            output: Default::default(),
         },
     )
     .unwrap();

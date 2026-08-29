@@ -426,6 +426,7 @@ impl AgentWorkspace {
             let settlement = if ok {
                 Settlement::Complete {
                     summary: "人工判定成功".into(),
+                    output: Default::default(),
                 }
             } else {
                 Settlement::Fail {

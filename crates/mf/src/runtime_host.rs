@@ -1319,7 +1319,7 @@ fn run_http_turn(
                 text: summary.clone(),
             },
         ));
-        return HttpOutcome::Settled(Settlement::Complete { summary });
+        return HttpOutcome::Settled(Settlement::complete(summary));
     }
 
     // 真实 provider:工具循环(API Agent 通过 complete_step/fail_step 工具显式结算)
@@ -1456,6 +1456,7 @@ fn run_http_turn(
                     ));
                     return HttpOutcome::Settled(Settlement::Complete {
                         summary: arg_str("summary"),
+                        output: Default::default(),
                     });
                 }
                 "fail_step" => {

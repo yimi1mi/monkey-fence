@@ -192,6 +192,7 @@ impl Fixture {
                 &token,
                 Settlement::Complete {
                     summary: "完成".into(),
+                    output: Default::default(),
                 },
             )
             .unwrap();
@@ -349,6 +350,7 @@ fn auto_retry_preserves_lease_for_next_attempt() {
             &token,
             Settlement::Complete {
                 summary: "重试成功".into(),
+                output: Default::default(),
             },
         )
         .unwrap();

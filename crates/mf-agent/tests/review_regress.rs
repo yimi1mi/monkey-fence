@@ -361,6 +361,7 @@ fn same_session_key_serialized_across_tasks_same_tick() {
         &first,
         Settlement::Complete {
             summary: String::new(),
+            output: Default::default(),
         },
     )
     .unwrap();
@@ -402,6 +403,7 @@ fn settlement_targets_active_revision_step() {
         &token,
         Settlement::Complete {
             summary: "done".into(),
+            output: Default::default(),
         },
     )
     .unwrap();

@@ -306,14 +306,39 @@ impl Default for RetryPolicy {
 }
 
 /// Agent Run 的显式结算:唯一成功依据(见 ADR 0001 与 `mfctl`)。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// `Complete.output` 是结构化自定义输出(下游经 `${nodes.<key>.output...}`
+/// 引用;`output.report_path` 等精确路径由 JSON 结构决定)。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Settlement {
-    Complete { summary: String },
-    Fail { reason: String },
+    Complete {
+        summary: String,
+        #[serde(default)]
+        output: serde_json::Value,
+    },
+    Fail {
+        reason: String,
+    },
 }
 
 impl Settlement {
+    /// 仅摘要的成功结算(无结构化输出)。
+    pub fn complete(summary: impl Into<String>) -> Settlement {
+        Settlement::Complete {
+            summary: summary.into(),
+            output: serde_json::Value::Null,
+        }
+    }
+    /// 摘要 + 结构化输出(mfctl `--output-json` / Runtime API)。
+    pub fn complete_with_output(
+        summary: impl Into<String>,
+        output: serde_json::Value,
+    ) -> Settlement {
+        Settlement::Complete {
+            summary: summary.into(),
+            output,
+        }
+    }
     pub fn kind_str(&self) -> &'static str {
         match self {
             Settlement::Complete { .. } => "complete",
@@ -322,7 +347,7 @@ impl Settlement {
     }
     pub fn payload(&self) -> &str {
         match self {
-            Settlement::Complete { summary } => summary,
+            Settlement::Complete { summary, .. } => summary,
             Settlement::Fail { reason } => reason,
         }
     }

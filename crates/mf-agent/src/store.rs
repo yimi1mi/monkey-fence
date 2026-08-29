@@ -1262,9 +1262,15 @@ impl Store {
             )?;
             // 成功结算与 Handoff 落库同一事务:下游解锁的前提是两者都已持久化
             if settlement.kind_str() == "complete" {
+                // 完整 Handoff:摘要 + 结构化 output(下游精确引用)+ 日志引用
                 let handoff = crate::handoff::Handoff {
                     status: "complete".into(),
                     summary: settlement.payload().to_string(),
+                    output: match &settlement {
+                        Settlement::Complete { output, .. } => output.clone(),
+                        Settlement::Fail { .. } => serde_json::Value::Null,
+                    },
+                    raw_log_ref: Some(format!("agent-run:{}", run.id)),
                     ..Default::default()
                 };
                 tx.execute(

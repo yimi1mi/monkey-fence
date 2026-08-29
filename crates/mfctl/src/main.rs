@@ -5,7 +5,7 @@
 //! - `MF_PIPE`:MonkeyFence 命名管道
 //!
 //! 命令:
-//!   mfctl step complete --summary "..."
+//!   mfctl step complete --summary "..." [--output-json '{"report_path":"..."}']
 //!   mfctl step fail --reason "..."
 //!   mfctl agent-state <working|waiting|blocked|done>
 //!   mfctl pipeline propose --file draft.json
@@ -53,6 +53,8 @@ fn run(args: &[String]) -> Result<String> {
             flag_key = Some("reason");
         } else if a == "--file" {
             flag_key = Some("file");
+        } else if a == "--output-json" {
+            flag_key = Some("output-json");
         } else if let Some(v) = a.strip_prefix("--token=") {
             flags.push(("token", v.to_string()));
         } else if let Some(v) = a.strip_prefix("--pipe=") {
@@ -63,6 +65,8 @@ fn run(args: &[String]) -> Result<String> {
             flags.push(("reason", v.to_string()));
         } else if let Some(v) = a.strip_prefix("--file=") {
             flags.push(("file", v.to_string()));
+        } else if let Some(v) = a.strip_prefix("--output-json=") {
+            flags.push(("output-json", v.to_string()));
         } else {
             positional.push(a);
         }
@@ -82,10 +86,17 @@ fn run(args: &[String]) -> Result<String> {
     }
 
     let (method, params) = match positional.as_slice() {
-        [cmd, sub] if cmd.as_str() == "step" && sub.as_str() == "complete" => (
-            "step.complete",
-            json!({ "summary": flag("summary").unwrap_or_default() }),
-        ),
+        [cmd, sub] if cmd.as_str() == "step" && sub.as_str() == "complete" => {
+            // 结构化输出(--output-json 或 --output-json=<json>):下游
+            // 经 ${nodes.<key>.output.<path>} 精确引用(如 output.report_path)
+            let mut params = json!({ "summary": flag("summary").unwrap_or_default() });
+            if let Some(text) = flag("output-json") {
+                let output: Value =
+                    serde_json::from_str(&text).with_context(|| "--output-json 必须是合法 JSON")?;
+                params["output"] = output;
+            }
+            ("step.complete", params)
+        }
         [cmd, sub] if cmd.as_str() == "step" && sub.as_str() == "fail" => (
             "step.fail",
             json!({ "reason": flag("reason").unwrap_or_default() }),

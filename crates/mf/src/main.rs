@@ -353,7 +353,8 @@ fn agent_smoke(project: Option<String>) -> i32 {
             orch.settle_by_token(
                 "mft_bogus",
                 Settlement::Complete {
-                    summary: String::new()
+                    summary: String::new(),
+                    output: Default::default(),
                 }
             ),
             Err(SettleError::UnknownToken)
@@ -365,7 +366,8 @@ fn agent_smoke(project: Option<String>) -> i32 {
             orch.settle_by_token(
                 &s1_run.capability_token,
                 Settlement::Complete {
-                    summary: "again".into()
+                    summary: "again".into(),
+                    output: Default::default(),
                 }
             ),
             Ok(SettleOutcome::AlreadyApplied)

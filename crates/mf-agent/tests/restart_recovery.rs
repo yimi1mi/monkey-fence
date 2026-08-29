@@ -278,6 +278,7 @@ fn interrupted_run_can_still_be_settled_manually() {
             &fx.token,
             Settlement::Complete {
                 summary: "人工确认完成".into(),
+                output: Default::default(),
             },
         )
         .unwrap();

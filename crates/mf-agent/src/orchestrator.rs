@@ -1808,7 +1808,9 @@ impl Orchestrator {
         }
     }
 
-    /// 上游节点(按节点键)最近一次 Handoff;直接依赖且已结算才有输出。
+    /// 上游节点(按节点键)最近一次 Handoff。加载**全部传递祖先**
+    /// (不只直接依赖):深链节点(如 a→b→c 中的 a)的输出对 c 可见,
+    /// `${nodes.a.output.report_path}` 等传递引用才能解析。
     fn upstream_handoffs(
         &self,
         step: &StepView,
@@ -1821,7 +1823,34 @@ impl Orchestrator {
         let Ok(rows) = self.store.list_handoff_rows(step.task_id) else {
             return out;
         };
-        for dep_key in deps {
+        // 依赖图(id → 键)展开:从直接依赖 BFS 收集全部祖先键
+        let id_to_key: HashMap<i64, &str> =
+            steps.iter().map(|s| (s.id, s.step_key.as_str())).collect();
+        let deps_of: HashMap<&str, Vec<&str>> = steps
+            .iter()
+            .map(|s| {
+                (
+                    s.step_key.as_str(),
+                    s.deps
+                        .iter()
+                        .filter_map(|d| id_to_key.get(d).copied())
+                        .collect(),
+                )
+            })
+            .collect();
+        let mut ancestors: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut queue: Vec<&str> = deps.iter().map(String::as_str).collect();
+        while let Some(key) = queue.pop() {
+            if !seen.insert(key) {
+                continue;
+            }
+            ancestors.push(key.to_string());
+            if let Some(upstream) = deps_of.get(key) {
+                queue.extend(upstream.iter().copied());
+            }
+        }
+        for dep_key in &ancestors {
             let Some(dep_step) = steps.iter().find(|s| s.step_key == *dep_key) else {
                 continue;
             };

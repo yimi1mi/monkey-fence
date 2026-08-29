@@ -187,6 +187,7 @@ fn full_workflow_e2e_real_process_secret_pin_merge() {
             &token,
             mf_agent::Settlement::Complete {
                 summary: "E2E 检查完成".into(),
+                output: Default::default(),
             },
         )
         .unwrap();

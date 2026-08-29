@@ -118,6 +118,7 @@ pub fn execute_action(
                     } else {
                         settle_text.to_string()
                     },
+                    output: Default::default(),
                 }
             };
             use mf_agent::orchestrator::Orchestrator;

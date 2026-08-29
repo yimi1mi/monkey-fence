@@ -114,6 +114,7 @@ fn settlement_actions_carry_labels() {
     // 人工结算两种结果的动作语义
     let complete = RunAction::Settle(Settlement::Complete {
         summary: "ok".into(),
+        output: Default::default(),
     });
     let fail = RunAction::Settle(Settlement::Fail {
         reason: "bad".into(),
