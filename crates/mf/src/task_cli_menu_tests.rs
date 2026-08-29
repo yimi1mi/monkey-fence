@@ -93,7 +93,8 @@ fn menu_filter_matches_label_and_kind() {
 fn launch_entry_carries_launch_mode_and_reference() {
     let entry = launch_menu_entry(&menu_types()[0], None);
     assert_eq!(entry.kind, MenuKind::DefaultCli);
-    assert_eq!(entry.agent_ref.as_deref(), Some("codex"));
+    // 启动引用是完整贡献 ID(短 id 只留给显式 legacy 内置回退)
+    assert_eq!(entry.agent_ref.as_deref(), Some("monkeyfence.t"));
     // 默认 CLI 交互启动,沿用外部已有配置,不写入
     assert!(entry.note.contains("沿用"));
 
@@ -123,4 +124,75 @@ fn ad_hoc_launch_never_changes_task_status_label() {
     let menu = build_task_cli_menu(&menu_types(), &menu_instances());
     let term = menu.iter().find(|i| i.kind == MenuKind::Terminal).unwrap();
     assert!(term.note.contains("不改变任务状态"), "{}", term.note);
+}
+
+// ---------- I5:第三方贡献全链路使用完整贡献 ID ----------
+
+#[test]
+fn default_cli_menu_entries_carry_full_contribution_id() {
+    // DefaultCli 的启动引用必须是完整贡献 ID(publisher.plugin.agent_type):
+    // 短 id 只对显式 legacy 内置回退路径有意义 —— 第三方类型用短 id
+    // 会在 resolve_adapter(按完整贡献 ID 查找)处解析失败
+    let mut types = menu_types();
+    types.push(crate::agent_instance_editor::AgentTypeInfo {
+        full_contribution_id: "acme.tools.super-agent".into(),
+        plugin_version: "1.0.0".into(),
+        content_hash: "hash-1".into(),
+        config_schema_fields: Vec::new(),
+        id: "super-agent".into(),
+        name: "Super Agent".into(),
+        plugin_name: "acme.tools".into(),
+        detected: true,
+        supports_isolated_config: true,
+        default_command: "super-agent".into(),
+        adapter: "generic-command".into(),
+        modes: vec![mf_agent::RunMode::Interactive],
+    });
+    let menu = build_task_cli_menu(&types, &menu_instances());
+    let entry = menu
+        .iter()
+        .find(|e| e.kind == MenuKind::DefaultCli && e.label == "Super Agent")
+        .expect("检测到的第三方 CLI 应出现在菜单");
+    assert_eq!(
+        entry.agent_ref.as_deref(),
+        Some("acme.tools.super-agent"),
+        "DefaultCli 启动引用必须是完整贡献 ID(短 id 解析不了第三方贡献)"
+    );
+    // 内置类型同样携带完整贡献 ID(下游按完整 ID 查找,短 id 仅作
+    // legacy 回退兼容)
+    let codex = menu
+        .iter()
+        .find(|e| e.kind == MenuKind::DefaultCli && e.label == "Codex")
+        .unwrap();
+    assert!(
+        codex.agent_ref.as_deref().unwrap_or("").contains('.'),
+        "内置类型也应以完整贡献 ID 引用:{:?}",
+        codex.agent_ref
+    );
+}
+
+#[test]
+fn launch_menu_entry_default_cli_uses_full_contribution_id() {
+    let mut types = menu_types();
+    types.push(crate::agent_instance_editor::AgentTypeInfo {
+        full_contribution_id: "acme.tools.super-agent".into(),
+        plugin_version: "1.0.0".into(),
+        content_hash: "hash-1".into(),
+        config_schema_fields: Vec::new(),
+        id: "super-agent".into(),
+        name: "Super Agent".into(),
+        plugin_name: "acme.tools".into(),
+        detected: true,
+        supports_isolated_config: true,
+        default_command: "super-agent".into(),
+        adapter: "generic-command".into(),
+        modes: vec![mf_agent::RunMode::Interactive],
+    });
+    let info = types.last().unwrap();
+    let entry = launch_menu_entry(info, None);
+    assert_eq!(
+        entry.agent_ref.as_deref(),
+        Some("acme.tools.super-agent"),
+        "默认 CLI 启动条目必须用完整贡献 ID"
+    );
 }

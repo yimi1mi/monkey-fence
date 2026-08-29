@@ -835,6 +835,44 @@ impl Orchestrator {
         self.assign_workflow(task_id, &version, agent_type_plugins, unsafe_parallel)
     }
 
+    /// 任务本地工作流的「分配并确认运行」原子路径(I13):
+    /// - 无 draft Revision、或草稿在上次冻结后又保存过
+    ///   (task_workflows.updated_at > draft created_at)→ 重新编译冻结;
+    /// - 已有与当前草稿一致的未激活 draft → 直接确认,不重复 assign
+    ///   (assign 只建 draft,active_revision 要到确认才激活 —— 用
+    ///   active_revision 判断会误判为"未分配"而重复冻结);
+    /// 然后激活并开始调度。
+    pub fn assign_and_confirm_task_local(
+        &self,
+        task_id: i64,
+        agent_type_plugins: &HashMap<String, PluginSourcePin>,
+    ) -> Result<TaskView> {
+        if !self.task_local_draft_is_frozen(task_id) {
+            self.assign_task_local_workflow(task_id, agent_type_plugins)?;
+        }
+        self.confirm_and_run(task_id)
+    }
+
+    /// 任务本地草稿是否已被冻结成 Revision(draft 待确认或 active 均算):
+    /// 以草稿最近保存时间与 Revision 冻结时间比较 —— 草稿在冻结后又
+    /// 保存过即视为已变化,需要重新冻结;未变化则复用既有 Revision。
+    fn task_local_draft_is_frozen(&self, task_id: i64) -> bool {
+        let Ok(Some(saved_at)) = self.store.task_workflow_saved_at(&self.root_str, task_id) else {
+            return false;
+        };
+        if let Ok(Some((_, created))) = self.store.latest_draft_revision(task_id) {
+            if created >= saved_at {
+                return true; // 冻结于最近保存之后:draft 一致,待确认
+            }
+        }
+        if let Ok(Some(rev)) = self.store.active_revision(task_id) {
+            if rev.created_at >= saved_at {
+                return true; // 当前活动 Revision 即最新草稿
+            }
+        }
+        false
+    }
+
     /// 项目 Store 里的任务本地草稿 → 模板版本形态(无草稿报错)。
     fn task_local_version(&self, task_id: i64) -> Result<WorkflowTemplateVersion> {
         let Some(draft) = self.store.load_task_workflow(&self.root_str, task_id)? else {
@@ -2135,6 +2173,7 @@ impl Orchestrator {
             let prompt = build_workflow_prompt(task, &node, &run.capability_token, &upstream);
             let run_temp = trusted_run_temp(run.id);
             let spec = WorkflowLaunchSpec {
+                project_root: self.root.clone(),
                 run_id: run.id,
                 step_id: step.id,
                 task_id: task.id,
@@ -2164,6 +2203,7 @@ impl Orchestrator {
         let prompt = build_prompt(task, step, &run.capability_token);
         let spec_profile = legacy_profile.expect("非工作流路径必然解析出 Profile");
         let spec = LaunchSpec {
+            project_root: self.root.clone(),
             run_id: run.id,
             step_id: step.id,
             task_id: task.id,

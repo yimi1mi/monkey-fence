@@ -135,6 +135,8 @@ impl TaskSidebar {
         let app = self.app.clone();
         // 生产分配链:模板选择 → 当前版本 → assign_workflow(编译+pin+Revision)
         let assign_app = self.app.clone();
+        // Composer 的并行风险开关随提交持久化(默认 false;模板分配沿用)
+        let unsafe_parallel_choice = state.allow_unsafe_parallel();
         let assign =
             move |root: &PathBuf, task_id: i64, choice: &crate::task_composer::WorkflowChoice| {
                 let crate::task_composer::WorkflowChoice::Template(key) = choice else {
@@ -146,16 +148,20 @@ impl TaskSidebar {
                     .into_iter()
                     .next_back()
                     .ok_or_else(|| anyhow::anyhow!("模板 {key} 不存在"))?;
-                // 非 Git 根的并行风险开关读取该任务持久化的选择(默认拒绝)
-                let unsafe_parallel = assign_app
-                    .orchestrator_of(root)
-                    .and_then(|orch| {
-                        orch.store
-                            .task_workflow_unsafe_parallel(&root.to_string_lossy(), task_id)
-                            .ok()
-                    })
-                    .unwrap_or(false);
-                assign_app.assign_workflow(root, task_id, version.version_id, unsafe_parallel)?;
+                if let Some(orch) = assign_app.orchestrator_of(root) {
+                    // 持久化用户本次的显式选择(重启/重分配沿用;默认拒绝)
+                    orch.store.set_task_assign_unsafe_parallel(
+                        &root.to_string_lossy(),
+                        task_id,
+                        unsafe_parallel_choice,
+                    )?;
+                }
+                assign_app.assign_workflow(
+                    root,
+                    task_id,
+                    version.version_id,
+                    unsafe_parallel_choice,
+                )?;
                 Ok(())
             };
         match state.submit_with_workflow(move |root| app.orchestrator_of(root), assign) {
@@ -834,7 +840,8 @@ fn default_command_of(app: &std::sync::Arc<crate::app_ctx::AppCtx>, agent_type: 
         .contributions()
         .agent_types()
         .into_iter()
-        .find(|(_, _, a)| a.id == agent_type)
+        // 菜单引用是完整贡献 ID;短 id 仅兼容显式 legacy 内置引用
+        .find(|(full_id, _, a)| full_id == agent_type || a.id == agent_type)
         .map(|(_, _, a)| a.command)
         .unwrap_or_default()
 }

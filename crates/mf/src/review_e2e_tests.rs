@@ -51,6 +51,41 @@ fn dir_hash(path: &Path) -> String {
     acc
 }
 
+/// 工作树指纹(忽略 .git / .mf-agent 等点前缀目录):
+/// 合并回滚断言只关心用户可见文件,不受 dangling git 对象/WAL 影响。
+#[cfg(test)]
+fn worktree_hash(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut acc = String::new();
+    fn walk(prefix: &str, path: &Path, acc: &mut String) {
+        let mut entries: Vec<_> = std::fs::read_dir(path)
+            .map(|it| {
+                it.filter_map(|e| e.ok())
+                    .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                    .collect()
+            })
+            .unwrap_or_default();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if entry.path().is_dir() {
+                walk(&rel, &entry.path(), acc);
+            } else {
+                let bytes = std::fs::read(entry.path()).unwrap_or_default();
+                let digest = Sha256::digest(&bytes);
+                acc.push_str(&format!("{rel}:{}:{:x}", bytes.len(), digest));
+            }
+        }
+    }
+    walk("", path, &mut acc);
+    acc
+}
+
 fn git_repo_with_commit(root: &Path) {
     let git = mf_vcs::git::Git::init(root).unwrap();
     std::fs::write(root.join("README.md"), "seed\n").unwrap();
@@ -375,4 +410,411 @@ fn dir_hash_detects_equal_length_rewrites() {
     // 内容相同(即使重写)哈希稳定
     std::fs::write(dir.path().join("a.txt"), "AAAA\n").unwrap();
     assert_eq!(before, dir_hash(dir.path()));
+}
+
+// ---------- I15:真实进程 E2E(parallel join / 嵌套+失败回滚 / PID 终止) ----------
+
+/// OS 进程表中是否存在该 PID(tasklist;非 Windows 环境返回 false)。
+#[cfg(test)]
+fn tasklist_has_pid(pid: u32) -> bool {
+    std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
+        .unwrap_or(false)
+}
+
+/// 真实项目 Git 仓库(位于独立 tempdir 的子目录:worktrees 根
+/// `<tempdir>/.worktrees` 随 tempdir 隔离,避免与其他并行测试的
+/// `mf-run-*` worktree 名在共享 %TEMP%\.worktrees 下互相污染)。
+#[cfg(test)]
+struct E2eProject {
+    _catalog_dir: tempfile::TempDir,
+    _holder: tempfile::TempDir,
+    root: PathBuf,
+    ctx: Arc<AppCtx>,
+}
+
+#[cfg(test)]
+fn e2e_project_with_catalog() -> E2eProject {
+    let catalog_dir = tempfile::tempdir().unwrap();
+    let catalog = mf_agent::CatalogStore::open(&catalog_dir.path().join("catalog.db")).unwrap();
+    let ctx = AppCtx::with_parts_opt(mf_agent::Config::default(), catalog, false);
+    let holder = tempfile::tempdir().unwrap();
+    let root = holder.path().join("repo");
+    std::fs::create_dir_all(&root).unwrap();
+    git_repo_with_commit(&root);
+    E2eProject {
+        _catalog_dir: catalog_dir,
+        _holder: holder,
+        root,
+        ctx,
+    }
+}
+
+/// 等待任务下至少 count 个 run 到达 AwaitingOutcome(进程已退出)。
+#[cfg(test)]
+fn wait_runs_awaiting(orch: &Arc<mf_agent::Orchestrator>, task_id: i64, count: usize) -> bool {
+    wait_until(Duration::from_secs(40), || {
+        orch.store
+            .list_runs_of_task(task_id)
+            .map(|runs| {
+                runs.iter()
+                    .filter(|r| r.status == RunStatus::AwaitingOutcome)
+                    .count()
+                    >= count
+            })
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(test)]
+fn token_of_latest_run(orch: &Arc<mf_agent::Orchestrator>, task_id: i64) -> String {
+    orch.store
+        .list_runs_of_task(task_id)
+        .unwrap()
+        .into_iter()
+        .max_by_key(|r| r.id)
+        .unwrap()
+        .capability_token
+}
+
+#[test]
+fn e2e_parallel_join_real_processes_merge_as_batch_downstream_sees_all() {
+    if !cfg!(windows) {
+        return;
+    }
+    let e2e = e2e_project_with_catalog();
+    let (project, ctx) = (&e2e.root, &e2e.ctx);
+    let orch = ctx.open_project(project.to_path_buf()).unwrap();
+    let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+    // 三个实例:并行父各写一个文件,join 节点写汇合标记
+    let mk = |argv: &[&str]| -> mf_agent::AgentInstanceSnapshot {
+        let draft = e2e_instance_draft(&cmd, argv);
+        // 只取一次实例:直接用 snapshot 形态(draft→snapshot 同构)
+        let id = ctx.catalog_store.create_agent_instance(draft).unwrap().id;
+        ctx.catalog_store
+            .snapshot_agent_instance(&id, None)
+            .unwrap()
+    };
+    let inst_a = mk(&["/C", "echo from-a>pa.txt"]);
+    let inst_b = mk(&["/C", "echo from-b>pb.txt"]);
+    let inst_c = mk(&["/C", "echo joined>pj.txt"]);
+    let node = |key: &str, deps: &[&str], inst: &str| mf_agent::workflow::WorkflowNodeDraft {
+        key: key.into(),
+        title: format!("节点 {key}"),
+        instructions: format!("做 {key}"),
+        agent_instance_id: inst.into(),
+        deps: deps.iter().map(|s| s.to_string()).collect(),
+    };
+    let task = orch
+        .create_task("并行 join E2E", "真实进程并行+汇合")
+        .unwrap();
+    let version = ctx
+        .catalog_store
+        .save_template(&mf_agent::workflow::WorkflowTemplateDraft {
+            key: "e2e-join".into(),
+            name: "并行 join".into(),
+            task_local: false,
+            nodes: vec![
+                node("a", &[], &inst_a.id),
+                node("b", &[], &inst_b.id),
+                node("c", &["a", "b"], &inst_c.id),
+            ],
+        })
+        .unwrap();
+    ctx.assign_workflow(project, task.id, version.version_id, false)
+        .unwrap();
+    orch.confirm_and_run(task.id).unwrap();
+
+    // 两个并行节点都以真实进程运行并退出
+    assert!(
+        wait_runs_awaiting(&orch, task.id, 2),
+        "两个并行父节点都应完成真实进程运行"
+    );
+    let run_of_step = |key: &str| {
+        let steps = orch.store.task_steps(task.id).unwrap();
+        let step = steps.iter().find(|s| s.step_key == key).unwrap();
+        orch.store
+            .list_runs_of_step(step.id)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .next()
+            .unwrap()
+    };
+    // a 先结算:join 批未完整 → 不汇合(项目目录零落盘)
+    orch.settle_by_token(
+        &run_of_step("a").capability_token,
+        mf_agent::Settlement::complete("A 完成"),
+    )
+    .unwrap();
+    assert!(
+        !project.join("pa.txt").exists(),
+        "join 批未完整:a 的修改不得提前汇合落盘"
+    );
+    // b 结算:整批汇合 → 两个父修改都进项目目录,join 节点才派发
+    orch.settle_by_token(
+        &run_of_step("b").capability_token,
+        mf_agent::Settlement::complete("B 完成"),
+    )
+    .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            project.join("pa.txt").is_file() && project.join("pb.txt").is_file()
+        }),
+        "整批汇合后两个父节点的修改都必须落盘"
+    );
+    // 下游 join 真实进程派发(其 worktree 从汇合基线检出)并退出
+    let c_step_id = {
+        let steps = orch.store.task_steps(task.id).unwrap();
+        steps.iter().find(|s| s.step_key == "c").unwrap().id
+    };
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            orch.store
+                .list_runs_of_step(c_step_id)
+                .map(|runs| runs.iter().any(|r| r.status == RunStatus::AwaitingOutcome))
+                .unwrap_or(false)
+        }),
+        "join 节点应被派发并以真实进程运行到待结算"
+    );
+    // 结算 join → 收敛成功,汇合标记落盘
+    orch.settle_by_token(
+        &run_of_step("c").capability_token,
+        mf_agent::Settlement::complete("汇合完成"),
+    )
+    .unwrap();
+    let converged = wait_until(Duration::from_secs(30), || {
+        orch.store
+            .task_view(task.id)
+            .unwrap()
+            .map(|t| t.status == TaskStatus::Succeeded)
+            .unwrap_or(false)
+    });
+    if !converged {
+        for row in orch.store.list_pending_merges(Some(task.id)).unwrap() {
+            eprintln!("PENDING-MERGE conflicts={:?}", row.conflicts);
+        }
+        for step in orch.store.task_steps(task.id).unwrap() {
+            eprintln!("STEP {} {:?}", step.step_key, step.status);
+        }
+        for r in orch.store.list_runs_of_task(task.id).unwrap() {
+            eprintln!("RUN {} {:?} {:?}", r.id, r.status, r.outcome);
+        }
+    }
+    assert!(
+        converged,
+        "任务应收敛成功,实际 {:?}",
+        orch.store.task_view(task.id).unwrap().map(|t| t.status)
+    );
+    assert!(project.join("pj.txt").is_file());
+    orch.stop();
+    ctx.close_project(&project.to_path_buf());
+}
+
+#[test]
+fn e2e_nested_file_merge_failure_rolls_back_then_recovers() {
+    if !cfg!(windows) {
+        return;
+    }
+    let e2e = e2e_project_with_catalog();
+    let (project, ctx) = (&e2e.root, &e2e.ctx);
+    let orch = ctx.open_project(project.to_path_buf()).unwrap();
+    let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+    // 真实进程在 worktree 内创建嵌套目录文件
+    let instance = ctx
+        .catalog_store
+        .create_agent_instance(e2e_instance_draft(
+            &cmd,
+            &[
+                "/C",
+                "mkdir docs\\deep 2>nul & echo nested>docs\\deep\\nested.md",
+            ],
+        ))
+        .unwrap();
+    let task = orch
+        .create_task("嵌套回滚 E2E", "嵌套文件+失败回滚")
+        .unwrap();
+    let version = ctx
+        .catalog_store
+        .save_template(&mf_agent::workflow::WorkflowTemplateDraft {
+            key: "e2e-nested".into(),
+            name: "嵌套".into(),
+            task_local: false,
+            nodes: vec![mf_agent::workflow::WorkflowNodeDraft {
+                key: "build".into(),
+                title: "构建".into(),
+                instructions: "写嵌套文件".into(),
+                agent_instance_id: instance.id.clone(),
+                deps: vec![],
+            }],
+        })
+        .unwrap();
+    ctx.assign_workflow(project, task.id, version.version_id, false)
+        .unwrap();
+    orch.confirm_and_run(task.id).unwrap();
+    assert!(wait_runs_awaiting(&orch, task.id, 1), "真实进程应完成");
+
+    // 注入失败障碍:项目目录中 docs 已是普通文件 → 合并应用中段失败
+    std::fs::write(project.join("docs"), "not a directory\n").unwrap();
+    let baseline_hash = worktree_hash(project);
+    orch.settle_by_token(
+        &token_of_latest_run(&orch, task.id),
+        mf_agent::Settlement::complete("嵌套构建完成"),
+    )
+    .unwrap();
+    // 合并失败 → needs-you + 待决行;项目目录零部分写(含障碍文件原样)
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            orch.store
+                .task_view(task.id)
+                .unwrap()
+                .map(|t| t.status == TaskStatus::NeedsYou)
+                .unwrap_or(false)
+        }),
+        "合并失败必须进入 needs-you,实际 {:?}",
+        orch.store.task_view(task.id).unwrap().map(|t| t.status)
+    );
+    assert_eq!(
+        orch.store.list_pending_merges(Some(task.id)).unwrap().len(),
+        1,
+        "失败必须持久化为待决汇合"
+    );
+    assert_eq!(
+        worktree_hash(project),
+        baseline_hash,
+        "合并失败后项目工作树必须整体回滚(零部分写)"
+    );
+    let git = mf_vcs::git::Git::open(project).unwrap();
+    let rev_id = orch.store.active_revision(task.id).unwrap().unwrap().id;
+    let refname = mf_vcs::git::Git::integration_ref(task.id, rev_id);
+    assert!(
+        git.read_ref(&refname).unwrap().is_none(),
+        "失败的合并不得推进集成基线 ref"
+    );
+
+    // 清除障碍后重试合并:嵌套文件落盘、任务收敛成功
+    std::fs::remove_file(project.join("docs")).unwrap();
+    let remaining = orch.resolve_pending_merges(task.id).unwrap();
+    assert!(remaining.is_empty(), "{remaining:?}");
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            orch.store
+                .task_view(task.id)
+                .unwrap()
+                .map(|t| t.status == TaskStatus::Succeeded)
+                .unwrap_or(false)
+        }),
+        "清障重试后任务应收敛,实际 {:?}",
+        orch.store.task_view(task.id).unwrap().map(|t| t.status)
+    );
+    let nested = project.join("docs").join("deep").join("nested.md");
+    assert!(nested.is_file(), "嵌套文件最终必须落盘");
+    assert!(std::fs::read_to_string(&nested).unwrap().contains("nested"));
+    orch.stop();
+    ctx.close_project(&project.to_path_buf());
+}
+
+#[test]
+fn e2e_cancel_run_terminates_real_os_process_and_releases_worktree() {
+    if !cfg!(windows) {
+        return;
+    }
+    let e2e = e2e_project_with_catalog();
+    let (project, ctx) = (&e2e.root, &e2e.ctx);
+    let orch = ctx.open_project(project.to_path_buf()).unwrap();
+    let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+    // 常驻进程(/K 不退出),等待取消
+    let instance = ctx
+        .catalog_store
+        .create_agent_instance(e2e_instance_draft(&cmd, &["/K"]))
+        .unwrap();
+    let task = orch.create_task("PID 终止 E2E", "取消真实进程").unwrap();
+    let version = ctx
+        .catalog_store
+        .save_template(&mf_agent::workflow::WorkflowTemplateDraft {
+            key: "e2e-cancel".into(),
+            name: "取消".into(),
+            task_local: false,
+            nodes: vec![mf_agent::workflow::WorkflowNodeDraft {
+                key: "hang".into(),
+                title: "常驻".into(),
+                instructions: "等待取消".into(),
+                agent_instance_id: instance.id.clone(),
+                deps: vec![],
+            }],
+        })
+        .unwrap();
+    ctx.assign_workflow(project, task.id, version.version_id, false)
+        .unwrap();
+    orch.confirm_and_run(task.id).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(20), || {
+            orch.store
+                .list_runs_of_task(task.id)
+                .map(|runs| runs.iter().any(|r| r.status == RunStatus::Running))
+                .unwrap_or(false)
+        }),
+        "等待真实进程派发"
+    );
+    let run = orch
+        .store
+        .list_runs_of_task(task.id)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.status == RunStatus::Running)
+        .unwrap();
+    let session_id = run.session_id.expect("工作流 run 绑定会话");
+    // 工作流会话注册在 run 的执行租约工作目录(worktree)键下
+    // (租约行在 run 行之后写入:轮询等待)
+    let mut lease_path = None;
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            lease_path = orch
+                .store
+                .list_execution_leases(task.id)
+                .unwrap()
+                .into_iter()
+                .find(|l| l.status == "held")
+                .map(|l| std::path::PathBuf::from(l.path));
+            lease_path.is_some()
+        }),
+        "worktree 租约应持有,实际 {:?}",
+        orch.store.list_execution_leases(task.id).unwrap()
+    );
+    let lease_path = lease_path.unwrap();
+    // 会话注册键 = 项目根(进程 cwd 是租约路径,但路由按项目根)
+    let workdir_key = project.to_string_lossy().to_string();
+    // OS PID 可观测且进程真实存活
+    assert!(
+        wait_until(Duration::from_secs(10), || ctx
+            .registry
+            .session_pid(&workdir_key, session_id)
+            .is_some()),
+        "会话应有可观测 OS PID"
+    );
+    let pid = ctx.registry.session_pid(&workdir_key, session_id).unwrap();
+    assert!(tasklist_has_pid(pid), "前置:PID {pid} 应存活");
+
+    // 取消:确认真实 OS 进程终止(不是 kill 后立刻谎报)
+    let cancelled = orch.cancel_run(run.id).unwrap();
+    assert_eq!(cancelled.status, RunStatus::Cancelled);
+    let gone = wait_until(Duration::from_secs(5), || !tasklist_has_pid(pid));
+    if !gone {
+        let line = std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        panic!("取消返回后 OS 进程必须真正终止(PID {pid} 仍可见: {line})");
+    }
+    // 租约释放:worktree 目录清理
+    assert!(
+        wait_until(Duration::from_secs(10), || !lease_path.exists()),
+        "取消后 worktree 应释放: {}",
+        lease_path.display()
+    );
+    orch.stop();
+    ctx.close_project(&project.to_path_buf());
 }

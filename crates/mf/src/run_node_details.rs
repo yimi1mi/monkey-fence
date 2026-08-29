@@ -33,6 +33,11 @@ pub struct NodeExtras {
     pub handoff_summary: Option<String>,
     pub handoff_files: Vec<String>,
     pub handoff_verification: Option<String>,
+    pub handoff_artifacts: Vec<String>,
+    pub handoff_blockers: Vec<String>,
+    pub handoff_recommendations: Vec<String>,
+    /// 结构化自定义输出(紧凑 JSON)。
+    pub handoff_output: Option<String>,
     pub lease: Option<String>,
     pub log_ref: Option<String>,
 }
@@ -126,6 +131,26 @@ impl RunNodeDetails {
                 line.push_str(&format!("(验证 {verification})"));
             }
             lines.push(line);
+        }
+        if !self.extras.handoff_artifacts.is_empty() {
+            lines.push(format!(
+                "产物: {}",
+                self.extras.handoff_artifacts.join(", ")
+            ));
+        }
+        if !self.extras.handoff_blockers.is_empty() {
+            lines.push(format!("阻塞: {}", self.extras.handoff_blockers.join("; ")));
+        }
+        if !self.extras.handoff_recommendations.is_empty() {
+            lines.push(format!(
+                "建议: {}",
+                self.extras.handoff_recommendations.join("; ")
+            ));
+        }
+        if let Some(output) = &self.extras.handoff_output {
+            if !output.trim().is_empty() && output != "{}" {
+                lines.push(format!("输出: {output}"));
+            }
         }
         if let Some(lease) = &self.extras.lease {
             lines.push(format!("Lease: {lease}"));

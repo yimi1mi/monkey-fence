@@ -45,7 +45,10 @@ pub fn build_task_cli_menu(
         out.push(MenuEntry {
             kind: MenuKind::DefaultCli,
             label: t.name.clone(),
-            agent_ref: Some(t.id.clone()),
+            // 启动引用用完整贡献 ID:第三方类型只有完整 ID 能被
+            // resolve_adapter(按完整贡献 ID 查找)解析;短 id 仅是
+            // 显式 legacy 内置回退路径
+            agent_ref: Some(t.full_contribution_id.clone()),
             note: format!("默认 CLI:沿用外部已有配置,不执行任何写入;不改变任务状态"),
         });
     }
@@ -81,7 +84,7 @@ pub fn launch_menu_entry(info: &AgentTypeInfo, instance_id: Option<String>) -> M
         None => MenuEntry {
             kind: MenuKind::DefaultCli,
             label: info.name.clone(),
-            agent_ref: Some(info.id.clone()),
+            agent_ref: Some(info.full_contribution_id.clone()),
             note: "默认 CLI:沿用外部已有配置,不执行任何写入".into(),
         },
         Some(id) => MenuEntry {

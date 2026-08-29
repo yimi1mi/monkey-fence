@@ -394,3 +394,90 @@ fn composer_assign_failure_leaves_no_draft_task() {
     );
     orch.stop();
 }
+
+// ---------- I9:全局模板 Composer 的并行风险开关(持久化,默认 false) ----------
+
+#[test]
+fn composer_unsafe_parallel_defaults_false_and_persisted_on_submit() {
+    use crate::task_composer::TaskComposerState;
+    let dir = tempfile::tempdir().unwrap();
+    let projects = vec![(dir.path().to_path_buf(), "P".to_string())];
+    let mut state = TaskComposerState::new(projects.clone(), Some(&dir.path().to_path_buf()));
+    state.set_title("t");
+    state.set_goal("g");
+    state.set_templates(vec![("tpl".into(), "模板".into())]);
+    state.select_workflow("tpl");
+    // 默认关闭(非隔离目录下并行编译默认拒绝)
+    assert!(!state.allow_unsafe_parallel());
+    assert!(state.unsafe_parallel_label().contains("关闭"));
+
+    // 开启后随提交持久化到项目 Store(task_assign_settings)
+    state.toggle_unsafe_parallel();
+    assert!(state.allow_unsafe_parallel());
+    assert!(state.unsafe_parallel_label().contains("开启"));
+
+    let created = state
+        .submit_with_workflow(
+            |root| {
+                Some(
+                    mf_agent::Orchestrator::start(
+                        Store::open(&root.join("composer.db")).unwrap(),
+                        root.clone(),
+                        Config::default(),
+                        Arc::new(NoopHost),
+                        Arc::new(RwLock::new(ProfileCatalog::default())),
+                        GlobalLimiter::new(4),
+                        "pipe".into(),
+                        Arc::new(
+                            mf_agent::execution_directory::ProjectDirectoryProvider::default(),
+                        ),
+                    )
+                    .unwrap(),
+                )
+            },
+            |root, task_id, _choice| {
+                // 与 sidebar 生产闭包同型:提交时持久化用户显式选择
+                let store = Store::open(&root.join("composer.db")).unwrap();
+                store
+                    .set_task_assign_unsafe_parallel(&root.to_string_lossy(), task_id, true)
+                    .unwrap();
+                assert!(store
+                    .task_assign_unsafe_parallel(&root.to_string_lossy(), task_id)
+                    .unwrap());
+                Ok(())
+            },
+        )
+        .unwrap();
+    // 持久化读取:默认 false,无记录的任务不继承他人选择
+    let store = Store::open(&dir.path().join("composer.db")).unwrap();
+    let task_id = match created {
+        crate::project_context::ActivationTarget::Task { task_id, .. } => task_id,
+        _ => panic!("应激活任务"),
+    };
+    assert!(!store
+        .task_assign_unsafe_parallel(&dir.path().to_string_lossy(), task_id + 999)
+        .unwrap());
+}
+
+#[test]
+fn task_assign_unsafe_parallel_persists_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("assign.db");
+    let store = mf_agent::Store::open(&db).unwrap();
+    let key = dir.path().to_string_lossy().to_string();
+    assert!(!store.task_assign_unsafe_parallel(&key, 5).unwrap());
+    store
+        .set_task_assign_unsafe_parallel(&key, 5, true)
+        .unwrap();
+    // 重新打开(重启恢复)后仍可读
+    let reopened = mf_agent::Store::open(&db).unwrap();
+    assert!(reopened.task_assign_unsafe_parallel(&key, 5).unwrap());
+    // 关闭后再次持久化为 false
+    reopened
+        .set_task_assign_unsafe_parallel(&key, 5, false)
+        .unwrap();
+    assert!(!mf_agent::Store::open(&db)
+        .unwrap()
+        .task_assign_unsafe_parallel(&key, 5)
+        .unwrap());
+}

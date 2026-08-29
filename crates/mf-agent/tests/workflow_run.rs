@@ -1752,3 +1752,69 @@ fn cancel_task_without_stop_confirmation_keeps_task_recoverable() {
     assert!(fx.directory.released.lock().is_empty());
     fx.orch.stop();
 }
+
+// ---------- I13:assign-then-confirm 不重复 assign ----------
+
+#[test]
+fn assign_and_confirm_task_local_reuses_unchanged_draft_and_refreezes_on_edit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    fx.pins.resolve_ok(true);
+    let task = fx.orch.create_task("任务本地", "g").unwrap();
+    let save_draft = |nodes: Vec<mf_agent::workflow::WorkflowNodeDraft>| {
+        fx.orch
+            .store
+            .save_task_workflow(
+                &tmp.path().to_string_lossy(),
+                task.id,
+                &mf_agent::workflow::WorkflowTemplateDraft {
+                    key: format!("task-{}", task.id),
+                    name: "任务工作流".into(),
+                    task_local: true,
+                    nodes,
+                },
+                false,
+            )
+            .unwrap();
+    };
+    save_draft(vec![node("a", &[], "做 A", &fx.instance_id)]);
+
+    // 第一次:冻结 + 确认(一个 draft Revision → active)
+    let t = fx
+        .orch
+        .assign_and_confirm_task_local(task.id, &plugin_index())
+        .unwrap();
+    assert_eq!(t.status, TaskStatus::Running);
+    assert_eq!(fx.orch.store.list_revision_ids(task.id).unwrap().len(), 1);
+
+    // 草稿未变再次确认:不得重复 assign(active_revision 判断会误判
+    // "仍 none"而重复冻结 —— 这里幂等复用同一 Revision)
+    let t = fx
+        .orch
+        .assign_and_confirm_task_local(task.id, &plugin_index())
+        .unwrap();
+    assert_eq!(t.status, TaskStatus::Running);
+    assert_eq!(
+        fx.orch.store.list_revision_ids(task.id).unwrap().len(),
+        1,
+        "草稿未变时不得重复冻结 Revision"
+    );
+
+    // 草稿被再次保存(内容变化/updated_at 更新)→ 重新冻结新 draft 并确认
+    fx.orch.pause_task(task.id).unwrap();
+    save_draft(vec![
+        node("a", &[], "做 A", &fx.instance_id),
+        node("b", &[], "做 B", &fx.instance_id),
+    ]);
+    let t = fx
+        .orch
+        .assign_and_confirm_task_local(task.id, &plugin_index())
+        .unwrap();
+    assert_eq!(t.status, TaskStatus::Running);
+    let revisions = fx.orch.store.list_revision_ids(task.id).unwrap();
+    assert!(
+        revisions.len() >= 2,
+        "草稿变化后必须重新冻结(实际 {revisions:?})"
+    );
+    fx.orch.stop();
+}

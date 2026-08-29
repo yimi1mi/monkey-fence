@@ -110,6 +110,15 @@ impl RunMonitorSnapshot {
                         extras.handoff_files = row.handoff.changed_files.clone();
                         extras.handoff_verification =
                             row.handoff.verification.as_ref().map(|v| v.to_string());
+                        extras.handoff_artifacts = row.handoff.artifacts.clone();
+                        extras.handoff_blockers = row.handoff.blockers.clone();
+                        extras.handoff_recommendations = row.handoff.recommendations.clone();
+                        extras.handoff_output = row
+                            .handoff
+                            .output
+                            .as_object()
+                            .filter(|map| !map.is_empty())
+                            .map(|map| serde_json::to_string(map).unwrap_or_default());
                         extras.log_ref = row.handoff.raw_log_ref.clone();
                     }
                     if let Some(lease) = self
@@ -155,6 +164,32 @@ fn placeholder_run() -> RunView {
         outcome_payload: None,
         started_at: String::new(),
         ended_at: None,
+    }
+}
+
+/// 危险动作的显式确认意图(I14:不能一键直接执行)。
+#[derive(Debug, Clone, PartialEq)]
+pub enum PendingConfirm {
+    /// 跳过节点(放弃该步骤的执行与产出)。
+    Skip { node_index: usize },
+    /// 取消运行(终止进程、释放执行租约)。
+    CancelRun { node_index: usize },
+    /// 重试待决汇合(把隔离租约的变更合并回项目目录)。
+    MergeRetry,
+}
+
+/// 是否需要二次确认(Skip 放弃步骤 / Cancel 终止进程;
+/// 合并重试经 PendingConfirm::MergeRetry 显式确认)。
+pub fn requires_confirmation(action: &RunAction) -> bool {
+    matches!(action, RunAction::Skip | RunAction::Cancel)
+}
+
+/// 确认提示文案(说明后果,用户显式选择)。
+pub fn confirmation_prompt(action: &RunAction) -> String {
+    match action {
+        RunAction::Skip => "确认跳过该节点?跳过后本步骤不再执行,产出被放弃。".into(),
+        RunAction::Cancel => "确认取消该运行?将终止 Agent 进程并释放执行租约(不可恢复)。".into(),
+        _ => "确认执行该操作?".into(),
     }
 }
 
@@ -261,6 +296,8 @@ pub struct RunMonitor {
     input: String,
     input_focused: bool,
     status: String,
+    /// 危险动作的待确认意图(显式确认后才执行)。
+    pending_confirm: Option<PendingConfirm>,
     focus_handle: FocusHandle,
 }
 
@@ -273,6 +310,7 @@ impl RunMonitor {
             input: String::new(),
             input_focused: false,
             status: String::new(),
+            pending_confirm: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -309,9 +347,15 @@ impl RunMonitor {
         self.input = input;
     }
 
-    /// 用户点击「重试合并」:整批重新汇合待决冲突(可恢复;
-    /// 仍有冲突时保留租约与持久化行,任务保持 needs-you)。
+    /// 用户点击「重试合并」:先进入确认状态(I14 危险动作,
+    /// 不得一键直接合并);确认后执行 resolve_pending_merge_confirmed。
     pub fn resolve_pending_merge(&mut self, cx: &mut Context<Self>) {
+        self.pending_confirm = Some(PendingConfirm::MergeRetry);
+        self.status = "确认重试合并?将把隔离租约的全部变更合并回项目目录。".into();
+        cx.notify();
+    }
+
+    fn resolve_pending_merge_confirmed(&mut self, cx: &mut Context<Self>) {
         let result = match self.orchestrator() {
             Some(orch) => {
                 let (_, task_id) = self.task.clone().expect("orchestrator 存在则任务存在");
@@ -341,7 +385,22 @@ impl RunMonitor {
     }
 
     /// 执行节点动作(完整 Orchestrator 链)后刷新投影。
+    /// 危险动作(Skip/Cancel)先进入确认状态 —— 不得一键直接执行。
     pub fn run_action(&mut self, idx: usize, action: RunAction, cx: &mut Context<Self>) {
+        if requires_confirmation(&action) {
+            self.pending_confirm = Some(match action {
+                RunAction::Skip => PendingConfirm::Skip { node_index: idx },
+                RunAction::Cancel => PendingConfirm::CancelRun { node_index: idx },
+                _ => unreachable!("requires_confirmation 只放行 Skip/Cancel"),
+            });
+            self.status = confirmation_prompt(&action);
+            cx.notify();
+            return;
+        }
+        self.execute_confirmed(idx, action, cx);
+    }
+
+    fn execute_confirmed(&mut self, idx: usize, action: RunAction, cx: &mut Context<Self>) {
         let details = match self.snapshot.node_details().get(idx) {
             Some(d) => d.clone(),
             None => return,
@@ -356,6 +415,30 @@ impl RunMonitor {
         }
         self.refresh();
         cx.notify();
+    }
+
+    /// 用户显式确认待决危险动作后执行。
+    pub fn confirm_pending(&mut self, cx: &mut Context<Self>) {
+        match self.pending_confirm.take() {
+            Some(PendingConfirm::Skip { node_index }) => {
+                self.execute_confirmed(node_index, RunAction::Skip, cx);
+            }
+            Some(PendingConfirm::CancelRun { node_index }) => {
+                self.execute_confirmed(node_index, RunAction::Cancel, cx);
+            }
+            Some(PendingConfirm::MergeRetry) => {
+                self.resolve_pending_merge_confirmed(cx);
+            }
+            None => {}
+        }
+    }
+
+    /// 放弃待确认动作。
+    pub fn dismiss_pending(&mut self, cx: &mut Context<Self>) {
+        if self.pending_confirm.take().is_some() {
+            self.status = "已取消操作".into();
+            cx.notify();
+        }
     }
 
     fn render_nodes(&self, cx: &Context<Self>) -> AnyElement {
@@ -449,6 +532,20 @@ impl RunMonitor {
                             detail.attempts, detail.run_id
                         )),
                 );
+            // 富显示行实际渲染(Session/Handoff 摘要与文件/产物/阻塞/
+            // 建议/结构化输出/租约/日志引用)—— 已收集的投影必须可见
+            let extra_lines = detail.extra_lines();
+            for (line_idx, line) in extra_lines.iter().enumerate() {
+                row = row.child(
+                    gpui::div()
+                        .id(gpui::ElementId::Name(
+                            format!("rm-extra-{idx}-{line_idx}").into(),
+                        ))
+                        .text_size(px(8.5))
+                        .text_color(rgb(crate::theme::Theme::fg_dim()))
+                        .child(line.clone()),
+                );
+            }
             for action in &detail.actions {
                 let label = match action {
                     RunAction::Continue => "继续",
@@ -504,6 +601,64 @@ impl RunMonitor {
             .into_any_element()
     }
 
+    /// 危险动作确认面板(显式「确认执行/取消」;Esc 取消)。
+    fn render_confirm(&self, cx: &Context<Self>) -> AnyElement {
+        let prompt = match &self.pending_confirm {
+            Some(_) => self.status.clone(),
+            None => return gpui::div().into_any_element(),
+        };
+        gpui::div()
+            .id("rm-confirm-panel")
+            .flex()
+            .gap_2()
+            .items_center()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(crate::theme::Theme::danger()))
+            .text_size(px(10.))
+            .text_color(rgb(crate::theme::Theme::warning()))
+            .child(prompt)
+            .child(
+                gpui::div()
+                    .id("rm-confirm-yes")
+                    .px_2()
+                    .h(px(20.))
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(crate::theme::Theme::danger()))
+                    .text_size(px(9.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                    .child("确认执行")
+                    .on_click(cx.listener(|monitor: &mut RunMonitor, _ev, _w, cx| {
+                        monitor.confirm_pending(cx);
+                    })),
+            )
+            .child(
+                gpui::div()
+                    .id("rm-confirm-no")
+                    .px_2()
+                    .h(px(20.))
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(crate::theme::Theme::border()))
+                    .text_size(px(9.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                    .child("取消")
+                    .on_click(cx.listener(|monitor: &mut RunMonitor, _ev, _w, cx| {
+                        monitor.dismiss_pending(cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn render_input(&self, cx: &Context<Self>) -> AnyElement {
         gpui::div()
             .id("rm-input")
@@ -535,7 +690,12 @@ impl RunMonitor {
 
     pub fn handle_key(&mut self, ev: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
         match ev.keystroke.key.as_str() {
-            "escape" => self.input_focused = false,
+            "escape" => {
+                if self.pending_confirm.is_some() {
+                    self.dismiss_pending(cx);
+                }
+                self.input_focused = false;
+            }
             "backspace" => {
                 self.input.pop();
             }
@@ -568,6 +728,7 @@ impl Render for RunMonitor {
             None => "运行监控".to_string(),
         };
         let nodes = self.render_nodes(cx);
+        let confirm = self.render_confirm(cx);
         let input = self.render_input(cx);
         let status = self.status.clone();
         gpui::div()
@@ -586,6 +747,7 @@ impl Render for RunMonitor {
                     .child(gpui::div().text_size(px(12.)).child(header)),
             )
             .child(nodes)
+            .child(confirm)
             .child(input)
             .when(!status.is_empty(), |d| {
                 d.child(

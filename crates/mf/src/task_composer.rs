@@ -30,6 +30,9 @@ pub struct TaskComposerState {
     workflow_choice: WorkflowChoice,
     /// 可分配的全局模板 (key, 名称);由宿主从目录库注入。
     templates: Vec<(String, String)>,
+    /// 非隔离目录提供器下并行的显式风险开关(默认 false 拒绝;
+    /// 提交时持久化到项目 Store,模板分配沿用)。
+    allow_unsafe_parallel: bool,
 }
 
 /// 任务创建的工作流分配。
@@ -53,6 +56,7 @@ impl TaskComposerState {
             goal_follows_title: true,
             workflow_choice: WorkflowChoice::TaskLocal,
             templates: Vec::new(),
+            allow_unsafe_parallel: false,
         }
     }
 
@@ -148,6 +152,25 @@ impl TaskComposerState {
     /// 提交校验:Project 必选、Title/Goal 必填(无当前 Project 时不能提交)。
     pub fn workflow_choice(&self) -> &WorkflowChoice {
         &self.workflow_choice
+    }
+
+    /// 非隔离目录并行风险开关(默认 false:编译器默认拒绝并行)。
+    pub fn allow_unsafe_parallel(&self) -> bool {
+        self.allow_unsafe_parallel
+    }
+
+    /// 切换风险开关(显式用户动作;提交时持久化)。
+    pub fn toggle_unsafe_parallel(&mut self) {
+        self.allow_unsafe_parallel = !self.allow_unsafe_parallel;
+    }
+
+    /// 风险开关展示标签。
+    pub fn unsafe_parallel_label(&self) -> String {
+        if self.allow_unsafe_parallel {
+            "共享目录并行:开启(自担冲突风险;Git 项目无需开启)".into()
+        } else {
+            "共享目录并行:关闭(默认)".into()
+        }
     }
 
     /// 选择工作流:模板键空串 = 任务本地。
@@ -382,8 +405,41 @@ impl TaskComposer {
                     .cursor_pointer()
                     .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                     .child(self.state.workflow_choice_label())
+                    // 并行风险开关(全局模板 Composer 也有;默认关闭)
+                    .when(self.state.allow_unsafe_parallel(), |d| {
+                        d.text_color(rgb(crate::theme::Theme::warning()))
+                    })
+                    .child(format!("  |  {}", self.state.unsafe_parallel_label()))
                     .on_click(cx.listener(|c: &mut TaskComposer, _, _, cx| {
                         c.state.cycle_workflow();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .id("composer-unsafe-parallel")
+                    .px_2()
+                    .h(px(20.))
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(if self.state.allow_unsafe_parallel() {
+                        crate::theme::Theme::warning()
+                    } else {
+                        crate::theme::Theme::border()
+                    }))
+                    .text_size(px(9.5))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                    .child(if self.state.allow_unsafe_parallel() {
+                        "⚠ 共享目录并行:开启(点击关闭)"
+                    } else {
+                        "共享目录并行:关闭(默认,点击开启)"
+                    })
+                    .on_click(cx.listener(|c: &mut TaskComposer, _, _, cx| {
+                        // 危险开关必须显式点击切换(默认 false)
+                        c.state.toggle_unsafe_parallel();
                         cx.notify();
                     })),
             )

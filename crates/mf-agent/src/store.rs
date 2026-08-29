@@ -1871,6 +1871,96 @@ impl Store {
     // ---------- 任务本地工作流(项目 Store,按 project+task 键) ----------
 
     /// 保存任务本地工作流草稿(同键覆盖;跨项目同 task id 互不影响)。
+    /// 任务最新 draft Revision 的 (id, created_at);无 draft 为 None。
+    /// 「分配并确认」用它判断是否需要重新冻结(避免 active_revision 仍
+    /// 为 none 时重复 assign)。
+    pub fn latest_draft_revision(&self, task_id: i64) -> Result<Option<(i64, String)>> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT id, created_at FROM pipeline_revisions
+                 WHERE task_id = ?1 AND status = 'draft'
+                 ORDER BY revision DESC LIMIT 1",
+                params![task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    /// 任务本地工作流草稿的最近保存时间(rfc3339);无草稿为 None。
+    pub fn task_workflow_saved_at(
+        &self,
+        project_key: &str,
+        task_id: i64,
+    ) -> Result<Option<String>> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT updated_at FROM task_workflows
+                 WHERE project_key = ?1 AND task_id = ?2",
+                params![project_key, task_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    /// 任务分配设置(全局模板路径的持久化 unsafe-parallel 开关)。
+    /// 与 task_workflows(任务本地草稿)分离:模板分配没有本地草稿。
+    pub fn set_task_assign_unsafe_parallel(
+        &self,
+        project_key: &str,
+        task_id: i64,
+        allow: bool,
+    ) -> Result<()> {
+        self.with_tx(|c| {
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS task_assign_settings (
+                     project_key TEXT NOT NULL,
+                     task_id INTEGER NOT NULL,
+                     allow_unsafe_parallel INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (project_key, task_id)
+                 )",
+                [],
+            )?;
+            c.execute(
+                "INSERT INTO task_assign_settings (project_key, task_id, allow_unsafe_parallel)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(project_key, task_id) DO UPDATE SET
+                     allow_unsafe_parallel = excluded.allow_unsafe_parallel",
+                params![project_key, task_id, allow as i64],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// 任务分配的持久化 unsafe-parallel 开关(无记录 = false 默认拒绝)。
+    pub fn task_assign_unsafe_parallel(&self, project_key: &str, task_id: i64) -> Result<bool> {
+        self.with_conn(|c| {
+            // 兼容旧库:表可能尚未创建
+            c.execute(
+                "CREATE TABLE IF NOT EXISTS task_assign_settings (
+                     project_key TEXT NOT NULL,
+                     task_id INTEGER NOT NULL,
+                     allow_unsafe_parallel INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (project_key, task_id)
+                 )",
+                [],
+            )
+            .ok();
+            let value: Option<i64> = c
+                .query_row(
+                    "SELECT allow_unsafe_parallel FROM task_assign_settings
+                     WHERE project_key = ?1 AND task_id = ?2",
+                    params![project_key, task_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(value.unwrap_or(0) != 0)
+        })
+    }
+
     /// `allow_unsafe_parallel`:非隔离目录提供器下并行的显式风险接受
     /// (持久化;分配时作为编译器输入,不是临时 UI 状态)。
     pub fn save_task_workflow(

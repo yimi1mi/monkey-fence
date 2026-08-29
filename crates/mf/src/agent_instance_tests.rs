@@ -433,3 +433,41 @@ fn secret_env_referencing_undeclared_secret_is_rejected() {
     state.remove_secret_ref("sk-not-declared");
     assert!(state.secret_env_map.is_empty());
 }
+
+// ---------- I5:编辑页按完整贡献 ID 解析类型 ----------
+
+#[test]
+fn editor_resolves_type_info_by_full_contribution_id() {
+    use crate::agent_instance_editor::resolve_type_info;
+    let third_party = AgentTypeInfo {
+        id: "super-agent".into(),
+        full_contribution_id: "acme.tools.super-agent".into(),
+        name: "Super Agent".into(),
+        plugin_name: "acme.tools".into(),
+        plugin_version: "1.0.0".into(),
+        content_hash: "hash".into(),
+        detected: true,
+        supports_isolated_config: true,
+        default_command: "super-agent".into(),
+        adapter: "generic-command".into(),
+        modes: vec![mf_agent::RunMode::Interactive],
+        config_schema_fields: Vec::new(),
+    };
+    let types = vec![detected_type(), third_party.clone()];
+    // 实例快照保存的是完整贡献 ID(to_draft 新引用一律完整形态)
+    let resolved = resolve_type_info(&types, "acme.tools.super-agent").unwrap();
+    assert_eq!(resolved.full_contribution_id, "acme.tools.super-agent");
+    // legacy 内置实例的短 id 仍可解析(显式兼容回退)
+    let legacy = resolve_type_info(&types, &detected_type().id).unwrap();
+    assert_eq!(legacy.id, detected_type().id);
+    // 编辑页导出的新引用是完整贡献 ID
+    let mut state =
+        crate::agent_instance_editor::AgentInstanceEditorState::new(third_party.clone());
+    state.set_name("第三方实例");
+    state.set_executable("super-agent");
+    let draft = state.to_draft();
+    assert_eq!(
+        draft.agent_type, "acme.tools.super-agent",
+        "编辑页导出的 agent_type 必须是完整贡献 ID"
+    );
+}

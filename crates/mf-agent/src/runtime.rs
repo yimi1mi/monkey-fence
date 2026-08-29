@@ -87,6 +87,9 @@ pub struct AgentTypeDescriptor {
 /// 一次 Agent Run 的启动规格。
 #[derive(Debug, Clone)]
 pub struct LaunchSpec {
+    /// 项目根(注册表路由键:run/session id 是项目内行号,跨项目会碰撞;
+    /// 与进程 cwd 无关 —— cwd 是 `workdir`/租约路径)。
+    pub project_root: PathBuf,
     pub run_id: i64,
     pub step_id: i64,
     pub task_id: i64,
@@ -133,6 +136,9 @@ pub struct AdHocLaunchSpec {
 /// 后启动。宿主不得改写 `run_temp`(可信物化根由调度器提供)。
 #[derive(Debug, Clone)]
 pub struct WorkflowLaunchSpec {
+    /// 项目根(注册表路由键;worktree 租约路径只作进程 cwd —— 用租约
+    /// 路径注册会让 stop_run/恢复探测按项目根寻址时找不到绑定)。
+    pub project_root: PathBuf,
     pub run_id: i64,
     pub step_id: i64,
     pub task_id: i64,

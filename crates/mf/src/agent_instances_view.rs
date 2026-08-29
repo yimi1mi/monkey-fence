@@ -245,12 +245,12 @@ impl AgentInstancesPage {
                     id: row.id.clone(),
                     name: row.name.clone(),
                     agent_type: row.agent_type.clone(),
-                    type_name: model
-                        .type_infos()
-                        .iter()
-                        .find(|t| t.id == row.agent_type)
-                        .map(|t| t.name.clone())
-                        .unwrap_or_else(|| row.agent_type.clone()),
+                    type_name: crate::agent_instance_editor::resolve_type_info(
+                        model.type_infos(),
+                        &row.agent_type,
+                    )
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| row.agent_type.clone()),
                     enabled: row.enabled,
                     current_version: row.current_version,
                     scope: row.scope,
@@ -282,10 +282,7 @@ impl AgentInstancesPage {
         &self,
         agent_type: &str,
     ) -> Option<crate::agent_instance_editor::AgentTypeInfo> {
-        self.model
-            .type_infos()
-            .iter()
-            .find(|t| t.id == agent_type)
+        crate::agent_instance_editor::resolve_type_info(self.model.type_infos(), agent_type)
             .cloned()
     }
 
@@ -304,7 +301,8 @@ impl AgentInstancesPage {
         let snapshot = mf_agent::AgentInstanceSnapshot {
             id: format!("default-{}", info.id),
             name: format!("{} 默认 CLI", info.name),
-            agent_type: info.id.clone(),
+            // 完整贡献 ID:第三方类型短 id 无法被 resolve_adapter 解析
+            agent_type: info.full_contribution_id.clone(),
             version: 0,
             enabled: true,
             run_mode: mf_agent::RunMode::Interactive,

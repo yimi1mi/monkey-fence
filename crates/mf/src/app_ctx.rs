@@ -584,6 +584,17 @@ impl AppCtx {
         Ok(rev.id)
     }
 
+    /// 任务本地工作流「分配并确认运行」原子路径(I13):
+    /// 草稿未变时不重复冻结(直接确认),草稿变化则重新编译冻结后运行。
+    pub fn assign_and_confirm_task_local(&self, root: &Path, task_id: i64) -> Result<()> {
+        let orch = self
+            .orchestrator_of(root)
+            .ok_or_else(|| anyhow::anyhow!("项目未打开: {}", root.display()))?;
+        let index = adapter_launch::workflow_plugin_index(&self.plugins);
+        orch.assign_and_confirm_task_local(task_id, &index)?;
+        Ok(())
+    }
+
     /// ---------- Secret 管理(设计 §8:明文只在 Secret Store 内) ----------
 
     fn secret_store(&self) -> Result<mf_plugins::builtin_secret_store::BuiltinSecretStore> {

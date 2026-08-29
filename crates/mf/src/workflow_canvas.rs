@@ -241,30 +241,14 @@ impl WorkflowCanvas {
             cx.notify();
             return;
         };
-        let Some(orch) = self.app.orchestrator_of(&root) else {
-            self.status = "项目未打开".into();
-            cx.notify();
-            return;
-        };
-        // 无活动 Revision 时先冻结草稿(幂等:已分配则直接确认)
-        if orch
-            .store
-            .active_revision(task_id)
-            .unwrap_or(None)
-            .is_none()
-        {
-            self.save_draft(cx);
-            match self.app.assign_task_local_workflow(&root, task_id) {
-                Ok(_) => {}
-                Err(e) => {
-                    self.status = format!("{e:#}");
-                    cx.notify();
-                    return;
-                }
+        // 先保存当前编辑(脏内容进项目 Store),再走原子
+        // 「分配并确认」:草稿未变时不重复冻结,assign 产生的 draft
+        // 在确认前 active_revision 仍为 none —— 不用它判断是否已分配
+        self.save_draft(cx);
+        match self.app.assign_and_confirm_task_local(&root, task_id) {
+            Ok(()) => {
+                self.status = format!("任务 {task_id} 已确认运行");
             }
-        }
-        match orch.confirm_and_run(task_id) {
-            Ok(t) => self.status = format!("任务 {} 已开始运行({:?})", t.id, t.status),
             Err(e) => self.status = format!("{e:#}"),
         }
         cx.notify();

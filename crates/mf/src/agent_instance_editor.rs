@@ -6,6 +6,19 @@
 use mf_agent::agent_instance::{AgentInstanceDraft, AgentInstanceSnapshot};
 use mf_agent::{InstanceScope, RunMode};
 
+/// 按类型引用解析 UI 投影:优先完整贡献 ID(新引用一律是完整形态),
+/// 短 id 仅作为显式 legacy 内置实例快照的兼容回退。
+/// 第三方贡献只以完整 ID 出现 —— 编辑页/默认 CLI 的全链路解析必须命中。
+pub fn resolve_type_info<'a>(
+    types: &'a [AgentTypeInfo],
+    agent_type: &str,
+) -> Option<&'a AgentTypeInfo> {
+    types
+        .iter()
+        .find(|t| t.full_contribution_id == agent_type)
+        .or_else(|| types.iter().find(|t| t.id == agent_type))
+}
+
 /// Agent Type 的 UI 投影(来自插件贡献 + PATH 检测)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentTypeInfo {

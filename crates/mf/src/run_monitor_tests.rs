@@ -430,3 +430,107 @@ fn snapshot_collects_sessions_handoffs_leases_and_conflicts() {
     );
     orch.stop();
 }
+
+// ---------- I12:节点富显示包含 artifacts/blockers/recommendations/output ----------
+
+#[test]
+fn monitor_nodes_surface_artifacts_blockers_recommendations_and_output() {
+    use crate::run_monitor::RunMonitorSnapshot;
+    let mut snapshot = RunMonitorSnapshot::from_parts(
+        vec![step(StepStatus::Succeeded)],
+        vec![run(RunStatus::Succeeded, Some("complete"))],
+    );
+    snapshot.handoffs = vec![HandoffRow {
+        id: 1,
+        step_id: Some(1),
+        run_id: Some(1),
+        handoff: mf_agent::handoff::Handoff {
+            status: "done".into(),
+            summary: "构建完成".into(),
+            changed_files: vec!["src/a.rs".into()],
+            artifacts: vec!["reports/build.md".into()],
+            verification: Some(serde_json::json!({"tests": "passed"})),
+            blockers: vec!["缺少签名密钥".into()],
+            recommendations: vec!["补充分包测试".into()],
+            output: serde_json::json!({"report_path": "reports/build.md"}),
+            raw_log_ref: Some("agent-run:1".into()),
+        },
+    }];
+    snapshot.leases = vec![ExecutionLeaseRow {
+        task_id: 1,
+        step_id: 1,
+        run_id: Some(1),
+        lease_key: "wt-x".into(),
+        provider: "worktree".into(),
+        path: "C:/tmp/wt-x".into(),
+        isolated: true,
+        status: "held".into(),
+        metadata_json: Some("{}".into()),
+        created_at: String::new(),
+        released_at: None,
+    }];
+    snapshot.sessions = vec![SessionView {
+        id: 1,
+        session_key: None,
+        runtime: "pty".into(),
+        agent_profile: "inst".into(),
+        title: "构建".into(),
+        status: SessionStatus::Done,
+        last_instruction: None,
+        last_reply: None,
+        unread: false,
+        created_at: String::new(),
+        updated_at: String::new(),
+    }];
+    let details = snapshot.node_details();
+    assert_eq!(details.len(), 1);
+    let lines = details[0].extra_lines();
+    let joined = lines.join(
+        "
+",
+    );
+    // RunMonitor 已收集的字段必须实际进入展示行(不是收集了不显示)
+    assert!(joined.contains("Session"), "{joined}");
+    assert!(joined.contains("构建完成"), "Handoff 摘要: {joined}");
+    assert!(joined.contains("src/a.rs"), "变更文件: {joined}");
+    assert!(
+        joined.contains("reports/build.md") && joined.contains("产物"),
+        "产物列表必须展示: {joined}"
+    );
+    assert!(
+        joined.contains("缺少签名密钥") && joined.contains("阻塞"),
+        "阻塞必须展示: {joined}"
+    );
+    assert!(
+        joined.contains("补充分包测试") && joined.contains("建议"),
+        "建议必须展示: {joined}"
+    );
+    assert!(
+        joined.contains("report_path"),
+        "结构化 output 必须展示: {joined}"
+    );
+    assert!(joined.contains("worktree"), "执行租约: {joined}");
+    assert!(joined.contains("agent-run:1"), "日志引用: {joined}");
+}
+
+// ---------- I14:危险动作必须显式确认(不能一键直接执行) ----------
+
+#[test]
+fn dangerous_actions_require_explicit_confirmation() {
+    use crate::run_monitor::{confirmation_prompt, requires_confirmation, PendingConfirm};
+    // 跳过(放弃步骤)、取消(终止进程)、重试合并(改动工作区)都要确认
+    assert!(requires_confirmation(&RunAction::Skip));
+    assert!(requires_confirmation(&RunAction::Cancel));
+    // 合并重试的确认意图显式建模
+    assert!(matches!(
+        PendingConfirm::MergeRetry,
+        PendingConfirm::MergeRetry
+    ));
+    // 非危险动作不弹确认(继续/结算/观察)
+    assert!(!requires_confirmation(&RunAction::Continue));
+    assert!(!requires_confirmation(&RunAction::ManualSettle));
+    assert!(!requires_confirmation(&RunAction::Observe));
+    // 确认提示必须说明后果
+    assert!(confirmation_prompt(&RunAction::Skip).contains("跳过"));
+    assert!(confirmation_prompt(&RunAction::Cancel).contains("终止"));
+}

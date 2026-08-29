@@ -413,7 +413,8 @@ fn launch_pty(
     spec: &LaunchSpec,
     events: Sender<(i64, RuntimeEvent)>,
 ) {
-    let project = spec.workdir.to_string_lossy().to_string();
+    // 注册表按项目根路由(跨项目 id 碰撞隔离);workdir 只是进程 cwd
+    let project = spec.project_root.to_string_lossy().to_string();
     if spec.attach_existing_session && registry.session_alive(&project, spec.session_id) {
         // 复用存活会话:直接发送提示
         let _ = registry.send_prompt(&project, spec.session_id, &spec.prompt);
@@ -942,7 +943,7 @@ fn launch_workflow_pty(
     plan: &mf_agent::LaunchPlan,
     events: Sender<(i64, RuntimeEvent)>,
 ) -> Result<()> {
-    let project = spec.workdir.to_string_lossy().to_string();
+    let project = spec.project_root.to_string_lossy().to_string();
     // 复用存活会话:直接发送提示,不再拉起进程
     if spec.attach_existing_session && registry.session_alive(&project, spec.session_id) {
         registry.send_prompt(&project, spec.session_id, &spec.prompt)?;
@@ -1239,7 +1240,7 @@ enum HttpOutcome {
 }
 
 fn launch_http(registry: &SessionRegistry, spec: &LaunchSpec, events: Sender<(i64, RuntimeEvent)>) {
-    let project = spec.workdir.to_string_lossy().to_string();
+    let project = spec.project_root.to_string_lossy().to_string();
     // HTTP 会话复用:同键存活则续用 transcript(会话连续性)
     if spec.attach_existing_session && registry.session_alive(&project, spec.session_id) {
         let key = session_key(&project, spec.session_id);
@@ -2016,6 +2017,7 @@ mod tests {
     ) -> mf_agent::runtime::WorkflowLaunchSpec {
         use mf_agent::runtime::WorkflowLaunchSpec;
         WorkflowLaunchSpec {
+            project_root: std::env::temp_dir(),
             run_id,
             step_id: 1,
             task_id: 1,
@@ -2088,6 +2090,7 @@ mod tests {
         let (events, rx) = crossbeam_channel::bounded(64);
         let workdir = std::env::temp_dir();
         let spec = LaunchSpec {
+            project_root: workdir.clone(),
             run_id: 77,
             step_id: 1,
             task_id: 1,
@@ -2160,6 +2163,7 @@ mod tests {
         let (events, _rx) = crossbeam_channel::bounded(16);
         let workdir = std::env::temp_dir();
         let spec = LaunchSpec {
+            project_root: workdir.clone(),
             run_id: 42,
             step_id: 1,
             task_id: 1,
