@@ -212,6 +212,37 @@ impl SessionRegistry {
         Self::kill_at(&self.sessions, &key);
     }
 
+    /// 停止 run 绑定的会话进程并等待停止确认(reader 线程观察到进程
+    /// 结束、PTY 关闭后置 alive=false)。返回时进程已停止(或超时告警),
+    /// 调用方此后才可安全标记 Cancelled / 释放执行租约。
+    /// 未知 run(无绑定/已退出)返回 false。
+    pub fn stop_run(&self, project: &str, run_id: i64) -> bool {
+        let run_key = session_key(project, run_id);
+        let bound = self.run_sessions.lock().get(&run_key).cloned();
+        let Some(session_key_of_run) = bound else {
+            return false;
+        };
+        let inner = self.sessions.lock().get(&session_key_of_run).cloned();
+        Self::kill_at(&self.sessions, &session_key_of_run);
+        self.run_sessions.lock().remove(&run_key);
+        let Some(inner) = inner else {
+            return false;
+        };
+        let alive = match &inner {
+            SessionInner::Pty(p) => &p.alive,
+            SessionInner::Http(h) => &h.alive,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while alive.load(Ordering::SeqCst) {
+            if std::time::Instant::now() >= deadline {
+                log::warn!("run {run_id} 会话进程停止未在 10s 内确认(可能被外部阻塞)");
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        true
+    }
+
     fn kill_at(sessions: &Mutex<HashMap<String, SessionInner>>, key: &str) {
         if let Some(s) = sessions.lock().remove(key) {
             match &s {
@@ -1570,8 +1601,12 @@ impl RuntimeHost for RuntimeHostImpl {
         let _ = self.registry.send_prompt(project, session_id, text);
     }
 
-    fn stop_run(&self, _project: &str, _run_id: i64) {
-        // run 级停止由 Orchestrator 结算/取消语义处理;这里保持会话存活(可复用)
+    fn stop_run(&self, project: &str, run_id: i64) {
+        // run 级停止 = 真终止 run 绑定的会话进程并等待停止确认;
+        // 返回后调用方才标记 Cancelled / 释放执行租约(隔离目录不再被写)
+        if !self.registry.stop_run(project, run_id) {
+            log::debug!("stop_run:run {run_id} 无存活绑定会话(可能已退出)");
+        }
     }
 
     fn kill_session(&self, project: &str, session_id: i64) {
@@ -1871,5 +1906,70 @@ mod tests {
         assert!(registry.snapshot("proj", 7).is_none());
         assert!(registry.send_prompt("proj", 7, "hi").is_err());
         registry.kill_session("proj", 1); // 不存在时是 no-op
+    }
+
+    #[test]
+    fn stop_run_terminates_bound_session_process_and_waits() {
+        // run 级停止必须真终止 run→session 进程并等待停止确认:
+        // 返回时注册表条目已移除、存活探测为假(不能是 no-op)
+        let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        let host = RuntimeHostImpl::new(registry.clone());
+        let (events, _rx) = crossbeam_channel::bounded(16);
+        let workdir = std::env::temp_dir();
+        let spec = LaunchSpec {
+            run_id: 42,
+            step_id: 1,
+            task_id: 1,
+            session_id: 7,
+            session_key: None,
+            attach_existing_session: false,
+            profile: AgentProfileSpec {
+                id: "cmd".into(),
+                display_name: "cmd".into(),
+                runtime: RuntimeKind::Pty,
+                command: cmd,
+                args: vec!["/K".into()], // /K 保持存活等待停止
+                env: vec![],
+                permission_args: vec![],
+                provider: None,
+                icon: None,
+                homepage: None,
+                hook: None,
+            },
+            step_title: "t".into(),
+            prompt: String::new(),
+            capability_token: "tok".into(),
+            pipe_name: "pipe".into(),
+            mfctl_hint: None,
+            workdir: workdir.clone(),
+        };
+        let project = workdir.to_string_lossy().to_string();
+        host.launch(spec, events);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if registry.session_alive(&project, 7) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        assert!(
+            registry.session_alive(&project, 7),
+            "前置:PTY 会话应存活等待停止"
+        );
+
+        let started = std::time::Instant::now();
+        host.stop_run(&project, 42);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "stop_run 应在时限内同步返回"
+        );
+        assert!(
+            !registry.session_alive(&project, 7),
+            "stop_run 返回后会话进程必须已停止"
+        );
+        assert!(registry.snapshot(&project, 7).is_none());
+        // 二次停止幂等
+        host.stop_run(&project, 42);
     }
 }

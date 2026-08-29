@@ -743,13 +743,17 @@ impl Orchestrator {
         ) {
             return Ok(run); // 终态幂等
         }
+        // stop_run 真终止进程并等待停止确认;返回后才结算/释放租约
         self.host.stop_run(&self.root_str, run.id);
         if let Some(session_id) = run.session_id {
             if !matches!(run.status, RunStatus::Interrupted) {
-                // 存活会话的进程由 stop_run 停止;此处只解除展示层活性
-                let _ =
+                // 进程已被 stop_run 终止:会话如实标记 Dead(不再是"可复用存活")
+                if let Some(s) =
                     self.store
-                        .update_session(session_id, Some(SessionStatus::Idle), None, None);
+                        .update_session(session_id, Some(SessionStatus::Dead), None, None)?
+                {
+                    self.emit(SchedulerEvent::SessionUpdated(s));
+                }
             }
         }
         let cancelled = self
