@@ -387,3 +387,74 @@ fn acquire_records_deps_and_baseline_in_lease_metadata() {
     assert_eq!(keys, vec!["build", "package"]);
     provider.release(&lease).unwrap();
 }
+
+// ---------- 并行兄弟先后结算:后完成者不得静默覆盖已汇合修改 ----------
+
+#[test]
+fn sequential_sibling_same_file_conflicts_without_overwrite() {
+    let fx = RepoFixture::with_base_files();
+    let provider = fx.provider();
+    let a = provider
+        .acquire(&fx.ctx_rev(21, "build", 1, 1, &[]))
+        .unwrap();
+    let b = provider
+        .acquire(&fx.ctx_rev(21, "docs", 1, 1, &[]))
+        .unwrap();
+    // 两个兄弟都改 shared.txt(各自基线都是 T0)
+    std::fs::write(a.path.join("shared.txt"), "from-build\n").unwrap();
+    std::fs::write(b.path.join("shared.txt"), "from-docs\n").unwrap();
+
+    // 先完成者单独汇合:成功,基线推进到 T1
+    assert_eq!(provider.merge(&[a.clone()]).unwrap(), MergeOutcome::Merged);
+    assert_eq!(norm(fx.root.join("shared.txt")), "from-build\n");
+
+    // 后完成者单独汇合:与"基线→当前集成 ref"之间已汇合的修改重叠
+    // → NeedsUser,项目目录零覆盖(仍是先完成者的版本)
+    match provider.merge(&[b.clone()]).unwrap() {
+        MergeOutcome::NeedsUser { conflicts } => {
+            assert!(
+                conflicts
+                    .iter()
+                    .any(|c| c.contains("shared.txt") && c.contains("已汇合")),
+                "冲突必须指向已汇合变更: {conflicts:?}"
+            );
+        }
+        other => panic!("应为 NeedsUser,得到 {other:?}(静默覆盖是缺陷)"),
+    }
+    assert_eq!(
+        norm(fx.root.join("shared.txt")),
+        "from-build\n",
+        "冲突时项目目录保持先完成者的已汇合版本"
+    );
+    let _ = provider.release(&a);
+    let _ = provider.release(&b);
+}
+
+#[test]
+fn sequential_sibling_disjoint_changes_stack_in_baseline() {
+    let fx = RepoFixture::with_base_files();
+    let provider = fx.provider();
+    let a = provider
+        .acquire(&fx.ctx_rev(22, "build", 1, 1, &[]))
+        .unwrap();
+    let b = provider
+        .acquire(&fx.ctx_rev(22, "docs", 1, 1, &[]))
+        .unwrap();
+    std::fs::write(a.path.join("a.txt"), "by-build\n").unwrap();
+    std::fs::write(b.path.join("b.txt"), "by-docs\n").unwrap();
+
+    assert_eq!(provider.merge(&[a.clone()]).unwrap(), MergeOutcome::Merged);
+    // 不重叠的兄弟:后完成者正常汇合,两者修改都保留,
+    // 且集成基线同时包含两者(下游从汇合结果检出可见全部)
+    assert_eq!(provider.merge(&[b.clone()]).unwrap(), MergeOutcome::Merged);
+    assert_eq!(norm(fx.root.join("a.txt")), "by-build\n");
+    assert_eq!(norm(fx.root.join("b.txt")), "by-docs\n");
+    let downstream = provider
+        .acquire(&fx.ctx_rev(22, "package", 1, 1, &["build", "docs"]))
+        .unwrap();
+    assert_eq!(norm(downstream.path.join("a.txt")), "by-build\n");
+    assert_eq!(norm(downstream.path.join("b.txt")), "by-docs\n");
+    let _ = provider.release(&a);
+    let _ = provider.release(&b);
+    let _ = provider.release(&downstream);
+}

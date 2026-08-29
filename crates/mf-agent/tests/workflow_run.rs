@@ -1174,3 +1174,177 @@ fn task_local_unsafe_parallel_flag_is_persisted_and_honored() {
     assert_eq!(fx.orch.store.revision_steps(rev.id).unwrap().len(), 2);
     fx.orch.stop();
 }
+
+// ---------- 真实 worktree:并行兄弟改同一文件 → needs-you、零覆盖 ----------
+
+#[test]
+fn parallel_siblings_same_file_conflict_needs_user_with_real_worktrees() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo_root = tmp.path().join("project");
+    std::fs::create_dir_all(&repo_root).unwrap();
+    {
+        // 真实 Git 仓库(基线提交含 shared.txt)
+        let repo = git2::Repository::init(&repo_root).unwrap();
+        let sig = git2::Signature::now("mf", "mf@test").unwrap();
+        std::fs::write(repo_root.join("shared.txt"), "base\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .unwrap();
+    }
+    let catalog = CatalogStore::memory().unwrap();
+    let instance = catalog
+        .create_agent_instance(instance_draft("worker", "agent.exe"))
+        .unwrap();
+    let pins = Arc::new(FakePins::default());
+    pins.resolve_ok(true);
+    let directory = Arc::new(
+        mf_plugins::git_worktree_provider::GitWorktreeProvider::new(repo_root.clone()).unwrap(),
+    );
+    assert!(directory.isolates());
+    let db_dir = repo_root.join(".mf-agent");
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let store = Store::open(&db_dir.join("workflow-v1.db")).unwrap();
+    let orch = Orchestrator::start_with(
+        store,
+        repo_root.clone(),
+        Config::default(),
+        Arc::new(RecordingHost::default()),
+        empty_profiles(),
+        GlobalLimiter::new(4),
+        "pipe".into(),
+        directory.clone(),
+        WorkflowKernel {
+            catalog: catalog.clone(),
+            pins: Some(pins.clone()),
+        },
+    )
+    .unwrap();
+
+    let version = {
+        let mut nodes = catalog
+            .save_template(&mf_agent::workflow::WorkflowTemplateDraft {
+                key: "parallel".into(),
+                name: "并行".into(),
+                task_local: false,
+                nodes: vec![
+                    WorkflowNodeDraft {
+                        key: "a".into(),
+                        title: "A".into(),
+                        instructions: "做 A".into(),
+                        agent_instance_id: instance.id.clone(),
+                        deps: vec![],
+                    },
+                    WorkflowNodeDraft {
+                        key: "b".into(),
+                        title: "B".into(),
+                        instructions: "做 B".into(),
+                        agent_instance_id: instance.id.clone(),
+                        deps: vec![],
+                    },
+                ],
+            })
+            .unwrap();
+        let _ = &mut nodes;
+        nodes
+    };
+    let task = orch.create_task("并行冲突", "g").unwrap();
+    orch.assign_workflow(task.id, &version, &plugin_index(), false)
+        .unwrap();
+    orch.confirm_and_run(task.id).unwrap();
+
+    // 两个并行节点都被派发,租约都持有
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            orch.store
+                .list_execution_leases(task.id)
+                .map(|ls| ls.iter().filter(|l| l.status == "held").count() == 2)
+                .unwrap_or(false)
+        }),
+        "两个并行节点的租约都应持有"
+    );
+    let lease_path = |key: &str| {
+        orch.store
+            .list_execution_leases(task.id)
+            .unwrap()
+            .into_iter()
+            .find(|l| {
+                let meta: serde_json::Value =
+                    serde_json::from_str(l.metadata_json.as_deref().unwrap_or("{}")).unwrap();
+                meta["step_key"].as_str() == Some(key)
+            })
+            .map(|l| std::path::PathBuf::from(l.path))
+            .unwrap()
+    };
+    let path_a = lease_path("a");
+    let path_b = lease_path("b");
+    // B 的基线原始字节(从它自己的 worktree 读,含检出时的换行形态)
+    let baseline_bytes = std::fs::read(path_b.join("shared.txt")).unwrap();
+    // 两个 worktree 都改 shared.txt
+    std::fs::write(path_a.join("shared.txt"), "from-a\n").unwrap();
+    std::fs::write(path_b.join("shared.txt"), "from-b\n").unwrap();
+
+    let token_for_step = |key: &str| {
+        let steps = orch.store.task_steps(task.id).unwrap();
+        let step = steps.iter().find(|s| s.step_key == key).unwrap();
+        let run = orch
+            .store
+            .list_runs_of_step(step.id)
+            .unwrap()
+            .into_iter()
+            .rev()
+            .next()
+            .unwrap();
+        run.capability_token
+    };
+
+    // A 先结算:单独汇合成功
+    orch.settle_by_token(&token_for_step("a"), Settlement::complete("A 完成"))
+        .unwrap();
+    let norm = |p: std::path::PathBuf| std::fs::read_to_string(p).unwrap().replace("\r\n", "\n");
+    assert_eq!(norm(repo_root.join("shared.txt")), "from-a\n");
+
+    // B 后结算:与已汇合的 A 修改重叠 → NeedsUser,任务 needs-you,
+    // 持久化待决行,项目目录零覆盖
+    orch.settle_by_token(&token_for_step("b"), Settlement::complete("B 完成"))
+        .unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            orch.store.task_view(task.id).unwrap().unwrap().status == TaskStatus::NeedsYou
+        }),
+        "后完成者与已汇合修改重叠必须进入 needs-you,实际 {:?}",
+        orch.store.task_view(task.id).unwrap().map(|t| t.status)
+    );
+    assert_eq!(norm(repo_root.join("shared.txt")), "from-a\n", "零覆盖");
+    let pending = orch.store.list_pending_merges(Some(task.id)).unwrap();
+    assert_eq!(pending.len(), 1, "待决冲突必须持久化: {pending:?}");
+    assert!(
+        pending[0]
+            .conflicts
+            .iter()
+            .any(|c| c.contains("shared.txt")),
+        "{:?}",
+        pending[0].conflicts
+    );
+
+    // 用户解决:B 放弃修改(恢复基线字节)→ 重试合并 → 收敛成功
+    std::fs::write(path_b.join("shared.txt"), &baseline_bytes).unwrap();
+    let remaining = orch.resolve_pending_merges(task.id).unwrap();
+    assert!(remaining.is_empty(), "{remaining:?}");
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            orch.store.task_view(task.id).unwrap().unwrap().status == TaskStatus::Succeeded
+        }),
+        "解决后任务应收敛,实际 {:?}",
+        orch.store.task_view(task.id).unwrap().map(|t| t.status)
+    );
+    assert_eq!(norm(repo_root.join("shared.txt")), "from-a\n");
+    // 租约清理:B 的 worktree 释放
+    assert!(!path_b.exists(), "解决后 B 的 worktree 应释放");
+    orch.stop();
+}

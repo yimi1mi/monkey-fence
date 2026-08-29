@@ -124,10 +124,21 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
         let repo = git2::Repository::open(&self.repo_root)
             .with_context(|| format!("打开仓库失败: {}", self.repo_root.display()))?;
         let head_tree_id = repo.head()?.peel_to_commit()?.tree_id();
+        let refname = merge_integration_ref(&worktree_leases)?;
+        let git_probe = Git::open(&self.repo_root)?;
+        // 当前集成 ref 树(已含兄弟节点已汇合的修改;无 ref 时为 None)
+        let integrated_tree: Option<git2::Oid> = git_probe
+            .read_ref(&refname)?
+            .and_then(|oid| repo.find_commit(oid).ok())
+            .map(|c| c.tree_id());
 
         // 1. 第一遍:批量预检 —— 各租约相对"各自基线"的变更文件集
         //    (不持有 Diff —— git2 的 Diff 借用其所属 Repository)。
-        //    任一重叠 → NeedsUser;此时项目目录零写入。
+        //    两类重叠都 → NeedsUser,此时项目目录零写入:
+        //    a. 批内两个租约改了同一文件;
+        //    b. 租约改的文件在"它的基线 → 当前集成 ref"之间已被其他
+        //       已汇合租约修改 —— 并行兄弟先后结算时,后完成者不得
+        //       静默覆盖先完成者已汇合的修改。
         let mut changed_by_lease: Vec<(String, HashSet<String>, git2::Oid)> = Vec::new();
         for lease in &worktree_leases {
             let baseline_tree = lease_baseline_tree(&repo, lease, head_tree_id);
@@ -147,6 +158,18 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
                 let (b, files_b, _) = &changed_by_lease[j];
                 for file in files_a.intersection(files_b) {
                     conflicts.push(format!("{file}(修改者: {a} 与 {b})"));
+                }
+            }
+        }
+        // 已汇合的外部变更:基线树 → 当前集成 ref 树之间的差异路径
+        if let Some(current) = integrated_tree {
+            for (label, files, baseline) in &changed_by_lease {
+                if *baseline == current {
+                    continue; // 基线即最新(本租约自身汇合后的幂等重试)
+                }
+                let merged_since = tree_diff_paths(&repo, *baseline, current);
+                for file in files.intersection(&merged_since) {
+                    conflicts.push(format!("{file}(修改者: {label} 与 已汇合的其他节点)"));
                 }
             }
         }
@@ -184,12 +207,11 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
         }
 
         // 3. 推进 Task/Revision 集成基线:下游 acquire 从汇合结果检出。
-        //    批内租约共享同一集成 ref(同 task+rev);从首个租约的基线树
-        //    叠加全部已应用变更(预检保证无重叠,叠加序无关)。
-        let refname = merge_integration_ref(&worktree_leases)?;
-        let base_tree = changed_by_lease
-            .first()
-            .map(|(_, _, t)| *t)
+        //    基底是「当前集成 ref 树」(已含兄弟节点已汇合的修改;预检
+        //    已保证本批变更与之无重叠),而非首个租约的旧基线 —— 否则
+        //    后结算的兄弟会把先结算者的变更从基线中挤掉。
+        let base_tree = integrated_tree
+            .or_else(|| changed_by_lease.first().map(|(_, _, t)| *t))
             .unwrap_or(head_tree_id);
         let tree_id = build_merged_tree(&repo, self.repo_root.clone(), base_tree, &applied)?;
         let git = Git::open(&self.repo_root)?;
@@ -351,6 +373,25 @@ fn changed_files_with_status(
     out.sort();
     out.dedup();
     Ok(out)
+}
+
+/// 两棵树之间的差异路径集(基线 → 集成 ref;兄弟节点已汇合的修改)。
+fn tree_diff_paths(repo: &git2::Repository, from: git2::Oid, to: git2::Oid) -> HashSet<String> {
+    let (Ok(from_tree), Ok(to_tree)) = (repo.find_tree(from), repo.find_tree(to)) else {
+        return HashSet::new();
+    };
+    match repo.diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None) {
+        Ok(diff) => diff
+            .deltas()
+            .filter_map(|d| {
+                d.new_file()
+                    .path()
+                    .or_else(|| d.old_file().path())
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+            })
+            .collect(),
+        Err(_) => HashSet::new(),
+    }
 }
 
 /// worktree 相对基线的变更文件集(正斜杠规范化)。

@@ -2477,6 +2477,7 @@ dependencies = [
  "chrono",
  "crossbeam-channel",
  "dirs 5.0.1",
+ "git2",
  "log",
  "mf-plugins",
  "mf-skills",
