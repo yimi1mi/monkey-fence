@@ -195,7 +195,8 @@ impl WorkflowPluginPins for FakePins {
     }
 }
 
-/// 可脚本化目录提供器:acquire 可失败、merge 结果可切换、记录 release。
+/// 可脚本化目录提供器:acquire 可失败、merge 结果可切换、记录 release
+/// 与每次合并的批大小(join 批次语义回归用)。
 struct ScriptedDirectory {
     root: PathBuf,
     acquire_fails: AtomicBool,
@@ -204,6 +205,8 @@ struct ScriptedDirectory {
     /// false → 返回 NeedsUser(冲突);true → Merged。
     merge_ok: AtomicBool,
     merges: AtomicUsize,
+    /// 每次调用的批大小(leases.len()),按调用顺序。
+    merge_batches: Mutex<Vec<usize>>,
     released: Mutex<Vec<String>>,
 }
 
@@ -215,6 +218,7 @@ impl ScriptedDirectory {
             isolates: AtomicBool::new(true),
             merge_ok: AtomicBool::new(true),
             merges: AtomicUsize::new(0),
+            merge_batches: Mutex::new(Vec::new()),
             released: Mutex::new(Vec::new()),
         }
     }
@@ -243,8 +247,9 @@ impl ExecutionDirectoryProvider for ScriptedDirectory {
             metadata: serde_json::json!({ "step_key": ctx.step_key }),
         })
     }
-    fn merge(&self, _leases: &[ExecutionLease]) -> anyhow::Result<MergeOutcome> {
+    fn merge(&self, leases: &[ExecutionLease]) -> anyhow::Result<MergeOutcome> {
         self.merges.fetch_add(1, Ordering::SeqCst);
+        self.merge_batches.lock().push(leases.len());
         if self.merge_ok.load(Ordering::SeqCst) {
             Ok(MergeOutcome::Merged)
         } else {
@@ -1347,4 +1352,263 @@ fn parallel_siblings_same_file_conflict_needs_user_with_real_worktrees() {
     // 租约清理:B 的 worktree 释放
     assert!(!path_b.exists(), "解决后 B 的 worktree 应释放");
     orch.stop();
+}
+
+// ---------- join 汇合批:并行父分支作为完整批次合并(C1 / I10 / I11) ----------
+
+/// 按节点键取最近一次 run 的能力令牌。
+fn token_of_node(orch: &Orchestrator, task_id: i64, key: &str) -> String {
+    let steps = orch.store.task_steps(task_id).unwrap();
+    let step = steps.iter().find(|s| s.step_key == key).unwrap();
+    orch.store
+        .list_runs_of_step(step.id)
+        .unwrap()
+        .into_iter()
+        .rev()
+        .next()
+        .unwrap()
+        .capability_token
+}
+
+#[test]
+fn join_parents_merge_as_one_complete_batch_after_both_settle() {
+    // a、b 并行 → join(c 依赖两者):a 先结算不得单独汇合/释放/推进基线,
+    // b 结算后才以完整父批次(2 个租约)一次合并,下游 c 才被派发
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    fx.pins.resolve_ok(true);
+    let version = fx.template(
+        "join",
+        vec![
+            node("a", &[], "做 A", &fx.instance_id),
+            node("b", &[], "做 B", &fx.instance_id),
+            node("c", &["a", "b"], "汇合两者", &fx.instance_id),
+        ],
+    );
+    let task = fx.orch.create_task("并行汇合", "g").unwrap();
+    fx.assign_and_run(task.id, &version);
+    assert!(wait_until(Duration::from_secs(5), || fx
+        .host
+        .workflow
+        .lock()
+        .len()
+        == 2));
+
+    // a 先成功结算:join 批不完整 → 零汇合、零释放、c 不派发
+    fx.orch
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "a"),
+            Settlement::complete("A 完成"),
+        )
+        .unwrap();
+    assert_eq!(
+        fx.directory.merges.load(Ordering::SeqCst),
+        0,
+        "join 批未完成:不得用单 Lease 汇合"
+    );
+    assert!(
+        fx.directory.released.lock().is_empty(),
+        "join 批未完成:不得释放父租约"
+    );
+    assert!(
+        fx.host
+            .workflow
+            .lock()
+            .iter()
+            .all(|(spec, _)| spec.node_key != "c"),
+        "join 批未完成:下游不得派发(基线未含全部上游)"
+    );
+
+    // b 结算:完整父批次一次合并(2 个租约),随后 c 派发
+    fx.orch
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "b"),
+            Settlement::complete("B 完成"),
+        )
+        .unwrap();
+    assert_eq!(
+        fx.directory.merges.load(Ordering::SeqCst),
+        1,
+        "b 结算必须恰好触发一次汇合"
+    );
+    assert_eq!(
+        fx.directory.merge_batches.lock()[0],
+        2,
+        "汇合必须是完整父租约批次(实际 {:?})",
+        fx.directory.merge_batches.lock()
+    );
+    assert_eq!(
+        fx.directory.released.lock().len(),
+        2,
+        "批成功后两个父租约都释放"
+    );
+    assert!(wait_until(Duration::from_secs(5), || {
+        fx.host
+            .workflow
+            .lock()
+            .iter()
+            .any(|(spec, _)| spec.node_key == "c")
+    }));
+    fx.orch.stop();
+}
+
+#[test]
+fn join_batch_conflict_pends_both_leases_and_resolve_resumes_scheduling() {
+    // join 批冲突:两个父租约都持久化为待决、保持持有;用户解决后
+    // 任务恢复 Running,下游继续派发(不是停在 needs-you)
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    fx.pins.resolve_ok(true);
+    let version = fx.template(
+        "join",
+        vec![
+            node("a", &[], "做 A", &fx.instance_id),
+            node("b", &[], "做 B", &fx.instance_id),
+            node("c", &["a", "b"], "汇合两者", &fx.instance_id),
+        ],
+    );
+    let task = fx.orch.create_task("并行冲突", "g").unwrap();
+    fx.assign_and_run(task.id, &version);
+    assert!(wait_until(Duration::from_secs(5), || fx
+        .host
+        .workflow
+        .lock()
+        .len()
+        == 2));
+
+    fx.directory.merge_ok.store(false, Ordering::SeqCst);
+    fx.orch
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "a"),
+            Settlement::complete("A 完成"),
+        )
+        .unwrap();
+    assert_eq!(
+        fx.orch.store.task_view(task.id).unwrap().unwrap().status,
+        TaskStatus::Running,
+        "批未完成时无冲突判定:任务保持运行"
+    );
+    fx.orch
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "b"),
+            Settlement::complete("B 完成"),
+        )
+        .unwrap();
+    assert_eq!(
+        fx.directory.merges.load(Ordering::SeqCst),
+        1,
+        "b 结算触发整批判定"
+    );
+    assert_eq!(fx.directory.merge_batches.lock()[0], 2);
+    assert_eq!(
+        fx.orch.store.task_view(task.id).unwrap().unwrap().status,
+        TaskStatus::NeedsYou,
+        "整批冲突必须进入 needs-you"
+    );
+    // 两个父租约都持久化为待决、保持持有
+    let pending = fx.orch.store.list_pending_merges(Some(task.id)).unwrap();
+    assert_eq!(
+        pending.len(),
+        2,
+        "完整批次的每个父租约都要持久化: {pending:?}"
+    );
+    assert!(fx.directory.released.lock().is_empty(), "冲突时零释放");
+    assert!(
+        fx.host
+            .workflow
+            .lock()
+            .iter()
+            .all(|(spec, _)| spec.node_key != "c"),
+        "needs-you 期间下游不派发"
+    );
+
+    // 用户解决后重试:整批合并成功 → 双租约释放、任务回 Running、c 派发
+    fx.directory.merge_ok.store(true, Ordering::SeqCst);
+    let remaining = fx.orch.resolve_pending_merges(task.id).unwrap();
+    assert!(remaining.is_empty(), "{remaining:?}");
+    assert_eq!(fx.directory.released.lock().len(), 2);
+    assert_eq!(
+        fx.orch.store.task_view(task.id).unwrap().unwrap().status,
+        TaskStatus::Running,
+        "待决汇合解决且注意力清空后必须恢复 Running"
+    );
+    assert!(wait_until(Duration::from_secs(5), || {
+        fx.host
+            .workflow
+            .lock()
+            .iter()
+            .any(|(spec, _)| spec.node_key == "c")
+    }));
+
+    // c 结算 → 任务收敛成功
+    fx.orch
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "c"),
+            Settlement::complete("汇合完成"),
+        )
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        fx.orch.store.task_view(task.id).unwrap().unwrap().status == TaskStatus::Succeeded
+    }));
+    fx.orch.stop();
+}
+
+#[test]
+fn archive_task_with_pending_join_merge_releases_worktrees() {
+    // 待决汇合的 join 批(两父租约)在归档时必须释放 worktree,
+    // 不能只清 DB/内存映射留下磁盘痕迹
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    fx.pins.resolve_ok(true);
+    let version = fx.template(
+        "join",
+        vec![
+            node("a", &[], "做 A", &fx.instance_id),
+            node("b", &[], "做 B", &fx.instance_id),
+            node("c", &["a", "b"], "汇合两者", &fx.instance_id),
+        ],
+    );
+    let task = fx.orch.create_task("归档待决", "g").unwrap();
+    fx.assign_and_run(task.id, &version);
+    assert!(wait_until(Duration::from_secs(5), || fx
+        .host
+        .workflow
+        .lock()
+        .len()
+        == 2));
+    fx.directory.merge_ok.store(false, Ordering::SeqCst);
+    fx.orch
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "a"),
+            Settlement::complete("A 完成"),
+        )
+        .unwrap();
+    fx.orch
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "b"),
+            Settlement::complete("B 完成"),
+        )
+        .unwrap();
+    assert_eq!(
+        fx.orch.store.task_view(task.id).unwrap().unwrap().status,
+        TaskStatus::NeedsYou
+    );
+    // 无活动 run(两个父 run 都已成功结算)→ 允许归档;
+    // 归档必须释放待决的两个父租约(复用取消清理语义)
+    fx.orch.archive_task(task.id).unwrap();
+    let released_after_archive = fx.directory.released.lock().clone();
+    assert_eq!(
+        released_after_archive.len(),
+        2,
+        "归档必须释放待决汇合的全部父租约:{released_after_archive:?}"
+    );
+    assert!(
+        fx.orch
+            .store
+            .list_pending_merges(Some(task.id))
+            .unwrap()
+            .is_empty(),
+        "归档后待决行清空"
+    );
+    fx.orch.stop();
 }
