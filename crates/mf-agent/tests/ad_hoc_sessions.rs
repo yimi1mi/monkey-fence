@@ -65,7 +65,9 @@ impl RuntimeHost for MockHost {
 
     fn launch(&self, _spec: LaunchSpec, _events: Sender<(i64, RuntimeEvent)>) {}
     fn send_prompt(&self, _project: &str, _run_id: i64, _session_id: i64, _text: &str) {}
-    fn stop_run(&self, _project: &str, _run_id: i64) {}
+    fn stop_run(&self, _project: &str, _run_id: i64) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn kill_session(&self, _project: &str, _session_id: i64) {}
     fn kill_ad_hoc(&self, _project: &str, _session_id: i64) {}
     fn answer_question(&self, _project: &str, _run_id: i64, _answer: &str) {}
@@ -610,7 +612,9 @@ impl RuntimeHost for KillRecordingHost {
     }
     fn launch(&self, _spec: LaunchSpec, _events: Sender<(i64, RuntimeEvent)>) {}
     fn send_prompt(&self, _p: &str, _r: i64, _s: i64, _t: &str) {}
-    fn stop_run(&self, _p: &str, _r: i64) {}
+    fn stop_run(&self, _p: &str, _r: i64) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn kill_session(&self, _p: &str, _s: i64) {}
     fn kill_ad_hoc(&self, project: &str, display_session_id: i64) {
         self.kills

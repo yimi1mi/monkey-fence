@@ -276,10 +276,13 @@ impl Orchestrator {
 
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
-        // 停止所有在途运行(会话进程交给 Session Registry 决定是否保留)
+        // 停止所有在途运行(会话进程交给 Session Registry 决定是否保留);
+        // 停止未确认只记录(关闭路径不因个别进程阻塞而失败)
         if let Ok(runs) = self.store.running_runs() {
             for run in runs {
-                self.host.stop_run(&self.root_str, run.id);
+                if let Err(e) = self.host.stop_run(&self.root_str, run.id) {
+                    log::warn!("关闭时停止 run {} 未确认: {e:#}", run.id);
+                }
             }
         }
     }
@@ -505,18 +508,44 @@ impl Orchestrator {
         Ok(t)
     }
 
-    /// 终止任务:停止在途运行,未终结 Step → cancelled,Task → cancelled。
+    /// 终止任务:停止在途运行(等待真实终止确认),未终结 Step →
+    /// cancelled,Task → cancelled。任一运行停止未确认 → 该 run 转入
+    /// Interrupted、任务进入 needs-you 并返回 Err(不标 Cancelled,
+    /// 保留可恢复状态;进程可能仍在写隔离目录)。
     pub fn cancel_task(&self, task_id: i64) -> Result<TaskView> {
+        let mut stop_failures: Vec<String> = Vec::new();
         for run in self.store.running_runs()? {
             if run.task_id != task_id {
                 continue;
             }
-            self.host.stop_run(&self.root_str, run.id);
+            if let Err(e) = self.host.stop_run(&self.root_str, run.id) {
+                stop_failures.push(format!("run {}: {e:#}", run.id));
+                if let Some(r) = self.store.set_run_status(run.id, RunStatus::Interrupted)? {
+                    self.release_slot(run.id);
+                    self.emit(SchedulerEvent::RunUpdated(r));
+                }
+                continue; // 未确认终止:不标 Cancelled、不释放租约
+            }
             if let Some(r) = self.store.set_run_status(run.id, RunStatus::Cancelled)? {
                 self.release_slot(run.id);
                 self.release_lease_of_run(run.id);
                 self.emit(SchedulerEvent::RunUpdated(r));
             }
+        }
+        if !stop_failures.is_empty() {
+            if let Some(t) = self.store.task_view(task_id)? {
+                if !t.status.terminal() {
+                    if let Some(t) = self.store.set_task_status(t.id, TaskStatus::NeedsYou)? {
+                        self.store.set_task_unread(t.id, true).ok();
+                        self.emit(SchedulerEvent::TaskUpdated(t));
+                    }
+                }
+            }
+            anyhow::bail!(
+                "任务 {task_id} 部分运行停止未确认,已标记 interrupted;\
+                 任务进入 needs-you(不释放执行租约):{}",
+                stop_failures.join("; ")
+            );
         }
         for step in self.store.task_steps(task_id)? {
             if !step.status.terminal() {
@@ -914,8 +943,10 @@ impl Orchestrator {
         self.step_leases.lock().retain(|_, l| l.id != lease.id);
     }
 
-    /// 终止单个 Agent Run(完整动作):请求宿主停止进程、结算为
-    /// cancelled、释放并发槽与执行租约。幂等;未知 run 报错。
+    /// 终止单个 Agent Run(完整动作):请求宿主停止进程、**等待真实终止
+    /// 确认**后结算为 cancelled、释放并发槽与执行租约。幂等;未知 run
+    /// 报错。停止未确认 → run 转入 Interrupted、任务 needs-you、返回 Err
+    /// (不标 Cancelled、不释放租约:进程可能仍在写隔离目录)。
     pub fn cancel_run(&self, run_id: i64) -> Result<RunView> {
         let run = self
             .store
@@ -927,8 +958,27 @@ impl Orchestrator {
         ) {
             return Ok(run); // 终态幂等
         }
-        // stop_run 真终止进程并等待停止确认;返回后才结算/释放租约
-        self.host.stop_run(&self.root_str, run.id);
+        // stop_run 真终止进程并等待停止确认;确认后才结算/释放租约
+        if let Err(stop_err) = self.host.stop_run(&self.root_str, run.id) {
+            // 未确认终止:不标 Cancelled、不释放租约/不动会话状态 ——
+            // 进程可能仍在运行;转入 Interrupted 等待人工处理
+            self.release_slot(run.id);
+            if let Some(r) = self.store.set_run_status(run.id, RunStatus::Interrupted)? {
+                self.emit(SchedulerEvent::RunUpdated(r));
+            }
+            if let Some(t) = self.store.task_view(run.task_id)? {
+                if !t.status.terminal() {
+                    if let Some(t) = self.store.set_task_status(t.id, TaskStatus::NeedsYou)? {
+                        self.store.set_task_unread(t.id, true).ok();
+                        self.emit(SchedulerEvent::TaskUpdated(t));
+                    }
+                }
+            }
+            anyhow::bail!(
+                "Run {run_id} 停止未确认,已标记为 interrupted\
+                 (不释放执行租约): {stop_err:#}"
+            );
+        }
         if let Some(session_id) = run.session_id {
             if !matches!(run.status, RunStatus::Interrupted) {
                 // 进程已被 stop_run 终止:会话如实标记 Dead(不再是"可复用存活")

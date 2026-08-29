@@ -158,8 +158,9 @@ fn cancel_action_stops_process_and_releases_lease() {
             Ok(())
         }
         fn send_prompt(&self, _: &str, _: i64, _: i64, _: &str) {}
-        fn stop_run(&self, _: &str, run_id: i64) {
+        fn stop_run(&self, _: &str, run_id: i64) -> anyhow::Result<()> {
             self.stopped.lock().push(run_id);
+            Ok(())
         }
         fn kill_session(&self, _: &str, _: i64) {}
         fn kill_ad_hoc(&self, _: &str, _: i64) {}
@@ -276,7 +277,9 @@ fn snapshot_collects_sessions_handoffs_leases_and_conflicts() {
             Ok(())
         }
         fn send_prompt(&self, _: &str, _: i64, _: i64, _: &str) {}
-        fn stop_run(&self, _: &str, _: i64) {}
+        fn stop_run(&self, _: &str, _: i64) -> anyhow::Result<()> {
+            Ok(())
+        }
         fn kill_session(&self, _: &str, _: i64) {}
         fn kill_ad_hoc(&self, _: &str, _: i64) {}
         fn answer_question(&self, _: &str, _: i64, _: &str) {}

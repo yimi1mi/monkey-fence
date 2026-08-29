@@ -107,8 +107,9 @@ impl RuntimeHost for MockHost {
         let _ = events.send((run_id, RuntimeEvent::Launched));
     }
     fn send_prompt(&self, _project: &str, _run_id: i64, _session_id: i64, _text: &str) {}
-    fn stop_run(&self, _project: &str, _run_id: i64) {
+    fn stop_run(&self, _project: &str, _run_id: i64) -> anyhow::Result<()> {
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
+        Ok(())
     }
     fn kill_session(&self, _project: &str, _session_id: i64) {}
     fn kill_ad_hoc(&self, _project: &str, _session_id: i64) {}

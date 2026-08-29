@@ -213,9 +213,12 @@ pub trait RuntimeHost: Send + Sync {
     /// `project`:项目根路径 —— run/session id 是各项目数据库的行号,
     /// 跨项目会碰撞,宿主必须以 (project, id) 定位真实会话。
     fn send_prompt(&self, project: &str, run_id: i64, session_id: i64, text: &str);
-    /// 停止一次运行:真终止 run 绑定的会话进程并等待停止确认后才返回
-    /// (调用方此后才可标记 Cancelled / 释放执行租约)。无绑定会话时 no-op。
-    fn stop_run(&self, project: &str, run_id: i64);
+    /// 停止一次运行:真终止 run 绑定的会话进程,并**等待真实终止确认**
+    /// (child 已被 wait/reap、生命周期已收口)后才返回 Ok。
+    /// Err = 停止未在时限内确认(进程可能仍在运行):调用方不得标记
+    /// Cancelled / 释放执行租约,应转入 Interrupted 等人工处理。
+    /// 无绑定会话(已退出/未知 run)时 Ok(无进程可停)。
+    fn stop_run(&self, project: &str, run_id: i64) -> Result<()>;
     /// 强制终止整个会话(进程)。
     fn kill_session(&self, project: &str, session_id: i64);
     /// 强制终止离散 CLI 会话(补偿路径:启动后 DB 写失败等场景,

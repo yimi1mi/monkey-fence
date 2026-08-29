@@ -51,6 +51,39 @@ struct PtySession {
     title: Mutex<String>,
     output_tail: Mutex<Vec<u8>>,
     alive: AtomicBool,
+    /// OS 进程 PID(终止验证/诊断;无进程时 None)。
+    pid: Option<u32>,
+    /// child 的 reap 归属:true = reader 线程持有 child(launch_pty),
+    /// stop/kill 方需关闭 master 解除 reader 阻塞,由 reader wait 后
+    /// 确认终止;false = 独立 waiter 线程持有 child(工作流/离散会话),
+    /// waiter wait 后自行关闭 master 并确认终止。
+    reader_owns_reap: bool,
+    /// 终止确认:reap 线程在 child.wait()(reap)完成、生命周期收口后
+    /// 置位并唤醒。kill 请求本身不置位 —— stop_run 据此等待真实终止。
+    terminated: Mutex<bool>,
+    terminated_cv: parking_lot::Condvar,
+}
+
+impl PtySession {
+    /// 标记进程已真正终止(child 已 reap、生命周期已收口)。
+    fn mark_terminated(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+        let mut terminated = self.terminated.lock();
+        *terminated = true;
+        self.terminated_cv.notify_all();
+    }
+
+    /// 等待终止确认(真实 OS 进程已 reap);超时返回 false。
+    fn wait_terminated(&self, timeout: std::time::Duration) -> bool {
+        let mut terminated = self.terminated.lock();
+        if !*terminated {
+            let result = self.terminated_cv.wait_for(&mut terminated, timeout);
+            if result.timed_out() && !*terminated {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 struct HttpSession {
@@ -212,50 +245,93 @@ impl SessionRegistry {
         Self::kill_at(&self.sessions, &key);
     }
 
-    /// 停止 run 绑定的会话进程并等待停止确认(reader 线程观察到进程
-    /// 结束、PTY 关闭后置 alive=false)。返回时进程已停止(或超时告警),
-    /// 调用方此后才可安全标记 Cancelled / 释放执行租约。
-    /// 未知 run(无绑定/已退出)返回 false。
-    pub fn stop_run(&self, project: &str, run_id: i64) -> bool {
+    /// 停止 run 绑定的会话进程并等待**真实终止确认**(child 已被
+    /// reader/waiter 线程 wait/reap、生命周期已收口)。
+    /// Ok = 已确认停止(或本无绑定会话);Err = 时限内未确认
+    /// (进程可能仍在运行,调用方不得标记 Cancelled/释放租约)。
+    pub fn stop_run(&self, project: &str, run_id: i64) -> Result<()> {
         let run_key = session_key(project, run_id);
-        let bound = self.run_sessions.lock().get(&run_key).cloned();
+        let bound = self.run_sessions.lock().remove(&run_key);
         let Some(session_key_of_run) = bound else {
-            return false;
+            return Ok(()); // 无绑定:无进程可停,视为已停止
         };
-        let inner = self.sessions.lock().get(&session_key_of_run).cloned();
-        Self::kill_at(&self.sessions, &session_key_of_run);
-        self.run_sessions.lock().remove(&run_key);
+        let inner = self.sessions.lock().remove(&session_key_of_run);
         let Some(inner) = inner else {
-            return false;
+            return Ok(()); // 绑定指向的会话已摘除(自然退出/已清理)
         };
-        let alive = match &inner {
-            SessionInner::Pty(p) => &p.alive,
-            SessionInner::Http(h) => &h.alive,
-        };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while alive.load(Ordering::SeqCst) {
-            if std::time::Instant::now() >= deadline {
-                log::warn!("run {run_id} 会话进程停止未在 10s 内确认(可能被外部阻塞)");
-                return false;
+        match &inner {
+            SessionInner::Http(h) => {
+                h.cancel.store(true, Ordering::SeqCst);
+                h.alive.store(false, Ordering::SeqCst);
+                Ok(())
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            SessionInner::Pty(p) => {
+                // 停止输入;请求进程终止。真实终止由 reader/waiter 线程
+                // child.wait() 确认后 mark_terminated —— 不在 kill 后
+                // 立刻谎报 alive=false。
+                p.writer.lock().take();
+                if let Some(mut killer) = p.killer.lock().take() {
+                    if let Err(e) = killer.kill() {
+                        log::warn!("run {run_id} 会话进程 kill 请求失败: {e}");
+                    }
+                }
+                if let Some(mut child) = p.child.lock().take() {
+                    // reader/waiter 尚未接管 child:直接终止并同步 reap
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    p.master.lock().take();
+                    p.mark_terminated();
+                }
+                if p.reader_owns_reap {
+                    // ConPTY 在 master 存续期间不给 reader EOF:关闭 master
+                    // 解除 reader 阻塞,由 reader 完成 child.wait 并确认终止
+                    p.master.lock().take();
+                }
+                if p.wait_terminated(std::time::Duration::from_secs(10)) {
+                    Ok(())
+                } else {
+                    Err(anyhow!(
+                        "run {run_id} 会话进程停止未在 10s 内确认(可能被外部阻塞)"
+                    ))
+                }
+            }
         }
-        true
+    }
+
+    /// PTY 会话的 OS 进程 PID(终止验证/诊断;HTTP 或无进程时 None)。
+    pub fn session_pid(&self, project: &str, session_id: i64) -> Option<u32> {
+        match self
+            .sessions
+            .lock()
+            .get(&session_key(project, session_id))?
+        {
+            SessionInner::Pty(p) => p.pid,
+            SessionInner::Http(_) => None,
+        }
     }
 
     fn kill_at(sessions: &Mutex<HashMap<String, SessionInner>>, key: &str) {
         if let Some(s) = sessions.lock().remove(key) {
             match &s {
                 SessionInner::Pty(p) => {
-                    p.alive.store(false, Ordering::SeqCst);
                     p.writer.lock().take();
                     if let Some(mut killer) = p.killer.lock().take() {
                         let _ = killer.kill();
                     }
                     if let Some(mut child) = p.child.lock().take() {
+                        // reader/waiter 未接管 child:直接终止并同步 reap,
+                        // 终止已确认
                         let _ = child.kill();
+                        let _ = child.wait();
+                        p.master.lock().take();
+                        p.mark_terminated();
                     }
-                    p.master.lock().take();
+                    if p.reader_owns_reap {
+                        // reader 持有 child:关闭 master 解除其阻塞,
+                        // 由 reader wait 后收口;waiter 模式则交给 waiter
+                        p.master.lock().take();
+                    }
+                    // 此处绝不伪造"进程已死"(alive 由 reap 方维护)
                 }
                 SessionInner::Http(h) => {
                     h.cancel.store(true, Ordering::SeqCst);
@@ -429,6 +505,7 @@ fn launch_pty(
     };
     drop(pair.slave);
     let killer = child.clone_killer();
+    let pid = child.process_id();
 
     let session = Arc::new(PtySession {
         session_id: spec.session_id,
@@ -441,6 +518,10 @@ fn launch_pty(
         title: Mutex::new(spec.profile.display_name.clone()),
         output_tail: Mutex::new(Vec::new()),
         alive: AtomicBool::new(true),
+        pid,
+        reader_owns_reap: true,
+        terminated: Mutex::new(false),
+        terminated_cv: parking_lot::Condvar::new(),
     });
     registry.register(
         &project,
@@ -492,7 +573,9 @@ fn launch_pty(
                     }
                 }
             }
-            reader_session.alive.store(false, Ordering::SeqCst);
+            // 生命周期收口顺序:先 wait(reap 真实 OS 进程)→ 清理
+            // PTY 资源 → 上报退出事件 → 最后确认终止(唤醒 stop_run)。
+            // stop_run 返回即代表进程已被 reap 且事件已发。
             let code = child
                 .as_mut()
                 .and_then(|c| c.wait().ok())
@@ -503,6 +586,7 @@ fn launch_pty(
             let _ = events_out.send((run_id, RuntimeEvent::AgentState(mf_agent::AgentState::Dead)));
             // 进程已结束并 wait:摘除注册表条目(不 kill)
             reader_registry.kill_session(&reader_project, reader_session.session_id);
+            reader_session.mark_terminated();
         });
     if let Err(error) = spawned {
         // reader 线程未启动:无人读取/等待 PTY → 收回 child kill + wait
@@ -515,7 +599,7 @@ fn launch_pty(
         }
         session.writer.lock().take();
         session.master.lock().take();
-        session.alive.store(false, Ordering::SeqCst);
+        session.mark_terminated(); // child 已同步 reap:终止已确认
         registry.kill_session(&project, spec.session_id);
         let _ = events.send((
             spec.run_id,
@@ -691,6 +775,7 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
     })?;
     drop(pair.slave);
     let killer = child.clone_killer();
+    let pid = child.process_id();
 
     let session = Arc::new(PtySession {
         session_id: spec.session_id,
@@ -703,6 +788,10 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
         title: Mutex::new(spec.title.clone()),
         output_tail: Mutex::new(Vec::new()),
         alive: AtomicBool::new(true),
+        pid,
+        reader_owns_reap: false,
+        terminated: Mutex::new(false),
+        terminated_cv: parking_lot::Condvar::new(),
     });
     registry.register(&project, display_id, SessionInner::Pty(session.clone()));
     // 看护 armed:下方任何失败路径(初始 stdin 写入、线程启动)
@@ -735,6 +824,8 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
             *waiter_slot.lock() = code;
             // 先写 slot 再关 master:reader 被解除阻塞时退出码已就绪
             waiter_session.master.lock().take();
+            // child 已 reap:确认终止(唤醒等待中的 stop_run/kill)
+            waiter_session.mark_terminated();
         })
         .context("启动离散会话 waiter 线程失败")?;
 
@@ -813,6 +904,7 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
             // 注册键是展示会话行 —— 必须用 display ID 摘除,
             // ad_hoc 行号(事件 tag)与它分属两套自增序列,互不相等。
             reader_registry.kill_session(&reader_project, reader_display_id);
+            // 终止确认由 waiter 负责(child.wait 完成即置位)
         });
     if let Err(error) = build {
         // guard 仍 armed → drop 时 kill(killer)+摘除注册表;waiter 负责 reap
@@ -929,6 +1021,7 @@ fn launch_workflow_pty(
     })?;
     drop(pair.slave);
     let killer = child.clone_killer();
+    let pid = child.process_id();
 
     let session = Arc::new(PtySession {
         session_id: spec.session_id,
@@ -941,6 +1034,10 @@ fn launch_workflow_pty(
         title: Mutex::new(spec.step_title.clone()),
         output_tail: Mutex::new(Vec::new()),
         alive: AtomicBool::new(true),
+        pid,
+        reader_owns_reap: true,
+        terminated: Mutex::new(false),
+        terminated_cv: parking_lot::Condvar::new(),
     });
     registry.register(
         &project,
@@ -974,6 +1071,8 @@ fn launch_workflow_pty(
             let code = child.wait().ok().map(|status| status.exit_code() as i32);
             *waiter_slot.lock() = code;
             waiter_session.master.lock().take();
+            // child 已 reap:确认终止(唤醒等待中的 stop_run/kill)
+            waiter_session.mark_terminated();
         })
         .context("启动工作流 waiter 线程失败")?;
 
@@ -1031,6 +1130,7 @@ fn launch_workflow_pty(
             let _ = events_out.send((run_id, RuntimeEvent::AgentState(mf_agent::AgentState::Dead)));
             // 进程已结束并 wait:摘除注册表条目(不 kill)
             reader_registry.kill_session(&reader_project, reader_session_id);
+            // 终止确认由 waiter 负责(child.wait 完成即置位)
         });
     if let Err(error) = build {
         // guard 仍 armed → drop 时 kill(killer)+摘除注册表;waiter 负责 reap
@@ -1597,12 +1697,11 @@ impl RuntimeHost for RuntimeHostImpl {
         let _ = self.registry.send_prompt(project, session_id, text);
     }
 
-    fn stop_run(&self, project: &str, run_id: i64) {
-        // run 级停止 = 真终止 run 绑定的会话进程并等待停止确认;
-        // 返回后调用方才标记 Cancelled / 释放执行租约(隔离目录不再被写)
-        if !self.registry.stop_run(project, run_id) {
-            log::debug!("stop_run:run {run_id} 无存活绑定会话(可能已退出)");
-        }
+    fn stop_run(&self, project: &str, run_id: i64) -> Result<()> {
+        // run 级停止 = 真终止 run 绑定的会话进程并等待真实终止确认
+        // (child 已 reap、生命周期已收口);Err = 未确认,调用方不得
+        // 标记 Cancelled / 释放执行租约(隔离目录可能仍被写)
+        self.registry.stop_run(project, run_id)
     }
 
     fn kill_session(&self, project: &str, session_id: i64) {
@@ -1904,6 +2003,91 @@ mod tests {
         registry.kill_session("proj", 1); // 不存在时是 no-op
     }
 
+    /// OS 进程表中是否存在该 PID(tasklist;非 Windows 环境返回 false)。
+    fn tasklist_has_pid(pid: u32) -> bool {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn stop_run_confirms_real_os_process_termination_by_pid() {
+        // stop_run 返回 = 真实 OS 进程终止已确认:
+        // 1) 退出事件已上报(reader/waiter 已 child.wait 完成 reap);
+        // 2) OS 进程表里该 PID 已消失(kill 后不得立刻谎报 alive=false)。
+        if !cfg!(windows) {
+            return;
+        }
+        let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        let host = RuntimeHostImpl::new(registry.clone());
+        let (events, rx) = crossbeam_channel::bounded(64);
+        let workdir = std::env::temp_dir();
+        let spec = LaunchSpec {
+            run_id: 77,
+            step_id: 1,
+            task_id: 1,
+            session_id: 9,
+            session_key: None,
+            attach_existing_session: false,
+            profile: AgentProfileSpec {
+                id: "cmd".into(),
+                display_name: "cmd".into(),
+                runtime: RuntimeKind::Pty,
+                command: cmd,
+                args: vec!["/K".into()], // 常驻等待停止
+                env: vec![],
+                permission_args: vec![],
+                provider: None,
+                icon: None,
+                homepage: None,
+                hook: None,
+            },
+            step_title: "t".into(),
+            prompt: String::new(),
+            capability_token: "tok".into(),
+            pipe_name: "pipe".into(),
+            mfctl_hint: None,
+            workdir: workdir.clone(),
+        };
+        let project = workdir.to_string_lossy().to_string();
+        host.launch(spec, events);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if registry.session_alive(&project, 9) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        assert!(registry.session_alive(&project, 9), "前置:PTY 会话应存活");
+        let pid = registry
+            .session_pid(&project, 9)
+            .expect("PTY 会话必须可观测 OS PID(终止验证的前提)");
+        assert!(tasklist_has_pid(pid), "前置:PID {pid} 应存在于 OS 进程表");
+
+        host.stop_run(&project, 77)
+            .expect("stop_run 必须在真实终止确认后成功返回");
+        // 返回即确认:退出事件已送达(不等待、不轮询)
+        let mut saw_exited = false;
+        while let Ok((_, ev)) = rx.try_recv() {
+            if matches!(ev, RuntimeEvent::Exited { .. }) {
+                saw_exited = true;
+            }
+        }
+        assert!(
+            saw_exited,
+            "stop_run 返回时进程生命周期必须已收口(Exited 已上报)"
+        );
+        assert!(
+            !tasklist_has_pid(pid),
+            "stop_run 返回后 OS 进程必须真正终止(PID {pid} 仍可见)"
+        );
+        // 二次停止幂等(无绑定会话 → 视为已停止)
+        host.stop_run(&project, 77).unwrap();
+    }
+
     #[test]
     fn stop_run_terminates_bound_session_process_and_waits() {
         // run 级停止必须真终止 run→session 进程并等待停止确认:
@@ -1955,7 +2139,7 @@ mod tests {
         );
 
         let started = std::time::Instant::now();
-        host.stop_run(&project, 42);
+        host.stop_run(&project, 42).unwrap();
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
             "stop_run 应在时限内同步返回"
@@ -1966,6 +2150,6 @@ mod tests {
         );
         assert!(registry.snapshot(&project, 7).is_none());
         // 二次停止幂等
-        host.stop_run(&project, 42);
+        host.stop_run(&project, 42).unwrap();
     }
 }

@@ -269,6 +269,8 @@ impl ExecutionDirectoryProvider for ScriptedDirectory {
 struct RecordingHost {
     workflow: Mutex<Vec<(WorkflowLaunchSpec, mf_agent::LaunchPlan)>>,
     senders: Mutex<HashMap<String, Sender<(i64, RuntimeEvent)>>>,
+    /// true → stop_run 返回 Err(注入"停止未确认"场景)。
+    stop_fails: AtomicBool,
 }
 
 impl RuntimeHost for RecordingHost {
@@ -293,7 +295,12 @@ impl RuntimeHost for RecordingHost {
         Ok(())
     }
     fn send_prompt(&self, _project: &str, _run_id: i64, _session_id: i64, _text: &str) {}
-    fn stop_run(&self, _project: &str, _run_id: i64) {}
+    fn stop_run(&self, _project: &str, _run_id: i64) -> anyhow::Result<()> {
+        if self.stop_fails.load(Ordering::SeqCst) {
+            anyhow::bail!("会话进程停止未在时限内确认(脚本注入)")
+        }
+        Ok(())
+    }
     fn kill_session(&self, _project: &str, _session_id: i64) {}
     fn kill_ad_hoc(&self, _project: &str, _display_session_id: i64) {}
     fn answer_question(&self, _project: &str, _run_id: i64, _answer: &str) {}
@@ -1610,5 +1617,90 @@ fn archive_task_with_pending_join_merge_releases_worktrees() {
             .is_empty(),
         "归档后待决行清空"
     );
+    fx.orch.stop();
+}
+
+// ---------- C3:停止未确认 → Interrupted/needs-you,不标 Cancelled ----------
+
+#[test]
+fn cancel_run_without_stop_confirmation_marks_interrupted_not_cancelled() {
+    // stop_run 未确认进程终止:run 不得标 Cancelled、不得释放执行租约;
+    // 进入 Interrupted,任务 needs-you(进程可能仍在写隔离目录)
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    fx.pins.resolve_ok(true);
+    let version = fx.template("t", vec![node("a", &[], "做 A", &fx.instance_id)]);
+    let task = fx.orch.create_task("取消未确认", "g").unwrap();
+    fx.assign_and_run(task.id, &version);
+    assert!(wait_until(Duration::from_secs(5), || fx
+        .host
+        .workflow
+        .lock()
+        .len()
+        == 1));
+    let run_id = {
+        let runs = fx.orch.store.list_runs_of_task(task.id).unwrap();
+        runs.iter()
+            .find(|r| r.status == RunStatus::Running)
+            .unwrap()
+            .id
+    };
+
+    fx.host.stop_fails.store(true, Ordering::SeqCst);
+    let err = fx.orch.cancel_run(run_id).unwrap_err();
+    assert!(err.to_string().contains("未确认"), "{err:#}");
+    let run = fx.orch.store.run_view(run_id).unwrap().unwrap();
+    assert_eq!(
+        run.status,
+        RunStatus::Interrupted,
+        "未确认终止必须 Interrupted,不能谎称 Cancelled"
+    );
+    assert!(
+        fx.directory.released.lock().is_empty(),
+        "未确认终止不得释放执行租约(进程可能仍在写)"
+    );
+    assert_eq!(
+        fx.orch.store.task_view(task.id).unwrap().unwrap().status,
+        TaskStatus::NeedsYou,
+        "任务应进入需要人工处理状态"
+    );
+    fx.orch.stop();
+}
+
+#[test]
+fn cancel_task_without_stop_confirmation_keeps_task_recoverable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    fx.pins.resolve_ok(true);
+    let version = fx.template("t", vec![node("a", &[], "做 A", &fx.instance_id)]);
+    let task = fx.orch.create_task("任务取消未确认", "g").unwrap();
+    fx.assign_and_run(task.id, &version);
+    assert!(wait_until(Duration::from_secs(5), || fx
+        .host
+        .workflow
+        .lock()
+        .len()
+        == 1));
+    let run_id = {
+        let runs = fx.orch.store.list_runs_of_task(task.id).unwrap();
+        runs.iter()
+            .find(|r| r.status == RunStatus::Running)
+            .unwrap()
+            .id
+    };
+
+    fx.host.stop_fails.store(true, Ordering::SeqCst);
+    let err = fx.orch.cancel_task(task.id).unwrap_err();
+    assert!(err.to_string().contains("未确认"), "{err:#}");
+    assert_eq!(
+        fx.orch.store.run_view(run_id).unwrap().unwrap().status,
+        RunStatus::Interrupted
+    );
+    assert_eq!(
+        fx.orch.store.task_view(task.id).unwrap().unwrap().status,
+        TaskStatus::NeedsYou,
+        "停止未确认时任务不得标 Cancelled(保留可恢复状态)"
+    );
+    assert!(fx.directory.released.lock().is_empty());
     fx.orch.stop();
 }

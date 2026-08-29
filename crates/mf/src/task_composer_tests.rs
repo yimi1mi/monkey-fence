@@ -26,7 +26,9 @@ impl RuntimeHost for NoopHost {
         Ok(())
     }
     fn send_prompt(&self, _p: &str, _r: i64, _s: i64, _t: &str) {}
-    fn stop_run(&self, _p: &str, _r: i64) {}
+    fn stop_run(&self, _p: &str, _r: i64) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn kill_session(&self, _p: &str, _s: i64) {}
     fn kill_ad_hoc(&self, _p: &str, _s: i64) {}
     fn answer_question(&self, _p: &str, _r: i64, _a: &str) {}
