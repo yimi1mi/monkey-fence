@@ -120,12 +120,15 @@ fn full_workflow_e2e_real_process_secret_pin_merge() {
         .unwrap();
     ctx.assign_workflow(project.path(), task.id, version.version_id, false)
         .unwrap();
-    // pin 已按任务 run_key 固定
+    // pin 已按「规范化 project + task + revision」run_key 固定
     let pins = catalog.list_plugin_pins().unwrap();
+    let rev_ids = orch.store.list_revision_ids(task.id).unwrap();
+    assert_eq!(rev_ids.len(), 1, "分配后应有一个 Revision");
+    let expected_key =
+        mf_agent::orchestrator::workflow_pin_key(project.path(), task.id, rev_ids[0]);
     assert!(
-        pins.iter()
-            .any(|p| p.run_key == format!("task-{}", task.id)),
-        "工作流分配必须 pin 插件: {pins:?}"
+        pins.iter().any(|p| p.run_key == expected_key),
+        "工作流分配必须 pin 插件: {pins:?}(期望 {expected_key})"
     );
 
     // 3) 运行:真实 PTY 子进程(worktree 目录内执行)
@@ -221,13 +224,13 @@ fn full_workflow_e2e_real_process_secret_pin_merge() {
         }),
         "worktree 应在汇合后释放"
     );
-    // 任务成功后插件 pin 释放
+    // 任务成功后插件 pin 释放(全部 Revision 的 key)
     assert!(
         wait_until(Duration::from_secs(10), || !catalog
             .list_plugin_pins()
             .unwrap()
             .iter()
-            .any(|p| p.run_key == format!("task-{}", task.id))),
+            .any(|p| p.run_key == expected_key)),
         "任务成功后应释放插件 pin"
     );
 

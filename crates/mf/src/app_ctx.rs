@@ -485,6 +485,7 @@ impl AppCtx {
             &self.plugins,
             &self.catalog_store,
             instance_snapshot,
+            None,
             run_temp.clone(),
             root.to_path_buf(),
             prompt,

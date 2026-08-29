@@ -155,22 +155,30 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     cond()
 }
 
-/// pin 生命周期假实现:记录调用,可注入 resolve 失败。
+/// pin 生命周期假实现:记录调用,可注入 resolve 失败与指定包 pin 失败。
 #[derive(Default)]
 struct FakePins {
     pinned: Mutex<Vec<(String, PluginSourcePin)>>,
     released: Mutex<Vec<String>>,
     resolve_ok: AtomicBool,
+    /// 命中 full_id 的 pin_for_run 失败(部分失败回滚测试)。
+    fail_on: Mutex<Option<String>>,
 }
 
 impl FakePins {
     fn resolve_ok(&self, ok: bool) {
         self.resolve_ok.store(ok, Ordering::SeqCst);
     }
+    fn fail_on(&self, full_id: &str) {
+        *self.fail_on.lock() = Some(full_id.to_string());
+    }
 }
 
 impl WorkflowPluginPins for FakePins {
     fn pin_for_run(&self, run_key: &str, pin: &PluginSourcePin) -> anyhow::Result<()> {
+        if self.fail_on.lock().as_deref() == Some(pin.full_id.as_str()) {
+            anyhow::bail!("插件包 {} 不可用(脚本注入失败)", pin.full_id);
+        }
         self.pinned.lock().push((run_key.to_string(), pin.clone()));
         Ok(())
     }
@@ -403,7 +411,11 @@ fn assign_workflow_compiles_pins_and_creates_active_revision() {
     // 插件 pin 已按任务 run_key 固定
     let pinned = fx.pins.pinned.lock().clone();
     assert_eq!(pinned.len(), 1, "去重后每个插件只 pin 一次");
-    assert_eq!(pinned[0].0, format!("task-{}", task.id));
+    assert_eq!(
+        pinned[0].0,
+        mf_agent::orchestrator::workflow_pin_key(tmp.path(), task.id, rev.id),
+        "pin key 必须含规范化 project+task+revision"
+    );
     assert_eq!(pinned[0].1.full_id, "builtin.core");
     assert_eq!(pinned[0].1.content_hash, "hash-generic");
     // Step 已投影,快照含插件 pin
@@ -566,14 +578,19 @@ fn two_node_workflow_dispatches_frozen_instance_end_to_end() {
     assert!(wait_until(Duration::from_secs(5), || {
         fx.orch.store.task_view(task.id).unwrap().unwrap().status == TaskStatus::Succeeded
     }));
+    let released_expected = {
+        // 任务全部 Revision 的 pin key 都应释放
+        let revs = fx.orch.store.list_revision_ids(task.id).unwrap();
+        revs.into_iter()
+            .map(|r| mf_agent::orchestrator::workflow_pin_key(tmp.path(), task.id, r))
+            .collect::<Vec<_>>()
+    };
     assert!(
         wait_until(Duration::from_secs(5), || {
-            fx.pins
-                .released
-                .lock()
-                .contains(&format!("task-{}", task.id))
+            let released = fx.pins.released.lock();
+            released_expected.iter().all(|k| released.contains(k))
         }),
-        "任务成功后应释放插件 pin"
+        "任务成功后应释放全部 Revision 的插件 pin"
     );
 }
 
@@ -796,4 +813,148 @@ fn merge_conflicts_persist_across_restart_and_resolve() {
         TaskStatus::Succeeded
     );
     orch3.stop();
+}
+
+// ---------- pin 生命周期:重分配 / 部分失败 / 归档 ----------
+
+#[test]
+fn reassign_releases_previous_revision_pins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    fx.pins.resolve_ok(true);
+    let v1 = fx.template("v1", vec![node("a", &[], "做 A", &fx.instance_id)]);
+    let v2 = fx.template("v2", vec![node("x", &[], "做 X", &fx.instance_id)]);
+    let task = fx.orch.create_task("标题", "").unwrap();
+
+    let rev1 = fx
+        .orch
+        .assign_workflow(task.id, &v1, &plugin_index(), false)
+        .unwrap();
+    fx.orch.confirm_and_run(task.id).unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        fx.host.workflow.lock().len() == 1
+    }));
+    // 运行中重新分配必须先暂停
+    assert!(fx
+        .orch
+        .assign_workflow(task.id, &v2, &plugin_index(), false)
+        .is_err());
+    fx.orch.pause_task(task.id).unwrap();
+    let rev2 = fx
+        .orch
+        .assign_workflow(task.id, &v2, &plugin_index(), false)
+        .unwrap();
+    assert_ne!(rev1.id, rev2.id);
+    // 旧活动 Revision 的 pin 精确释放,新 Revision 持有自己的 pin
+    assert!(
+        fx.pins
+            .released
+            .lock()
+            .contains(&mf_agent::orchestrator::workflow_pin_key(
+                tmp.path(),
+                task.id,
+                rev1.id
+            )),
+        "重分配后应释放旧 Revision pin:{:?}",
+        fx.pins.released.lock()
+    );
+    assert!(
+        fx.pins
+            .pinned
+            .lock()
+            .iter()
+            .any(|(k, _)| *k
+                == mf_agent::orchestrator::workflow_pin_key(tmp.path(), task.id, rev2.id)),
+        "新 Revision 应有自己的 pin"
+    );
+    fx.orch.stop();
+}
+
+#[test]
+fn pin_partial_failure_rolls_back_revision_and_pins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    // 两个不同 Agent Type 的实例 → 两个插件包 pin;第二个失败
+    let second = {
+        let mut draft = instance_draft("worker-2", "agent2.exe");
+        draft.agent_type = "other-type".into();
+        fx.catalog.create_agent_instance(draft).unwrap()
+    };
+    let mut index = plugin_index();
+    index.insert(
+        "other-type".into(),
+        plugin_pin("builtin.other", "hash-other"),
+    );
+    fx.pins.fail_on("builtin.other");
+    let version = fx.template(
+        "t",
+        vec![
+            node("a", &[], "做 A", &fx.instance_id),
+            node("b", &[], "做 B", &second.id),
+        ],
+    );
+    let task = fx.orch.create_task("标题", "").unwrap();
+    let err = fx
+        .orch
+        .assign_workflow(task.id, &version, &index, false)
+        .unwrap_err();
+    assert!(err.to_string().contains("builtin.other"), "{err:#}");
+    // 部分失败精确回滚:已 pin 的引用被释放、draft Revision 被删除
+    assert_eq!(fx.pins.released.lock().len(), 1, "必须回收本次 run_key");
+    assert!(
+        fx.pins.released.lock()[0].contains("rev-"),
+        "回滚的是本次 revision key"
+    );
+    assert!(
+        fx.orch.store.list_revision_ids(task.id).unwrap().is_empty(),
+        "pin 失败不得留下 draft Revision"
+    );
+    fx.orch.stop();
+}
+
+#[test]
+fn archive_task_releases_all_revision_pins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    fx.pins.resolve_ok(true);
+    let version = fx.template("t", vec![node("a", &[], "做 A", &fx.instance_id)]);
+    let task = fx.orch.create_task("标题", "").unwrap();
+    let rev = fx
+        .orch
+        .assign_workflow(task.id, &version, &plugin_index(), false)
+        .unwrap();
+    fx.orch.confirm_and_run(task.id).unwrap();
+    assert!(wait_until(Duration::from_secs(5), || fx
+        .host
+        .workflow
+        .lock()
+        .len()
+        == 1));
+    let token = { fx.host.workflow.lock()[0].0.capability_token.clone() };
+    // 失败结算收口活动 run 后归档
+    fx.orch
+        .settle_by_token(
+            &token,
+            Settlement::Fail {
+                reason: "收口".into(),
+            },
+        )
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        !fx.orch.store.task_has_active_runs(task.id).unwrap()
+    }));
+    fx.orch.archive_task(task.id).unwrap();
+    assert!(
+        fx.pins
+            .released
+            .lock()
+            .contains(&mf_agent::orchestrator::workflow_pin_key(
+                tmp.path(),
+                task.id,
+                rev.id
+            )),
+        "归档必须释放 Revision pin:{:?}",
+        fx.pins.released.lock()
+    );
+    fx.orch.stop();
 }

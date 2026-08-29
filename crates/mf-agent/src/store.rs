@@ -1659,6 +1659,64 @@ impl Store {
         })
     }
 
+    /// 删除尚未激活的 draft Revision(pin 失败回滚用;连带删除投影 Step)。
+    /// 非 draft(已激活/已废弃)拒绝删除。
+    pub fn delete_draft_revision(&self, revision_id: i64) -> Result<()> {
+        self.with_tx(|c| {
+            let status: Option<String> = c
+                .query_row(
+                    "SELECT status FROM pipeline_revisions WHERE id = ?1",
+                    params![revision_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match status.as_deref() {
+                None => Ok(()), // 已不存在:幂等
+                Some("draft") => {
+                    c.execute(
+                        "DELETE FROM step_deps WHERE step_id IN
+                           (SELECT id FROM steps WHERE revision_id = ?1)",
+                        params![revision_id],
+                    )?;
+                    c.execute(
+                        "DELETE FROM steps WHERE revision_id = ?1",
+                        params![revision_id],
+                    )?;
+                    c.execute(
+                        "DELETE FROM pipeline_revisions WHERE id = ?1",
+                        params![revision_id],
+                    )?;
+                    Ok(())
+                }
+                Some(other) => anyhow::bail!("拒绝删除非 draft 状态的 Revision({other})"),
+            }
+        })
+    }
+
+    /// 任务全部 Revision 行 id(升序;pin 释放按键遍历)。
+    pub fn list_revision_ids(&self, task_id: i64) -> Result<Vec<i64>> {
+        self.with_conn(|c| {
+            let mut stmt =
+                c.prepare("SELECT id FROM pipeline_revisions WHERE task_id = ?1 ORDER BY id")?;
+            let ids = stmt
+                .query_map(params![task_id], |r| r.get(0))?
+                .collect::<std::result::Result<Vec<i64>, _>>()?;
+            Ok(ids)
+        })
+    }
+
+    /// Revision 归属的任务 id。
+    pub fn task_of_revision(&self, revision_id: i64) -> Result<Option<i64>> {
+        self.with_conn(|c| {
+            Ok(c.query_row(
+                "SELECT task_id FROM pipeline_revisions WHERE id = ?1",
+                params![revision_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+    }
+
     /// 读取 Revision 冻结的工作流快照(旧 PipelineDraft revision 为 None)。
     pub fn revision_snapshot(
         &self,

@@ -581,10 +581,14 @@ impl Orchestrator {
                         .join("\n")
                 )
             })?;
-        // 先 pin 后写库:Revision 创建失败时回滚 pin,不留悬挂引用
-        let run_key = workflow_pin_key(task_id);
-        let mut pinned: Vec<PluginSourcePin> = Vec::new();
+        // 预编译通过才写库(pin key 含 revision id,必须先建 Revision);
+        // pin 失败 → 精确回滚:释放本次 run_key 已 pin 引用 + 删除刚建的 draft Revision
+        let previous_active = self.store.active_revision(task_id)?;
+        let rev = self.store.create_workflow_revision(task_id, &snapshot)?;
+        let run_key = workflow_pin_key(&self.root, task_id, rev.id);
         if let Some(pins) = &self.workflow.pins {
+            let mut pinned: Vec<PluginSourcePin> = Vec::new();
+            let mut failure: Option<anyhow::Error> = None;
             for node in &snapshot.nodes {
                 let Some(pin) = &node.plugin else {
                     continue;
@@ -592,25 +596,36 @@ impl Orchestrator {
                 if pinned.contains(pin) {
                     continue;
                 }
-                pins.pin_for_run(&run_key, pin)?;
-                pinned.push(pin.clone());
+                match pins.pin_for_run(&run_key, pin) {
+                    Ok(()) => pinned.push(pin.clone()),
+                    Err(e) => {
+                        failure = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = failure {
+                // 部分失败精确释放:只回收本次 run_key(其他 Revision 的 pin 不受影响)
+                if let Err(release_err) = pins.release_run_pins(&run_key) {
+                    log::warn!("回滚 pin 失败(可能留下悬挂引用): {release_err:#}");
+                }
+                if let Err(del) = self.store.delete_draft_revision(rev.id) {
+                    log::warn!("回滚 draft Revision 失败: {del:#}");
+                }
+                return Err(e);
             }
         }
-        match self.store.create_workflow_revision(task_id, &snapshot) {
-            Ok(rev) => {
-                self.emit(SchedulerEvent::RevisionCreated(rev.clone()));
-                if let Some(t) = self.store.task_view(task_id)? {
-                    self.emit(SchedulerEvent::TaskUpdated(t));
-                }
-                Ok(rev)
-            }
-            Err(e) => {
-                if let Some(pins) = &self.workflow.pins {
-                    let _ = pins.release_run_pins(&run_key);
-                }
-                Err(e)
+        // 重分配:新 Revision 冻结成功后释放旧活动 Revision 的 pin
+        if let Some(old) = previous_active {
+            if old.id != rev.id {
+                self.release_revision_pins(old.id);
             }
         }
+        self.emit(SchedulerEvent::RevisionCreated(rev.clone()));
+        if let Some(t) = self.store.task_view(task_id)? {
+            self.emit(SchedulerEvent::TaskUpdated(t));
+        }
+        Ok(rev)
     }
 
     /// 用户解决汇合冲突后重试:以持久化行为源整批重新汇合(批量预检 +
@@ -1114,10 +1129,28 @@ impl Orchestrator {
     }
 
     /// 释放任务的插件 pin(成功收敛/取消/归档后;幂等)。
+    /// pin key 按 Revision 维护:遍历任务全部 Revision 逐个释放。
     fn release_workflow_pins(&self, task_id: i64) {
+        let Ok(revisions) = self.store.list_revision_ids(task_id) else {
+            return;
+        };
+        for revision_id in revisions {
+            self.release_revision_pins(revision_id);
+        }
+    }
+
+    /// 释放单个 Revision 的插件 pin(幂等)。
+    fn release_revision_pins(&self, revision_id: i64) {
+        let task_id = self
+            .store
+            .task_of_revision(revision_id)
+            .ok()
+            .flatten()
+            .unwrap_or(0);
         if let Some(pins) = &self.workflow.pins {
-            if let Err(e) = pins.release_run_pins(&workflow_pin_key(task_id)) {
-                log::warn!("释放任务 {task_id} 的插件 pin 失败: {e:#}");
+            let run_key = workflow_pin_key(&self.root, task_id, revision_id);
+            if let Err(e) = pins.release_run_pins(&run_key) {
+                log::warn!("释放 Revision {revision_id} 的插件 pin 失败: {e:#}");
             }
         }
     }
@@ -2151,9 +2184,29 @@ fn trusted_run_temp(run_id: i64) -> PathBuf {
         .join(format!("{}-{run_id}", std::process::id()))
 }
 
-/// 任务级插件 pin run_key(任务生命周期内固定)。
-fn workflow_pin_key(task_id: i64) -> String {
-    format!("task-{task_id}")
+/// 任务级插件 pin run_key:规范化 project + task + revision。
+/// pin 生命周期实际按 Revision 维护(重分配各持各的 key);
+/// 跨项目同 task id 不会碰撞到同一把 pin。
+pub fn workflow_pin_key(project_root: &std::path::Path, task_id: i64, revision_id: i64) -> String {
+    format!(
+        "wf/{}/task-{}/rev-{}",
+        normalize_project_for_pin(project_root),
+        task_id,
+        revision_id
+    )
+}
+
+/// 项目根规范化:统一分隔符为 `/`、去尾斜杠;Windows 大小写不敏感。
+fn normalize_project_for_pin(project_root: &std::path::Path) -> String {
+    let mut text = project_root.to_string_lossy().replace('\\', "/");
+    while text.ends_with('/') && text.len() > 1 {
+        text.pop();
+    }
+    if cfg!(windows) {
+        text.to_lowercase()
+    } else {
+        text
+    }
 }
 
 /// 从数据库行重建租约对象(重启恢复路径)。
@@ -2301,5 +2354,26 @@ fn resolve_handoff_path(handoff: &crate::handoff::Handoff, path: &str) -> String
         serde_json::Value::Null => format!("(交接输出无字段 `{path}`)"),
         serde_json::Value::String(s) => s.clone(),
         other => serde_json::to_string_pretty(other).unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod pin_key_tests {
+    use super::*;
+
+    #[test]
+    fn pin_key_includes_normalized_project_task_revision() {
+        use std::path::Path;
+        let a = workflow_pin_key(Path::new("D:/work/Alpha"), 3, 7);
+        // 分隔符与大小写规范化(Windows):反斜杠/大小写差异是同一项目
+        let b = workflow_pin_key(Path::new("D:\\WORK\\alpha\\"), 3, 7);
+        assert_eq!(a, b, "同项目不同写法必须得到同一 pin key");
+        // 跨项目同 task/rev 不碰撞
+        let other = workflow_pin_key(Path::new("D:/work/Beta"), 3, 7);
+        assert_ne!(a, other);
+        // 同任务不同 revision 不互相覆盖(重分配各自 pin)
+        let next_rev = workflow_pin_key(Path::new("D:/work/Alpha"), 3, 8);
+        assert_ne!(a, next_rev);
+        assert!(a.starts_with("wf/d:/work/alpha/task-3/rev-7") || a.contains("task-3/rev-7"));
     }
 }

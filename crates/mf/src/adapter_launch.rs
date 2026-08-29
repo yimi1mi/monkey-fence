@@ -45,6 +45,70 @@ pub fn resolve_adapter(
     Ok((resolved, std::sync::Arc::from(adapter)))
 }
 
+/// 按 Revision 冻结的插件包 pin 解析 Adapter(Runtime 从 pinned package
+/// manifest/worker 声明取适配器,不随插件更新漂移):
+/// - 内容寻址包:`resolve` 校验内容哈希后从该包 manifest 的 agent_types
+///   定位 Adapter(worker 型贡献同样由 manifest 声明,首版接入适配器契约);
+/// - 内置合成插件:当前注册表贡献必须与 pin 的包版本一致;
+/// - 无 pin(旧快照/离散会话):回退当前注册表 + legacy 映射。
+pub fn resolve_adapter_for_pin(
+    plugins: &Arc<PluginRegistry>,
+    pin: Option<&PluginSourcePin>,
+    agent_type: &str,
+) -> Result<Arc<dyn AgentAdapter>> {
+    let Some(pin) = pin else {
+        let (_, adapter) = resolve_adapter(plugins, agent_type)?;
+        return Ok(adapter);
+    };
+    if !pin.content_hash.is_empty() {
+        let resolved = plugins.resolve(&pin.full_id, &pin.version, &pin.content_hash)?;
+        let contribution = resolved
+            .manifest
+            .agent_types
+            .iter()
+            .find(|a| a.id == agent_type || format!("{}.{}", pin.full_id, a.id) == agent_type);
+        let contribution = contribution.ok_or_else(|| {
+            anyhow::anyhow!(
+                "pin 的插件包 {}@{} 不贡献 Agent Type `{agent_type}`",
+                pin.full_id,
+                pin.version
+            )
+        })?;
+        let adapter_id = contribution.adapter.as_str();
+        return mf_plugins::builtin::adapter_for(adapter_id)
+            .map(std::sync::Arc::from)
+            .ok_or_else(|| anyhow::anyhow!("尚不支持 Agent Adapter: {adapter_id}"));
+    }
+    // 内置合成插件:在 pin 的插件包贡献里定位 Agent Type(接受完整贡献 ID
+    // 与历史短 id 两种引用形态),当前注册表版本必须与 pin 一致
+    let entries = plugins.contributions().agent_types();
+    let matched = entries.into_iter().find(|(full_id, source, contribution)| {
+        source.plugin_full_id == pin.full_id
+            && (full_id == agent_type
+                || contribution.id == agent_type
+                || format!("{}.{}", pin.full_id, contribution.id) == agent_type)
+    });
+    let (full_id, source, contribution) = matched.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Agent Type `{agent_type}` 不存在或不属于 pin 的插件包 {}@{}",
+            pin.full_id,
+            pin.version
+        )
+    })?;
+    let _ = full_id;
+    anyhow::ensure!(
+        source.plugin_version == pin.version,
+        "Agent Type `{agent_type}` 的插件版本与 pin 不一致(pin {}@{},当前 {}@{})",
+        pin.full_id,
+        pin.version,
+        source.plugin_full_id,
+        source.plugin_version
+    );
+    mf_plugins::builtin::adapter_for(contribution.adapter.as_str())
+        .map(std::sync::Arc::from)
+        .ok_or_else(|| anyhow::anyhow!("尚不支持 Agent Adapter: {}", contribution.adapter))
+}
+
 /// 声明的运行模式是否包含请求模式。
 pub fn contribution_supports_mode(modes: &[String], mode: mf_agent::RunMode) -> bool {
     modes.iter().any(|declared| declared == mode.as_str())
@@ -64,12 +128,15 @@ pub fn grants_shell(plugins: &Arc<PluginRegistry>, source: Option<&ContributionS
 
 /// 校验实例 + 解封 Secret + 编译 LaunchPlan(生产链唯一入口)。
 /// `run_token` 是本次运行的凭据(离散会话/工作流 Step 各自命名);
+/// `pin` 是 Revision 冻结的插件包身份(工作流 Step 按 pin 解析 Adapter;
+/// 离散会话为 None,走当前注册表);
 /// `external_config = true` 表示 Default CLI 只读外部配置意图。
 #[allow(clippy::too_many_arguments)]
 pub fn compile_instance_launch(
     plugins: &Arc<PluginRegistry>,
     catalog: &Arc<CatalogStore>,
     instance: &AgentInstanceSnapshot,
+    pin: Option<&PluginSourcePin>,
     run_temp: PathBuf,
     workdir: PathBuf,
     prompt: Option<String>,
@@ -77,7 +144,7 @@ pub fn compile_instance_launch(
     external_config: bool,
     secret_master_key: Option<[u8; 32]>,
 ) -> Result<LaunchPlan> {
-    let (resolved, adapter) = resolve_adapter(plugins, &instance.agent_type)?;
+    let adapter = resolve_adapter_for_pin(plugins, pin, &instance.agent_type)?;
     let validation_errors = adapter.validate(instance);
     if !validation_errors.is_empty() {
         anyhow::bail!("Agent Instance 配置无效: {}", validation_errors.join("; "));
@@ -85,7 +152,12 @@ pub fn compile_instance_launch(
     let mut launch_ctx = LaunchContext::new(run_temp, workdir);
     launch_ctx.prompt = prompt;
     launch_ctx.external_config = external_config;
-    launch_ctx.grants_shell = grants_shell(plugins, resolved.as_ref().map(|(src, _)| src));
+    // Shell 能力门控按当前注册表的启用状态(pinned 包已停用时保守拒绝)
+    let contribution_source = plugins
+        .contributions()
+        .find_agent_type(&instance.agent_type)
+        .map(|(src, _)| src);
+    launch_ctx.grants_shell = grants_shell(plugins, contribution_source.as_ref());
     if !instance.sealed_secret_ids.is_empty() {
         let secret_store = match secret_master_key {
             Some(key) => mf_plugins::builtin_secret_store::BuiltinSecretStore::with_master_key(

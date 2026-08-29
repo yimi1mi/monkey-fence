@@ -1539,12 +1539,14 @@ impl RuntimeHost for RuntimeHostImpl {
         let Some(launcher) = &self.launcher else {
             anyhow::bail!("工作流派发未接线插件宿主(RuntimeHostImpl::with_launcher)");
         };
-        // 真实生产链:冻结 Agent Instance → Agent Adapter → LaunchPlan → PTY
+        // 真实生产链:冻结 Agent Instance → Agent Adapter → LaunchPlan → PTY。
+        // Adapter 按 Revision 冻结的插件包 pin 解析(不随插件更新漂移)。
         let run_token = format!("step:{}:{}", spec.run_id, spec.node_key);
         let plan = crate::adapter_launch::compile_instance_launch(
             &launcher.plugins,
             &launcher.catalog,
             &spec.instance,
+            spec.plugin.as_ref(),
             spec.run_temp.clone(),
             spec.workdir.clone(),
             Some(spec.prompt.clone()),

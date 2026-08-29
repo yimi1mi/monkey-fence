@@ -285,3 +285,76 @@ fn app_ctx_seals_and_deletes_secrets_storing_only_references() {
     assert!(!ctx.delete_secret(&id).unwrap());
     assert!(ctx.list_secrets().unwrap().is_empty());
 }
+
+// ---------- Runtime 按 Revision 冻结的插件包 pin 解析 Adapter ----------
+
+mod pinned_adapter_tests {
+    use crate::adapter_launch::resolve_adapter_for_pin;
+    use mf_agent::workflow::PluginSourcePin;
+    use mf_plugins::PluginHost;
+
+    fn registry() -> std::sync::Arc<PluginHost> {
+        PluginHost::load_at_with_catalog(
+            std::env::temp_dir().join("mf-pin-adapter-test"),
+            mf_agent::CatalogStore::memory().unwrap(),
+            &mf_agent::Config::default(),
+            &[],
+        )
+    }
+
+    /// 内置 claude 贡献的当前身份(合成插件 content_hash 为空)。
+    fn claude_pin(plugins: &PluginHost, version_override: Option<&str>) -> PluginSourcePin {
+        let (_, source, _) = plugins
+            .contributions()
+            .agent_types()
+            .into_iter()
+            .find(|(_, s, c)| s.plugin_full_id == "monkeyfence.claude" && c.id == "claude")
+            .expect("内置 claude 贡献");
+        PluginSourcePin {
+            full_id: source.plugin_full_id.clone(),
+            version: version_override
+                .map(str::to_string)
+                .unwrap_or_else(|| source.plugin_version.clone()),
+            content_hash: String::new(), // 内置合成插件:无内容寻址哈希
+        }
+    }
+
+    #[test]
+    fn pinned_version_resolves_adapter_from_matching_contribution() {
+        let plugins = registry();
+        let pin = claude_pin(&plugins, None);
+        let adapter =
+            resolve_adapter_for_pin(&plugins, Some(&pin), "monkeyfence.claude.claude").unwrap();
+        assert_eq!(adapter.id(), "claude-code");
+    }
+
+    #[test]
+    fn pinned_version_mismatch_is_rejected() {
+        let plugins = registry();
+        let pin = claude_pin(&plugins, Some("0.0.0-other"));
+        let err = match resolve_adapter_for_pin(&plugins, Some(&pin), "monkeyfence.claude.claude") {
+            Err(e) => e,
+            Ok(_) => panic!("版本不一致的 pin 必须被拒绝"),
+        };
+        assert!(err.to_string().contains("不一致"), "{err:#}");
+    }
+
+    #[test]
+    fn content_addressed_pin_with_bad_hash_is_rejected() {
+        let plugins = registry();
+        let mut pin = claude_pin(&plugins, None);
+        pin.content_hash = "sha256:not-a-real-package".into();
+        let err = match resolve_adapter_for_pin(&plugins, Some(&pin), "monkeyfence.claude.claude") {
+            Err(e) => e,
+            Ok(_) => panic!("内容哈希不存在的 pin 必须被拒绝"),
+        };
+        assert!(err.to_string().contains("插件包不存在"), "{err:#}");
+    }
+
+    #[test]
+    fn missing_pin_falls_back_to_current_registry() {
+        let plugins = registry();
+        let adapter = resolve_adapter_for_pin(&plugins, None, "monkeyfence.claude.claude").unwrap();
+        assert_eq!(adapter.id(), "claude-code");
+    }
+}
