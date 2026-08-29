@@ -591,3 +591,101 @@ fn sequential_sibling_disjoint_changes_stack_in_baseline() {
     let _ = provider.release(&b);
     let _ = provider.release(&downstream);
 }
+
+// ---------- 用户本地漂移(C3):merge 应用前检测项目工作目录未提交修改 ----------
+
+/// 用户对 foo.txt 有未提交本地修改,Agent 租约也改 foo.txt:
+/// 必须 NeedsUser(或真实三方合并),绝不能覆盖用户字节;
+/// 项目目录零写入。
+#[test]
+fn merge_rejects_when_user_has_uncommitted_overlap_in_project_dir() {
+    let fx = RepoFixture::with_base_files();
+    let provider = fx.provider();
+    let lease = provider.acquire(&fx.ctx(1, "a", 1)).unwrap();
+    // Agent 在自己的 worktree 改 a.txt
+    std::fs::write(
+        worktree_path(&fx.root, "mf-run-1-a-1").join("a.txt"),
+        "from-agent\n",
+    )
+    .unwrap();
+    // 用户在项目工作目录有 a.txt 的未提交修改
+    std::fs::write(fx.root.join("a.txt"), "user-uncommitted\n").unwrap();
+
+    let out = provider.merge(&[lease.clone()]).unwrap();
+    let MergeOutcome::NeedsUser { conflicts } = out else {
+        panic!("同路径用户未提交修改必须 NeedsUser,实际 {out:?}");
+    };
+    assert!(
+        conflicts.iter().any(|c| c.contains("a.txt")),
+        "冲突必须指明重叠路径: {conflicts:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.root.join("a.txt")).unwrap(),
+        "user-uncommitted\n",
+        "用户未提交修改绝不能被覆盖"
+    );
+    provider.release(&lease).unwrap();
+}
+
+/// 用户漂移在不同路径(bar.txt):Agent 改 a.txt 合并照常成功,
+/// bar.txt 保留用户修改(不得误删),a.txt 更新为 Agent 内容。
+#[test]
+fn merge_allows_user_drift_on_unrelated_paths() {
+    let fx = RepoFixture::with_base_files();
+    let provider = fx.provider();
+    let lease = provider.acquire(&fx.ctx(2, "a", 1)).unwrap();
+    std::fs::write(
+        worktree_path(&fx.root, "mf-run-2-a-1").join("a.txt"),
+        "from-agent\n",
+    )
+    .unwrap();
+    std::fs::write(fx.root.join("b.txt"), "user-uncommitted-b\n").unwrap();
+
+    let out = provider.merge(&[lease.clone()]).unwrap();
+    assert!(
+        matches!(out, MergeOutcome::Merged),
+        "不同路径漂移不得阻塞: {out:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.root.join("b.txt")).unwrap(),
+        "user-uncommitted-b\n",
+        "不同路径的用户未提交修改必须保留"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.root.join("a.txt")).unwrap(),
+        "from-agent\n",
+        "Agent 修改必须应用"
+    );
+    provider.release(&lease).unwrap();
+}
+
+/// 用户新建的同名未跟踪文件(untracked)与 Agent 新建文件同路径:
+/// 同样是用户漂移,必须 NeedsUser 零覆盖。
+#[test]
+fn merge_rejects_untracked_user_file_on_agent_created_path() {
+    let fx = RepoFixture::with_base_files();
+    let provider = fx.provider();
+    let lease = provider.acquire(&fx.ctx(3, "a", 1)).unwrap();
+    std::fs::write(
+        worktree_path(&fx.root, "mf-run-3-a-1").join("new.txt"),
+        "from-agent\n",
+    )
+    .unwrap();
+    // 用户在项目工作目录已有同名未跟踪文件(未提交)
+    std::fs::write(fx.root.join("new.txt"), "user-untracked\n").unwrap();
+
+    let out = provider.merge(&[lease.clone()]).unwrap();
+    let MergeOutcome::NeedsUser { conflicts } = out else {
+        panic!("未跟踪同名文件必须 NeedsUser,实际 {out:?}");
+    };
+    assert!(
+        conflicts.iter().any(|c| c.contains("new.txt")),
+        "{conflicts:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.root.join("new.txt")).unwrap(),
+        "user-untracked\n",
+        "用户未跟踪文件绝不能被覆盖"
+    );
+    provider.release(&lease).unwrap();
+}

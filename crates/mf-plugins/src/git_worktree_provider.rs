@@ -175,6 +175,22 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
                 }
             }
         }
+        // c. 用户本地漂移:项目工作目录相对「应用基底树」的未提交修改
+        //    (含未跟踪文件)与批内变更路径重叠 → NeedsUser,项目目录
+        //    零写入,绝不覆盖用户字节;不同路径的漂移不受影响。
+        let apply_base = integrated_tree
+            .or_else(|| changed_by_lease.first().map(|(_, _, t)| *t))
+            .unwrap_or(head_tree_id);
+        let user_drift = project_dir_drift_paths(&repo, apply_base)?;
+        if !user_drift.is_empty() {
+            for (label, files, _) in &changed_by_lease {
+                for file in files.intersection(&user_drift) {
+                    conflicts.push(format!(
+                        "{file}(项目工作目录存在未提交的本地修改,与 {label} 的汇合变更重叠)"
+                    ));
+                }
+            }
+        }
         if !conflicts.is_empty() {
             conflicts.sort();
             conflicts.dedup();
@@ -516,6 +532,29 @@ fn tree_diff_paths(repo: &git2::Repository, from: git2::Oid, to: git2::Oid) -> H
             .collect(),
         Err(_) => HashSet::new(),
     }
+}
+
+/// 项目主工作目录相对基底树的未提交漂移路径集(用户本地修改):
+/// 修改/删除的已跟踪文件 + 未跟踪文件(含未跟踪目录递归)。
+/// 这是 merge 的应用基底(项目目录"理应"等于它 + 已应用的汇合),
+/// 与批内变更路径重叠时不得覆盖 —— 由调用方判 NeedsUser。
+fn project_dir_drift_paths(
+    repo: &git2::Repository,
+    base_tree_id: git2::Oid,
+) -> Result<HashSet<String>> {
+    let base_tree = repo.find_tree(base_tree_id)?;
+    let mut options = git2::DiffOptions::new();
+    options.include_untracked(true).recurse_untracked_dirs(true);
+    let diff = repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut options))?;
+    Ok(diff
+        .deltas()
+        .filter_map(|d| {
+            d.new_file()
+                .path()
+                .or_else(|| d.old_file().path())
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+        })
+        .collect())
 }
 
 /// worktree 相对基线的变更文件集(正斜杠规范化)。
