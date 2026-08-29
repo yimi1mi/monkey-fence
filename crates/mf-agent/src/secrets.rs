@@ -118,7 +118,9 @@ pub trait SecretStore: Send + Sync {
 /// 匹配支持跨 read chunk 的部分前缀;流结束(`finish`)立即释放
 /// 明文表 —— 不随会话长期驻留。缓冲与 Secret 表 drop 时 zeroize。
 pub struct StreamingRedactor {
-    secrets: Vec<Zeroizing<Vec<u8>>>,
+    /// zeroizing 租约的共享引用 —— 明文唯一形态在租约里,
+    /// 这里绝不复制副本(最后一个引用 drop 即擦除)。
+    secrets: Vec<std::sync::Arc<SecretLease>>,
     max_len: usize,
     carry: Vec<u8>,
 }
@@ -126,28 +128,28 @@ pub struct StreamingRedactor {
 impl StreamingRedactor {
     /// 用 Secret 明文构造(测试与遗留路径;生产应使用 `from_leases`)。
     pub fn new(secret_values: Vec<Vec<u8>>) -> StreamingRedactor {
-        let secrets: Vec<Zeroizing<Vec<u8>>> = secret_values
+        Self::from_leases(
+            secret_values
+                .into_iter()
+                .filter(|value| !value.is_empty())
+                .map(|value| std::sync::Arc::new(SecretLease::new("redactor", value)))
+                .collect(),
+        )
+    }
+
+    /// 从 zeroizing 租约构造(Runtime 启动期):共享 Arc 引用,
+    /// 不 `.to_vec()` 复制明文 —— 明文随最后一个租约引用 drop 擦除。
+    pub fn from_leases(leases: Vec<std::sync::Arc<SecretLease>>) -> StreamingRedactor {
+        let secrets: Vec<std::sync::Arc<SecretLease>> = leases
             .into_iter()
-            .filter(|value| !value.is_empty())
-            .map(Zeroizing::new)
+            .filter(|lease| !lease.is_empty())
             .collect();
-        let max_len = secrets.iter().map(|s| s.len()).max().unwrap_or(0);
+        let max_len = secrets.iter().map(|lease| lease.len()).max().unwrap_or(0);
         StreamingRedactor {
             secrets,
             max_len,
             carry: Vec::new(),
         }
-    }
-
-    /// 从 zeroizing 租约构造(Runtime 启动期;共享引用,不再复制明文)。
-    pub fn from_leases(leases: Vec<std::sync::Arc<SecretLease>>) -> StreamingRedactor {
-        Self::new(
-            leases
-                .iter()
-                .filter(|lease| !lease.is_empty())
-                .map(|lease| lease.as_slice().to_vec())
-                .collect(),
-        )
     }
 
     pub fn is_noop(&self) -> bool {
@@ -157,8 +159,8 @@ impl StreamingRedactor {
     fn match_at(&self, data: &[u8], pos: usize) -> Option<usize> {
         self.secrets
             .iter()
-            .find(|secret| data[pos..].starts_with(&secret[..]))
-            .map(|secret| secret.len())
+            .find(|lease| data[pos..].starts_with(lease.as_slice()))
+            .map(|lease| lease.len())
     }
 
     /// 脱敏一个输出块。最后 `max_len - 1` 个原始字节可能是不完整前缀,
@@ -206,7 +208,7 @@ impl StreamingRedactor {
                 i += 1;
             }
         }
-        self.secrets.clear(); // 释放 zeroizing 明文(最后一个共享引用归零即擦除)
+        self.secrets.clear(); // 归还共享引用(最后一个引用 drop 即擦除明文)
         out
     }
 }
@@ -215,6 +217,48 @@ impl Drop for StreamingRedactor {
     fn drop(&mut self) {
         use zeroize::Zeroize;
         self.carry.zeroize();
+    }
+}
+
+/// spawn 环境块中 Secret 值的一次性明文形态(I7):
+/// - 构造时借用 LaunchPlan 的 `secret_env` 租约(不复制 Arc),
+///   把每个值解成 Zeroizing 的 UTF-8 缓冲 —— 不是随计划/会话长期
+///   存活的普通 String/OsString 副本;
+/// - `iter()` 在 spawn 现场借用给 CommandBuilder;
+/// - drop 时逐值擦除(Zeroizing),spawn 结束明文零残留。
+pub struct SecretEnvBlock {
+    entries: Vec<(String, Zeroizing<String>)>,
+}
+
+impl SecretEnvBlock {
+    /// 从 LaunchPlan 的 secret_env 租约构造(值必须是 UTF-8)。
+    pub fn from_leases(
+        secret_env: &[(String, std::sync::Arc<SecretLease>)],
+    ) -> anyhow::Result<SecretEnvBlock> {
+        let mut entries = Vec::with_capacity(secret_env.len());
+        for (key, lease) in secret_env {
+            let value = std::str::from_utf8(lease.as_slice()).map_err(|_| {
+                anyhow::anyhow!(
+                    "Secret `{}` 不是有效 UTF-8,无法注入环境变量 {key}",
+                    lease.id()
+                )
+            })?;
+            entries.push((key.clone(), Zeroizing::new(value.to_string())));
+        }
+        Ok(SecretEnvBlock { entries })
+    }
+
+    /// 环境条目视图(spawn 现场使用;不得长期持有值引用)。
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -331,6 +375,45 @@ mod carry_bound_tests {
 mod lease_redactor_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn from_leases_shares_lease_references_without_copying_plaintext() {
+        // 构造不得复制明文副本:只共享 zeroizing 租约的 Arc 引用
+        // (StrongCount 证明);redactor 生命周期结束即归还引用。
+        let lease = Arc::new(SecretLease::new("sec", b"tok-42".to_vec()));
+        let mut redactor = StreamingRedactor::from_leases(vec![lease.clone()]);
+        assert_eq!(
+            Arc::strong_count(&lease),
+            2,
+            "from_leases 不得 .to_vec() 复制整份 secret(应共享租约引用)"
+        );
+        // 共享引用的脱敏同样有效
+        let a = redactor.redact_chunk(b"tok-42");
+        let b = redactor.finish();
+        let text = String::from_utf8_lossy(&[a, b].concat()).into_owned();
+        assert!(text.contains("***"), "{text}");
+        assert!(!text.contains("tok-42"), "{text}");
+        drop(redactor);
+        assert_eq!(
+            Arc::strong_count(&lease),
+            1,
+            "redactor 结束后必须归还租约引用(不再持有明文)"
+        );
+    }
+
+    #[test]
+    fn secret_env_block_borrows_leases_and_reports_values() {
+        let lease = Arc::new(SecretLease::new("sec", b"env-value".to_vec()));
+        let block =
+            super::SecretEnvBlock::from_leases(&[("MY_KEY".into(), lease.clone())]).unwrap();
+        assert_eq!(Arc::strong_count(&lease), 1, "不得复制租约 Arc");
+        let pairs: Vec<(&str, &str)> = block.iter().collect();
+        assert_eq!(pairs, vec![("MY_KEY", "env-value")]);
+        assert_eq!(block.len(), 1);
+        // 非 UTF-8 secret 不能进环境块(拒绝而不是替换/丢弃)
+        let bad = Arc::new(SecretLease::new("bad", vec![0xff, 0xfe]));
+        assert!(super::SecretEnvBlock::from_leases(&[("K".into(), bad)]).is_err());
+    }
 
     #[test]
     fn from_leases_redacts_and_finish_releases_plaintext() {

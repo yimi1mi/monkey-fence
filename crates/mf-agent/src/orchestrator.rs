@@ -658,6 +658,9 @@ impl Orchestrator {
             .store
             .set_task_status(task_id, TaskStatus::Running)?
             .unwrap_or(t);
+        // 激活把旧 active 置为 superseded:尝试释放其 pin
+        // (仍有存活/可重试 run 的旧 Revision 由结算钩子延迟释放)
+        self.release_stale_revision_pins(task_id);
         self.emit(SchedulerEvent::TaskUpdated(t.clone()));
         Ok(t)
     }
@@ -732,7 +735,6 @@ impl Orchestrator {
             })?;
         // 预编译通过才写库(pin key 含 revision id,必须先建 Revision);
         // pin 失败 → 精确回滚:释放本次 run_key 已 pin 引用 + 删除刚建的 draft Revision
-        let previous_active = self.store.active_revision(task_id)?;
         let rev = self.store.create_workflow_revision(task_id, &snapshot)?;
         let run_key = workflow_pin_key(&self.root, task_id, rev.id);
         if let Some(pins) = &self.workflow.pins {
@@ -764,17 +766,44 @@ impl Orchestrator {
                 return Err(e);
             }
         }
-        // 重分配:新 Revision 冻结成功后释放旧活动 Revision 的 pin
-        if let Some(old) = previous_active {
-            if old.id != rev.id {
-                self.release_revision_pins(old.id);
-            }
-        }
+        // 重分配:清理陈旧 Revision 的 pin(旧 active 在确认新 Revision、
+        // 其 run 全部收口前保持 —— 存活 run 的重试仍需解析 pin;
+        // 被更新 draft 取代的 stale draft 立即释放,永不运行不泄漏)
+        self.release_stale_revision_pins(task_id);
         self.emit(SchedulerEvent::RevisionCreated(rev.clone()));
         if let Some(t) = self.store.task_view(task_id)? {
             self.emit(SchedulerEvent::TaskUpdated(t));
         }
         Ok(rev)
+    }
+
+    /// 释放任务的陈旧 Revision pin:
+    /// - stale draft(非最新 draft 的未激活 Revision)→ 立即释放(永不运行);
+    /// - superseded 且无存活 run、无可重试步骤 → 释放;
+    /// - active / 最新 draft / 仍有存活或可重试 run 的 → 保持
+    ///   (确认激活与结算/跳过钩子会再次尝试)。
+    fn release_stale_revision_pins(&self, task_id: i64) {
+        let Ok(revisions) = self.store.revision_statuses(task_id) else {
+            return;
+        };
+        let latest_draft = revisions
+            .iter()
+            .filter(|(_, status)| status == "draft")
+            .map(|(id, _)| *id)
+            .max();
+        for (revision_id, status) in revisions {
+            let releasable = match status.as_str() {
+                "draft" => latest_draft != Some(revision_id),
+                "superseded" => self
+                    .store
+                    .revision_pins_release_safe(revision_id)
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if releasable {
+                self.release_revision_pins(revision_id);
+            }
+        }
     }
 
     /// 编译任务本地工作流(项目 Store 草稿;只校验,不写库)。
@@ -1112,6 +1141,8 @@ impl Orchestrator {
             }
         }
         self.emit(SchedulerEvent::StepUpdated(s.clone()));
+        // 跳过让可重试状态消失:尝试释放被推迟的旧 Revision pin
+        self.release_stale_revision_pins(step.task_id);
         self.check_convergence(step.task_id)?;
         Ok(s)
     }
@@ -1314,6 +1345,8 @@ impl Orchestrator {
                 }
             }
         }
+        // run 收口可能让被推迟的旧 Revision pin 变为可释放(延迟释放钩子)
+        self.release_stale_revision_pins(run.task_id);
         if let Err(e) = self.check_convergence(run.task_id) {
             self.emit(SchedulerEvent::Error(format!("收敛检查失败: {e:#}")));
         }

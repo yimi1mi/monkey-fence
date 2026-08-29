@@ -1782,6 +1782,55 @@ impl Store {
         })
     }
 
+    /// 任务全部 Revision 的 (id, status)(陈旧 pin 清理用)。
+    pub fn revision_statuses(&self, task_id: i64) -> Result<Vec<(i64, String)>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, status FROM pipeline_revisions WHERE task_id = ?1 ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map(params![task_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// superseded Revision 的插件 pin 是否可安全释放:
+    /// 无存活 run(running / awaiting-outcome)且无可重试步骤
+    /// (failed / blocked / awaiting-outcome / needs-input)。
+    /// 非 superseded(active/draft)一律不可。
+    pub fn revision_pins_release_safe(&self, revision_id: i64) -> Result<bool> {
+        self.with_conn(|c| {
+            let status: Option<String> = c
+                .query_row(
+                    "SELECT status FROM pipeline_revisions WHERE id = ?1",
+                    params![revision_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if status.as_deref() != Some("superseded") {
+                return Ok(false);
+            }
+            let live_runs: i64 = c.query_row(
+                "SELECT COUNT(*) FROM agent_runs
+                 WHERE revision_id = ?1 AND status IN ('running', 'awaiting-outcome')",
+                params![revision_id],
+                |r| r.get(0),
+            )?;
+            if live_runs > 0 {
+                return Ok(false);
+            }
+            let retryable: i64 = c.query_row(
+                "SELECT COUNT(*) FROM steps
+                 WHERE revision_id = ?1
+                   AND status IN ('failed', 'blocked', 'awaiting-outcome', 'needs-input')",
+                params![revision_id],
+                |r| r.get(0),
+            )?;
+            Ok(retryable == 0)
+        })
+    }
+
     /// Revision 归属的任务 id。
     pub fn task_of_revision(&self, revision_id: i64) -> Result<Option<i64>> {
         self.with_conn(|c| {

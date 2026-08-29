@@ -37,9 +37,16 @@ impl WorkflowPluginPins for PluginHostPins {
     }
 }
 
-/// 在执行目录贡献里按完整贡献 ID 定位 worktree 提供器
-/// (贡献 id 必须精确是 `worktree`,不是任意"声明隔离"的贡献)。
-/// 返回命中的完整贡献 ID(用于诊断日志)。
+/// 内置 worktree 提供器的固定 pinned 身份:合成插件
+/// `monkeyfence.directories` 的 `worktree` 贡献。进程内硬编码的
+/// GitWorktreeProvider 只属于这个身份;第三方目录提供器必须走
+/// worker/工厂解析(首版未接线),无论命名多相似都不能借名顶替。
+pub const WORKTREE_PLUGIN_FULL_ID: &str = "monkeyfence.directories";
+pub const WORKTREE_CONTRIBUTION_ID: &str = "worktree";
+
+/// 在执行目录贡献里按**完整 pinned 身份**定位 worktree 提供器:
+/// 来源插件必须是内置 `monkeyfence.directories`,贡献 id 与 kind 都精确
+/// 是 `worktree`,且隔离/并行声明一致。返回命中的完整贡献 ID(诊断用)。
 pub fn worktree_contribution_id(
     directories: &[(
         String,
@@ -47,23 +54,43 @@ pub fn worktree_contribution_id(
         mf_plugins::contribution_registry::ExecutionDirectoryContribution,
     )],
 ) -> Option<String> {
+    let pinned_full_id = format!("{WORKTREE_PLUGIN_FULL_ID}.{WORKTREE_CONTRIBUTION_ID}");
     directories
         .iter()
-        .find(|(full_id, _, contribution)| {
-            contribution.isolates && contribution.id == "worktree" && full_id.ends_with(".worktree")
+        .find(|(full_id, source, contribution)| {
+            source.plugin_full_id == WORKTREE_PLUGIN_FULL_ID
+                && full_id == &pinned_full_id
+                && contribution.id == WORKTREE_CONTRIBUTION_ID
+                && contribution.kind == WORKTREE_CONTRIBUTION_ID
+                && contribution.isolates
+                && contribution.supports_parallel
         })
         .map(|(full_id, _, _)| full_id.clone())
 }
 
-/// 解析项目的执行目录提供器:按完整贡献 ID(`*.worktree`)命中插件贡献
-/// 才使用 worktree 隔离(Git 仓库才可创建),否则回退内核共享项目目录。
+/// 解析项目的执行目录提供器:按完整 pinned 身份(内置
+/// monkeyfence.directories.worktree)且来源插件授予所需能力
+/// (fs_read/fs_write/vcs:检出、汇合写回、refs 操作)才使用 worktree
+/// 隔离(Git 仓库才可创建),否则回退内核共享项目目录。
 fn directory_provider_for(
     root: &Path,
     plugins: &Arc<PluginRegistry>,
 ) -> Arc<dyn mf_agent::execution_directory::ExecutionDirectoryProvider> {
     let directories = plugins.contributions().execution_directories();
     if let Some(contribution_id) = worktree_contribution_id(&directories) {
-        if mf_vcs::git::Git::is_repo(root) {
+        // pinned 权限校验:来源插件启用,且清单声明 worktree 所需能力
+        let authorized = plugins.summaries().into_iter().any(|summary| {
+            summary.full_id == WORKTREE_PLUGIN_FULL_ID
+                && summary.enabled
+                && summary.capabilities.fs_read
+                && summary.capabilities.fs_write
+                && summary.capabilities.vcs
+        });
+        if !authorized {
+            log::warn!(
+                "贡献 {contribution_id} 命中但来源插件未启用或缺worktree 所需能力                 (fs_read/fs_write/vcs),回退共享目录"
+            );
+        } else if mf_vcs::git::Git::is_repo(root) {
             match mf_plugins::git_worktree_provider::GitWorktreeProvider::new(root.to_path_buf()) {
                 Ok(provider) => {
                     log::info!("执行目录提供器:{contribution_id}(worktree 隔离)");
@@ -763,5 +790,53 @@ mod worktree_contribution_tests {
             directory("worktree", false),
         );
         assert_eq!(worktree_contribution_id(&[weak]), None);
+    }
+
+    #[test]
+    fn third_party_worktree_namesake_never_resolves_to_hardcoded_provider() {
+        // 伪装成 worktree 的第三方贡献(id/kind/isolates/supports_parallel
+        // 全部一致)不得命中:进程内 GitWorktreeProvider 只属于内置
+        // monkeyfence.directories 的 pinned 贡献;第三方目录提供器必须
+        // 走 worker 解析,不能借命名顶替拿到 worktree 隔离语义
+        let evil = || {
+            (
+                "evil.plugin.worktree".to_string(),
+                source("evil.plugin"),
+                directory("worktree", true),
+            )
+        };
+        assert_eq!(
+            worktree_contribution_id(&[evil()]),
+            None,
+            "第三方贡献不得解析为硬编码 GitWorktreeProvider"
+        );
+        // 正主与伪装同时在场:只命中内置贡献
+        let real = (
+            "monkeyfence.directories.worktree".to_string(),
+            source("monkeyfence.directories"),
+            directory("worktree", true),
+        );
+        assert_eq!(
+            worktree_contribution_id(&[evil(), real.clone()]),
+            Some("monkeyfence.directories.worktree".to_string())
+        );
+    }
+
+    #[test]
+    fn worktree_contribution_requires_declared_kind_match() {
+        // 内置来源但 kind 不是 worktree(策略实现标识不符):拒绝
+        let wrong_kind = (
+            "monkeyfence.directories.worktree".to_string(),
+            source("monkeyfence.directories"),
+            mf_plugins::contribution_registry::ExecutionDirectoryContribution {
+                id: "worktree".into(),
+                name: "worktree".into(),
+                kind: "some-other-kind".into(),
+                supports_parallel: true,
+                isolates: true,
+                description: String::new(),
+            },
+        );
+        assert_eq!(worktree_contribution_id(&[wrong_kind]), None);
     }
 }

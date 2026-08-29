@@ -218,10 +218,17 @@ impl PluginHost {
                     homepage: String::new(),
                     icon: String::new(),
                 },
-                capabilities: crate::manifest::Capabilities::default(),
                 worker: None,
                 agent_types: vec![],
                 node_types: vec![],
+                // worktree 提供器读写工作区并操作集成 refs:
+                // 能力声明由清单承载,解析方(app_ctx)据此做 pinned 校验
+                capabilities: crate::manifest::Capabilities {
+                    fs_read: true,
+                    fs_write: true,
+                    vcs: true,
+                    ..Default::default()
+                },
                 execution_directory_providers: vec![
                     crate::project_directory_provider::contribution(),
                     crate::git_worktree_provider::contribution(),

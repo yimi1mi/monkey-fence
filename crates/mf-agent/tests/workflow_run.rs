@@ -850,7 +850,9 @@ fn merge_conflicts_persist_across_restart_and_resolve() {
 // ---------- pin 生命周期:重分配 / 部分失败 / 归档 ----------
 
 #[test]
-fn reassign_releases_previous_revision_pins() {
+fn reassign_holds_old_pins_until_runs_settle_then_releases() {
+    // I4:旧 active Revision 有存活 run 时不能立刻 release;
+    // 仅 superseded 且无 active/retryable Runs 才释放。
     let tmp = tempfile::tempdir().unwrap();
     let fx = Fixture::new(tmp.path());
     fx.pins.resolve_ok(true);
@@ -877,17 +879,11 @@ fn reassign_releases_previous_revision_pins() {
         .assign_workflow(task.id, &v2, &plugin_index(), false)
         .unwrap();
     assert_ne!(rev1.id, rev2.id);
-    // 旧活动 Revision 的 pin 精确释放,新 Revision 持有自己的 pin
+    let rev1_key = mf_agent::orchestrator::workflow_pin_key(tmp.path(), task.id, rev1.id);
+    // rev1 仍有存活 run(运行中的 a 节点):重分配不得立刻释放其 pin
     assert!(
-        fx.pins
-            .released
-            .lock()
-            .contains(&mf_agent::orchestrator::workflow_pin_key(
-                tmp.path(),
-                task.id,
-                rev1.id
-            )),
-        "重分配后应释放旧 Revision pin:{:?}",
+        !fx.pins.released.lock().contains(&rev1_key),
+        "旧 active Revision 有存活 run 时不得释放 pin(重试仍需解析 pin):{:?}",
         fx.pins.released.lock()
     );
     assert!(
@@ -898,6 +894,58 @@ fn reassign_releases_previous_revision_pins() {
             .any(|(k, _)| *k
                 == mf_agent::orchestrator::workflow_pin_key(tmp.path(), task.id, rev2.id)),
         "新 Revision 应有自己的 pin"
+    );
+
+    // 确认新 Revision(rev1 → superseded)且旧 run 全部成功收口后:
+    // rev1 的 pin 才释放(确认/结算钩子触发延迟释放)。
+    // 若以失败收口,failed 步骤视为可重试 → pin 继续保持(保守不泄漏)。
+    let token = { fx.host.workflow.lock()[0].0.capability_token.clone() };
+    fx.orch
+        .settle_by_token(&token, Settlement::complete("旧流程成功收口"))
+        .unwrap();
+    fx.orch.confirm_and_run(task.id).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            fx.pins.released.lock().contains(&rev1_key)
+        }),
+        "superseded 且无存活/可重试 run 后应释放旧 Revision pin:{:?}",
+        fx.pins.released.lock()
+    );
+    fx.orch.stop();
+}
+
+#[test]
+fn stale_draft_revision_pins_do_not_leak() {
+    // I4:未激活的旧 draft Revision(被更新的 draft 取代)pin 不得泄漏
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    let v1 = fx.template("v1", vec![node("a", &[], "做 A", &fx.instance_id)]);
+    let v2 = fx.template("v2", vec![node("b", &[], "做 B", &fx.instance_id)]);
+    let task = fx.orch.create_task("标题", "").unwrap();
+    let rev1 = fx
+        .orch
+        .assign_workflow(task.id, &v1, &plugin_index(), false)
+        .unwrap();
+    let rev2 = fx
+        .orch
+        .assign_workflow(task.id, &v2, &plugin_index(), false)
+        .unwrap();
+    assert_ne!(rev1.id, rev2.id);
+    let rev1_key = mf_agent::orchestrator::workflow_pin_key(tmp.path(), task.id, rev1.id);
+    assert!(
+        fx.pins.released.lock().contains(&rev1_key),
+        "被更新 draft 取代的旧 draft pin 必须立即释放(永不运行):{:?}",
+        fx.pins.released.lock()
+    );
+    // 最新 draft 保持 pin(即将被确认运行)
+    assert!(
+        fx.pins
+            .pinned
+            .lock()
+            .iter()
+            .any(|(k, _)| *k
+                == mf_agent::orchestrator::workflow_pin_key(tmp.path(), task.id, rev2.id)),
+        "最新 draft 应保持 pin"
     );
     fx.orch.stop();
 }

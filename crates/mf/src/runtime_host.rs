@@ -983,17 +983,14 @@ fn launch_workflow_pty(
         cmd.env(k, v);
     }
     // Secret 值只进入 spawn 调用的环境块;脱敏器共享 zeroizing 租约
-    // (不复制明文副本),流结束即释放 —— 不随会话长期持明文
+    // (不复制明文副本),流结束即释放 —— 不随会话长期持明文。
+    // 环境值经 SecretEnvBlock(Zeroizing 缓冲,drop 擦除)注入,
+    // 不以普通 String/OsString 副本长期存在。
     let mut redactor = mf_agent::secrets::StreamingRedactor::from_leases(
         plan.secret_env.iter().map(|(_, l)| l.clone()).collect(),
     );
-    for (key, lease) in &plan.secret_env {
-        let value = std::str::from_utf8(lease.as_slice()).with_context(|| {
-            format!(
-                "Secret `{}` 不是有效 UTF-8,无法注入环境变量 {key}",
-                lease.id()
-            )
-        })?;
+    let secret_env = mf_agent::secrets::SecretEnvBlock::from_leases(&plan.secret_env)?;
+    for (key, value) in secret_env.iter() {
         cmd.env(key, value);
     }
     // 能力令牌 + 管道名注入环境(mfctl 结算纪律在提示文本中)
@@ -1649,6 +1646,15 @@ impl RuntimeHostImpl {
     }
 }
 
+/// 工作流 Step 的 Secret 解封授权令牌:Store 为每次 Agent Run 签发的
+/// 一次性 capability_token(随机内容,全局唯一,跨项目不碰撞)。
+/// 授权在 compile_instance_launch 内 RAII 回收(authorize → 解封 →
+/// revoke),不留长期有效凭据。run_id/node_key 是项目内数据库行号,
+/// 不得作为全局授权键。
+fn workflow_secret_run_token(spec: &mf_agent::runtime::WorkflowLaunchSpec) -> String {
+    spec.capability_token.clone()
+}
+
 impl RuntimeHost for RuntimeHostImpl {
     fn launch(&self, spec: LaunchSpec, events: Sender<(i64, RuntimeEvent)>) {
         match spec.profile.runtime {
@@ -1668,7 +1674,7 @@ impl RuntimeHost for RuntimeHostImpl {
         };
         // 真实生产链:冻结 Agent Instance → Agent Adapter → LaunchPlan → PTY。
         // Adapter 按 Revision 冻结的插件包 pin 解析(不随插件更新漂移)。
-        let run_token = format!("step:{}:{}", spec.run_id, spec.node_key);
+        let run_token = workflow_secret_run_token(&spec);
         let plan = crate::adapter_launch::compile_instance_launch(
             &launcher.plugins,
             &launcher.catalog,
@@ -2001,6 +2007,62 @@ mod tests {
         assert!(registry.snapshot("proj", 7).is_none());
         assert!(registry.send_prompt("proj", 7, "hi").is_err());
         registry.kill_session("proj", 1); // 不存在时是 no-op
+    }
+
+    fn workflow_spec(
+        run_id: i64,
+        node_key: &str,
+        capability_token: &str,
+    ) -> mf_agent::runtime::WorkflowLaunchSpec {
+        use mf_agent::runtime::WorkflowLaunchSpec;
+        WorkflowLaunchSpec {
+            run_id,
+            step_id: 1,
+            task_id: 1,
+            session_id: 1,
+            session_key: None,
+            attach_existing_session: false,
+            node_key: node_key.into(),
+            step_title: "t".into(),
+            instance: mf_agent::AgentInstanceSnapshot {
+                id: "inst".into(),
+                name: "inst".into(),
+                agent_type: "generic-command".into(),
+                version: 1,
+                enabled: true,
+                run_mode: mf_agent::RunMode::OneShot,
+                executable: "x.exe".into(),
+                argv: vec![],
+                env: vec![],
+                config: serde_json::json!({}),
+                execution_contract: serde_json::json!({}),
+                sealed_secret_ids: vec![],
+            },
+            plugin: None,
+            prompt: String::new(),
+            capability_token: capability_token.into(),
+            pipe_name: "pipe".into(),
+            mfctl_hint: None,
+            workdir: std::env::temp_dir(),
+            run_temp: std::env::temp_dir(),
+        }
+    }
+
+    #[test]
+    fn workflow_secret_token_is_globally_unique_across_projects() {
+        // 同一 run_id + node_key 属于不同项目(各自数据库行号):
+        // 授权令牌不得相同(跨项目/全局授权碰撞会把 A 项目的 Secret
+        // 解封授权泄露给 B 项目);令牌应使用 Store 签发的全局唯一
+        // capability token,而不是 step:{run_id}:{node_key}
+        let a = workflow_spec(1, "x", "mft_aaaaaaaaaaaaaaaa");
+        let b = workflow_spec(1, "x", "mft_bbbbbbbbbbbbbbbb");
+        let token_a = workflow_secret_run_token(&a);
+        let token_b = workflow_secret_run_token(&b);
+        assert_ne!(token_a, token_b, "跨项目同 run/节点必须得到不同授权令牌");
+        assert!(
+            !token_a.starts_with("step:"),
+            "项目内键(step:run:node)不得作为全局授权令牌: {token_a}"
+        );
     }
 
     /// OS 进程表中是否存在该 PID(tasklist;非 Windows 环境返回 false)。
