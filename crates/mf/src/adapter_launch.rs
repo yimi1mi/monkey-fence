@@ -118,3 +118,67 @@ pub fn workflow_plugin_index(plugins: &Arc<PluginRegistry>) -> HashMap<String, P
     }
     index
 }
+
+/// 内置 CLI 类型的声明式配置字段(合成插件无根目录,代码内声明;
+/// 与 manifest config_schema 文件同构)。
+fn builtin_config_schema_fields(agent_type: &str) -> Vec<crate::declarative_form::FormField> {
+    use crate::declarative_form::FormField;
+    let f = |id: &str, label: &str, kind: &str, required: bool, options: Vec<&str>| FormField {
+        id: id.into(),
+        label: label.into(),
+        kind: kind.into(),
+        required,
+        placeholder: String::new(),
+        options: options.into_iter().map(str::to_string).collect(),
+    };
+    match agent_type {
+        "claude" | "claude-code" => vec![
+            f(
+                "permission_mode",
+                "权限模式",
+                "select",
+                false,
+                vec!["default", "acceptEdits", "plan", "bypassPermissions"],
+            ),
+            f("secret_env", "Secret 环境变量", "text", false, vec![]),
+        ],
+        "codex" => vec![f("model", "模型", "text", false, vec![])],
+        _ => Vec::new(),
+    }
+}
+
+/// 加载 Agent Type 的 config_schema 字段:
+/// 安装插件读 manifest 声明的 Schema 文件(相对插件根),
+/// 内置合成类型用代码内声明;其余为空(编辑器不渲染表单段)。
+pub fn config_schema_fields(
+    plugins: &Arc<PluginRegistry>,
+    full_contribution_id: &str,
+) -> Vec<crate::declarative_form::FormField> {
+    if let Some((source, contribution)) = plugins
+        .contributions()
+        .find_agent_type(full_contribution_id)
+    {
+        if contribution.config_schema.is_empty() {
+            // 内置合成插件:full_id 无内容寻址根
+            return builtin_config_schema_fields(&contribution.id);
+        }
+        // 安装插件:从插件包根读 Schema 文件
+        let summary = plugins
+            .summaries()
+            .into_iter()
+            .find(|s| s.full_id == source.plugin_full_id);
+        let _ = summary;
+        if let Some(root) = plugins.plugin_root_of(&source.plugin_full_id) {
+            let path = root.join(&contribution.config_schema);
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(schema) = serde_json::from_str::<serde_json::Value>(&text) {
+                    return crate::declarative_form::DeclarativeForm::from_json(&schema)
+                        .fields()
+                        .to_vec();
+                }
+            }
+        }
+        return builtin_config_schema_fields(&contribution.id);
+    }
+    builtin_config_schema_fields(full_contribution_id)
+}

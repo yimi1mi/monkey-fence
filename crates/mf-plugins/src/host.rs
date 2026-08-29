@@ -776,6 +776,15 @@ impl PluginHost {
 
     // ---------- 贡献查找 ----------
 
+    /// 插件包根目录(内置合成插件为 None)。
+    pub fn plugin_root_of(&self, full_id: &str) -> Option<PathBuf> {
+        self.plugins
+            .read()
+            .iter()
+            .find(|p| p.full_id == full_id)
+            .and_then(|p| p.root.clone())
+    }
+
     /// 当前启用插件的类型化贡献索引(按完整贡献 ID 查找)。
     pub fn contributions(&self) -> ContributionRegistry {
         ContributionRegistry::from_enabled(&self.plugins.read())

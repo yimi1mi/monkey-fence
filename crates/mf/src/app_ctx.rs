@@ -173,6 +173,8 @@ pub struct AppCtx {
     pub overview: Arc<ProjectOverviewHub>,
     /// 已打开项目(私有:外部走 overview snapshot / 查询方法)。
     projects: Mutex<Vec<ProjectHandle>>,
+    /// Secret Store 主密钥覆盖(None = 生产 OS keyring;测试注入确定性密钥)。
+    secret_master_key: Mutex<Option<[u8; 32]>>,
     #[allow(dead_code)]
     pipe: Mutex<Option<PipeServer>>,
     pipe_orchestrators: Option<Arc<Mutex<Vec<Arc<Orchestrator>>>>>,
@@ -181,23 +183,43 @@ pub struct AppCtx {
 impl AppCtx {
     pub fn new() -> Arc<AppCtx> {
         let config = mf_agent::Config::load().unwrap_or_default();
-        let skills = mf_skills::load_skills(None);
         let catalog_store = CatalogStore::open_default().unwrap_or_else(|e| {
             // 目录库打不开不阻塞启动(插件页/实例页后续访问时再暴露错误),
             // 但必须留下日志,不允许静默降级到无提示状态。
             log::error!("目录库打开失败: {e:#}");
             CatalogStore::memory().expect("内存目录库初始化不可能失败")
         });
+        Self::with_parts(config, catalog_store)
+    }
+
+    /// 以给定配置与目录库组装(生产 new 与测试共用同一装配链)。
+    pub fn with_parts(config: mf_agent::Config, catalog_store: Arc<CatalogStore>) -> Arc<AppCtx> {
+        Self::with_parts_opt(config, catalog_store, true)
+    }
+
+    ///  时不启动 mfctl 管道服务(测试并行时避免
+    /// 与被测管道服务器抢注同名管道实例)。
+    pub fn with_parts_opt(
+        config: mf_agent::Config,
+        catalog_store: Arc<CatalogStore>,
+        start_pipe: bool,
+    ) -> Arc<AppCtx> {
+        let skills = mf_skills::load_skills(None);
         let plugins = PluginRegistry::load_with_catalog(catalog_store.clone(), &config, &skills);
         let registry = SessionRegistry::new(config.clone());
         let limiter = GlobalLimiter::new(config.engine.global_concurrency.max(1));
         let keep_awake = Arc::new(KeepAwake::new());
         let catalog = Arc::new(RwLock::new(ProfileCatalog::default()));
         let orchs: Arc<Mutex<Vec<Arc<Orchestrator>>>> = Arc::new(Mutex::new(Vec::new()));
-        let pipe_server = PipeServer::start(orchs.clone()).ok();
-        if pipe_server.is_none() {
-            log::warn!("mfctl 管道服务启动失败(结算将不可用)");
-        }
+        let pipe_server = if start_pipe {
+            let server = PipeServer::start(orchs.clone()).ok();
+            if server.is_none() {
+                log::warn!("mfctl 管道服务启动失败(结算将不可用)");
+            }
+            server
+        } else {
+            None
+        };
         let ctx = Arc::new(AppCtx {
             registry: registry.clone(),
             plugins: plugins.clone(),
@@ -213,10 +235,19 @@ impl AppCtx {
                 keep_awake: keep_awake.clone(),
             })),
             projects: Mutex::new(Vec::new()),
+            secret_master_key: Mutex::new(None),
             pipe: Mutex::new(pipe_server),
             pipe_orchestrators: Some(orchs),
         });
         ctx.refresh_catalog();
+        ctx
+    }
+
+    /// 测试构造:独立目录库 + 确定性 Secret 主密钥(不触 OS keyring、
+    /// 不碰用户真实 ~/.monkeyfence)。
+    pub fn with_catalog_for_tests(catalog: Arc<CatalogStore>) -> Arc<AppCtx> {
+        let ctx = Self::with_parts_opt(mf_agent::Config::default(), catalog, false);
+        *ctx.secret_master_key.lock() = Some([7u8; 32]);
         ctx
     }
 
@@ -474,6 +505,56 @@ impl AppCtx {
         let index = adapter_launch::workflow_plugin_index(&self.plugins);
         let rev = orch.assign_workflow(task_id, &version, &index, allow_unsafe_shared_directory)?;
         Ok(rev.id)
+    }
+
+    /// ---------- Secret 管理(设计 §8:明文只在 Secret Store 内) ----------
+
+    fn secret_store(&self) -> Result<mf_plugins::builtin_secret_store::BuiltinSecretStore> {
+        use mf_agent::secrets::SecretStore as _;
+        let _ = &self.secret_master_key; // 见下:覆盖时用确定性密钥
+        if let Some(key) = *self.secret_master_key.lock() {
+            mf_plugins::builtin_secret_store::BuiltinSecretStore::with_master_key(
+                self.catalog_store.clone(),
+                key,
+            )
+        } else {
+            mf_plugins::builtin_secret_store::BuiltinSecretStore::open(self.catalog_store.clone())
+        }
+    }
+
+    /// 加密保存 Secret,返回稳定引用 ID(实例只保存该引用)。
+    pub fn seal_secret(&self, name: &str, value: &str) -> Result<String> {
+        use mf_agent::secrets::SecretStore as _;
+        if value.is_empty() {
+            anyhow::bail!("Secret 值不能为空");
+        }
+        self.secret_store()?.seal(name, value.as_bytes())
+    }
+
+    /// 删除 Secret(仍被实例引用时拒绝,先解除引用)。
+    pub fn delete_secret(&self, id: &str) -> Result<bool> {
+        use mf_agent::secrets::SecretStore as _;
+        let referenced = self
+            .catalog_store
+            .list_agent_instances(None)?
+            .iter()
+            .any(|row| {
+                self.catalog_store
+                    .snapshot_agent_instance(&row.id, None)
+                    .map(|snap| snap.sealed_secret_ids.iter().any(|s| s == id))
+                    .unwrap_or(false)
+            });
+        anyhow::ensure!(
+            !referenced,
+            "Secret `{id}` 仍被 Agent Instance 引用,先解除引用再删除"
+        );
+        self.secret_store()?.delete(id)
+    }
+
+    /// 脱敏描述列表(名称/长度,无明文)。
+    pub fn list_secrets(&self) -> Result<Vec<mf_agent::secrets::SecretDescription>> {
+        use mf_agent::secrets::SecretStore as _;
+        self.secret_store()?.list()
     }
 
     /// 活动项目数(用于关闭确认)。

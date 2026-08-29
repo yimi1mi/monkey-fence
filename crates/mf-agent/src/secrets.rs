@@ -106,6 +106,10 @@ pub trait SecretStore: Send + Sync {
     fn delete(&self, secret_id: &str) -> Result<bool>;
     /// 脱敏描述(不含明文)。
     fn describe(&self, secret_id: &str) -> Result<SecretDescription>;
+    /// 全部 Secret 的脱敏描述(升序;无枚举能力的实现返回空)。
+    fn list(&self) -> Result<Vec<SecretDescription>> {
+        Ok(Vec::new())
+    }
 }
 
 /// 流式 Secret 脱敏器:CLI 输出进入 screen/output_tail 前逐块脱敏。
@@ -268,5 +272,44 @@ mod streaming_redactor_tests {
         // 直接断言:开头两处相邻都被替换
         assert!(text.starts_with("******"), "{text}");
         assert!(text.ends_with(" tail"));
+    }
+}
+
+#[cfg(test)]
+mod carry_bound_tests {
+    use super::*;
+
+    #[test]
+    fn redactor_carry_never_holds_ordinary_plaintext_long_term() {
+        // 大量普通明文流过:carry 缓冲必须保持有界(≤ 最长 Secret - 1),
+        // 不会积累输出明文;Secret 表外的字节全部即时放行。
+        let mut redactor = StreamingRedactor::new(vec![b"tok".to_vec()]);
+        let chunk = vec![b'x'; 4096];
+        let mut total = 0usize;
+        for _ in 0..64 {
+            total += redactor.redact_chunk(&chunk).len();
+        }
+        // 只有最后 max_len-1 = 2 字节可能滞留 carry
+        assert_eq!(total, 64 * 4096 - 2, "普通明文不得长期滞留 carry");
+        // 流结束全部冲出
+        let rest = redactor.finish();
+        assert_eq!(rest, b"xx".to_vec());
+    }
+
+    #[test]
+    fn carry_flush_never_releases_a_full_secret() {
+        // Secret 被块边界切开:carry 持有的只能是未确认前缀,
+        // finish 冲出时完整 Secret 仍必须被替换。
+        let mut redactor = StreamingRedactor::new(vec![b"secret-key".to_vec()]);
+        let a = redactor.redact_chunk(b"abc secret-");
+        let b = redactor.redact_chunk(b"key tail");
+        let c = redactor.finish();
+        let text = String::from_utf8_lossy(&[a, b, c].concat()).into_owned();
+        assert!(
+            !text.contains("secret-key"),
+            "finish 泄露完整 Secret: {text}"
+        );
+        assert!(text.contains("***"), "完整 Secret 应被替换: {text}");
+        assert!(text.ends_with(" tail"), "普通明文应放行: {text}");
     }
 }

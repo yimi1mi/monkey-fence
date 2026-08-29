@@ -249,6 +249,29 @@ impl SecretStore for BuiltinSecretStore {
             byte_len: sealed.len().saturating_sub(NONCE_LEN),
         })
     }
+
+    fn list(&self) -> Result<Vec<SecretDescription>> {
+        let rows: Vec<(String, Vec<u8>)> = self.catalog.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT secret_key, ciphertext FROM sealed_secrets
+                 WHERE store_id = ?1 ORDER BY secret_key",
+            )?;
+            let out = stmt
+                .query_map(rusqlite::params![STORE_ID], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(out)
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(|(key, sealed)| SecretDescription {
+                id: key.clone(),
+                name: key,
+                byte_len: sealed.len().saturating_sub(NONCE_LEN),
+            })
+            .collect())
+    }
 }
 
 fn parse_key_hex(hex: &str) -> Result<[u8; 32]> {

@@ -40,9 +40,8 @@ impl FormValue {
 }
 
 /// 声明式表单状态:字段 + 值 + 校验,独立于 GPUI 渲染。
-/// 插件 config_schema 文件渲染随 UI Task 5(插件贡献页)接线;
-/// 内置类型当前无自定义 Schema。
-#[allow(dead_code)]
+/// 字段来自插件 manifest 的 agent_types[].config_schema 文件
+/// (JSON `{"fields":[...]}`)或内置类型的代码内声明。
 #[derive(Debug, Clone, Default)]
 pub struct DeclarativeForm {
     fields: Vec<FormField>,
@@ -55,6 +54,53 @@ impl DeclarativeForm {
             fields,
             values: HashMap::new(),
         }
+    }
+
+    /// 从插件 Schema JSON 解析:`{"fields":[{id,label,kind,required,
+    /// placeholder,options}]}`。非法字段安全跳过。
+    pub fn from_json(schema: &serde_json::Value) -> DeclarativeForm {
+        let mut fields = Vec::new();
+        if let Some(list) = schema.get("fields").and_then(|v| v.as_array()) {
+            for item in list {
+                let str_of = |key: &str| {
+                    item.get(key)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string()
+                };
+                let id = str_of("id");
+                if id.is_empty() {
+                    continue;
+                }
+                fields.push(FormField {
+                    id,
+                    label: str_of("label"),
+                    kind: {
+                        let kind = str_of("kind");
+                        if kind.is_empty() {
+                            "text".to_string()
+                        } else {
+                            kind
+                        }
+                    },
+                    required: item
+                        .get("required")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    placeholder: str_of("placeholder"),
+                    options: item
+                        .get("options")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|o| o.as_str().map(str::to_string))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                });
+            }
+        }
+        DeclarativeForm::new(fields)
     }
 
     pub fn fields(&self) -> &[FormField] {

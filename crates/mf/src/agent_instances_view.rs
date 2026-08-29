@@ -145,6 +145,11 @@ enum PageField {
     Executable,
     Argv,
     Env,
+    ProjectKey,
+    /// config_schema 表单字段(索引)。
+    ConfigField(usize),
+    SecretName,
+    SecretValue,
 }
 
 /// Agent 实例页(独立 GPUI 实体,模式同 TaskComposer):
@@ -160,6 +165,10 @@ pub struct AgentInstancesPage {
     pub status: String,
     /// 当前选中任务(默认 CLI 启动的离散会话挂载点)。
     pub selected_task: Option<(std::path::PathBuf, i64)>,
+    /// Secret 管理:新 Secret 名称/值输入(值只在按键时短暂存在,
+    /// seal 后立即清空,不进任何持久化)。
+    secret_name_input: String,
+    secret_value_input: String,
 }
 
 impl AgentInstancesPage {
@@ -176,6 +185,8 @@ impl AgentInstancesPage {
             focus_handle: cx.focus_handle(),
             status: String::new(),
             selected_task: None,
+            secret_name_input: String::new(),
+            secret_value_input: String::new(),
         };
         page.refresh();
         page
@@ -200,6 +211,10 @@ impl AgentInstancesPage {
                     plugin_name: src.plugin_full_id.clone(),
                     plugin_version: src.plugin_version.clone(),
                     content_hash: src.content_hash.clone(),
+                    config_schema_fields: crate::adapter_launch::config_schema_fields(
+                        &self.app.plugins,
+                        &full_contribution_id,
+                    ),
                     detected,
                     supports_isolated_config: a.supports_isolated_config,
                     default_command: a.command.clone(),
@@ -217,7 +232,36 @@ impl AgentInstancesPage {
             model.push_type(info);
         }
         if let Ok(rows) = self.app.catalog_store.list_agent_instances(None) {
-            model.load_instances(&rows);
+            // 快照解析 executable/run_mode(列表投影不再丢字段)
+            for row in &rows {
+                let snapshot = self
+                    .app
+                    .catalog_store
+                    .snapshot_agent_instance(&row.id, None)
+                    .ok();
+                model.push_instance(InstanceListInstance {
+                    id: row.id.clone(),
+                    name: row.name.clone(),
+                    agent_type: row.agent_type.clone(),
+                    type_name: model
+                        .type_infos()
+                        .iter()
+                        .find(|t| t.id == row.agent_type)
+                        .map(|t| t.name.clone())
+                        .unwrap_or_else(|| row.agent_type.clone()),
+                    enabled: row.enabled,
+                    current_version: row.current_version,
+                    scope: row.scope,
+                    executable: snapshot
+                        .as_ref()
+                        .map(|s| s.executable.clone())
+                        .unwrap_or_default(),
+                    run_mode: snapshot
+                        .as_ref()
+                        .map(|s| s.run_mode)
+                        .unwrap_or(mf_agent::RunMode::Interactive),
+                });
+            }
         }
         self.model = model;
     }
@@ -301,12 +345,26 @@ impl AgentInstancesPage {
             .snapshot_agent_instance(instance_id, None)
         {
             Ok(snapshot) => {
+                let row = self
+                    .app
+                    .catalog_store
+                    .get_agent_instance(instance_id)
+                    .ok()
+                    .flatten();
                 let info = self
                     .type_info_of(&snapshot.agent_type)
                     .unwrap_or_else(|| fallback_type_info(&snapshot.agent_type));
+                let (scope, project_key, enabled) = match &row {
+                    Some(row) => (row.scope, row.project_key.clone(), row.enabled),
+                    None => (mf_agent::InstanceScope::User, None, true),
+                };
                 self.editor = Some(
                     crate::agent_instance_editor::AgentInstanceEditorState::from_instance(
-                        info, &snapshot,
+                        info,
+                        &snapshot,
+                        scope,
+                        project_key.as_deref(),
+                        enabled,
                     ),
                 );
                 self.field = PageField::None;
@@ -328,7 +386,7 @@ impl AgentInstancesPage {
             cx.notify();
             return;
         }
-        let draft = state.to_draft(mf_agent::InstanceScope::User, None);
+        let draft = state.to_draft();
         let result = match &state.editing_instance_id {
             Some(id) => self
                 .app
@@ -349,6 +407,44 @@ impl AgentInstancesPage {
                 self.refresh();
             }
             Err(e) => self.status = format!("保存失败: {e:#}"),
+        }
+        cx.notify();
+    }
+
+    /// 密封输入的 Secret(值缓冲立即清空;成功后可附加引用)。
+    pub fn seal_secret_input(&mut self, cx: &mut Context<Self>) {
+        let name = self.secret_name_input.trim().to_string();
+        if name.is_empty() || self.secret_value_input.is_empty() {
+            self.status = "Secret 名称与值都不能为空".into();
+            cx.notify();
+            return;
+        }
+        match self.app.seal_secret(&name, &self.secret_value_input) {
+            Ok(id) => {
+                self.status = format!("已密封 Secret {id}(引用它而不再保存明文)");
+                if let Some(state) = self.editor.as_mut() {
+                    state.add_secret_ref(&id);
+                }
+            }
+            Err(e) => self.status = format!("密封失败: {e:#}"),
+        }
+        // 无论成败都立即清空值缓冲(不长期持有明文)
+        self.secret_value_input.clear();
+        self.field = PageField::None;
+        cx.notify();
+    }
+
+    /// 删除 Secret(仍被实例引用时后端拒绝)。
+    pub fn delete_secret_by_id(&mut self, id: String, cx: &mut Context<Self>) {
+        match self.app.delete_secret(&id) {
+            Ok(true) => {
+                self.status = format!("已删除 Secret {id}");
+                if let Some(state) = self.editor.as_mut() {
+                    state.remove_secret_ref(&id);
+                }
+            }
+            Ok(false) => self.status = format!("Secret {id} 不存在"),
+            Err(e) => self.status = format!("删除失败: {e:#}"),
         }
         cx.notify();
     }
@@ -397,6 +493,30 @@ impl AgentInstancesPage {
             cx.notify();
             return;
         }
+        // Secret 管理输入(页面层缓冲;seal 后立即清空)
+        match self.field {
+            PageField::SecretName | PageField::SecretValue => {
+                let buffer = if self.field == PageField::SecretName {
+                    &mut self.secret_name_input
+                } else {
+                    &mut self.secret_value_input
+                };
+                match key {
+                    "backspace" => {
+                        buffer.pop();
+                    }
+                    "enter" => self.field = PageField::None,
+                    _ => {
+                        if let Some(ch) = ev.keystroke.key_char.as_ref() {
+                            buffer.push_str(ch);
+                        }
+                    }
+                }
+                cx.notify();
+                return;
+            }
+            _ => {}
+        }
         let Some(state) = self.editor.as_mut() else {
             self.field = PageField::None;
             return;
@@ -436,7 +556,16 @@ fn field_text(
         PageField::Executable => Some(state.executable.clone()),
         PageField::Argv => Some(state.argv_text.clone()),
         PageField::Env => Some(state.env_text.clone()),
-        _ => None,
+        PageField::ProjectKey => Some(state.project_key.clone()),
+        PageField::ConfigField(i) => state
+            .config_form()
+            .fields()
+            .get(i)
+            .map(|f| state.config_form().masked_value(&f.id)),
+        // Secret 输入在页面层(非编辑器状态)
+        PageField::SecretName | PageField::SecretValue | PageField::None | PageField::Filter => {
+            None
+        }
     }
 }
 
@@ -450,6 +579,14 @@ fn set_field_text(
         PageField::Executable => state.set_executable(text),
         PageField::Argv => state.set_argv(text),
         PageField::Env => state.set_env_lines(text),
+        PageField::ProjectKey => state.set_project_key(text),
+        PageField::ConfigField(i) => {
+            if let Some(f) = state.config_form().fields().get(i).cloned() {
+                if f.kind != "secret" {
+                    state.set_config_value(&f.id, text);
+                }
+            }
+        }
         _ => {}
     }
 }
@@ -473,6 +610,7 @@ fn fallback_type_info(agent_type: &str) -> crate::agent_instance_editor::AgentTy
         plugin_name: "未知来源".into(),
         plugin_version: String::new(),
         content_hash: String::new(),
+        config_schema_fields: Vec::new(),
         detected: false,
         supports_isolated_config: false,
         default_command: String::new(),
@@ -616,56 +754,57 @@ impl Render for AgentInstancesPage {
             let _ = entry_id;
         }
 
-        let editor: AnyElement =
-            match &self.editor {
-                None => gpui::div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_color(rgb(crate::theme::Theme::fg_dim()))
-                    .text_size(px(11.))
-                    .child("从左侧选择 Agent 类型新建实例,或点击既有实例编辑")
-                    .into_any_element(),
-                Some(state) => {
-                    let errors = state.validation();
-                    let can_save = state.can_save();
-                    let editing = state.editing_instance_id.is_some();
-                    let error_text = errors
-                        .iter()
-                        .map(|e| e.message.clone())
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    let secret_display = state.secret_display();
-                    let header = if editing {
-                        format!("编辑实例 · {}", state.info.name)
+        let editor: AnyElement = match &self.editor {
+            None => gpui::div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(rgb(crate::theme::Theme::fg_dim()))
+                .text_size(px(11.))
+                .child("从左侧选择 Agent 类型新建实例,或点击既有实例编辑")
+                .into_any_element(),
+            Some(state) => {
+                let errors = state.validation();
+                let can_save = state.can_save();
+                let editing = state.editing_instance_id.is_some();
+                let error_text = errors
+                    .iter()
+                    .map(|e| e.message.clone())
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let secret_display = state.secret_display();
+                let secrets_list = self.app.list_secrets().unwrap_or_default();
+                let header = if editing {
+                    format!("编辑实例 · {}", state.info.name)
+                } else {
+                    format!("新建实例 · {}", state.info.name)
+                };
+                let adapter_note = format!(
+                    "适配器 {} · 贡献 {} · {}",
+                    state.info.adapter,
+                    state.info.full_contribution_id,
+                    if state.info.supports_isolated_config {
+                        "支持隔离配置"
                     } else {
-                        format!("新建实例 · {}", state.info.name)
-                    };
-                    let adapter_note = format!(
-                        "适配器 {} · {}",
-                        state.info.adapter,
-                        if state.info.supports_isolated_config {
-                            "支持隔离配置"
-                        } else {
-                            "不支持隔离配置"
-                        }
-                    );
-                    let values = [
-                        (PageField::Name, "名称", state.name.clone()),
-                        (
-                            PageField::Executable,
-                            "可执行文件",
-                            state.executable.clone(),
-                        ),
-                        (PageField::Argv, "参数(空格分隔)", state.argv_text.clone()),
-                        (
-                            PageField::Env,
-                            "环境变量(每行 KEY=VALUE)",
-                            state.env_text.clone(),
-                        ),
-                    ];
-                    gpui::div()
+                        "不支持隔离配置"
+                    }
+                );
+                let values = [
+                    (PageField::Name, "名称", state.name.clone()),
+                    (
+                        PageField::Executable,
+                        "可执行文件",
+                        state.executable.clone(),
+                    ),
+                    (PageField::Argv, "参数(空格分隔)", state.argv_text.clone()),
+                    (
+                        PageField::Env,
+                        "环境变量(每行 KEY=VALUE)",
+                        state.env_text.clone(),
+                    ),
+                ];
+                gpui::div()
                     .id("inst-editor-scroll")
                     .flex_1()
                     .min_w_0()
@@ -741,6 +880,230 @@ impl Render for AgentInstancesPage {
                                             )),
                                     )
                             }))
+                            // 作用域 / 项目键 / 运行模式 / 启用(复审阻塞项 5)
+                            .child(
+                                gpui::div()
+                                    .id("inst-scope-toggle")
+                                    .flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                                    .on_click(cx.listener(
+                                        |page: &mut AgentInstancesPage, _ev, _w, cx| {
+                                            if let Some(state) = page.editor.as_mut() {
+                                                state.toggle_scope();
+                                            }
+                                            cx.notify();
+                                        },
+                                    ))
+                                    .child(
+                                        gpui::div()
+                                            .w(px(140.))
+                                            .text_size(px(10.))
+                                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                            .child("作用域(点击切换)"),
+                                    )
+                                    .child(
+                                        gpui::div()
+                                            .text_size(px(10.))
+                                            .child(match state.scope {
+                                                mf_agent::InstanceScope::User => {
+                                                    "User(全局可见)".to_string()
+                                                }
+                                                mf_agent::InstanceScope::Project => {
+                                                    "Project(绑定项目)".to_string()
+                                                }
+                                            }),
+                                    ),
+                            )
+                            .when(state.scope == mf_agent::InstanceScope::Project, |d| {
+                                d.child(
+                                    gpui::div()
+                                        .flex()
+                                        .gap_2()
+                                        .items_start()
+                                        .child(
+                                            gpui::div()
+                                                .w(px(140.))
+                                                .text_size(px(10.))
+                                                .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                                .child("project_key"),
+                                        )
+                                        .child(
+                                            gpui::div()
+                                                .id("inst-project-key")
+                                                .flex_1()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(rgb(
+                                                    if self.field == PageField::ProjectKey {
+                                                        crate::theme::Theme::accent()
+                                                    } else {
+                                                        crate::theme::Theme::border()
+                                                    },
+                                                ))
+                                                .text_size(px(10.))
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(
+                                                    |page: &mut AgentInstancesPage, _ev, _w, cx| {
+                                                        page.field = PageField::ProjectKey;
+                                                        cx.notify();
+                                                    },
+                                                ))
+                                                .child(if state.project_key.is_empty() {
+                                                    "(必填;如 my-project)".to_string()
+                                                } else {
+                                                    state.project_key.clone()
+                                                }),
+                                        ),
+                                )
+                            })
+                            .child(
+                                gpui::div()
+                                    .id("inst-run-mode-toggle")
+                                    .flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .cursor_pointer()
+                                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                                    .on_click(cx.listener(
+                                        |page: &mut AgentInstancesPage, _ev, _w, cx| {
+                                            if let Some(state) = page.editor.as_mut() {
+                                                state.toggle_run_mode();
+                                            }
+                                            cx.notify();
+                                        },
+                                    ))
+                                    .child(
+                                        gpui::div()
+                                            .w(px(140.))
+                                            .text_size(px(10.))
+                                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                            .child("运行模式(点击切换)"),
+                                    )
+                                    .child(
+                                        gpui::div().text_size(px(10.)).child(match state.run_mode {
+                                            mf_agent::RunMode::Interactive => "交互".to_string(),
+                                            mf_agent::RunMode::OneShot => "一次性".to_string(),
+                                        }),
+                                    ),
+                            )
+                            .when(editing, |d| {
+                                d.child(
+                                    gpui::div()
+                                        .id("inst-enabled-toggle")
+                                        .flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                                        .on_click(cx.listener(
+                                            |page: &mut AgentInstancesPage, _ev, _w, cx| {
+                                                if let Some(state) = page.editor.as_mut() {
+                                                    state.toggle_enabled();
+                                                }
+                                                cx.notify();
+                                            },
+                                        ))
+                                        .child(
+                                            gpui::div()
+                                                .w(px(140.))
+                                                .text_size(px(10.))
+                                                .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                                .child("启用(点击切换)"),
+                                        )
+                                        .child(
+                                            gpui::div().text_size(px(10.)).child(
+                                                if state.enabled {
+                                                    "已启用".to_string()
+                                                } else {
+                                                    "已禁用".to_string()
+                                                },
+                                            ),
+                                        ),
+                                )
+                            })
+                            // 插件 config_schema 声明式表单(真渲染)
+                            .children(
+                                state
+                                    .config_form()
+                                    .fields()
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(idx, field)| {
+                                        let label = format!(
+                                            "{}{}",
+                                            field.label,
+                                            if field.required { "(必填)" } else { "" }
+                                        );
+                                        let is_secret = field.kind == "secret";
+                                        let options_note = if field.kind == "select" {
+                                            format!("(可选:{})", field.options.join(" / "))
+                                        } else {
+                                            String::new()
+                                        };
+                                        gpui::div()
+                                            .flex()
+                                            .gap_2()
+                                            .items_start()
+                                            .child(
+                                                gpui::div()
+                                                    .w(px(140.))
+                                                    .text_size(px(10.))
+                                                    .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                                    .child(label),
+                                            )
+                                            .child(
+                                                gpui::div()
+                                                    .id(gpui::ElementId::Name(
+                                                        format!("inst-config-{}", field.id).into(),
+                                                    ))
+                                                    .flex_1()
+                                                    .px_2()
+                                                    .py_1()
+                                                    .rounded_md()
+                                                    .border_1()
+                                                    .border_color(rgb(
+                                                        if self.field
+                                                            == PageField::ConfigField(idx)
+                                                        {
+                                                            crate::theme::Theme::accent()
+                                                        } else {
+                                                            crate::theme::Theme::border()
+                                                        },
+                                                    ))
+                                                    .text_size(px(10.))
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(
+                                                        move |page: &mut AgentInstancesPage,
+                                                              _ev,
+                                                              _w,
+                                                              cx| {
+                                                            page.field =
+                                                                PageField::ConfigField(idx);
+                                                            cx.notify();
+                                                        },
+                                                    ))
+                                                    .child(format!(
+                                                        "{}{}",
+                                                        state.config_form().masked_value(&field.id),
+                                                        options_note
+                                                    ))
+                                                    .when(is_secret, |d| {
+                                                        d.child(
+                                                            gpui::div().text_size(px(9.)).child(
+                                                                "(Secret 引用;由下方 Secret 管理选择)",
+                                                            ),
+                                                        )
+                                                    }),
+                                            )
+                                    })
+                                    .collect::<Vec<_>>(),
+                            )
+                            // Secret 引用(只显示引用 id + 掩码,不输入明文)
                             .child(
                                 gpui::div()
                                     .flex()
@@ -756,15 +1119,180 @@ impl Render for AgentInstancesPage {
                                     .child(
                                         gpui::div()
                                             .flex_1()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_1()
+                                            .child(
+                                                gpui::div()
+                                                    .text_size(px(10.))
+                                                    .text_color(rgb(
+                                                        crate::theme::Theme::fg_dim(),
+                                                    ))
+                                                    .child(if secret_display.is_empty() {
+                                                        "(无)".to_string()
+                                                    } else {
+                                                        secret_display
+                                                    }),
+                                            )
+                                            .child(
+                                                // 目录库 Secret 列表:点击附加引用
+                                                gpui::div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap_1()
+                                                    .children(secrets_list.iter().map(
+                                                        |desc| {
+                                                            let id = desc.id.clone();
+                                                            let referenced =
+                                                                state.secret_refs.contains(&id);
+                                                            gpui::div()
+                                                                .id(gpui::ElementId::Name(
+                                                                    format!(
+                                                                        "inst-secret-{id}"
+                                                                    )
+                                                                    .into(),
+                                                                ))
+                                                                .flex()
+                                                                .gap_2()
+                                                                .items_center()
+                                                                .text_size(px(9.))
+                                                                .cursor_pointer()
+                                                                .hover(|d| {
+                                                                    d.bg(rgb(
+                                                                        crate::theme::Theme::bg_hover(),
+                                                                    ))
+                                                                })
+                                                                .child(format!(
+                                                                    "{} = •••• ({}B)",
+                                                                    desc.name, desc.byte_len
+                                                                ))
+                                                                .child(if referenced {
+                                                                    "解除引用".to_string()
+                                                                } else {
+                                                                    "附加引用".to_string()
+                                                                })
+                                                                .on_click(cx.listener(
+                                                                    move |page: &mut AgentInstancesPage,
+                                                                          _ev,
+                                                                          _w,
+                                                                          cx| {
+                                                                        if let Some(state) =
+                                                                            page.editor.as_mut()
+                                                                        {
+                                                                            if referenced {
+                                                                                state.remove_secret_ref(&id);
+                                                                            } else {
+                                                                                state.add_secret_ref(&id);
+                                                                            }
+                                                                        }
+                                                                        cx.notify();
+                                                                    },
+                                                                ))
+                                                        },
+                                                    )),
+                                            ),
+                                    ),
+                            )
+                            // Secret 管理:seal(名称+值)/ 删除
+                            .child(
+                                gpui::div()
+                                    .flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        gpui::div()
+                                            .w(px(140.))
                                             .text_size(px(10.))
                                             .text_color(rgb(crate::theme::Theme::fg_dim()))
-                                            .child(if secret_display.is_empty() {
-                                                "(无;Secret 由 Secret Store 管理,不在此输入明文)"
-                                                    .to_string()
+                                            .child("Secret 管理"),
+                                    )
+                                    .child(
+                                        gpui::div()
+                                            .id("inst-secret-name")
+                                            .w(px(110.))
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(rgb(
+                                                if self.field == PageField::SecretName {
+                                                    crate::theme::Theme::accent()
+                                                } else {
+                                                    crate::theme::Theme::border()
+                                                },
+                                            ))
+                                            .text_size(px(9.))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(
+                                                |page: &mut AgentInstancesPage, _ev, _w, cx| {
+                                                    page.field = PageField::SecretName;
+                                                    cx.notify();
+                                                },
+                                            ))
+                                            .child(if self.secret_name_input.is_empty() {
+                                                "名称…".to_string()
                                             } else {
-                                                secret_display
+                                                self.secret_name_input.clone()
                                             }),
-                                    ),
+                                    )
+                                    .child(
+                                        gpui::div()
+                                            .id("inst-secret-value")
+                                            .w(px(110.))
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(rgb(
+                                                if self.field == PageField::SecretValue {
+                                                    crate::theme::Theme::accent()
+                                                } else {
+                                                    crate::theme::Theme::border()
+                                                },
+                                            ))
+                                            .text_size(px(9.))
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(
+                                                |page: &mut AgentInstancesPage, _ev, _w, cx| {
+                                                    page.field = PageField::SecretValue;
+                                                    cx.notify();
+                                                },
+                                            ))
+                                            .child(if self.secret_value_input.is_empty() {
+                                                "值(密封后即清空)…".to_string()
+                                            } else {
+                                                "••••".to_string()
+                                            }),
+                                    )
+                                    .child(
+                                        action_chip(
+                                            gpui::ElementId::Name("inst-secret-seal".into()),
+                                            "密封",
+                                            crate::theme::Theme::accent(),
+                                            true,
+                                        )
+                                        .on_click(cx.listener(
+                                            |page: &mut AgentInstancesPage, _ev, _w, cx| {
+                                                page.seal_secret_input(cx);
+                                            },
+                                        )),
+                                    )
+                                    .children(secrets_list.iter().map(|desc| {
+                                        let id = desc.id.clone();
+                                        action_chip(
+                                            gpui::ElementId::Name(
+                                                format!("inst-secret-del-{}", desc.id).into(),
+                                            ),
+                                            "删除",
+                                            crate::theme::Theme::danger(),
+                                            true,
+                                        )
+                                        .on_click(cx.listener(
+                                            move |page: &mut AgentInstancesPage, _ev, _w, cx| {
+                                                page.delete_secret_by_id(id.clone(), cx);
+                                            },
+                                        ))
+                                    }).collect::<Vec<_>>()),
                             )
                             .child(
                                 gpui::div()
@@ -850,8 +1378,8 @@ impl Render for AgentInstancesPage {
                             }),
                     )
                     .into_any_element()
-                }
-            };
+            }
+        };
 
         let status = self.status.clone();
         let filter_focused = self.field == PageField::Filter;

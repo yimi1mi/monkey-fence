@@ -17,6 +17,7 @@ fn detected_type() -> AgentTypeInfo {
         plugin_name: "MonkeyFence 内置".into(),
         plugin_version: "0.1.0".into(),
         content_hash: String::new(),
+        config_schema_fields: Vec::new(),
         detected: true,
         supports_isolated_config: false,
         default_command: "agent.exe".into(),
@@ -58,7 +59,7 @@ fn complete_fields_can_save_and_produce_draft() {
     assert!(errors.is_empty(), "{errors:?}");
     assert!(state.can_save());
 
-    let draft: AgentInstanceDraft = state.to_draft(InstanceScope::User, None);
+    let draft: AgentInstanceDraft = state.to_draft();
     assert_eq!(draft.name, "审查");
     assert_eq!(draft.executable, "agent.exe");
     assert_eq!(draft.argv, vec!["--prompt".to_string(), "目标".to_string()]);
@@ -205,4 +206,82 @@ fn declarative_form_validates_required_and_holds_values() {
     // 未知字段安全忽略
     form.set_value("ghost", "x");
     assert_eq!(form.get("ghost"), None);
+}
+
+// ---------- 复审阻塞项 5:作用域/运行模式/启用 + Schema 表单 + Secret 管理 ----------
+
+#[test]
+fn editor_roundtrips_scope_project_run_mode_and_enabled() {
+    let mut state = crate::agent_instance_editor::AgentInstanceEditorState::new(detected_type());
+    state.set_name("项目实例");
+    state.set_scope(mf_agent::InstanceScope::Project);
+    state.set_project_key("proj-key");
+    state.set_run_mode(mf_agent::RunMode::OneShot);
+    state.set_enabled(false);
+    let draft = state.to_draft();
+    // 编辑器状态必须真实落到草案(不再硬编码 User/None/true)
+    assert_eq!(draft.scope, mf_agent::InstanceScope::Project);
+    assert_eq!(draft.project_key.as_deref(), Some("proj-key"));
+    assert_eq!(draft.run_mode, mf_agent::RunMode::OneShot);
+    assert!(!draft.enabled, "启用开关必须可编辑");
+    // user 作用域不得携带 project key
+    state.set_scope(mf_agent::InstanceScope::User);
+    state.set_project_key("proj-key");
+    assert!(
+        state
+            .validation()
+            .iter()
+            .any(|e| e.code == "scope-project-key"),
+        "User 作用域携带 project_key 必须报错"
+    );
+}
+
+#[test]
+fn config_schema_form_renders_into_draft_config() {
+    // 插件声明式 Schema(与 manifest config_schema 文件同构)
+    let schema = serde_json::json!({
+        "fields": [
+            { "id": "permission_mode", "label": "权限模式", "kind": "select",
+              "required": true, "options": ["default", "acceptEdits"] },
+            { "id": "api_key_ref", "label": "API Key", "kind": "secret", "required": false }
+        ]
+    });
+    let form = crate::declarative_form::DeclarativeForm::from_json(&schema);
+    assert_eq!(form.fields().len(), 2);
+    let mut state = crate::agent_instance_editor::AgentInstanceEditorState::new(detected_type());
+    state.set_config_form(form);
+    state.set_name("claude 实例");
+    state.set_config_value("permission_mode", "acceptEdits");
+    state.set_config_value("api_key_ref", "sec-123");
+    // Secret 字段只存引用
+    assert_eq!(state.config_form().masked_value("api_key_ref"), "••••");
+    let draft = state.to_draft();
+    assert_eq!(draft.config["permission_mode"], "acceptEdits");
+    assert_eq!(draft.config["api_key_ref"], "sec-123");
+    // 必填校验在表单层生效
+    let mut empty = crate::agent_instance_editor::AgentInstanceEditorState::new(detected_type());
+    empty.set_config_form(crate::declarative_form::DeclarativeForm::from_json(&schema));
+    empty.set_name("x");
+    assert!(empty
+        .validation()
+        .iter()
+        .any(|e| e.message.contains("权限模式")));
+}
+
+#[test]
+fn app_ctx_seals_and_deletes_secrets_storing_only_references() {
+    // 独立目录库 + 注入主密钥:不触 OS keyring、不碰用户真实目录库
+    let catalog = mf_agent::CatalogStore::memory().unwrap();
+    let ctx = crate::app_ctx::AppCtx::with_catalog_for_tests(catalog);
+    let id = ctx.seal_secret("ANTHROPIC_KEY", "sk-live-abc").unwrap();
+    assert!(!id.is_empty());
+    // 列表只有脱敏描述
+    let list = ctx.list_secrets().unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].name, "ANTHROPIC_KEY");
+    assert!(!format!("{:?}", list[0]).contains("sk-live-abc"));
+    // 删除幂等语义
+    assert!(ctx.delete_secret(&id).unwrap());
+    assert!(!ctx.delete_secret(&id).unwrap());
+    assert!(ctx.list_secrets().unwrap().is_empty());
 }

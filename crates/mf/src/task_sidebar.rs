@@ -351,6 +351,7 @@ impl TaskSidebar {
                     plugin_name: src.plugin_full_id.clone(),
                     plugin_version: src.plugin_version.clone(),
                     content_hash: src.content_hash.clone(),
+                    config_schema_fields: Vec::new(),
                     detected: mf_plugins::builtin::detect_on_path(&a.command).is_some(),
                     supports_isolated_config: a.supports_isolated_config,
                     default_command: a.command.clone(),
@@ -369,16 +370,34 @@ impl TaskSidebar {
             .list_agent_instances(None)
             .map(|rows| {
                 rows.into_iter()
-                    .map(|row| crate::agent_instances_view::InstanceListInstance {
-                        id: row.id.clone(),
-                        name: row.name.clone(),
-                        agent_type: row.agent_type.clone(),
-                        type_name: row.name.clone(),
-                        enabled: row.enabled,
-                        current_version: row.current_version,
-                        scope: row.scope,
-                        executable: String::new(),
-                        run_mode: mf_agent::RunMode::Interactive,
+                    .map(|row| {
+                        let snapshot = self
+                            .app
+                            .catalog_store
+                            .snapshot_agent_instance(&row.id, None)
+                            .ok();
+                        crate::agent_instances_view::InstanceListInstance {
+                            id: row.id.clone(),
+                            name: row.name.clone(),
+                            agent_type: row.agent_type.clone(),
+                            // 类型名从贡献解析(此前误用实例名)
+                            type_name: types
+                                .iter()
+                                .find(|t| t.id == row.agent_type)
+                                .map(|t| t.name.clone())
+                                .unwrap_or_else(|| row.agent_type.clone()),
+                            enabled: row.enabled,
+                            current_version: row.current_version,
+                            scope: row.scope,
+                            executable: snapshot
+                                .as_ref()
+                                .map(|s| s.executable.clone())
+                                .unwrap_or_default(),
+                            run_mode: snapshot
+                                .as_ref()
+                                .map(|s| s.run_mode)
+                                .unwrap_or(mf_agent::RunMode::Interactive),
+                        }
                     })
                     .collect::<Vec<_>>()
             })
@@ -823,6 +842,7 @@ fn temp_generic_type_info() -> crate::agent_instance_editor::AgentTypeInfo {
         plugin_name: "内置".into(),
         plugin_version: String::new(),
         content_hash: String::new(),
+        config_schema_fields: Vec::new(),
         detected: true,
         supports_isolated_config: false,
         default_command: String::new(),

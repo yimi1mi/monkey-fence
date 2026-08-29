@@ -23,6 +23,8 @@ pub struct AgentTypeInfo {
     pub default_command: String,
     pub adapter: String,
     pub modes: Vec<RunMode>,
+    /// manifest config_schema 声明的表单字段(编辑器真渲染 DeclarativeForm)。
+    pub config_schema_fields: Vec<crate::declarative_form::FormField>,
 }
 
 /// 结构校验错误(机器码 + 人类可读信息)。
@@ -52,26 +54,46 @@ pub struct AgentInstanceEditorState {
     /// Secret 引用(id 列表;明文由 Secret Store 管理,不进编辑器)。
     pub secret_refs: Vec<String>,
     pub run_mode: RunMode,
+    /// 作用域(User/Project)与项目键(Project 必填)。
+    pub scope: InstanceScope,
+    pub project_key: String,
+    /// 启用开关(禁用的实例不参与分配/启动)。
+    pub enabled: bool,
+    /// 插件 config_schema 声明式表单(值并入实例 config)。
+    config_form: crate::declarative_form::DeclarativeForm,
     /// 编辑已有实例时固定其 id。
     pub editing_instance_id: Option<String>,
 }
 
 impl AgentInstanceEditorState {
     pub fn new(info: AgentTypeInfo) -> AgentInstanceEditorState {
+        let config_form =
+            crate::declarative_form::DeclarativeForm::new(info.config_schema_fields.clone());
         AgentInstanceEditorState {
             executable: info.default_command.clone(),
             run_mode: info.modes.first().copied().unwrap_or(RunMode::Interactive),
+            scope: InstanceScope::User,
+            project_key: String::new(),
+            enabled: true,
             info,
             name: String::new(),
             argv_text: String::new(),
             env_text: String::new(),
             secret_refs: Vec::new(),
+            config_form,
             editing_instance_id: None,
         }
     }
 
-    /// 从既有实例装载(编辑路径)。
-    pub fn from_instance(info: AgentTypeInfo, snapshot: &AgentInstanceSnapshot) -> Self {
+    /// 从既有实例装载(编辑路径);scope/project_key/enabled 是行级
+    /// 开关(不在版本快照里),由调用方从实例行带出。
+    pub fn from_instance(
+        info: AgentTypeInfo,
+        snapshot: &AgentInstanceSnapshot,
+        scope: InstanceScope,
+        project_key: Option<&str>,
+        enabled: bool,
+    ) -> Self {
         let mut state = Self::new(info);
         state.name = snapshot.name.clone();
         state.executable = snapshot.executable.clone();
@@ -84,6 +106,15 @@ impl AgentInstanceEditorState {
             .join("\n");
         state.secret_refs = snapshot.sealed_secret_ids.clone();
         state.run_mode = snapshot.run_mode;
+        state.scope = scope;
+        state.project_key = project_key.unwrap_or_default().to_string();
+        state.enabled = enabled;
+        // 既有 config 值回填表单
+        for field in state.config_form.fields().to_vec() {
+            if let Some(value) = snapshot.config.get(&field.id).and_then(|v| v.as_str()) {
+                state.config_form.set_value(&field.id, value);
+            }
+        }
         state.editing_instance_id = Some(snapshot.id.clone());
         state
     }
@@ -102,6 +133,53 @@ impl AgentInstanceEditorState {
 
     pub fn set_env_lines(&mut self, env: &str) {
         self.env_text = env.to_string();
+    }
+
+    pub fn set_scope(&mut self, scope: InstanceScope) {
+        self.scope = scope;
+    }
+
+    pub fn set_project_key(&mut self, key: &str) {
+        self.project_key = key.to_string();
+    }
+
+    pub fn set_run_mode(&mut self, mode: RunMode) {
+        self.run_mode = mode;
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    pub fn toggle_scope(&mut self) {
+        self.scope = match self.scope {
+            InstanceScope::User => InstanceScope::Project,
+            InstanceScope::Project => InstanceScope::User,
+        };
+    }
+
+    pub fn toggle_run_mode(&mut self) {
+        self.run_mode = match self.run_mode {
+            RunMode::Interactive => RunMode::OneShot,
+            RunMode::OneShot => RunMode::Interactive,
+        };
+    }
+
+    pub fn toggle_enabled(&mut self) {
+        self.enabled = !self.enabled;
+    }
+
+    /// 替换声明式表单(类型变化/Schema 加载完成后)。
+    pub fn set_config_form(&mut self, form: crate::declarative_form::DeclarativeForm) {
+        self.config_form = form;
+    }
+
+    pub fn config_form(&self) -> &crate::declarative_form::DeclarativeForm {
+        &self.config_form
+    }
+
+    pub fn set_config_value(&mut self, id: &str, raw: &str) {
+        self.config_form.set_value(id, raw);
     }
 
     pub fn add_secret_ref(&mut self, secret_id: &str) {
@@ -146,6 +224,21 @@ impl AgentInstanceEditorState {
                 ));
             }
         }
+        match (self.scope, self.project_key.trim()) {
+            (InstanceScope::Project, "") => {
+                errors.push(err(
+                    "scope-project-key",
+                    "Project 作用域必须填写 project_key",
+                ));
+            }
+            (InstanceScope::User, k) if !k.is_empty() => {
+                errors.push(err("scope-project-key", "User 作用域不能携带 project_key"));
+            }
+            _ => {}
+        }
+        for message in self.config_form.validation() {
+            errors.push(err("config-schema", message));
+        }
         errors
     }
 
@@ -153,18 +246,18 @@ impl AgentInstanceEditorState {
         self.validation().is_empty()
     }
 
-    /// 导出目录库草案。
-    pub fn to_draft(
-        &self,
-        scope: InstanceScope,
-        project_key: Option<String>,
-    ) -> AgentInstanceDraft {
+    /// 导出目录库草案(作用域/项目键/启用/运行模式取编辑器状态)。
+    pub fn to_draft(&self) -> AgentInstanceDraft {
+        let project_key = match self.scope {
+            InstanceScope::Project => Some(self.project_key.trim().to_string()),
+            InstanceScope::User => None,
+        };
         AgentInstanceDraft {
             name: self.name.trim().to_string(),
             agent_type: self.info.id.clone(),
-            scope,
+            scope: self.scope,
             project_key,
-            enabled: true,
+            enabled: self.enabled,
             run_mode: self.run_mode,
             executable: self.executable.trim().to_string(),
             argv: self
@@ -176,7 +269,7 @@ impl AgentInstanceEditorState {
                 .into_iter()
                 .filter_map(|(_bad, kv)| kv.ok().flatten())
                 .collect(),
-            config: serde_json::json!({}),
+            config: self.config_form.to_json(),
             execution_contract: serde_json::json!({
                 "input": "argv",
                 "completion": if self.run_mode == RunMode::OneShot { "process-exit" } else { "manual" },
@@ -188,7 +281,7 @@ impl AgentInstanceEditorState {
     /// 一次性启动快照(临时实例):不落目录库,直接以当前编辑字段启动。
     /// `instance_key` 是临时标识(不与目录库实例 ID 冲突)。
     pub fn to_launch_snapshot(&self, instance_key: &str) -> AgentInstanceSnapshot {
-        let draft = self.to_draft(InstanceScope::User, None);
+        let draft = self.to_draft();
         AgentInstanceSnapshot {
             id: instance_key.to_string(),
             name: draft.name,
