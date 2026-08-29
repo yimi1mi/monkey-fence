@@ -5,13 +5,25 @@
 
 pub use crate::run_node_details::{needs_you_reasons, RunAction, RunNodeDetails};
 
-use mf_agent::model::{RunView, Settlement, StepView};
+use mf_agent::model::{ExecutionLeaseRow, HandoffRow, RunView, SessionView, Settlement, StepView};
+use mf_agent::orchestrator::Orchestrator;
+use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Run Monitor 视图数据(一次任务的投影)。
+/// Run Monitor 视图数据(一次任务的投影):
+/// 步骤/运行之外还携带 Session、Handoff、执行租约与待决汇合冲突,
+/// 节点行与冲突面板都从这里渲染。
 pub struct RunMonitorSnapshot {
     pub steps: Vec<StepView>,
     pub runs: Vec<RunView>,
+    /// 任务关联的会话(按 run.session_id 收集)。
+    pub sessions: Vec<SessionView>,
+    /// 每个步骤最近一次 Handoff(含 files/verification/output)。
+    pub handoffs: Vec<HandoffRow>,
+    /// 任务的执行租约(路径/提供器/持有状态)。
+    pub leases: Vec<ExecutionLeaseRow>,
+    /// 待决汇合冲突(持久化行投影;空 = 无冲突)。
+    pub pending_conflicts: Vec<String>,
     /// 手工结算输入缓冲(空 = 未输入)。
     pub settle_input: String,
 }
@@ -21,12 +33,65 @@ impl RunMonitorSnapshot {
         RunMonitorSnapshot {
             steps,
             runs,
+            sessions: Vec::new(),
+            handoffs: Vec::new(),
+            leases: Vec::new(),
+            pending_conflicts: Vec::new(),
             settle_input: String::new(),
         }
     }
 
-    /// 每个步骤的最新 run 详情(按 step_key)。
+    /// 从 Orchestrator 收集完整投影(Store 查询 + 待决冲突)。
+    pub fn collect(orch: &Arc<Orchestrator>, task_id: i64) -> RunMonitorSnapshot {
+        let steps = orch.store.task_steps(task_id).unwrap_or_default();
+        let runs = orch.store.list_runs_of_task(task_id).unwrap_or_default();
+        let session_ids: Vec<i64> = runs.iter().filter_map(|r| r.session_id).collect();
+        let sessions = orch
+            .store
+            .list_sessions()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|s| session_ids.contains(&s.id))
+            .collect();
+        // 每个步骤最近一次 Handoff(handoffs 按 id 升序,倒序取第一个)
+        let mut handoffs: Vec<HandoffRow> = Vec::new();
+        for step in &steps {
+            if let Some(row) = orch
+                .store
+                .list_handoff_rows(task_id)
+                .unwrap_or_default()
+                .into_iter()
+                .rev()
+                .find(|r| r.step_id == Some(step.id))
+            {
+                handoffs.push(row);
+            }
+        }
+        let leases = orch
+            .store
+            .list_execution_leases(task_id)
+            .unwrap_or_default();
+        let pending_conflicts = orch.pending_merge_conflicts(task_id);
+        RunMonitorSnapshot {
+            steps,
+            runs,
+            sessions,
+            handoffs,
+            leases,
+            pending_conflicts,
+            settle_input: String::new(),
+        }
+    }
+
+    /// 每个步骤的最新 run 详情(按 step_key;附 Session/Handoff/租约投影)。
     pub fn node_details(&self) -> Vec<RunNodeDetails> {
+        let sessions_by_id: HashMap<i64, &SessionView> =
+            self.sessions.iter().map(|s| (s.id, s)).collect();
+        let handoff_by_step: HashMap<i64, &HandoffRow> = self
+            .handoffs
+            .iter()
+            .map(|h| (h.step_id.unwrap_or(0), h))
+            .collect();
         self.steps
             .iter()
             .map(|step| {
@@ -35,8 +100,35 @@ impl RunMonitorSnapshot {
                     .iter()
                     .filter(|r| r.step_id == step.id)
                     .max_by_key(|r| r.id);
+                let mut extras = crate::run_node_details::NodeExtras::default();
+                if let Some(run) = latest {
+                    if let Some(session) = run.session_id.and_then(|id| sessions_by_id.get(&id)) {
+                        extras.session_status = Some(format!("{:?}", session.status));
+                    }
+                    if let Some(row) = handoff_by_step.get(&step.id) {
+                        extras.handoff_summary = Some(row.handoff.summary.clone());
+                        extras.handoff_files = row.handoff.changed_files.clone();
+                        extras.handoff_verification =
+                            row.handoff.verification.as_ref().map(|v| v.to_string());
+                        extras.log_ref = row.handoff.raw_log_ref.clone();
+                    }
+                    if let Some(lease) = self
+                        .leases
+                        .iter()
+                        .rev()
+                        .find(|l| l.run_id == Some(run.id) || l.step_id == step.id)
+                    {
+                        extras.lease = Some(format!(
+                            "{} {} [{}]",
+                            lease.provider, lease.path, lease.status
+                        ));
+                    }
+                }
                 match latest {
-                    Some(run) => RunNodeDetails::from((run, step)),
+                    Some(run) => RunNodeDetails {
+                        extras,
+                        ..RunNodeDetails::from((run, step))
+                    },
                     None => {
                         // 无 run(未派发):仅观察
                         let mut details = RunNodeDetails::from((&placeholder_run(), step));
@@ -211,12 +303,36 @@ impl RunMonitor {
         let Some(orch) = self.app.orchestrator_of(&root) else {
             return;
         };
-        let steps = orch.store.task_steps(task_id).unwrap_or_default();
-        let runs = orch.store.list_runs_of_task(task_id).unwrap_or_default();
-        // 输入缓冲跨刷新保留(用户正在键入)
+        // 完整投影:Session/Handoff/租约/待决冲突(冲突面板 + 节点富显示)
         let input = std::mem::take(&mut self.input);
-        self.snapshot = RunMonitorSnapshot::from_parts(steps, runs);
+        self.snapshot = RunMonitorSnapshot::collect(&orch, task_id);
         self.input = input;
+    }
+
+    /// 用户点击「重试合并」:整批重新汇合待决冲突(可恢复;
+    /// 仍有冲突时保留租约与持久化行,任务保持 needs-you)。
+    pub fn resolve_pending_merge(&mut self, cx: &mut Context<Self>) {
+        let result = match self.orchestrator() {
+            Some(orch) => {
+                let (_, task_id) = self.task.clone().expect("orchestrator 存在则任务存在");
+                orch.resolve_pending_merges(task_id)
+                    .map(|remaining| {
+                        if remaining.is_empty() {
+                            "汇合完成:冲突全部解决,租约已释放".to_string()
+                        } else {
+                            format!("仍存在冲突:{} ", remaining.join("; "))
+                        }
+                    })
+                    .map_err(|e| format!("{e:#}"))
+            }
+            None => Err("项目未打开".into()),
+        };
+        match result {
+            Ok(msg) => self.status = msg,
+            Err(e) => self.status = e,
+        }
+        self.refresh();
+        cx.notify();
     }
 
     fn orchestrator(&self) -> Option<Arc<mf_agent::Orchestrator>> {
@@ -256,6 +372,50 @@ impl RunMonitor {
                 .into_any_element();
         }
         let mut list = gpui::div().flex().flex_col().gap_1().p_2();
+        // 待决汇合冲突面板:列出冲突 + 重试合并(merge pending 可恢复)
+        if !self.snapshot.pending_conflicts.is_empty() {
+            list = list.child(
+                gpui::div()
+                    .id("rm-merge-conflicts")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(crate::theme::Theme::warning()))
+                    .child(
+                        gpui::div()
+                            .text_size(px(10.))
+                            .text_color(rgb(crate::theme::Theme::warning()))
+                            .child("隔离目录汇合冲突(租约保持持有,解决后重试合并)"),
+                    )
+                    .children(self.snapshot.pending_conflicts.iter().map(|c| {
+                        gpui::div()
+                            .text_size(px(9.))
+                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .child(format!("• {c}"))
+                    }))
+                    .child(
+                        gpui::div()
+                            .id("rm-merge-retry")
+                            .px_2()
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(crate::theme::Theme::warning()))
+                            .text_size(px(9.))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                            .child("重试合并")
+                            .on_click(cx.listener(|monitor: &mut RunMonitor, _ev, _w, cx| {
+                                monitor.resolve_pending_merge(cx);
+                            })),
+                    ),
+            );
+        }
         for (idx, detail) in details.iter().enumerate() {
             let mut row = gpui::div()
                 .flex()

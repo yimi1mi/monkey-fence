@@ -247,3 +247,183 @@ fn cancel_action_stops_process_and_releases_lease() {
     assert_eq!(after.status, mf_agent::model::RunStatus::Cancelled);
     orch.stop();
 }
+
+// ---------- 复审阻塞项 12:Run Monitor 富显示 + 待决冲突可恢复 ----------
+
+#[test]
+fn snapshot_collects_sessions_handoffs_leases_and_conflicts() {
+    use crate::run_monitor::RunMonitorSnapshot;
+    use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
+    use mf_agent::runtime::{AdHocLaunchSpec, LaunchSpec, RuntimeEvent, RuntimeHost};
+    use parking_lot::RwLock;
+
+    struct NoopHost;
+    impl RuntimeHost for NoopHost {
+        fn launch_workflow(
+            &self,
+            _spec: mf_agent::runtime::WorkflowLaunchSpec,
+            _events: crossbeam_channel::Sender<(i64, RuntimeEvent)>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn launch(
+            &self,
+            _spec: LaunchSpec,
+            _events: crossbeam_channel::Sender<(i64, RuntimeEvent)>,
+        ) {
+        }
+        fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn send_prompt(&self, _: &str, _: i64, _: i64, _: &str) {}
+        fn stop_run(&self, _: &str, _: i64) {}
+        fn kill_session(&self, _: &str, _: i64) {}
+        fn kill_ad_hoc(&self, _: &str, _: i64) {}
+        fn answer_question(&self, _: &str, _: i64, _: &str) {}
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = mf_agent::Store::open(&dir.path().join("rich.db")).unwrap();
+    let mut index = mf_agent::pipeline::ProfileIndex::default();
+    index.entries.insert(
+        "mock".into(),
+        mf_agent::pipeline::ProfileAvailability {
+            installed: true,
+            enabled: true,
+            detected: true,
+        },
+    );
+    let mut specs = std::collections::HashMap::new();
+    specs.insert(
+        "mock".to_string(),
+        mf_agent::AgentProfileSpec {
+            id: "mock".into(),
+            display_name: "Mock".into(),
+            runtime: mf_agent::RuntimeKind::Http,
+            command: String::new(),
+            args: vec![],
+            env: vec![],
+            permission_args: vec![],
+            provider: None,
+            icon: None,
+            homepage: None,
+            hook: None,
+        },
+    );
+    let orch = Orchestrator::start(
+        store,
+        dir.path().to_path_buf(),
+        mf_agent::Config::default(),
+        std::sync::Arc::new(NoopHost),
+        std::sync::Arc::new(RwLock::new(ProfileCatalog { index, specs })),
+        GlobalLimiter::new(4),
+        "pipe".into(),
+        std::sync::Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
+    )
+    .unwrap();
+    let task = orch.create_task("富显示", "g").unwrap();
+
+    // 造数据:步骤 + run(带会话)+ 租约 + Handoff + 待决冲突
+    let step = {
+        orch.save_pipeline(
+            task.id,
+            &mf_agent::PipelineDraft {
+                steps: vec![mf_agent::StepDraft {
+                    key: "build".into(),
+                    title: "构建".into(),
+                    instructions: String::new(),
+                    agent_profile: "mock".into(),
+                    session_policy: mf_agent::SessionPolicy::Fresh,
+                    deps: vec![],
+                }],
+            },
+        )
+        .unwrap();
+        orch.store.task_steps(task.id).unwrap().remove(0)
+    };
+    let session = orch
+        .store
+        .create_session(None, "pty", "mock", "构建")
+        .unwrap();
+    let run = orch
+        .store
+        .dispatch_run(task.id, step.id, step.revision_id, session.id)
+        .unwrap();
+    let lease = mf_agent::execution_directory::ExecutionLease {
+        id: "lease-1".into(),
+        path: dir.path().join("wt"),
+        isolated: true,
+        provider: "worktree".into(),
+        metadata: serde_json::json!({}),
+    };
+    orch.store
+        .insert_execution_lease(&lease, Some(run.id), step.id, task.id)
+        .unwrap();
+    orch.store
+        .insert_handoff(
+            task.id,
+            Some(step.id),
+            Some(run.id),
+            &mf_agent::handoff::Handoff {
+                status: "complete".into(),
+                summary: "构建完成".into(),
+                changed_files: vec!["src/main.rs".into()],
+                verification: Some(serde_json::json!({ "tests": "passed" })),
+                raw_log_ref: Some(format!("agent-run:{}", run.id)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    orch.store
+        .insert_pending_merge(
+            task.id,
+            &lease,
+            &["src/main.rs(修改者: a 与 b)".to_string()],
+        )
+        .unwrap();
+
+    let snapshot = RunMonitorSnapshot::collect(&orch, task.id);
+    // 待决冲突可见
+    assert!(
+        snapshot
+            .pending_conflicts
+            .iter()
+            .any(|c| c.contains("src/main.rs")),
+        "{:?}",
+        snapshot.pending_conflicts
+    );
+    // 节点富显示:Session / Handoff(摘要+文件+验证)/ 租约 / 日志引用
+    let details = snapshot.node_details();
+    assert_eq!(details.len(), 1);
+    let extras = &details[0].extras;
+    assert!(extras.session_status.is_some(), "Session 状态必须可见");
+    assert_eq!(extras.handoff_summary.as_deref(), Some("构建完成"));
+    assert_eq!(extras.handoff_files, vec!["src/main.rs".to_string()]);
+    assert!(extras.lease.as_deref().unwrap_or("").contains("worktree"));
+    assert!(
+        extras
+            .log_ref
+            .as_deref()
+            .unwrap_or("")
+            .starts_with("agent-run:"),
+        "日志引用必须可见"
+    );
+    let lines = details[0].extra_lines();
+    assert!(lines.iter().any(|l| l.contains("Session")));
+    assert!(lines
+        .iter()
+        .any(|l| l.contains("构建完成") && l.contains("src/main.rs")));
+    assert!(lines.iter().any(|l| l.contains("Lease")));
+
+    // 待决冲突可恢复:重试合并(此处目录提供器返回 NotRequired → 视为解决)
+    let remaining = orch.resolve_pending_merges(task.id).unwrap();
+    assert!(remaining.is_empty(), "{remaining:?}");
+    assert!(
+        orch.store
+            .list_pending_merges(Some(task.id))
+            .unwrap()
+            .is_empty(),
+        "解决后持久化行清空"
+    );
+    orch.stop();
+}

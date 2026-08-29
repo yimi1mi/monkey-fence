@@ -26,6 +26,17 @@ pub enum RunAction {
     Observe,
 }
 
+/// 节点附加投影(Run Monitor 富显示:Session/Handoff/租约/日志引用)。
+#[derive(Debug, Clone, Default)]
+pub struct NodeExtras {
+    pub session_status: Option<String>,
+    pub handoff_summary: Option<String>,
+    pub handoff_files: Vec<String>,
+    pub handoff_verification: Option<String>,
+    pub lease: Option<String>,
+    pub log_ref: Option<String>,
+}
+
 /// Run 节点详情投影。
 #[derive(Debug, Clone)]
 pub struct RunNodeDetails {
@@ -37,6 +48,7 @@ pub struct RunNodeDetails {
     pub attempts: i32,
     pub actions: Vec<RunAction>,
     pub success: bool,
+    pub extras: NodeExtras,
 }
 
 impl<'a> From<(&'a RunView, &'a StepView)> for RunNodeDetails {
@@ -84,6 +96,7 @@ impl<'a> From<(&'a RunView, &'a StepView)> for RunNodeDetails {
             attempts: step.attempts,
             actions,
             success,
+            extras: NodeExtras::default(),
         }
     }
 }
@@ -96,6 +109,31 @@ impl RunNodeDetails {
     /// 重试动作携带的模式(新会话;继续会话经 Continue)。
     pub fn retry_mode(&self) -> RetryMode {
         RetryMode::FreshSession
+    }
+
+    /// 富显示行:Session / Handoff(摘要+文件+验证)/ 租约 / 日志引用。
+    pub fn extra_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if let Some(session) = &self.extras.session_status {
+            lines.push(format!("Session: {session}"));
+        }
+        if let Some(summary) = &self.extras.handoff_summary {
+            let mut line = format!("Handoff: {summary}");
+            if !self.extras.handoff_files.is_empty() {
+                line.push_str(&format!("(文件 {})", self.extras.handoff_files.join(", ")));
+            }
+            if let Some(verification) = &self.extras.handoff_verification {
+                line.push_str(&format!("(验证 {verification})"));
+            }
+            lines.push(line);
+        }
+        if let Some(lease) = &self.extras.lease {
+            lines.push(format!("Lease: {lease}"));
+        }
+        if let Some(log) = &self.extras.log_ref {
+            lines.push(format!("日志: {log}"));
+        }
+        lines
     }
 }
 
