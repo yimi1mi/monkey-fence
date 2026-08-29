@@ -2,11 +2,13 @@
 //!
 //! - 集成基线:每个 Task/Revision 维护 hidden ref
 //!   `refs/mf/integration/task-<t>-rev-<r>`(初值 = 仓库 HEAD)。
-//!   acquire 从基线检出 worktree;merge 把变更复制回项目目录后把基线
+//!   acquire 从基线检出 worktree;merge 把变更落回项目目录后把基线
 //!   推进到汇合结果 —— 串行下游从汇合结果建租约,天然看见上游修改。
 //! - merge:按"拓扑依赖序 + 稳定节点键"排序;第一遍批量预检所有租约
 //!   相对各自主基线的变更集,任一文件被多个租约修改 → `NeedsUser`,
-//!   项目目录零部分写;第二遍才按序复制并推进基线。
+//!   项目目录零部分写;第二遍先在内存 index 构建完整汇合树(嵌套路径
+//!   递归构造子树),原子推进基线 ref,再以撤销日志回滚式应用到项目
+//!   目录 —— 应用失败时项目目录与集成 ref 整体回到合并前。
 //! - release:校验路径位于 `.worktrees` 之下后删除 worktree
 //!   (绝不触碰仓库根或仓库元数据)。非 Git 根回退共享目录(不隔离)。
 
@@ -179,47 +181,46 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
             return Ok(MergeOutcome::NeedsUser { conflicts });
         }
 
-        // 2. 第二遍:无重叠时按确定顺序把变更复制回项目工作目录。
-        //    不用 git apply:工作区 diff 里的 untracked 新文件没有 blob 内容,
-        //    apply 无法重建;文件级复制对已跟踪修改与新建文件同样成立。
-        let mut applied: Vec<(String, bool)> = Vec::new();
+        // 2. 逐租约收集变更(路径、删除标记、源内容)。内容在触碰项目
+        //    目录之前全部读出 —— 任一源文件读取失败时零写入。
+        let mut changes: Vec<MergeChange> = Vec::new();
         for lease in &worktree_leases {
             let baseline_tree = lease_baseline_tree(&repo, lease, head_tree_id);
             for (path, deleted) in changed_files_with_status(&repo, &lease.path, baseline_tree)? {
-                let src = lease.path.join(&path);
-                let dst = self.repo_root.join(&path);
-                if deleted {
-                    if dst.is_file() {
-                        std::fs::remove_file(&dst)
-                            .with_context(|| format!("合并删除失败: {}", dst.display()))?;
-                    }
+                let content = if deleted {
+                    None
                 } else {
-                    if let Some(parent) = dst.parent() {
-                        std::fs::create_dir_all(parent)
-                            .with_context(|| format!("合并建目录失败: {}", parent.display()))?;
-                    }
-                    std::fs::copy(&src, &dst).with_context(|| {
-                        format!("合并复制失败: {} -> {}", src.display(), dst.display())
-                    })?;
-                }
-                applied.push((path, deleted));
+                    let src = lease.path.join(&path);
+                    Some(
+                        std::fs::read(&src)
+                            .with_context(|| format!("读取合并源文件失败: {}", src.display()))?,
+                    )
+                };
+                changes.push(MergeChange {
+                    path,
+                    deleted,
+                    content,
+                });
             }
         }
 
-        // 3. 推进 Task/Revision 集成基线:下游 acquire 从汇合结果检出。
-        //    基底是「当前集成 ref 树」(已含兄弟节点已汇合的修改;预检
-        //    已保证本批变更与之无重叠),而非首个租约的旧基线 —— 否则
-        //    后结算的兄弟会把先结算者的变更从基线中挤掉。
+        // 3. 先在内存 index 上构建完整汇合树并验证(嵌套路径由
+        //    write_tree_to 递归构造子树;TreeBuilder::insert 只接受单段
+        //    路径,直接喂 `a/b/c` 会失败)。全部成功之前不推进 ref、
+        //    不写项目目录。
         let base_tree = integrated_tree
             .or_else(|| changed_by_lease.first().map(|(_, _, t)| *t))
             .unwrap_or(head_tree_id);
-        let tree_id = build_merged_tree(&repo, self.repo_root.clone(), base_tree, &applied)?;
+        let tree_id = build_merged_tree(&repo, base_tree, &changes)?;
+
+        // 4. 记录旧 ref → 原子推进集成基线(下游 acquire 从汇合结果检出)。
         let git = Git::open(&self.repo_root)?;
         let step_label = worktree_leases
             .first()
             .and_then(|l| l.metadata.get("step_key"))
             .and_then(|v| v.as_str())
             .unwrap_or("step");
+        let ref_before = git.read_ref(&refname)?;
         git.advance_integration_ref(
             &refname,
             tree_id,
@@ -228,6 +229,19 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
                 worktree_leases.len()
             ),
         )?;
+
+        // 5. 可回滚应用:撤销日志逐项记录,任一失败 → 逆序恢复项目目录
+        //    + 集成 ref 指回合并前(整体回到调用前状态)。
+        if let Err(apply_err) = self.apply_changes_with_rollback(&changes) {
+            if let Err(ref_err) = git.reset_integration_ref(&refname, ref_before) {
+                // 双重失败是最糟路径:如实上报(目录已恢复部分 + ref 未回滚;
+                // 重试合并以同一源幂等收敛)
+                return Err(
+                    apply_err.context(format!("合并应用失败且回滚集成 ref 失败: {ref_err:#}"))
+                );
+            }
+            return Err(apply_err.context("合并应用失败,项目目录与集成 ref 已回滚"));
+        }
         Ok(MergeOutcome::Merged)
     }
 
@@ -317,32 +331,142 @@ fn merge_integration_ref(leases: &[ExecutionLease]) -> Result<String> {
     Ok(Git::integration_ref(first.0, first.1))
 }
 
-/// 从基线树叠加已应用变更,构造汇合结果树(冲突已在预检排除,叠加序无关)。
+/// 一次合并的原子变更单元:路径(正斜杠)、是否删除、源内容
+/// (删除项为 None;内容在改动项目目录之前读出)。
+struct MergeChange {
+    path: String,
+    deleted: bool,
+    content: Option<Vec<u8>>,
+}
+
+/// 应用失败时的撤销动作(逆序执行恢复项目目录)。
+enum UndoOp {
+    /// 恢复被覆盖文件的旧内容。
+    RestoreOverwritten { path: PathBuf, bytes: Vec<u8> },
+    /// 删除本次新建的文件(新建的空目录保留,不影响内容语义)。
+    RemoveCreated { path: PathBuf },
+    /// 恢复被删除的文件。
+    RestoreDeleted { path: PathBuf, bytes: Vec<u8> },
+}
+
+impl GitWorktreeProvider {
+    /// 把变更应用到项目工作目录;每一步先记撤销项再动手,
+    /// 任一失败逆序回滚已应用部分后返回错误。
+    fn apply_changes_with_rollback(&self, changes: &[MergeChange]) -> Result<()> {
+        let mut undo: Vec<UndoOp> = Vec::new();
+        let apply = (|| -> Result<()> {
+            for change in changes {
+                let dst = self.repo_root.join(&change.path);
+                if change.deleted {
+                    if dst.is_file() {
+                        let bytes = std::fs::read(&dst)
+                            .with_context(|| format!("读取待删文件失败: {}", dst.display()))?;
+                        std::fs::remove_file(&dst)
+                            .with_context(|| format!("合并删除失败: {}", dst.display()))?;
+                        undo.push(UndoOp::RestoreDeleted { path: dst, bytes });
+                    }
+                    continue;
+                }
+                if let Some(parent) = dst.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent)
+                            .with_context(|| format!("合并建目录失败: {}", parent.display()))?;
+                    }
+                }
+                if dst.is_file() {
+                    let bytes = std::fs::read(&dst)
+                        .with_context(|| format!("读取待覆盖文件失败: {}", dst.display()))?;
+                    undo.push(UndoOp::RestoreOverwritten {
+                        path: dst.clone(),
+                        bytes,
+                    });
+                } else {
+                    undo.push(UndoOp::RemoveCreated { path: dst.clone() });
+                }
+                let content = change
+                    .content
+                    .as_deref()
+                    .expect("非删除变更的内容已在收集阶段读出");
+                std::fs::write(&dst, content)
+                    .with_context(|| format!("合并写文件失败: {}", dst.display()))?;
+            }
+            Ok(())
+        })();
+        match apply {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                for op in undo.iter().rev() {
+                    match op {
+                        UndoOp::RestoreOverwritten { path, bytes }
+                        | UndoOp::RestoreDeleted { path, bytes } => {
+                            if let Some(parent) = path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            let _ = std::fs::write(path, bytes);
+                        }
+                        UndoOp::RemoveCreated { path } => {
+                            let _ = std::fs::remove_file(path);
+                        }
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+}
+
+/// 从基底树叠加变更,在内存 index 上构造汇合结果树:
+/// `Index::add_frombuffer` 接受嵌套路径(`a/b/c.md`),
+/// `write_tree_to` 递归构造子树 —— TreeBuilder::insert 只接受单段
+/// 路径,不能直接用于嵌套文件。基底是「当前集成 ref 树」(已含兄弟
+/// 节点已汇合的修改;预检已保证本批变更与之无重叠)。
 fn build_merged_tree(
     repo: &git2::Repository,
-    project_root: PathBuf,
     base_tree_id: git2::Oid,
-    applied: &[(String, bool)],
+    changes: &[MergeChange],
 ) -> Result<git2::Oid> {
     let base_tree = repo.find_tree(base_tree_id)?;
-    let mut builder = repo.treebuilder(Some(&base_tree))?;
-    for (path, deleted) in applied {
-        if *deleted {
-            // remove 对不存在的路径是 no-op(前序租约已删)
-            let _ = builder.remove(path);
+    // 仓库支撑的 index(add_frombuffer 要求):read_tree 重置为基底树,
+    // 全程只改内存条目、绝不 write() —— 磁盘 index 不被触碰。
+    let mut index = repo.index()?;
+    index.read_tree(&base_tree)?;
+    for change in changes {
+        if change.deleted {
+            // remove 对不存在的路径幂等(前序租约已删 / 批内重复删除)
+            if let Err(e) = index.remove(std::path::Path::new(&change.path), 0) {
+                if e.code() != git2::ErrorCode::NotFound {
+                    return Err(e.into());
+                }
+            }
             continue;
         }
-        let content = std::fs::read(project_root.join(path))
-            .with_context(|| format!("读取已合并文件失败: {path}"))?;
-        let blob = repo.blob(&content)?;
-        // 保留基线中的可执行位(新文件按普通文件)
+        let content = change
+            .content
+            .as_deref()
+            .expect("非删除变更的内容已在收集阶段读出");
+        let blob = repo.blob(content)?;
+        // 保留基线中的可执行位(嵌套路径由 get_path 递归解析;新文件普通位)
         let mode = base_tree
-            .get_path(std::path::Path::new(path))
-            .map(|e| e.filemode())
-            .unwrap_or(0o100644);
-        builder.insert(path, blob, mode)?;
+            .get_path(std::path::Path::new(&change.path))
+            .map(|entry| entry.filemode())
+            .unwrap_or(0o100644) as u32;
+        let entry = git2::IndexEntry {
+            ctime: git2::IndexTime::new(0, 0),
+            mtime: git2::IndexTime::new(0, 0),
+            dev: 0,
+            ino: 0,
+            mode,
+            uid: 0,
+            gid: 0,
+            file_size: content.len() as u32,
+            flags: 0,
+            flags_extended: 0,
+            id: blob,
+            path: change.path.as_bytes().to_vec(),
+        };
+        index.add_frombuffer(&entry, content)?;
     }
-    Ok(builder.write()?)
+    Ok(index.write_tree_to(repo)?)
 }
 
 /// worktree 相对基线的变更:(路径, 是否删除)。

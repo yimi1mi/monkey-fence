@@ -430,6 +430,139 @@ fn sequential_sibling_same_file_conflicts_without_overwrite() {
     let _ = provider.release(&b);
 }
 
+// ---------- 原子合并:嵌套路径先建树、失败整体回滚(C2 回归) ----------
+
+#[test]
+fn nested_new_file_merges_and_downstream_worktree_sees_it() {
+    let fx = RepoFixture::with_base_files();
+    let provider = fx.provider();
+    let lease = provider
+        .acquire(&fx.ctx_rev(31, "build", 1, 1, &[]))
+        .unwrap();
+    std::fs::write(lease.path.join("a.txt"), "by-build\n").unwrap();
+    // 嵌套目录中的新文件(非根级单段路径)
+    std::fs::create_dir_all(lease.path.join("docs").join("guide")).unwrap();
+    std::fs::write(
+        lease.path.join("docs").join("guide").join("deep.md"),
+        "# deep\n",
+    )
+    .unwrap();
+    let outcome = provider.merge(&[lease.clone()]).unwrap();
+    assert_eq!(outcome, MergeOutcome::Merged, "嵌套新文件必须能合并");
+    assert_eq!(
+        norm(fx.root.join("docs").join("guide").join("deep.md")),
+        "# deep\n",
+        "项目目录必须落盘嵌套新文件"
+    );
+    // 集成基线 ref 的树包含嵌套路径:下游 acquire 从汇合结果检出可见
+    let down = provider
+        .acquire(&fx.ctx_rev(31, "package", 1, 1, &["build"]))
+        .unwrap();
+    assert_eq!(
+        norm(down.path.join("docs").join("guide").join("deep.md")),
+        "# deep\n",
+        "下游 worktree 必须看到嵌套新文件(基线树已包含)"
+    );
+    let _ = provider.release(&lease);
+    let _ = provider.release(&down);
+}
+
+#[test]
+fn nested_deleted_file_updates_baseline_tree() {
+    let fx = RepoFixture::with_base_files();
+    // 基线里先有嵌套文件
+    {
+        let repo = git2::Repository::open(&fx.root).unwrap();
+        let sig = git2::Signature::now("mf", "mf@test").unwrap();
+        std::fs::create_dir_all(fx.root.join("docs").join("guide")).unwrap();
+        std::fs::write(fx.root.join("docs").join("guide").join("old.md"), "old\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "nested base", &tree, &[&parent])
+            .unwrap();
+    }
+    let provider = fx.provider();
+    let lease = provider
+        .acquire(&fx.ctx_rev(33, "build", 1, 1, &[]))
+        .unwrap();
+    std::fs::remove_file(lease.path.join("docs").join("guide").join("old.md")).unwrap();
+    assert_eq!(
+        provider.merge(&[lease.clone()]).unwrap(),
+        MergeOutcome::Merged,
+        "删除嵌套文件必须能合并"
+    );
+    assert!(
+        !fx.root.join("docs").join("guide").join("old.md").exists(),
+        "项目目录中的嵌套文件应被删除"
+    );
+    // 基线树也不再有该文件
+    let git = mf_vcs::git::Git::open(&fx.root).unwrap();
+    let refname = mf_vcs::git::Git::integration_ref(33, 1);
+    let oid = git.read_ref(&refname).unwrap().unwrap();
+    let repo = git2::Repository::open(&fx.root).unwrap();
+    let commit = repo.find_commit(oid).unwrap();
+    assert!(
+        commit
+            .tree()
+            .unwrap()
+            .get_path(std::path::Path::new("docs/guide/old.md"))
+            .is_err(),
+        "集成基线树不得再包含已删除的嵌套文件"
+    );
+    let _ = provider.release(&lease);
+}
+
+#[test]
+fn merge_failure_mid_apply_rolls_back_project_dir_and_ref() {
+    let fx = RepoFixture::with_base_files();
+    let provider = fx.provider();
+    let lease = provider
+        .acquire(&fx.ctx_rev(32, "build", 1, 1, &[]))
+        .unwrap();
+    // 变更集:根级文件修改 + docs/ 下新文件。
+    // 预置障碍:项目目录中 `docs` 已是普通文件 → 应用到 docs/new.md 时
+    // create_dir_all 必然失败(应用中段注入失败)
+    std::fs::write(lease.path.join("a.txt"), "by-build\n").unwrap();
+    std::fs::create_dir_all(lease.path.join("docs")).unwrap();
+    std::fs::write(lease.path.join("docs").join("new.md"), "new\n").unwrap();
+    std::fs::write(fx.root.join("docs"), "not a directory\n").unwrap();
+
+    let git = mf_vcs::git::Git::open(&fx.root).unwrap();
+    let refname = mf_vcs::git::Git::integration_ref(32, 1);
+    let ref_before = git.read_ref(&refname).unwrap();
+    let err = provider.merge(&[lease.clone()]).unwrap_err();
+    assert!(
+        err.to_string().contains("目录") || format!("{err:#}").contains("dir"),
+        "失败原因应指向目录创建: {err:#}"
+    );
+    // 失败必须整体回滚:项目目录与集成 ref 都回到合并前(零部分写)
+    assert_eq!(
+        norm(fx.root.join("a.txt")),
+        "aaa\n",
+        "已复制的文件必须回滚,不得留部分写"
+    );
+    assert_eq!(
+        git.read_ref(&refname).unwrap(),
+        ref_before,
+        "失败时集成 ref 不得推进"
+    );
+    // 障碍清除后重试:整批成功
+    std::fs::remove_file(fx.root.join("docs")).unwrap();
+    assert_eq!(
+        provider.merge(&[lease.clone()]).unwrap(),
+        MergeOutcome::Merged
+    );
+    assert_eq!(norm(fx.root.join("a.txt")), "by-build\n");
+    assert_eq!(norm(fx.root.join("docs").join("new.md")), "new\n");
+    let _ = provider.release(&lease);
+}
+
 #[test]
 fn sequential_sibling_disjoint_changes_stack_in_baseline() {
     let fx = RepoFixture::with_base_files();

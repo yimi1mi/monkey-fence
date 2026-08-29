@@ -337,6 +337,28 @@ impl Git {
         Ok(oid)
     }
 
+    /// 把集成基线 ref 指回给定提交(合并应用失败的整体回滚用)。
+    /// `target = None` 表示合并前 ref 不存在 → 删除该 ref。
+    /// 幂等:ref 已处于目标状态时 no-op。
+    pub fn reset_integration_ref(&self, refname: &str, target: Option<git2::Oid>) -> Result<()> {
+        match target {
+            Some(oid) => {
+                let commit = self.repo.find_commit(oid)?;
+                if self.read_ref(refname)? == Some(oid) {
+                    return Ok(());
+                }
+                self.repo
+                    .reference(refname, commit.id(), true, "mf: rollback integration ref")?;
+            }
+            None => {
+                if let Some(mut reference) = self.repo.find_reference(refname).ok() {
+                    reference.delete()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// 删除任务全部集成基线 ref(任务终态清理);返回删除数。
     pub fn delete_integration_refs(&self, task_id: i64) -> Result<usize> {
         let prefix = format!("refs/mf/integration/task-{task_id}-");
