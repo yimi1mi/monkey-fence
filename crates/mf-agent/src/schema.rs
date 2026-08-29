@@ -209,6 +209,16 @@ CREATE TABLE IF NOT EXISTS pending_merges (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_pending_merges_task ON pending_merges(task_id);
+CREATE TABLE IF NOT EXISTS join_deferrals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES agent_tasks(id),
+    join_step_key TEXT NOT NULL,
+    lease_key TEXT NOT NULL,
+    lease_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(task_id, join_step_key, lease_key)
+);
+CREATE INDEX IF NOT EXISTS idx_join_deferrals_task ON join_deferrals(task_id);
 ";
 
 /// 目录库 v1 DDL:仅空表地基(字段随后续里程碑补全);

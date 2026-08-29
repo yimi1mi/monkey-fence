@@ -281,6 +281,16 @@ pub struct PendingMergeRow {
     pub conflicts: Vec<String>,
 }
 
+/// join_deferrals 行:「成功父节点等待兄弟」的 join 暂缓成员资格
+/// (task + join 节点 step_key + 暂缓租约;跨重启持久化,Store 是行为源)。
+#[derive(Debug, Clone)]
+pub struct JoinDeferralRow {
+    pub id: i64,
+    pub task_id: i64,
+    pub join_step_key: String,
+    pub lease: crate::execution_directory::ExecutionLease,
+}
+
 /// 手动重试模式(设计 §9.6):继续仍存活的交互式会话,或创建新会话。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryMode {

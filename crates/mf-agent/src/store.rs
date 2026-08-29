@@ -131,6 +131,20 @@ impl Store {
                 .context("补齐 pipeline_revisions.snapshot_json 列失败")?;
             }
         }
+        // join 暂缓持久化(旧库补表;新库由 V1 DDL 创建,幂等)
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS join_deferrals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL REFERENCES agent_tasks(id),
+                join_step_key TEXT NOT NULL,
+                lease_key TEXT NOT NULL,
+                lease_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(task_id, join_step_key, lease_key)
+            );
+            CREATE INDEX IF NOT EXISTS idx_join_deferrals_task ON join_deferrals(task_id);",
+        )
+        .context("补齐 join_deferrals 表失败")?;
         Ok(Store {
             conn: Mutex::new(conn),
         })
@@ -2241,6 +2255,140 @@ impl Store {
                 params![task_id],
             )?;
             Ok(n)
+        })
+    }
+
+    // ---------- join 暂缓持久化(Store 是行为源) ----------
+
+    /// 记录一条 join 暂缓:成功父节点的租约等待某 join 组的兄弟
+    /// (组未完整时写入;同组同租约幂等)。
+    pub fn insert_join_deferral(
+        &self,
+        task_id: i64,
+        join_step_key: &str,
+        lease: &crate::execution_directory::ExecutionLease,
+    ) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT OR IGNORE INTO join_deferrals
+                     (task_id, join_step_key, lease_key, lease_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    task_id,
+                    join_step_key,
+                    lease.id,
+                    serde_json::to_string(lease)?,
+                    now()
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// join 暂缓列表;`task_id = None` 返回全部任务(重启恢复用)。
+    pub fn list_join_deferrals(
+        &self,
+        task_id: Option<i64>,
+    ) -> Result<Vec<crate::model::JoinDeferralRow>> {
+        self.with_conn(|c| {
+            let (sql, with_param) = match task_id {
+                Some(_) => (
+                    "SELECT id, task_id, join_step_key, lease_json FROM join_deferrals
+                     WHERE task_id = ?1 ORDER BY id",
+                    true,
+                ),
+                None => (
+                    "SELECT id, task_id, join_step_key, lease_json FROM join_deferrals
+                     ORDER BY id",
+                    false,
+                ),
+            };
+            let mut stmt = c.prepare(sql)?;
+            let map_row = |r: &rusqlite::Row<'_>| -> std::result::Result<
+                crate::model::JoinDeferralRow,
+                rusqlite::Error,
+            > {
+                let lease_json: String = r.get(3)?;
+                let lease: crate::execution_directory::ExecutionLease =
+                    serde_json::from_str(&lease_json).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            lease_json.len(),
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                Ok(crate::model::JoinDeferralRow {
+                    id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    join_step_key: r.get(2)?,
+                    lease,
+                })
+            };
+            let rows = if with_param {
+                stmt.query_map(params![task_id], map_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            } else {
+                stmt.query_map([], map_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            Ok(rows)
+        })
+    }
+
+    /// 删除一组租约的全部 join 暂缓行(批汇合/进入待决/释放时)。
+    pub fn delete_join_deferrals_for_leases(&self, lease_keys: &[String]) -> Result<usize> {
+        if lease_keys.is_empty() {
+            return Ok(0);
+        }
+        self.with_conn(|c| {
+            let placeholders = vec!["?"; lease_keys.len()].join(",");
+            let sql = format!("DELETE FROM join_deferrals WHERE lease_key IN ({placeholders})");
+            let params: Vec<&dyn rusqlite::ToSql> = lease_keys
+                .iter()
+                .map(|k| k as &dyn rusqlite::ToSql)
+                .collect();
+            let n = c.execute(&sql, params.as_slice())?;
+            Ok(n)
+        })
+    }
+
+    /// 删除任务的全部 join 暂缓行(归档/取消/终态清理)。
+    pub fn delete_join_deferrals_for_task(&self, task_id: i64) -> Result<usize> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "DELETE FROM join_deferrals WHERE task_id = ?1",
+                params![task_id],
+            )?;
+            Ok(n)
+        })
+    }
+
+    /// 全部任务的 held 执行租约行(重启重建 held_leases/step_leases 用)。
+    pub fn list_held_execution_leases(&self) -> Result<Vec<ExecutionLeaseRow>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT lease_key, run_id, step_id, task_id, provider, path, isolated,
+                        metadata_json, status, created_at, released_at
+                 FROM execution_leases WHERE status = 'held' ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok(ExecutionLeaseRow {
+                        lease_key: r.get(0)?,
+                        run_id: r.get(1)?,
+                        step_id: r.get(2)?,
+                        task_id: r.get(3)?,
+                        provider: r.get(4)?,
+                        path: r.get(5)?,
+                        isolated: r.get::<_, i64>(6)? != 0,
+                        metadata_json: r.get(7)?,
+                        status: r.get(8)?,
+                        created_at: r.get(9)?,
+                        released_at: r.get(10)?,
+                    })
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(rows)
         })
     }
 

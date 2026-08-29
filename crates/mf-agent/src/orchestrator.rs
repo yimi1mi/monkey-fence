@@ -235,6 +235,8 @@ impl Orchestrator {
         }
         // 待决汇合恢复:持久化的冲突行装回内存,任务保持 needs-you
         orch.restore_pending_merges();
+        // held 执行租约与 join 暂缓从 Store 重建(行为源;含崩溃窗口冲刷)
+        orch.restore_held_leases();
         std::thread::Builder::new()
             .name("mf-dispatch".into())
             .spawn({
@@ -435,6 +437,10 @@ impl Orchestrator {
                 }
             }
         }
+        // 4) 任务的 join 暂缓行随终态清理(仍持有失败时不清理,保持可恢复)
+        if errors.is_empty() {
+            let _ = self.store.delete_join_deferrals_for_task(task_id);
+        }
         errors
     }
 
@@ -450,6 +456,9 @@ impl Orchestrator {
                 log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
             }
             let _ = self.store.release_execution_lease(&lease.id);
+            let _ = self
+                .store
+                .delete_join_deferrals_for_leases(&[lease.id.clone()]);
             self.step_leases.lock().retain(|_, l| l.id != lease.id);
             return;
         }
@@ -459,6 +468,9 @@ impl Orchestrator {
                 log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
             }
             let _ = self.store.release_execution_lease(&row.lease_key);
+            let _ = self
+                .store
+                .delete_join_deferrals_for_leases(&[row.lease_key.clone()]);
         }
     }
 
@@ -969,6 +981,45 @@ impl Orchestrator {
         *self.pending_merges.lock() = by_task;
     }
 
+    /// 重启恢复:held 执行租约与 join 暂缓从 Store 重建(Store 是行为源)。
+    /// - `execution_leases.status='held'` 行 → held_leases(run→租约)与
+    ///   step_leases(step→租约);join 暂缓中的成功父租约由此复活,
+    ///   后续兄弟结算才能汇合完整批、释放、下游看到全部上游;
+    /// - 清理指向已释放租约的暂缓行(自愈);
+    /// - 冲刷「全部父终态但批未汇合」的崩溃窗口(结算后、汇合前死亡)。
+    fn restore_held_leases(&self) {
+        let rows = match self.store.list_held_execution_leases() {
+            Ok(rows) => rows,
+            Err(e) => {
+                log::error!("重启恢复 held 执行租约失败: {e:#}");
+                return;
+            }
+        };
+        let mut tasks: HashSet<i64> = HashSet::new();
+        for row in rows {
+            let lease = lease_from_row(&row);
+            tasks.insert(row.task_id);
+            self.step_leases.lock().insert(row.step_id, lease.clone());
+            if let Some(run_id) = row.run_id {
+                self.held_leases.lock().insert(run_id, lease);
+            }
+        }
+        let deferrals = self.store.list_join_deferrals(None).unwrap_or_default();
+        let stale: Vec<String> = deferrals
+            .iter()
+            .filter(|d| !self.step_leases.lock().values().any(|l| l.id == d.lease.id))
+            .map(|d| d.lease.id.clone())
+            .collect();
+        if !stale.is_empty() {
+            if let Err(e) = self.store.delete_join_deferrals_for_leases(&stale) {
+                log::warn!("清理失效 join 暂缓行失败: {e:#}");
+            }
+        }
+        for task_id in tasks {
+            self.flush_completed_join_batches(task_id);
+        }
+    }
+
     /// 汇合一批隔离租约;返回冲突列表(空 = 全部合并成功)。
     fn merge_leases(&self, leases: &[ExecutionLease]) -> Result<Vec<String>> {
         let isolated: Vec<ExecutionLease> = leases.iter().filter(|l| l.isolated).cloned().collect();
@@ -1000,12 +1051,15 @@ impl Orchestrator {
         }
     }
 
-    /// 释放具体租约对象(进程内映射 + 数据库行)。
+    /// 释放具体租约对象(进程内映射 + 数据库行 + join 暂缓行)。
     fn release_lease_of_lease(&self, lease: &ExecutionLease) {
         if let Err(e) = self.directory.release(lease) {
             log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
         }
         let _ = self.store.release_execution_lease(&lease.id);
+        let _ = self
+            .store
+            .delete_join_deferrals_for_leases(&[lease.id.clone()]);
         self.held_leases.lock().retain(|_, l| l.id != lease.id);
         self.step_leases.lock().retain(|_, l| l.id != lease.id);
     }
@@ -1301,16 +1355,14 @@ impl Orchestrator {
             Settlement::Complete { .. } => {
                 // 隔离租约先汇合回项目目录;冲突 → needs-you(租约保持持有)
                 self.merge_or_pend(run);
-                // join 批未完整时暂缓 promote:下游必须从含全部上游的
-                // 汇合基线检出,不能在父分支半途派发
-                if !self.has_incomplete_join_deferral(run.task_id) {
-                    if let Some(rev) = self.store.active_revision(run.task_id).ok().flatten() {
-                        if let Ok(promoted) =
-                            self.store.with_tx(|c| Store::promote_ready_tx(c, rev.id))
-                        {
-                            for s in promoted {
-                                self.emit(SchedulerEvent::StepUpdated(s));
-                            }
+                // promote 无全局 join 门控:join 组的下游由 promote 的
+                // 依赖终态检查 + tick 的暂缓门控(依赖租约仍持有时不派发)
+                // 共同保证从含全部上游的汇合基线检出;无关分支不受阻塞
+                if let Some(rev) = self.store.active_revision(run.task_id).ok().flatten() {
+                    if let Ok(promoted) = self.store.with_tx(|c| Store::promote_ready_tx(c, rev.id))
+                    {
+                        for s in promoted {
+                            self.emit(SchedulerEvent::StepUpdated(s));
                         }
                     }
                 }
@@ -1392,11 +1444,12 @@ impl Orchestrator {
 
     /// 成功结算后的隔离租约汇合:合并成功 → 释放;
     /// 冲突/合并出错 → 租约保持持有并进入待决列表,任务 → needs-you。
-    /// 成功结算后的隔离租约汇合(join 感知,设计 §9.4):
-    /// - 该步骤是某个多父 join 节点的父节点 → 等组内全部父步骤终态后,
-    ///   把全部成功父节点的租约作为**一个完整批次**交给提供器按稳定
-    ///   拓扑/键序合并;批完整前不合并、不释放、不推进集成基线
-    ///   (并行父分支不得静默覆盖/丢修改,下游必须看到全部上游);
+    /// 成功结算后的隔离租约汇合(join 按组独立判定,设计 §9.4):
+    /// - 本步骤参与的**每个**多父 join 组各自检查完整性(禁止把共享父
+    ///   参与的多个组 union 成一个大组):组内全部父步骤终态 → 该组
+    ///   全部成功父节点的持有租约作为**一个完整批次**交给提供器合并;
+    /// - 组不完整 → 该租约保持持有并**持久化暂缓**(Store 是行为源),
+    ///   等待兄弟终态;共享父已随其他完整组汇合释放时不再记录;
     /// - 不参与任何 join → 单租约立即汇合(串行链语义不变);
     /// - 批次成功 → 释放全部;冲突/出错 → 全部保持持有并进入待决列表,
     ///   任务 → needs-you。
@@ -1410,49 +1463,120 @@ impl Orchestrator {
             self.release_lease_of_lease(&lease);
             return;
         }
-        match self.join_merge_batch(run, &lease) {
-            Some(batch) => self.apply_merge_batch(run.task_id, batch, run.id),
-            None => {
-                // join 批未完整:租约保持持有,等待兄弟节点终态;
-                // 下游 promote 由 has_incomplete_join_deferral 门控
+        let Some((steps, me_id)) = self.active_steps_of_run(run) else {
+            // 活动修订不可读:退回串行语义,单租约汇合
+            self.apply_merge_batch(run.task_id, vec![lease], run.id);
+            return;
+        };
+        let groups = Self::join_groups_of(&steps, me_id);
+        if groups.is_empty() {
+            self.apply_merge_batch(run.task_id, vec![lease], run.id);
+            return;
+        }
+        for (join_key, parents) in groups {
+            if parents.iter().all(|p| p.status.terminal()) {
+                let batch = self.held_leases_of_parents(run.task_id, &parents, Some(&lease));
+                if !batch.is_empty() {
+                    self.apply_merge_batch(run.task_id, batch, run.id);
+                }
+            } else if self.step_leases.lock().values().any(|l| l.id == lease.id) {
+                // 组未完整:租约仍持有才记录暂缓(可能已随先前的完整组
+                // 汇合释放,此时不得留下指向已释放租约的暂缓行)
+                if let Err(e) = self
+                    .store
+                    .insert_join_deferral(run.task_id, &join_key, &lease)
+                {
+                    log::error!("持久化 join 暂缓失败: {e:#}");
+                }
             }
         }
     }
 
-    /// join 批判定:`Some(batch)` = 可立即汇合的完整租约批(单租约,或
-    /// 组内全部父步骤终态时全部成功父节点的租约);`None` = 本步骤属于
-    /// 某个 join 组且组内仍有父步骤未终态(暂缓,不得提前汇合/释放)。
-    fn join_merge_batch(&self, run: &RunView, own: &ExecutionLease) -> Option<Vec<ExecutionLease>> {
-        let steps = self.store.revision_steps(run.revision_id).ok()?;
-        let me = steps.iter().find(|s| s.id == run.step_id)?;
-        // 直接子节点中的 join(多父)节点:本步骤是其父之一
-        let join_children: Vec<&StepView> = steps
-            .iter()
-            .filter(|s| s.deps.contains(&me.id) && s.deps.len() > 1)
-            .collect();
-        if join_children.is_empty() {
-            return Some(vec![own.clone()]); // 串行链/无下游:单租约立即汇合
-        }
-        // 组 = 这些 join 子节点的全部父步骤;全部终态批才完整
-        let mut parent_ids: HashSet<i64> = HashSet::new();
-        for child in &join_children {
-            parent_ids.extend(child.deps.iter().copied());
-        }
-        let parents: Vec<&StepView> = steps
-            .iter()
-            .filter(|s| parent_ids.contains(&s.id))
-            .collect();
-        if parents.iter().any(|p| !p.status.terminal()) {
+    /// 活动修订的步骤与本 run 步骤在其中的 id(结算把状态写到活动修订
+    /// 同 step_key 的步骤;修订编辑后 id 会变,按 step_key 对齐)。
+    fn active_steps_of_run(&self, run: &RunView) -> Option<(Vec<StepView>, i64)> {
+        let rev = self.store.active_revision(run.task_id).ok().flatten()?;
+        let steps = self.store.revision_steps(rev.id).ok()?;
+        if steps.is_empty() {
             return None;
         }
-        // 批 = 全部成功父节点仍持有的租约(失败/跳过的父节点无产出可汇)
-        let step_leases = self.step_leases.lock();
-        let batch: Vec<ExecutionLease> = parents
+        let me = steps
+            .iter()
+            .find(|s| s.id == run.step_id)
+            .map(|s| s.id)
+            .or_else(|| {
+                let key = self
+                    .store
+                    .step_view(run.step_id)
+                    .ok()
+                    .flatten()
+                    .map(|s| s.step_key)?;
+                steps.iter().find(|s| s.step_key == key).map(|s| s.id)
+            })?;
+        Some((steps, me))
+    }
+
+    /// `me` 作为父节点参与的每个多父 join 组(各自独立,绝不 union):
+    /// (join step_key, 该组全部父步骤),按 join step_key 稳定排序。
+    fn join_groups_of(steps: &[StepView], me_id: i64) -> Vec<(String, Vec<StepView>)> {
+        let mut join_children: Vec<&StepView> = steps
+            .iter()
+            .filter(|s| s.deps.len() > 1 && s.deps.contains(&me_id))
+            .collect();
+        join_children.sort_by_key(|s| s.id);
+        join_children
+            .into_iter()
+            .map(|child| {
+                let parents: Vec<StepView> = steps
+                    .iter()
+                    .filter(|s| child.deps.contains(&s.id))
+                    .cloned()
+                    .collect();
+                (child.step_key.clone(), parents)
+            })
+            .collect()
+    }
+
+    /// 组内成功父节点仍持有的租约(按 step_key 跨修订匹配;排除已进入
+    /// 待决汇合的租约)。`own` 是本次结算 run 的租约(优先收录)。
+    fn held_leases_of_parents(
+        &self,
+        task_id: i64,
+        parents: &[StepView],
+        own: Option<&ExecutionLease>,
+    ) -> Vec<ExecutionLease> {
+        let pending: HashSet<String> = self
+            .pending_merges
+            .lock()
+            .get(&task_id)
+            .map(|v| v.iter().map(|l| l.id.clone()).collect())
+            .unwrap_or_default();
+        let wanted: HashSet<&str> = parents
             .iter()
             .filter(|p| p.status == StepStatus::Succeeded)
-            .filter_map(|p| step_leases.get(&p.id).cloned())
+            .map(|p| p.step_key.as_str())
             .collect();
-        Some(batch)
+        let step_leases = self.step_leases.lock();
+        let mut batch: Vec<ExecutionLease> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        if let Some(own) = own {
+            if !pending.contains(&own.id) && lease_step_key(own).is_some_and(|k| wanted.contains(k))
+            {
+                batch.push(own.clone());
+                seen.insert(own.id.clone());
+            }
+        }
+        for lease in step_leases.values() {
+            if seen.contains(&lease.id) || pending.contains(&lease.id) {
+                continue;
+            }
+            if lease_step_key(lease).is_some_and(|k| wanted.contains(k)) {
+                batch.push(lease.clone());
+                seen.insert(lease.id.clone());
+            }
+        }
+        batch.sort_by_key(|l| lease_step_key(l).unwrap_or("").to_string());
+        batch
     }
 
     /// 把完整租约批汇合回项目目录:成功 → 释放全部租约;冲突/出错 →
@@ -1460,6 +1584,11 @@ impl Orchestrator {
     fn apply_merge_batch(&self, task_id: i64, leases: Vec<ExecutionLease>, trigger_run: i64) {
         if leases.is_empty() {
             return;
+        }
+        // 批有了结论(汇合或进入待决):该批租约的 join 暂缓行随之清除
+        let keys: Vec<String> = leases.iter().map(|l| l.id.clone()).collect();
+        if let Err(e) = self.store.delete_join_deferrals_for_leases(&keys) {
+            log::warn!("清除 join 暂缓行失败: {e:#}");
         }
         let conflicts = match self.merge_leases(&leases) {
             Ok(conflicts) => conflicts,
@@ -1508,37 +1637,9 @@ impl Orchestrator {
         });
     }
 
-    /// 任务是否存在"已成功、租约暂缓等待 join 兄弟"的父节点:
-    /// 暂缓期间不得 promote 下游(下游必须从含全部上游的汇合基线检出)。
-    fn has_incomplete_join_deferral(&self, task_id: i64) -> bool {
-        let Some(rev) = self.store.active_revision(task_id).ok().flatten() else {
-            return false;
-        };
-        let Ok(steps) = self.store.revision_steps(rev.id) else {
-            return false;
-        };
-        let step_has_lease = |id: i64| self.step_leases.lock().contains_key(&id);
-        for child in steps.iter().filter(|s| s.deps.len() > 1) {
-            if child
-                .deps
-                .iter()
-                .all(|pid| steps.iter().any(|s| s.id == *pid && s.status.terminal()))
-            {
-                continue; // 批已完整(已汇合或进入待决)
-            }
-            if child.deps.iter().any(|pid| {
-                steps.iter().any(|s| {
-                    s.id == *pid && s.status == StepStatus::Succeeded && step_has_lease(s.id)
-                })
-            }) {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// join 组因跳过/失败等事件补齐(全部父步骤终态)时,立即汇合
-    /// 已完整的父批次。幂等:无完整组或无持有租约则不动作。
+    /// join 组因跳过/失败/重启等事件补齐(全部父步骤终态)时,立即汇合
+    /// 已完整的父批次。按组独立判定(绝不 union),排除已进入待决汇合
+    /// 的租约。幂等:无完整组或无持有租约则不动作。
     fn flush_completed_join_batches(&self, task_id: i64) {
         let Some(rev) = self.store.active_revision(task_id).ok().flatten() else {
             return;
@@ -1546,21 +1647,18 @@ impl Orchestrator {
         let Ok(steps) = self.store.revision_steps(rev.id) else {
             return;
         };
-        for child in steps.iter().filter(|s| s.deps.len() > 1) {
-            let parents: Vec<&StepView> = steps
+        let mut joins: Vec<&StepView> = steps.iter().filter(|s| s.deps.len() > 1).collect();
+        joins.sort_by_key(|s| s.id);
+        for child in joins {
+            let parents: Vec<StepView> = steps
                 .iter()
                 .filter(|s| child.deps.contains(&s.id))
+                .cloned()
                 .collect();
             if parents.iter().any(|p| !p.status.terminal()) {
                 continue;
             }
-            let step_leases = self.step_leases.lock();
-            let batch: Vec<ExecutionLease> = parents
-                .iter()
-                .filter(|p| p.status == StepStatus::Succeeded)
-                .filter_map(|p| step_leases.get(&p.id).cloned())
-                .collect();
-            drop(step_leases);
+            let batch = self.held_leases_of_parents(task_id, &parents, None);
             if !batch.is_empty() {
                 self.apply_merge_batch(task_id, batch, 0);
             }
@@ -1945,7 +2043,16 @@ impl Orchestrator {
         if !self.global.try_begin_probe() {
             return Ok(());
         }
-        // 收集可派发 Step(按任务 → Step id 顺序)
+        // 收集可派发 Step(按任务 → Step id 顺序)。
+        // join 暂缓门控(按依赖精确阻塞):依赖步骤的租约仍持有
+        //(等待 join 兄弟汇合/待决冲突解决)时不得派发 —— 下游必须从
+        // 含全部上游的汇合基线检出;无关分支不受影响。
+        let deferred_keys: HashSet<String> = self
+            .step_leases
+            .lock()
+            .values()
+            .filter_map(|l| lease_step_key(l).map(str::to_string))
+            .collect();
         let mut candidates: Vec<(TaskView, StepView)> = Vec::new();
         for task in self.store.list_tasks(false)? {
             if task.status != TaskStatus::Running || task.paused {
@@ -1954,10 +2061,21 @@ impl Orchestrator {
             let Some(rev) = self.store.active_revision(task.id)? else {
                 continue;
             };
-            for step in self.store.revision_steps(rev.id)? {
-                if step.status == StepStatus::Ready {
-                    candidates.push((task.clone(), step));
+            let steps = self.store.revision_steps(rev.id)?;
+            let key_of: HashMap<i64, &str> =
+                steps.iter().map(|s| (s.id, s.step_key.as_str())).collect();
+            for step in &steps {
+                if step.status != StepStatus::Ready {
+                    continue;
                 }
+                if step
+                    .deps
+                    .iter()
+                    .any(|d| key_of.get(d).is_some_and(|k| deferred_keys.contains(*k)))
+                {
+                    continue; // 上游租约未汇合:等 join 批完整后再派发
+                }
+                candidates.push((task.clone(), step.clone()));
             }
         }
         // 会话键占用表:running run 的 session key
@@ -2714,6 +2832,12 @@ fn lease_from_row(row: &ExecutionLeaseRow) -> ExecutionLease {
             .and_then(|json| serde_json::from_str(json).ok())
             .unwrap_or(serde_json::Value::Null),
     }
+}
+
+/// 租约元数据中的 step_key(worktree/scripted 提供器都会写入;
+/// join 组成员与暂缓门控按它跨修订对齐)。
+fn lease_step_key(lease: &ExecutionLease) -> Option<&str> {
+    lease.metadata.get("step_key").and_then(|v| v.as_str())
 }
 
 /// 工作流节点初始提示:Task goal + 上游 Handoff 注入 + `${nodes.*}` 变量替换
