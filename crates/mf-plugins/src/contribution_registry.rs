@@ -3,12 +3,13 @@
 //! 因此贡献 id 本身允许包含 `.`。
 
 use crate::manifest::{
-    ExecutionDirectoryContribution, NodeTypeContribution, PluginManifest, SecretStoreContribution,
-    UiSchemaContribution, WorkflowTemplateContribution,
+    NodeTypeContribution, PluginManifest, SecretStoreContribution, UiSchemaContribution,
+    WorkflowTemplateContribution,
 };
 use crate::PluginEntry;
 
 pub use crate::manifest::AgentTypeContribution;
+pub use crate::manifest::ExecutionDirectoryContribution;
 
 /// 贡献所属的插件来源(运行期固定版本用)。
 #[derive(Debug, Clone)]

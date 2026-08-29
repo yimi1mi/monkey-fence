@@ -37,23 +37,40 @@ impl WorkflowPluginPins for PluginHostPins {
     }
 }
 
-/// 解析项目的执行目录提供器:插件贡献声明隔离能力的 worktree 优先
-/// (Git 仓库才可创建 worktree),否则回退内核共享项目目录。
+/// 在执行目录贡献里按完整贡献 ID 定位 worktree 提供器
+/// (贡献 id 必须精确是 `worktree`,不是任意"声明隔离"的贡献)。
+/// 返回命中的完整贡献 ID(用于诊断日志)。
+pub fn worktree_contribution_id(
+    directories: &[(
+        String,
+        mf_plugins::contribution_registry::ContributionSource,
+        mf_plugins::contribution_registry::ExecutionDirectoryContribution,
+    )],
+) -> Option<String> {
+    directories
+        .iter()
+        .find(|(full_id, _, contribution)| {
+            contribution.isolates && contribution.id == "worktree" && full_id.ends_with(".worktree")
+        })
+        .map(|(full_id, _, _)| full_id.clone())
+}
+
+/// 解析项目的执行目录提供器:按完整贡献 ID(`*.worktree`)命中插件贡献
+/// 才使用 worktree 隔离(Git 仓库才可创建),否则回退内核共享项目目录。
 fn directory_provider_for(
     root: &Path,
     plugins: &Arc<PluginRegistry>,
 ) -> Arc<dyn mf_agent::execution_directory::ExecutionDirectoryProvider> {
-    // 插件贡献的执行目录提供器:声明隔离能力的优先(Git 仓库才可用
-    // worktree);未命中或创建失败回退内核共享项目目录。
     let directories = plugins.contributions().execution_directories();
-    if directories
-        .iter()
-        .any(|(_, _, contribution)| contribution.isolates && mf_vcs::git::Git::is_repo(root))
-    {
-        if let Ok(provider) =
-            mf_plugins::git_worktree_provider::GitWorktreeProvider::new(root.to_path_buf())
-        {
-            return Arc::new(provider);
+    if let Some(contribution_id) = worktree_contribution_id(&directories) {
+        if mf_vcs::git::Git::is_repo(root) {
+            match mf_plugins::git_worktree_provider::GitWorktreeProvider::new(root.to_path_buf()) {
+                Ok(provider) => {
+                    log::info!("执行目录提供器:{contribution_id}(worktree 隔离)");
+                    return Arc::new(provider);
+                }
+                Err(e) => log::warn!("worktree 提供器初始化失败,回退共享目录: {e:#}"),
+            }
         }
     }
     Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default())
@@ -689,5 +706,62 @@ mod agent_launch_selection_tests {
         assert!(prompt.is_none(), "空白目标不得注入提示");
         apply_task_goal(&mut prompt, "修复登录超时");
         assert_eq!(prompt.as_deref(), Some("修复登录超时"));
+    }
+}
+
+#[cfg(test)]
+mod worktree_contribution_tests {
+    use super::*;
+    use mf_plugins::contribution_registry::ContributionSource;
+
+    fn directory(
+        id: &str,
+        isolates: bool,
+    ) -> mf_plugins::contribution_registry::ExecutionDirectoryContribution {
+        mf_plugins::contribution_registry::ExecutionDirectoryContribution {
+            id: id.into(),
+            name: id.into(),
+            kind: id.into(),
+            supports_parallel: isolates,
+            isolates,
+            description: String::new(),
+        }
+    }
+
+    fn source(full_id: &str) -> ContributionSource {
+        ContributionSource {
+            plugin_full_id: full_id.into(),
+            plugin_version: "0.1.0".into(),
+            content_hash: String::new(),
+        }
+    }
+
+    #[test]
+    fn worktree_provider_resolves_only_by_full_contribution_id() {
+        // 伪装的"隔离但不是 worktree"贡献不得命中
+        let decoy = (
+            "evil.plugin.not-worktree".to_string(),
+            source("evil.plugin"),
+            directory("not-worktree", true),
+        );
+        assert_eq!(worktree_contribution_id(&[decoy]), None);
+
+        // 正主:完整贡献 ID 以 .worktree 结尾且 id == worktree
+        let real = (
+            "monkeyfence.directories.worktree".to_string(),
+            source("monkeyfence.directories"),
+            directory("worktree", true),
+        );
+        assert_eq!(
+            worktree_contribution_id(&[real.clone()]),
+            Some("monkeyfence.directories.worktree".to_string())
+        );
+        // id 是 worktree 但插件声明为不隔离:不是可用 worktree 提供器
+        let weak = (
+            "monkeyfence.directories.worktree".to_string(),
+            source("monkeyfence.directories"),
+            directory("worktree", false),
+        );
+        assert_eq!(worktree_contribution_id(&[weak]), None);
     }
 }

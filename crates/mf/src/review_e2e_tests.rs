@@ -23,7 +23,8 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
 }
 
 fn dir_hash(path: &Path) -> String {
-    // 目录内容稳定指纹(相对路径 + 文件字节)
+    // 目录内容稳定指纹:相对路径 + 内容 SHA-256(等长改写也会被检出)
+    use sha2::{Digest, Sha256};
     let mut acc = String::new();
     fn walk(prefix: &str, path: &Path, acc: &mut String) {
         let mut entries: Vec<_> = std::fs::read_dir(path)
@@ -41,7 +42,8 @@ fn dir_hash(path: &Path) -> String {
                 walk(&rel, &entry.path(), acc);
             } else {
                 let bytes = std::fs::read(entry.path()).unwrap_or_default();
-                acc.push_str(&format!("{rel}:{}:", bytes.len()));
+                let digest = Sha256::digest(&bytes);
+                acc.push_str(&format!("{rel}:{}:{:x}", bytes.len(), digest));
             }
         }
     }
@@ -359,4 +361,18 @@ fn workspace_entities_mount_and_run_monitor_projects(cx: &mut gpui::TestAppConte
 
     orch.stop();
     ctx.close_project(&project.path().to_path_buf());
+}
+
+#[test]
+fn dir_hash_detects_equal_length_rewrites() {
+    // 指纹必须包含内容 SHA-256:等长改写(旧实现只看长度)也要被检出
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "AAAA\n").unwrap();
+    let before = dir_hash(dir.path());
+    std::fs::write(dir.path().join("a.txt"), "BBBB\n").unwrap();
+    let after = dir_hash(dir.path());
+    assert_ne!(before, after, "等长改写必须改变目录哈希");
+    // 内容相同(即使重写)哈希稳定
+    std::fs::write(dir.path().join("a.txt"), "AAAA\n").unwrap();
+    assert_eq!(before, dir_hash(dir.path()));
 }
