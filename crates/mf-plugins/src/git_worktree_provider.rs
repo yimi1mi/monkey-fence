@@ -22,10 +22,29 @@ use std::collections::HashSet;
 /// 提供器 ID(清单 `execution_directory_providers[].id`)。
 pub const PROVIDER_ID: &str = "worktree";
 
+/// 合并事务日志目录(位于仓库 `.git` 元数据内,不污染工作目录)。
+const JOURNAL_DIR: &str = "mf-merge-journals";
+
+/// 测试注入的合并故障点(生产恒为 None):
+/// 模拟“进程死亡”(不回滚、事务日志保留)与回滚自身失败。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MergeFault {
+    /// 事务日志写入后、ref 推进前死亡。
+    CrashAfterJournal,
+    /// ref 推进后、文件应用前死亡。
+    CrashAfterRefAdvance,
+    /// 第 N 个文件写入后死亡(不回滚)。
+    CrashAfterFiles(usize),
+    /// 应用失败后的回滚动作自身失败(验证回滚错误聚合)。
+    FailUndo,
+}
+
 pub struct GitWorktreeProvider {
     repo_root: PathBuf,
     /// `.worktrees` 根;非 Git 根为 None(回退共享目录)。
     worktrees_root: Option<PathBuf>,
+    /// 测试注入的合并故障点(生产恒 None)。
+    fault: parking_lot::Mutex<Option<MergeFault>>,
 }
 
 impl GitWorktreeProvider {
@@ -35,13 +54,25 @@ impl GitWorktreeProvider {
             Ok(GitWorktreeProvider {
                 repo_root,
                 worktrees_root: Some(git.worktree_root()?),
+                fault: parking_lot::Mutex::new(None),
             })
         } else {
             Ok(GitWorktreeProvider {
                 repo_root,
                 worktrees_root: None,
+                fault: parking_lot::Mutex::new(None),
             })
         }
+    }
+
+    /// 注入合并故障点(仅测试)。
+    #[cfg(test)]
+    pub(crate) fn set_merge_fault(&self, fault: MergeFault) {
+        *self.fault.lock() = Some(fault);
+    }
+
+    fn current_fault(&self) -> Option<MergeFault> {
+        *self.fault.lock()
     }
 
     fn worktree_name(ctx: &LeaseContext) -> String {
@@ -128,6 +159,9 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
         let head_tree_id = repo.head()?.peel_to_commit()?.tree_id();
         let refname = merge_integration_ref(&worktree_leases)?;
         let git_probe = Git::open(&self.repo_root)?;
+        // 上次合并留下的未完成事务日志必须先收敛(重放/清理),
+        // 否则预检会把崩溃残留当成冲突/漂移误判
+        self.recover_merge_journals()?;
         // 当前集成 ref 树(已含兄弟节点已汇合的修改;无 ref 时为 None)
         let integrated_tree: Option<git2::Oid> = git_probe
             .read_ref(&refname)?
@@ -229,7 +263,9 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
             .unwrap_or(head_tree_id);
         let tree_id = build_merged_tree(&repo, base_tree, &changes)?;
 
-        // 4. 记录旧 ref → 原子推进集成基线(下游 acquire 从汇合结果检出)。
+        // 4. 合并事务日志(旧 ref、目标 tree、目标文件内容与应用前
+        //    原状态)先于 ref 推进持久化:ref 更新与文件应用之间的
+        //    任何崩溃都可在启动(或下次合并前)重放/回滚一致收敛。
         let git = Git::open(&self.repo_root)?;
         let step_label = worktree_leases
             .first()
@@ -237,6 +273,20 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
             .and_then(|v| v.as_str())
             .unwrap_or("step");
         let ref_before = git.read_ref(&refname)?;
+        let journal = MergeJournal {
+            version: 1,
+            refname: refname.clone(),
+            ref_before: ref_before.map(|o| o.to_string()),
+            target_tree: tree_id.to_string(),
+            changes: self.snapshot_originals(&changes)?,
+        };
+        let journal_path = journal_file_for(&repo, &refname);
+        write_journal_atomic(&journal_path, &journal)?;
+        if self.current_fault() == Some(MergeFault::CrashAfterJournal) {
+            return Err(anyhow::anyhow!("(测试注入)事务日志写入后进程死亡"));
+        }
+
+        // 5. 原子推进集成基线 ref(下游 acquire 从汇合结果检出)。
         git.advance_integration_ref(
             &refname,
             tree_id,
@@ -245,20 +295,42 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
                 worktree_leases.len()
             ),
         )?;
-
-        // 5. 可回滚应用:撤销日志逐项记录,任一失败 → 逆序恢复项目目录
-        //    + 集成 ref 指回合并前(整体回到调用前状态)。
-        if let Err(apply_err) = self.apply_changes_with_rollback(&changes) {
-            if let Err(ref_err) = git.reset_integration_ref(&refname, ref_before) {
-                // 双重失败是最糟路径:如实上报(目录已恢复部分 + ref 未回滚;
-                // 重试合并以同一源幂等收敛)
-                return Err(
-                    apply_err.context(format!("合并应用失败且回滚集成 ref 失败: {ref_err:#}"))
-                );
-            }
-            return Err(apply_err.context("合并应用失败,项目目录与集成 ref 已回滚"));
+        if self.current_fault() == Some(MergeFault::CrashAfterRefAdvance) {
+            return Err(anyhow::anyhow!("(测试注入)ref 推进后进程死亡"));
         }
-        Ok(MergeOutcome::Merged)
+
+        // 6. 应用到项目目录;任一步失败逆序回滚已应用部分,回滚错误
+        //    聚合上报(绝不忽略、绝不谎报已回滚)。
+        match self.apply_journal_with_rollback(&journal) {
+            ApplyOutcome::Applied => {
+                let _ = std::fs::remove_file(&journal_path);
+                Ok(MergeOutcome::Merged)
+            }
+            ApplyOutcome::Crashed(msg) => Err(anyhow::anyhow!("(测试注入){msg}")),
+            ApplyOutcome::Failed {
+                error,
+                rolled_back_cleanly: true,
+            } => {
+                if let Err(ref_err) = git.reset_integration_ref(&refname, ref_before) {
+                    // ref 回滚失败:保留事务日志,如实聚合上报
+                    return Err(error.context(format!(
+                        "合并应用失败且回滚集成 ref 失败(已保留合并事务日志,恢复将重放): {ref_err:#}"
+                    )));
+                }
+                let _ = std::fs::remove_file(&journal_path);
+                Err(error.context("合并应用失败,项目目录与集成 ref 已回滚"))
+            }
+            ApplyOutcome::Failed {
+                error,
+                rolled_back_cleanly: false,
+            } => {
+                // 回滚未完全成功:不得宣称回滚成功 —— ref 保持推进、
+                // 事务日志保留,启动/下次合并前重放收敛(可恢复)
+                Err(error.context(
+                    "合并应用失败且回滚未完全成功:已保留合并事务日志,启动或下次合并前将重放恢复",
+                ))
+            }
+        }
     }
 
     fn release(&self, lease: &ExecutionLease) -> Result<()> {
@@ -299,6 +371,10 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
         let git = Git::open(&self.repo_root)?;
         git.delete_integration_refs(task_id)?;
         Ok(())
+    }
+
+    fn recover_interrupted(&self) -> Result<()> {
+        self.recover_merge_journals()
     }
 }
 
@@ -355,79 +431,366 @@ struct MergeChange {
     content: Option<Vec<u8>>,
 }
 
-/// 应用失败时的撤销动作(逆序执行恢复项目目录)。
-enum UndoOp {
-    /// 恢复被覆盖文件的旧内容。
-    RestoreOverwritten { path: PathBuf, bytes: Vec<u8> },
-    /// 删除本次新建的文件(新建的空目录保留,不影响内容语义)。
-    RemoveCreated { path: PathBuf },
-    /// 恢复被删除的文件。
-    RestoreDeleted { path: PathBuf, bytes: Vec<u8> },
+/// 事务日志中的变更:目标内容 + 应用前项目目录原状态(回滚/重放依据)。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct JournaledChange {
+    path: String,
+    deleted: bool,
+    /// 目标内容(hex;删除项为 None)。
+    content_hex: Option<String>,
+    /// 应用前项目目录该路径是否存在。
+    original_present: bool,
+    /// 应用前字节(hex;不存在为 None)。
+    original_hex: Option<String>,
+}
+
+/// 合并事务日志:ref 推进与文件应用之间崩溃时,启动(或下次合并前)
+/// 据此重放(已推进)或回滚(未推进),一致收敛。
+#[derive(serde::Serialize, serde::Deserialize)]
+struct MergeJournal {
+    version: u32,
+    refname: String,
+    /// 推进前的 ref 目标(None = 推进前 ref 不存在)。
+    ref_before: Option<String>,
+    /// 推进到的目标树。
+    target_tree: String,
+    changes: Vec<JournaledChange>,
+}
+
+/// 应用结果:成功 / 注入崩溃(不回滚,日志保留)/ 失败(是否完全回滚)。
+enum ApplyOutcome {
+    Applied,
+    Crashed(String),
+    Failed {
+        error: anyhow::Error,
+        rolled_back_cleanly: bool,
+    },
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(hex: &str) -> Result<Vec<u8>> {
+    anyhow::ensure!(hex.len() % 2 == 0, "hex 长度非法: {hex}");
+    (0..hex.len() / 2)
+        .map(|i| {
+            u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+                .with_context(|| format!("hex 字节非法: {hex}"))
+        })
+        .collect()
+}
+
+fn journal_dir_of(repo: &git2::Repository) -> PathBuf {
+    repo.path().join(JOURNAL_DIR)
+}
+
+fn journal_file_for(repo: &git2::Repository, refname: &str) -> PathBuf {
+    journal_dir_of(repo).join(format!("{}.json", refname.replace('/', "_")))
+}
+
+/// 事务日志原子写入:同目录临时文件 → 落盘 → 改名。
+fn write_journal_atomic(path: &std::path::Path, journal: &MergeJournal) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(serde_json::to_string(journal)?.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 impl GitWorktreeProvider {
-    /// 把变更应用到项目工作目录;每一步先记撤销项再动手,
-    /// 任一失败逆序回滚已应用部分后返回错误。
-    fn apply_changes_with_rollback(&self, changes: &[MergeChange]) -> Result<()> {
-        let mut undo: Vec<UndoOp> = Vec::new();
-        let apply = (|| -> Result<()> {
-            for change in changes {
-                let dst = self.repo_root.join(&change.path);
-                if change.deleted {
-                    if dst.is_file() {
-                        let bytes = std::fs::read(&dst)
-                            .with_context(|| format!("读取待删文件失败: {}", dst.display()))?;
-                        std::fs::remove_file(&dst)
-                            .with_context(|| format!("合并删除失败: {}", dst.display()))?;
-                        undo.push(UndoOp::RestoreDeleted { path: dst, bytes });
-                    }
-                    continue;
-                }
-                if let Some(parent) = dst.parent() {
-                    if !parent.as_os_str().is_empty() {
-                        std::fs::create_dir_all(parent)
-                            .with_context(|| format!("合并建目录失败: {}", parent.display()))?;
-                    }
-                }
-                if dst.is_file() {
-                    let bytes = std::fs::read(&dst)
-                        .with_context(|| format!("读取待覆盖文件失败: {}", dst.display()))?;
-                    undo.push(UndoOp::RestoreOverwritten {
-                        path: dst.clone(),
-                        bytes,
-                    });
+    /// 采集应用前项目目录原状态(事务日志的回滚/重放依据)。
+    fn snapshot_originals(&self, changes: &[MergeChange]) -> Result<Vec<JournaledChange>> {
+        changes
+            .iter()
+            .map(|c| {
+                let dst = self.repo_root.join(&c.path);
+                let original = if dst.is_file() {
+                    std::fs::read(&dst)
+                        .with_context(|| format!("读取应用前文件失败: {}", dst.display()))?
                 } else {
-                    undo.push(UndoOp::RemoveCreated { path: dst.clone() });
+                    Vec::new()
+                };
+                Ok(JournaledChange {
+                    path: c.path.clone(),
+                    deleted: c.deleted,
+                    content_hex: c.content.as_deref().map(hex_encode),
+                    original_present: dst.is_file(),
+                    original_hex: if dst.is_file() {
+                        Some(hex_encode(&original))
+                    } else {
+                        None
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// 把事务日志中的变更应用到项目工作目录;每一步可回滚,任一失败
+    /// 逆序恢复已应用部分。回滚动作自身的错误**聚合上报**(绝不忽略);
+    /// 回滚未完全成功时 `rolled_back_cleanly = false`(调用方不得宣称
+    /// 已回滚,事务日志保留供恢复)。注入的“进程死亡”不触发回滚
+    ///(事务日志保留,由恢复重放)。
+    fn apply_journal_with_rollback(&self, journal: &MergeJournal) -> ApplyOutcome {
+        enum Step {
+            Done,
+            Crash(String),
+            Fail(anyhow::Error),
+        }
+        let mut applied: Vec<&JournaledChange> = Vec::new();
+        let outcome = (|| -> Step {
+            for change in &journal.changes {
+                if let Err(e) = self.apply_one(change) {
+                    return Step::Fail(e);
                 }
-                let content = change
-                    .content
-                    .as_deref()
-                    .expect("非删除变更的内容已在收集阶段读出");
-                std::fs::write(&dst, content)
-                    .with_context(|| format!("合并写文件失败: {}", dst.display()))?;
+                applied.push(change);
+                if self.current_fault() == Some(MergeFault::CrashAfterFiles(applied.len())) {
+                    return Step::Crash(format!(
+                        "第 {} 个文件写入后进程死亡(已应用 {} 项)",
+                        applied.len(),
+                        applied.len()
+                    ));
+                }
             }
-            Ok(())
+            Step::Done
         })();
-        match apply {
-            Ok(()) => Ok(()),
-            Err(error) => {
-                for op in undo.iter().rev() {
-                    match op {
-                        UndoOp::RestoreOverwritten { path, bytes }
-                        | UndoOp::RestoreDeleted { path, bytes } => {
-                            if let Some(parent) = path.parent() {
-                                let _ = std::fs::create_dir_all(parent);
-                            }
-                            let _ = std::fs::write(path, bytes);
-                        }
-                        UndoOp::RemoveCreated { path } => {
-                            let _ = std::fs::remove_file(path);
-                        }
+        match outcome {
+            Step::Done => ApplyOutcome::Applied,
+            Step::Crash(msg) => ApplyOutcome::Crashed(msg),
+            Step::Fail(error) => {
+                let mut failures: Vec<String> = Vec::new();
+                for change in applied.iter().rev() {
+                    if let Err(e) = self.rollback_one(change) {
+                        failures.push(format!("{}: {e:#}", change.path));
                     }
                 }
-                Err(error)
+                if failures.is_empty() {
+                    ApplyOutcome::Failed {
+                        error,
+                        rolled_back_cleanly: true,
+                    }
+                } else {
+                    ApplyOutcome::Failed {
+                        error: error.context(format!(
+                            "回滚未完全成功(已保留合并事务日志,恢复将重放):{}",
+                            failures.join("; ")
+                        )),
+                        rolled_back_cleanly: false,
+                    }
+                }
             }
         }
+    }
+
+    /// 应用单条变更(删除 → 移除存在者;写入 → 建目录 + 覆盖/新建)。
+    fn apply_one(&self, change: &JournaledChange) -> Result<()> {
+        let dst = self.repo_root.join(&change.path);
+        if change.deleted {
+            if dst.is_file() {
+                std::fs::remove_file(&dst)
+                    .with_context(|| format!("合并删除失败: {}", dst.display()))?;
+            }
+            return Ok(());
+        }
+        let content = change
+            .content_hex
+            .as_deref()
+            .map(hex_decode)
+            .transpose()?
+            .expect("非删除变更的内容已在收集阶段读出");
+        if let Some(parent) = dst.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("合并建目录失败: {}", parent.display()))?;
+            }
+        }
+        std::fs::write(&dst, content).with_context(|| format!("合并写文件失败: {}", dst.display()))
+    }
+
+    /// 回滚单条已应用变更(按应用前原状态恢复)。
+    fn rollback_one(&self, change: &JournaledChange) -> Result<()> {
+        if self.current_fault() == Some(MergeFault::FailUndo) {
+            anyhow::bail!("(测试注入)回滚动作失败: {}", change.path);
+        }
+        let dst = self.repo_root.join(&change.path);
+        if change.deleted {
+            if !change.original_present {
+                return Ok(()); // 应用前本就不存在(删除为 no-op)
+            }
+            let original = hex_decode(
+                change
+                    .original_hex
+                    .as_deref()
+                    .expect("original_present 时必有原字节"),
+            )?;
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            return std::fs::write(&dst, original)
+                .with_context(|| format!("恢复被删文件失败: {}", dst.display()));
+        }
+        if !change.original_present {
+            // 应用前不存在:本次新建的文件 → 删除(新建的空目录保留)
+            if dst.is_file() {
+                return std::fs::remove_file(&dst)
+                    .with_context(|| format!("回滚删除新建文件失败: {}", dst.display()));
+            }
+            return Ok(());
+        }
+        let original = hex_decode(
+            change
+                .original_hex
+                .as_deref()
+                .expect("original_present 时必有原字节"),
+        )?;
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&dst, original)
+            .with_context(|| format!("恢复被覆盖文件失败: {}", dst.display()))
+    }
+
+    /// 启动/合并前恢复:重放或清理未完成的事务日志,一致收敛。
+    /// - ref 已推进到目标树 → 幂等重放应用(拒绝覆盖崩溃窗口内的
+    ///   外部修改);
+    /// - ref 仍在推进前位置 → 无应用发生,清日志;
+    /// - ref 与日志都不一致 → 保留日志报错(人工处理)。
+    /// 恢复/磁盘失败如实上报,不宣称成功。
+    fn recover_merge_journals(&self) -> Result<()> {
+        if self.worktrees_root.is_none() {
+            return Ok(());
+        }
+        let repo = git2::Repository::open(&self.repo_root)?;
+        let dir = journal_dir_of(&repo);
+        if !dir.is_dir() {
+            return Ok(());
+        }
+        let mut errors: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&dir)
+            .with_context(|| format!("读取事务日志目录失败: {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Err(e) = self.recover_journal_file(&repo, &path) {
+                errors.push(format!("{}: {e:#}", path.display()));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "合并事务日志恢复失败(日志已保留,可重试):{}",
+                errors.join("; ")
+            )
+        }
+    }
+
+    fn recover_journal_file(&self, repo: &git2::Repository, path: &std::path::Path) -> Result<()> {
+        let journal: MergeJournal = serde_json::from_str(&std::fs::read_to_string(path)?)
+            .with_context(|| format!("解析事务日志失败: {}", path.display()))?;
+        let git = Git::open(&self.repo_root)?;
+        let current = git.read_ref(&journal.refname)?;
+        let target_tree = git2::Oid::from_str(&journal.target_tree).ok();
+        let current_tree = current
+            .and_then(|o| git2::Oid::from_str(&o.to_string()).ok())
+            .and_then(|oid| repo.find_commit(oid).ok())
+            .map(|c| c.tree_id());
+        if current_tree.is_some() && current_tree == target_tree {
+            // ref 已推进:重放应用直到项目目录一致
+            self.replay_journal(&journal)
+                .with_context(|| format!("重放事务日志失败: {}", path.display()))?;
+            std::fs::remove_file(path)
+                .with_context(|| format!("删除已收敛的事务日志失败: {}", path.display()))?;
+            return Ok(());
+        }
+        let ref_before = journal
+            .ref_before
+            .as_deref()
+            .and_then(|s| git2::Oid::from_str(s).ok());
+        if current == ref_before {
+            // 推进前死亡:无任何文件应用发生 → 安全清日志
+            std::fs::remove_file(path)
+                .with_context(|| format!("删除未推进的事务日志失败: {}", path.display()))?;
+            return Ok(());
+        }
+        anyhow::bail!(
+            "集成 ref {} 状态与事务日志不一致(当前 {current:?},日志 ref_before={ref_before:?}):保留日志待人工处理",
+            journal.refname
+        );
+    }
+
+    /// 幂等重放:已是目标内容 → 跳过;仍是原状态 → 写入目标;
+    /// 崩溃窗口内被外部修改(既非原也非目标)→ 拒绝覆盖,保留可恢复。
+    fn replay_journal(&self, journal: &MergeJournal) -> Result<()> {
+        for change in &journal.changes {
+            let dst = self.repo_root.join(&change.path);
+            if change.deleted {
+                match std::fs::read(&dst) {
+                    Err(_) => continue, // 已删除
+                    Ok(bytes) => {
+                        let original =
+                            change.original_hex.as_deref().map(hex_decode).transpose()?;
+                        if change.original_present && Some(bytes) == original {
+                            std::fs::remove_file(&dst)
+                                .with_context(|| format!("重放删除失败: {}", dst.display()))?;
+                        } else if change.original_present {
+                            anyhow::bail!(
+                                "{} 在崩溃后被外部修改,拒绝重放删除(请人工处理)",
+                                change.path
+                            );
+                        }
+                        // 应用前本就不存在且现在存在:外部新建,不动
+                    }
+                }
+                continue;
+            }
+            let target = hex_decode(
+                change
+                    .content_hex
+                    .as_deref()
+                    .expect("非删除变更必有目标内容"),
+            )?;
+            match std::fs::read(&dst) {
+                Ok(bytes) if bytes == target => continue, // 已应用
+                Ok(bytes) => {
+                    let original = change.original_hex.as_deref().map(hex_decode).transpose()?;
+                    if change.original_present && Some(bytes) == original {
+                        std::fs::write(&dst, &target)
+                            .with_context(|| format!("重放写入失败: {}", dst.display()))?;
+                    } else {
+                        anyhow::bail!(
+                            "{} 在崩溃后被外部修改(疑似用户编辑),拒绝覆盖(请人工处理)",
+                            change.path
+                        );
+                    }
+                }
+                Err(_) if !change.original_present => {
+                    if let Some(parent) = dst.parent() {
+                        if !parent.as_os_str().is_empty() {
+                            std::fs::create_dir_all(parent)
+                                .with_context(|| format!("重放建目录失败: {}", parent.display()))?;
+                        }
+                    }
+                    std::fs::write(&dst, &target)
+                        .with_context(|| format!("重放新建失败: {}", dst.display()))?;
+                }
+                Err(_) => anyhow::bail!(
+                    "{} 应用前存在、崩溃后被删除,拒绝盲目重建(请人工处理)",
+                    change.path
+                ),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -641,5 +1004,217 @@ pub fn contribution() -> crate::manifest::ExecutionDirectoryContribution {
         supports_parallel: true,
         isolates: true,
         description: "并行 Agent Run 各自获得独立临时 worktree,汇合时按固定顺序无冲突合并".into(),
+    }
+}
+
+#[cfg(test)]
+mod merge_journal_tests {
+    use super::*;
+    use mf_agent::execution_directory::ExecutionDirectoryProvider;
+
+    fn fixture() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = git2::Repository::init(&root).unwrap();
+        let sig = git2::Signature::now("mf", "mf@test").unwrap();
+        std::fs::write(root.join("a.txt"), "aaa\n").unwrap();
+        std::fs::write(root.join("b.txt"), "bbb\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "base", &tree, &[])
+            .unwrap();
+        (dir, root)
+    }
+
+    fn ctx(root: &PathBuf, task: i64, step: &str) -> LeaseContext {
+        LeaseContext {
+            task_id: task,
+            step_id: 0,
+            revision_id: 1,
+            attempt: 1,
+            project_root: root.clone(),
+            step_key: step.into(),
+            deps: vec![],
+        }
+    }
+
+    fn wt_path(root: &PathBuf, task: i64, step: &str) -> PathBuf {
+        root.parent()
+            .unwrap()
+            .join(".worktrees")
+            .join(format!("mf-run-{task}-{step}-1"))
+    }
+
+    fn ref_tree(root: &PathBuf, refname: &str) -> Option<git2::Oid> {
+        let repo = git2::Repository::open(root).unwrap();
+        repo.find_reference(refname)
+            .ok()
+            .and_then(|r| r.peel_to_commit().ok())
+            .map(|c| c.tree_id())
+    }
+
+    /// ref 推进后、文件应用前崩溃:重启恢复必须重放应用到一致收敛。
+    #[test]
+    fn journal_replays_after_crash_between_ref_advance_and_apply() {
+        let (_dir, root) = fixture();
+        let provider = GitWorktreeProvider::new(root.clone()).unwrap();
+        let lease = provider.acquire(&ctx(&root, 1, "a")).unwrap();
+        std::fs::write(wt_path(&root, 1, "a").join("a.txt"), "from-agent\n").unwrap();
+
+        provider.set_merge_fault(MergeFault::CrashAfterRefAdvance);
+        let err = provider.merge(&[lease.clone()]).unwrap_err();
+        assert!(format!("{err:#}").contains("ref 推进后"), "{err:#}");
+        let refname = Git::integration_ref(1, 1);
+        let target = ref_tree(&root, &refname);
+        assert!(target.is_some(), "崩溃前 ref 已推进");
+        assert_ne!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "from-agent\n",
+            "崩溃点:文件尚未应用"
+        );
+
+        // “重启”:恢复重放,直到项目目录与 ref 一致
+        provider.recover_interrupted().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "from-agent\n",
+            "恢复必须重放应用"
+        );
+        assert_eq!(ref_tree(&root, &refname), target, "ref 保持推进结果");
+        let journal_dir = git2::Repository::open(&root)
+            .unwrap()
+            .path()
+            .join(JOURNAL_DIR);
+        assert!(
+            !journal_dir.exists() || std::fs::read_dir(&journal_dir).unwrap().count() == 0,
+            "收敛后事务日志必须清除"
+        );
+        provider.release(&lease).unwrap();
+    }
+
+    /// 第 N 个文件写入后崩溃:部分应用状态经恢复重放到全部就位。
+    #[test]
+    fn journal_replays_after_crash_mid_apply() {
+        let (_dir, root) = fixture();
+        let provider = GitWorktreeProvider::new(root.clone()).unwrap();
+        let lease = provider.acquire(&ctx(&root, 2, "a")).unwrap();
+        let wt = wt_path(&root, 2, "a");
+        std::fs::write(wt.join("a.txt"), "a2\n").unwrap();
+        std::fs::write(wt.join("b.txt"), "b2\n").unwrap();
+
+        provider.set_merge_fault(MergeFault::CrashAfterFiles(1));
+        let err = provider.merge(&[lease.clone()]).unwrap_err();
+        assert!(format!("{err:#}").contains("进程死亡"), "{err:#}");
+        let refname = Git::integration_ref(2, 1);
+        assert!(ref_tree(&root, &refname).is_some(), "ref 已推进");
+
+        provider.recover_interrupted().unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a2\n");
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "b2\n");
+        provider.release(&lease).unwrap();
+    }
+
+    /// 日志写入后、ref 推进前崩溃:恢复判定“未发生”并清日志,
+    /// 项目目录零应用。
+    #[test]
+    fn journal_cleaned_when_crash_before_ref_advance() {
+        let (_dir, root) = fixture();
+        let provider = GitWorktreeProvider::new(root.clone()).unwrap();
+        let lease = provider.acquire(&ctx(&root, 3, "a")).unwrap();
+        std::fs::write(wt_path(&root, 3, "a").join("a.txt"), "a3\n").unwrap();
+
+        provider.set_merge_fault(MergeFault::CrashAfterJournal);
+        assert!(provider.merge(&[lease.clone()]).is_err());
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "aaa\n"
+        );
+        let refname = Git::integration_ref(3, 1);
+        assert!(ref_tree(&root, &refname).is_none(), "ref 未推进");
+
+        provider.recover_interrupted().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "aaa\n",
+            "推进前崩溃:恢复不得应用任何变更"
+        );
+        provider.release(&lease).unwrap();
+    }
+
+    /// 应用失败且回滚自身失败:错误必须聚合、不得宣称回滚成功;
+    /// 事务日志保留,清障后恢复可收敛。
+    #[test]
+    fn rollback_failure_aggregates_errors_and_retains_journal_for_recovery() {
+        let (_dir, root) = fixture();
+        let provider = GitWorktreeProvider::new(root.clone()).unwrap();
+        let lease = provider.acquire(&ctx(&root, 4, "a")).unwrap();
+        let wt = wt_path(&root, 4, "a");
+        std::fs::write(wt.join("a.txt"), "a4\n").unwrap();
+        std::fs::create_dir_all(wt.join("docs")).unwrap();
+        std::fs::write(wt.join("docs").join("n.txt"), "n4\n").unwrap();
+        // 应用障碍:项目目录已存在同名普通文件 docs → create_dir_all 失败
+        std::fs::write(root.join("docs"), "blocked\n").unwrap();
+
+        provider.set_merge_fault(MergeFault::FailUndo);
+        let err = provider.merge(&[lease.clone()]).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("回滚未完全成功") && msg.contains("保留"),
+            "回滚失败必须聚合上报且明示保留事务日志: {msg}"
+        );
+        let refname = Git::integration_ref(4, 1);
+        assert!(
+            ref_tree(&root, &refname).is_some(),
+            "回滚未完全成功时不得谎称已回滚(ref 保持推进,靠恢复收敛)"
+        );
+
+        // 恢复被同一障碍阻挡:失败必须如实上报,日志保留
+        let recover_err = provider.recover_interrupted().unwrap_err();
+        assert!(
+            format!("{recover_err:#}").contains("docs"),
+            "{recover_err:#}"
+        );
+
+        // 清障后恢复收敛
+        std::fs::remove_file(root.join("docs")).unwrap();
+        provider.recover_interrupted().unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "a4\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("docs").join("n.txt")).unwrap(),
+            "n4\n"
+        );
+        provider.release(&lease).unwrap();
+    }
+
+    /// 恢复检测到崩溃窗口内用户改动 → 拒绝覆盖并保留日志(可恢复)。
+    #[test]
+    fn recovery_refuses_to_overwrite_user_edits_during_crash_window() {
+        let (_dir, root) = fixture();
+        let provider = GitWorktreeProvider::new(root.clone()).unwrap();
+        let lease = provider.acquire(&ctx(&root, 5, "a")).unwrap();
+        std::fs::write(wt_path(&root, 5, "a").join("a.txt"), "a5\n").unwrap();
+
+        provider.set_merge_fault(MergeFault::CrashAfterRefAdvance);
+        assert!(provider.merge(&[lease.clone()]).is_err());
+        // 崩溃窗口内用户改动了同一路径
+        std::fs::write(root.join("a.txt"), "user-edit\n").unwrap();
+
+        let err = provider.recover_interrupted().unwrap_err();
+        assert!(
+            format!("{err:#}").contains("外部修改"),
+            "用户编辑不得被恢复重放覆盖: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "user-edit\n",
+            "用户字节保持"
+        );
+        provider.release(&lease).unwrap();
     }
 }

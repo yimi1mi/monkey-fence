@@ -67,6 +67,11 @@ pub trait ExecutionDirectoryProvider: Send + Sync {
         let _ = task_id;
         Ok(())
     }
+    /// 启动恢复:提供器持久化痕迹的崩溃一致性检查(如合并事务日志)。
+    /// 默认无操作。失败必须如实上报 —— 不得静默吞掉或谎报已恢复。
+    fn recover_interrupted(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// 默认提供器:项目目录本身,不隔离;

@@ -192,6 +192,11 @@ impl Orchestrator {
                 orphan_steps.len()
             );
         }
+        // 提供器持久化痕迹的崩溃一致性恢复(如合并事务日志重放);
+        // 失败如实上报并保持可恢复状态,不阻塞启动(后续合并前会再试)
+        if let Err(e) = directory.recover_interrupted() {
+            log::error!("执行目录提供器崩溃恢复失败(保留可恢复状态): {e:#}");
+        }
         let (events_tx, events_rx) = crossbeam_channel::bounded(8192);
         let (runtime_tx, runtime_rx) = crossbeam_channel::bounded(8192);
         let stop = Arc::new(AtomicBool::new(false));
