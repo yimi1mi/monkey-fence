@@ -39,6 +39,40 @@ pub struct SessionSnapshot {
     pub transcript: Vec<(String, String)>, // (role, text)
 }
 
+/// 终止确认信号:生命周期真正的拥有方(reap 线程/工具循环线程)
+/// 在收口完成后置位;stop 据此等待**真实结束**,请求本身不置位。
+struct TermSignal {
+    terminated: Mutex<bool>,
+    cv: parking_lot::Condvar,
+}
+
+impl TermSignal {
+    fn new() -> TermSignal {
+        TermSignal {
+            terminated: Mutex::new(false),
+            cv: parking_lot::Condvar::new(),
+        }
+    }
+
+    fn mark(&self) {
+        let mut terminated = self.terminated.lock();
+        *terminated = true;
+        self.cv.notify_all();
+    }
+
+    /// 等待终止确认;超时返回 false。
+    fn wait_for(&self, timeout: std::time::Duration) -> bool {
+        let mut terminated = self.terminated.lock();
+        if !*terminated {
+            let result = self.cv.wait_for(&mut terminated, timeout);
+            if result.timed_out() && !*terminated {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 struct PtySession {
     session_id: i64,
     master: Mutex<Option<pty::PtyMaster>>,
@@ -62,29 +96,19 @@ struct PtySession {
     reader_owns_reap: bool,
     /// 终止确认:reap 线程在 child.wait()(reap)完成、生命周期收口后
     /// 置位并唤醒。kill 请求本身不置位 —— stop_run 据此等待真实终止。
-    terminated: Mutex<bool>,
-    terminated_cv: parking_lot::Condvar,
+    term: TermSignal,
 }
 
 impl PtySession {
     /// 标记进程已真正终止(child 已 reap、生命周期已收口)。
     fn mark_terminated(&self) {
         self.alive.store(false, Ordering::SeqCst);
-        let mut terminated = self.terminated.lock();
-        *terminated = true;
-        self.terminated_cv.notify_all();
+        self.term.mark();
     }
 
     /// 等待终止确认(真实 OS 进程已 reap);超时返回 false。
     fn wait_terminated(&self, timeout: std::time::Duration) -> bool {
-        let mut terminated = self.terminated.lock();
-        if !*terminated {
-            let result = self.terminated_cv.wait_for(&mut terminated, timeout);
-            if result.timed_out() && !*terminated {
-                return false;
-            }
-        }
-        true
+        self.term.wait_for(timeout)
     }
 }
 
@@ -96,6 +120,47 @@ struct HttpSession {
     answer_tx: Mutex<Option<Sender<String>>>,
     /// 终止信号。
     cancel: AtomicBool,
+    /// 工具循环线程的**真实结束**确认(循环退出、事件已上报后置位)。
+    term: TermSignal,
+    /// 工具循环线程 join 句柄(stop 确认后回收,不留 detached 泄漏)。
+    join: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl HttpSession {
+    /// 标记工具循环线程已真正结束(所有事件已上报)。
+    fn mark_terminated(&self) {
+        self.alive.store(false, Ordering::SeqCst);
+        self.term.mark();
+    }
+
+    fn wait_terminated(&self, timeout: std::time::Duration) -> bool {
+        self.term.wait_for(timeout)
+    }
+
+    /// ask_human 的可取消等待:分片轮询(250ms)检查 cancel,
+    /// stop 时通道被摘除(Disconnected)或 cancel 置位 → 立即返回,
+    /// 不再 6 小时盲等。
+    fn wait_answer(
+        &self,
+        rx: &crossbeam_channel::Receiver<String>,
+        budget: std::time::Duration,
+    ) -> Option<String> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if self.cancel.load(Ordering::SeqCst) {
+                return None;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            match rx.recv_timeout(remaining.min(std::time::Duration::from_millis(250))) {
+                Ok(answer) => return Some(answer),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
 }
 
 enum SessionInner {
@@ -125,6 +190,8 @@ pub struct SessionRegistry {
     sessions: Mutex<HashMap<String, SessionInner>>,
     run_sessions: Mutex<HashMap<String, String>>,
     config: Mutex<mf_agent::Config>,
+    /// stop 等待真实终止确认的时限(生产 10s;测试可调短)。
+    stop_confirm_timeout: parking_lot::RwLock<std::time::Duration>,
 }
 
 impl SessionRegistry {
@@ -133,7 +200,14 @@ impl SessionRegistry {
             sessions: Mutex::new(HashMap::new()),
             run_sessions: Mutex::new(HashMap::new()),
             config: Mutex::new(config),
+            stop_confirm_timeout: parking_lot::RwLock::new(std::time::Duration::from_secs(10)),
         })
+    }
+
+    /// 测试注入:调短 stop 终止确认时限。
+    #[cfg(test)]
+    pub(crate) fn set_stop_confirm_timeout(&self, timeout: std::time::Duration) {
+        *self.stop_confirm_timeout.write() = timeout;
     }
 
     pub fn update_config(&self, config: mf_agent::Config) {
@@ -263,9 +337,21 @@ impl SessionRegistry {
         };
         match &inner {
             SessionInner::Http(h) => {
+                // 发出终止信号并唤醒阻塞中的 ask_human;随后等待工具
+                // 循环线程**真正结束**(事件已上报、生命周期收口),
+                // 未确认前不得返回 Ok → 调用方不释放执行租约
                 h.cancel.store(true, Ordering::SeqCst);
-                h.alive.store(false, Ordering::SeqCst);
-                Ok(())
+                h.answer_tx.lock().take();
+                if h.wait_terminated(*self.stop_confirm_timeout.read()) {
+                    if let Some(handle) = h.join.lock().take() {
+                        let _ = handle.join();
+                    }
+                    Ok(())
+                } else {
+                    Err(anyhow!(
+                        "run {run_id} HTTP 工具循环未在时限内真正结束(可能仍在处理请求)"
+                    ))
+                }
             }
             SessionInner::Pty(p) => {
                 // 拥有并等待**整个进程树**(Windows Job Object):
@@ -357,6 +443,7 @@ impl SessionRegistry {
                 SessionInner::Http(h) => {
                     h.cancel.store(true, Ordering::SeqCst);
                     h.alive.store(false, Ordering::SeqCst);
+                    h.answer_tx.lock().take(); // 唤醒阻塞中的 ask_human
                 }
             }
         }
@@ -549,8 +636,7 @@ fn launch_pty(
         alive: AtomicBool::new(true),
         pid: Some(pid),
         reader_owns_reap: true,
-        terminated: Mutex::new(false),
-        terminated_cv: parking_lot::Condvar::new(),
+        term: TermSignal::new(),
     });
     registry.register(
         &project,
@@ -811,8 +897,7 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
         alive: AtomicBool::new(true),
         pid: Some(pid),
         reader_owns_reap: false,
-        terminated: Mutex::new(false),
-        terminated_cv: parking_lot::Condvar::new(),
+        term: TermSignal::new(),
     });
     registry.register(&project, display_id, SessionInner::Pty(session.clone()));
     // 看护 armed:下方任何失败路径(初始 stdin 写入、线程启动)
@@ -1051,8 +1136,7 @@ fn launch_workflow_pty(
         alive: AtomicBool::new(true),
         pid: Some(pid),
         reader_owns_reap: true,
-        terminated: Mutex::new(false),
-        terminated_cv: parking_lot::Condvar::new(),
+        term: TermSignal::new(),
     });
     registry.register(
         &project,
@@ -1292,6 +1376,8 @@ fn launch_http(registry: &SessionRegistry, spec: &LaunchSpec, events: Sender<(i6
         alive: AtomicBool::new(true),
         answer_tx: Mutex::new(None),
         cancel: AtomicBool::new(false),
+        term: TermSignal::new(),
+        join: Mutex::new(None),
     });
     registry.register(
         &project,
@@ -1339,7 +1425,8 @@ fn run_http_turn_async(
     let max_iterations = registry.config.lock().engine.max_iterations;
     let title = spec.step_title.clone();
     let cancel = session.clone();
-    std::thread::Builder::new()
+    let join_session = session.clone();
+    let handle = std::thread::Builder::new()
         .name(format!("http-agent-{run_id}"))
         .spawn(move || {
             let outcome = run_http_turn(
@@ -1359,12 +1446,16 @@ fn run_http_turn_async(
                 }
                 HttpOutcome::Pending => {
                     // 轮次结束但未结算 → Orchestrator 进入 awaiting-outcome
-                    session.alive.store(false, Ordering::SeqCst);
                     let _ = events2.send((run_id, RuntimeEvent::Exited { code: None }));
                 }
             }
-        })
-        .ok();
+            // 工具循环线程真正结束(事件已上报)后才确认终止:
+            // stop_run 据此等待,确认前不得释放执行租约
+            session.mark_terminated();
+        });
+    if let Ok(handle) = handle {
+        *join_session.join.lock() = Some(handle);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1583,17 +1674,19 @@ fn run_http_turn(
                     let _ = events.send((run_id, RuntimeEvent::Question(question)));
                     let (tx, rx) = crossbeam_channel::bounded::<String>(1);
                     *session.answer_tx.lock() = Some(tx);
-                    match rx.recv_timeout(std::time::Duration::from_secs(6 * 3600)) {
-                        Ok(answer) => {
+                    // 分片可取消等待:stop(通道摘除/cancel)立即唤醒,
+                    // 不再 6 小时盲等阻塞停止确认
+                    match session.wait_answer(&rx, std::time::Duration::from_secs(6 * 3600)) {
+                        Some(answer) => {
                             messages.push(ChatMessage::tool_result(
                                 call.id.clone(),
                                 format!("用户回答: {answer}"),
                             ));
                         }
-                        Err(_) => {
+                        None => {
                             messages.push(ChatMessage::tool_result(
                                 call.id.clone(),
-                                "用户未在时限内回答".into(),
+                                "用户未在时限内回答或运行已被停止".into(),
                             ));
                         }
                     }
@@ -2234,6 +2327,159 @@ mod tests {
         assert!(registry.snapshot(&project, 7).is_none());
         // 二次停止幂等
         host.stop_run(&project, 42).unwrap();
+    }
+
+    #[test]
+    fn http_stop_waits_for_background_loop_real_end() {
+        // I6:HTTP stop 不能只设 cancel/alive 就返回 Ok —— 必须持有
+        // 终止确认并等待工具循环线程真正结束(事件已上报)。
+        // 后台线程 600ms 后才结束:stop_run 必须等满且返回 Ok。
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        let session = Arc::new(HttpSession {
+            session_id: 11,
+            transcript: Mutex::new(Vec::new()),
+            alive: AtomicBool::new(true),
+            answer_tx: Mutex::new(None),
+            cancel: AtomicBool::new(false),
+            term: TermSignal::new(),
+            join: Mutex::new(None),
+        });
+        registry.register("proj", 11, SessionInner::Http(session.clone()));
+        registry.bind_run("proj", 501, 11);
+        let started = std::time::Instant::now();
+        let s2 = session.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            s2.mark_terminated(); // 循环线程真正结束
+        });
+        registry
+            .stop_run("proj", 501)
+            .expect("循环线程结束后必须确认停止");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(550),
+            "stop_run 必须等待循环线程真正结束,实际 {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn http_stop_unconfirmed_when_loop_never_ends() {
+        // 循环线程永不结束:stop_run 必须返回 Err(调用方不释放租约、
+        // 转 Interrupted 人工处理),不得谎报已停止。
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        registry.set_stop_confirm_timeout(std::time::Duration::from_millis(250));
+        let session = Arc::new(HttpSession {
+            session_id: 12,
+            transcript: Mutex::new(Vec::new()),
+            alive: AtomicBool::new(true),
+            answer_tx: Mutex::new(None),
+            cancel: AtomicBool::new(false),
+            term: TermSignal::new(),
+            join: Mutex::new(None),
+        });
+        registry.register("proj", 12, SessionInner::Http(session.clone()));
+        registry.bind_run("proj", 502, 12);
+        let err = registry.stop_run("proj", 502).expect_err("未确认必须 Err");
+        assert!(format!("{err:#}").contains("HTTP 工具循环"), "{err:#}");
+        assert!(session.cancel.load(Ordering::SeqCst), "终止信号必须已发出");
+    }
+
+    #[test]
+    fn ask_human_wait_wakes_on_stop() {
+        // ask_human 的 6 小时盲等必须可被 stop 唤醒:
+        // 通道摘除(Disconnected)+ cancel → 秒级返回。
+        let session = Arc::new(HttpSession {
+            session_id: 13,
+            transcript: Mutex::new(Vec::new()),
+            alive: AtomicBool::new(true),
+            answer_tx: Mutex::new(None),
+            cancel: AtomicBool::new(false),
+            term: TermSignal::new(),
+            join: Mutex::new(None),
+        });
+        let (tx, rx) = crossbeam_channel::bounded::<String>(1);
+        *session.answer_tx.lock() = Some(tx);
+        let s2 = session.clone();
+        let waiter = std::thread::spawn(move || {
+            s2.wait_answer(&rx, std::time::Duration::from_secs(6 * 3600))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        let started = std::time::Instant::now();
+        session.cancel.store(true, Ordering::SeqCst);
+        session.answer_tx.lock().take(); // stop_run 的唤醒动作
+        let answer = waiter.join().expect("等待必须被唤醒并返回");
+        assert!(answer.is_none(), "停止后不得返回用户回答");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "唤醒必须秒级,实际 {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn http_mock_turn_stop_confirms_after_thread_exit() {
+        // 端到端:Mock provider 轮次运行中发起 stop —— cancel 置位后
+        // 线程自然收尾(Mock 不感知 cancel),stop_run 必须等到线程
+        // **真正退出**(Settled 事件已上报)才返回 Ok。
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        let host = RuntimeHostImpl::new(registry.clone());
+        let (events, rx) = crossbeam_channel::bounded(64);
+        let workdir = std::env::temp_dir();
+        let spec = LaunchSpec {
+            project_root: workdir.clone(),
+            run_id: 601,
+            step_id: 1,
+            task_id: 1,
+            session_id: 21,
+            session_key: None,
+            attach_existing_session: false,
+            profile: AgentProfileSpec {
+                id: "mock".into(),
+                display_name: "mock".into(),
+                runtime: RuntimeKind::Http,
+                command: String::new(),
+                args: vec![],
+                env: vec![],
+                permission_args: vec![],
+                provider: Some(mf_agent::ProviderConfig {
+                    kind: mf_agent::ProviderKind::Mock,
+                    base_url: String::new(),
+                    api_key: String::new(),
+                    model: String::new(),
+                }),
+                icon: None,
+                homepage: None,
+                hook: None,
+            },
+            step_title: "mock 步骤".into(),
+            prompt: "MOCK_FAIL".into(), // Mock 睡 300ms 后结算失败
+            capability_token: "tok".into(),
+            pipe_name: "pipe".into(),
+            mfctl_hint: None,
+            workdir: workdir.clone(),
+        };
+        let project = workdir.to_string_lossy().to_string();
+        host.launch(spec, events);
+        // 等 Mock 轮次线程进入执行(300ms 睡眠窗口内发起 stop)
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        host.stop_run(&project, 601)
+            .expect("线程真正结束后必须确认停止");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(150),
+            "stop 必须等到线程退出(≥ Mock 剩余睡眠),实际 {:?}",
+            started.elapsed()
+        );
+        let mut saw_settled = false;
+        while let Ok((_, ev)) = rx.try_recv() {
+            if matches!(ev, RuntimeEvent::Settled(_)) {
+                saw_settled = true;
+            }
+        }
+        assert!(
+            saw_settled,
+            "stop 返回时工具循环线程必须已收口(Settled 事件已上报)"
+        );
     }
 
     #[test]
