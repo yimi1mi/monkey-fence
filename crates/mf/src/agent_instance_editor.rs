@@ -10,8 +10,13 @@ use mf_agent::{InstanceScope, RunMode};
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentTypeInfo {
     pub id: String,
+    /// 完整贡献 ID(`publisher.plugin.agent_type`);身份展示与 pin 解析使用。
+    pub full_contribution_id: String,
     pub name: String,
     pub plugin_name: String,
+    /// 贡献插件版本与内容哈希(实例页/插件页的活动 pin 展示)。
+    pub plugin_version: String,
+    pub content_hash: String,
     /// CLI 是否检测到(缺失时可见但不可保存实例)。
     pub detected: bool,
     pub supports_isolated_config: bool,
@@ -177,6 +182,26 @@ impl AgentInstanceEditorState {
                 "completion": if self.run_mode == RunMode::OneShot { "process-exit" } else { "manual" },
             }),
             sealed_secret_ids: self.secret_refs.clone(),
+        }
+    }
+
+    /// 一次性启动快照(临时实例):不落目录库,直接以当前编辑字段启动。
+    /// `instance_key` 是临时标识(不与目录库实例 ID 冲突)。
+    pub fn to_launch_snapshot(&self, instance_key: &str) -> AgentInstanceSnapshot {
+        let draft = self.to_draft(InstanceScope::User, None);
+        AgentInstanceSnapshot {
+            id: instance_key.to_string(),
+            name: draft.name,
+            agent_type: draft.agent_type,
+            version: 1,
+            enabled: true,
+            run_mode: draft.run_mode,
+            executable: draft.executable,
+            argv: draft.argv,
+            env: draft.env,
+            config: draft.config,
+            execution_contract: draft.execution_contract,
+            sealed_secret_ids: draft.sealed_secret_ids,
         }
     }
 }

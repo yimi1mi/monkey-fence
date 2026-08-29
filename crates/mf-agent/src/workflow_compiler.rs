@@ -12,7 +12,8 @@
 
 use crate::agent_instance::AgentInstanceSnapshot;
 use crate::workflow::{
-    WorkflowNodeDraft, WorkflowNodeSnapshot, WorkflowSnapshot, WorkflowTemplateVersion,
+    PluginSourcePin, WorkflowNodeDraft, WorkflowNodeSnapshot, WorkflowSnapshot,
+    WorkflowTemplateVersion,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -42,8 +43,9 @@ pub struct CompileInput<'a> {
     pub directory_provider_isolates: bool,
     /// 用户显式接受的"共享目录并行"风险开关(默认关闭)。
     pub allow_unsafe_shared_directory: bool,
-    /// 可用插件贡献的 Agent Type 集合(实例的 agent_type 必须在其中)。
-    pub available_agent_types: &'a HashSet<String>,
+    /// 可用插件贡献的 Agent Type → 所属插件包身份(实例的 agent_type 必须在其中;
+    /// 编译通过后把插件 pin 冻结进节点快照)。
+    pub agent_type_plugins: &'a HashMap<String, PluginSourcePin>,
     /// Agent Instance 解析器:错误表示实例不存在或不可读。
     pub resolve_instance: &'a dyn Fn(&str) -> anyhow::Result<AgentInstanceSnapshot>,
 }
@@ -103,6 +105,7 @@ impl WorkflowCompiler {
 
         // 4. 实例解析(存在 + 启用)+ 插件贡献校验
         let mut resolved: HashMap<&str, AgentInstanceSnapshot> = HashMap::new();
+        let mut resolved_plugin: HashMap<&str, PluginSourcePin> = HashMap::new();
         for node in nodes {
             match (input.resolve_instance)(&node.agent_instance_id) {
                 Err(e) => errors.push(CompileError::new(
@@ -118,7 +121,9 @@ impl WorkflowCompiler {
                             format!("实例 `{}` 已禁用", snapshot.name),
                         ));
                     }
-                    if !input.available_agent_types.contains(&snapshot.agent_type) {
+                    if let Some(pin) = input.agent_type_plugins.get(&snapshot.agent_type) {
+                        resolved_plugin.insert(node.key.as_str(), pin.clone());
+                    } else {
                         errors.push(CompileError::new(
                             "plugin-missing",
                             &node.key,
@@ -204,6 +209,7 @@ impl WorkflowCompiler {
                     instructions: node.instructions.clone(),
                     instance,
                     deps: node.deps.clone(),
+                    plugin: resolved_plugin.get(node.key.as_str()).cloned(),
                 }
             })
             .collect();

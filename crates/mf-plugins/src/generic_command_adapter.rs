@@ -51,6 +51,9 @@ pub(crate) fn compile_cli_launch(
 
     let mut env = snapshot.env.clone();
     let mut temp_files = Vec::new();
+    // Default CLI 只读外部配置意图:一律跳过隔离注入;
+    // config_files 声明与只读承诺冲突,显式拒绝(绝不写外部配置)
+    let isolation = if ctx.external_config { None } else { isolation };
     match isolation {
         Some(iso) => {
             let dir = ctx.run_temp.join(iso.subdir);
@@ -59,6 +62,12 @@ pub(crate) fn compile_cli_launch(
         }
         None => {
             if snapshot.config.get("config_files").is_some() {
+                if ctx.external_config {
+                    anyhow::bail!(
+                        "外部配置只读意图与 config_files 声明冲突:不得写入外部配置;\
+                     改用隔离实例以物化配置文件"
+                    );
+                }
                 anyhow::bail!(
                     "该 Agent Type 不支持进程级隔离配置(config_files);\
                      需要 CLI 专属配置请使用 claude-code / codex 适配器"

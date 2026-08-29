@@ -46,6 +46,11 @@ pub struct LeaseContext {
 /// 执行目录提供器接口(设计 §6.3)。
 pub trait ExecutionDirectoryProvider: Send + Sync {
     fn id(&self) -> &str;
+    /// 提供器是否提供独占隔离的租约(worktree = true;项目目录 = false)。
+    /// Workflow Compiler 据此判定并行安全,插件清单的隔离能力与其保持一致。
+    fn isolates(&self) -> bool {
+        false
+    }
     /// 为一次 Agent Run 获取路径租约。
     fn acquire(&self, run: &LeaseContext) -> Result<ExecutionLease>;
     /// 汇合:按固定顺序尝试无冲突合并;冲突返回 `NeedsUser`。

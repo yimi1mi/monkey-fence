@@ -14,6 +14,14 @@ use std::time::Duration;
 
 struct NoopHost;
 impl RuntimeHost for NoopHost {
+    fn launch_workflow(
+        &self,
+        _spec: mf_agent::runtime::WorkflowLaunchSpec,
+        _events: crossbeam_channel::Sender<(i64, mf_agent::RuntimeEvent)>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn launch(&self, _spec: LaunchSpec, _events: crossbeam_channel::Sender<(i64, RuntimeEvent)>) {}
     fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) -> anyhow::Result<()> {
         Ok(())

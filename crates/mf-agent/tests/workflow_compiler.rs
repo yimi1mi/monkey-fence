@@ -3,10 +3,10 @@
 //!
 //! 实例解析经注入闭包:编译器保持纯函数,不触目录库。
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use mf_agent::agent_instance::AgentInstanceSnapshot;
-use mf_agent::workflow::{WorkflowNodeDraft, WorkflowTemplateVersion};
+use mf_agent::workflow::{PluginSourcePin, WorkflowNodeDraft, WorkflowTemplateVersion};
 use mf_agent::workflow_compiler::{CompileInput, WorkflowCompiler};
 use mf_agent::RunMode;
 
@@ -76,14 +76,23 @@ fn resolver_for<'i>(
     }
 }
 
-static AGENT_TYPES: std::sync::OnceLock<HashSet<String>> = std::sync::OnceLock::new();
+static AGENT_TYPES: std::sync::OnceLock<HashMap<String, PluginSourcePin>> =
+    std::sync::OnceLock::new();
 
-fn agent_types() -> &'static HashSet<String> {
+fn agent_types() -> &'static HashMap<String, PluginSourcePin> {
     AGENT_TYPES.get_or_init(|| {
-        let mut set = HashSet::new();
-        set.insert("generic-command".to_string());
-        set.insert("claude-code".to_string());
-        set
+        let mut map = HashMap::new();
+        for agent_type in ["generic-command", "claude-code"] {
+            map.insert(
+                agent_type.to_string(),
+                PluginSourcePin {
+                    full_id: "builtin.core".into(),
+                    version: "1.0.0".into(),
+                    content_hash: format!("hash-{agent_type}"),
+                },
+            );
+        }
+        map
     })
 }
 
@@ -95,7 +104,7 @@ fn input<'a>(
         template,
         directory_provider_isolates: true,
         allow_unsafe_shared_directory: false,
-        available_agent_types: agent_types(),
+        agent_type_plugins: agent_types(),
         resolve_instance: resolve,
     }
 }

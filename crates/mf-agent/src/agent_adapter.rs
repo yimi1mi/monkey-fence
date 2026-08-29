@@ -141,6 +141,9 @@ pub struct LaunchContext {
     pub prompt: Option<String>,
     /// 插件是否被授权 Shell 能力(capabilities.shell)。
     pub grants_shell: bool,
+    /// "Default CLI"显式意图:沿用外部已有配置(只读,绝不写入)。
+    /// 为真时适配器跳过 run-temp 隔离注入,并拒绝 config_files 声明。
+    pub external_config: bool,
     /// 已解封 Secret(secret-id → zeroizing 租约)。
     pub secrets: HashMap<String, Arc<SecretLease>>,
 }
@@ -152,6 +155,7 @@ impl LaunchContext {
             workdir,
             prompt: None,
             grants_shell: false,
+            external_config: false,
             secrets: HashMap::new(),
         }
     }

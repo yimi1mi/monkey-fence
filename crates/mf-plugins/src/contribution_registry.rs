@@ -3,10 +3,12 @@
 //! 因此贡献 id 本身允许包含 `.`。
 
 use crate::manifest::{
-    AgentTypeContribution, ExecutionDirectoryContribution, NodeTypeContribution, PluginManifest,
-    SecretStoreContribution, UiSchemaContribution, WorkflowTemplateContribution,
+    ExecutionDirectoryContribution, NodeTypeContribution, PluginManifest, SecretStoreContribution,
+    UiSchemaContribution, WorkflowTemplateContribution,
 };
 use crate::PluginEntry;
+
+pub use crate::manifest::AgentTypeContribution;
 
 /// 贡献所属的插件来源(运行期固定版本用)。
 #[derive(Debug, Clone)]
@@ -79,6 +81,24 @@ impl ContributionRegistry {
             .map(|n| (src.clone(), n))
     }
 
+    /// 全部执行目录贡献:(完整贡献 ID, 来源, 贡献),按完整 ID 排序。
+    pub fn execution_directories(
+        &self,
+    ) -> Vec<(String, ContributionSource, ExecutionDirectoryContribution)> {
+        let mut out = Vec::new();
+        for (src, manifest) in &self.records {
+            for directory in &manifest.execution_directory_providers {
+                out.push((
+                    format!("{}.{}", src.plugin_full_id, directory.id),
+                    src.clone(),
+                    directory.clone(),
+                ));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     pub fn find_execution_directory(
         &self,
         full_contribution_id: &str,
@@ -127,18 +147,21 @@ impl ContributionRegistry {
             .map(|u| (src.clone(), u))
     }
 
-    /// 列出全部 Agent Type 贡献(带插件来源)。
-    pub fn agent_types(&self) -> Vec<(ContributionSource, AgentTypeContribution)> {
-        self.records
-            .iter()
-            .flat_map(|(src, m)| {
-                m.agent_types
-                    .iter()
-                    .cloned()
-                    .map(|a| (src.clone(), a))
-                    .collect::<Vec<_>>()
-            })
-            .collect()
+    /// 列出全部 Agent Type 贡献:(完整贡献 ID, 来源, 贡献),按完整 ID 稳定排序。
+    /// 供工作流编译输入(agent_type → 插件包 pin)与实例页列表使用。
+    pub fn agent_types(&self) -> Vec<(String, ContributionSource, AgentTypeContribution)> {
+        let mut out: Vec<(String, ContributionSource, AgentTypeContribution)> = Vec::new();
+        for (src, manifest) in &self.records {
+            for agent_type in &manifest.agent_types {
+                out.push((
+                    format!("{}.{}", src.plugin_full_id, agent_type.id),
+                    src.clone(),
+                    agent_type.clone(),
+                ));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
     }
 }
 

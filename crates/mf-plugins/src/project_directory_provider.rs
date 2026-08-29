@@ -70,6 +70,7 @@ pub fn contribution() -> crate::manifest::ExecutionDirectoryContribution {
         name: "项目目录".into(),
         kind: PROVIDER_ID.into(),
         supports_parallel: false,
+        isolates: false,
         description: "Agent Run 直接在项目目录执行(共享目录,不隔离)".into(),
     }
 }

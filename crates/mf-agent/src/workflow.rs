@@ -54,6 +54,15 @@ pub struct WorkflowTemplateVersion {
     pub created_at: String,
 }
 
+/// 冻结时固定的插件包身份:full ID + 版本 + 内容哈希。
+/// Revision 存续期内按它 pin 插件包(更新/卸载不改变已冻结运行)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginSourcePin {
+    pub full_id: String,
+    pub version: String,
+    pub content_hash: String,
+}
+
 /// 冻结的节点:节点数据 + 编译时刻的实例配置快照。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowNodeSnapshot {
@@ -62,6 +71,9 @@ pub struct WorkflowNodeSnapshot {
     pub instructions: String,
     pub instance: AgentInstanceSnapshot,
     pub deps: Vec<String>,
+    /// 贡献该节点 Agent Type 的插件包身份(旧快照无此字段)。
+    #[serde(default)]
+    pub plugin: Option<PluginSourcePin>,
 }
 
 /// 不可变工作流快照:Revision 保存的就是它。
@@ -90,6 +102,7 @@ pub fn freeze_workflow(
             instructions: draft.instructions.clone(),
             instance,
             deps: draft.deps.clone(),
+            plugin: None,
         });
     }
     Ok(WorkflowSnapshot {

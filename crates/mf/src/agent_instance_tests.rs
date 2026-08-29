@@ -12,8 +12,11 @@ use mf_agent::{InstanceScope, RunMode};
 fn detected_type() -> AgentTypeInfo {
     AgentTypeInfo {
         id: "generic-command".into(),
+        full_contribution_id: "monkeyfence.generic-command".into(),
         name: "通用命令".into(),
         plugin_name: "MonkeyFence 内置".into(),
+        plugin_version: "0.1.0".into(),
+        content_hash: String::new(),
         detected: true,
         supports_isolated_config: false,
         default_command: "agent.exe".into(),

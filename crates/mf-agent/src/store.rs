@@ -248,6 +248,49 @@ impl Store {
 
     // ---------- Revision / Step ----------
 
+    /// 工作流快照 → Step 投影(与快照落盘同一事务):
+    /// 节点键→step_key、标题/说明原样、agent_profile=冻结实例的 Agent Type、
+    /// 会话策略固定 fresh(每个节点独立会话),依赖按节点键接线。
+    fn project_workflow_steps_tx(
+        c: &Connection,
+        task_id: i64,
+        rev_id: i64,
+        snapshot: &crate::workflow::WorkflowSnapshot,
+    ) -> Result<()> {
+        let ts = now();
+        let mut key_to_id = HashMap::new();
+        for node in &snapshot.nodes {
+            c.execute(
+                "INSERT INTO steps (revision_id, task_id, step_key, title, instructions,
+                    agent_profile, session_policy, status, attempts, result, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'fresh', 'pending', 0, NULL, ?7, ?7)",
+                params![
+                    rev_id,
+                    task_id,
+                    node.key,
+                    node.title,
+                    node.instructions,
+                    node.instance.agent_type,
+                    ts,
+                ],
+            )?;
+            key_to_id.insert(node.key.clone(), c.last_insert_rowid());
+        }
+        for node in &snapshot.nodes {
+            if let Some(sid) = key_to_id.get(&node.key) {
+                for dep in &node.deps {
+                    if let Some(did) = key_to_id.get(dep) {
+                        c.execute(
+                            "INSERT OR IGNORE INTO step_deps (step_id, dep_step_id) VALUES (?1, ?2)",
+                            params![sid, did],
+                        )?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn insert_revision_steps(
         c: &Connection,
         task_id: i64,
@@ -1584,14 +1627,15 @@ impl Store {
 
     // ---------- Workflow 快照与 Handoff ----------
 
-    /// 保存序列化工作流快照为新 Revision(draft 状态;无 steps 投影,
-    /// 执行接线由 Run Coordinator 负责)。
+    /// 保存序列化工作流快照为新 Revision:同一事务内完成快照落盘与
+    /// Step 投影(节点键/标题/说明/依赖;agent_profile 投影为冻结实例的
+    /// Agent Type),失败不留半截 Revision。
     pub fn create_workflow_revision(
         &self,
         task_id: i64,
         snapshot: &crate::workflow::WorkflowSnapshot,
     ) -> Result<RevisionView> {
-        self.with_conn(|c| {
+        self.with_tx(|c| {
             let ts = now();
             let next: i64 = c.query_row(
                 "SELECT COALESCE(MAX(revision), 0) + 1 FROM pipeline_revisions WHERE task_id = ?1",
@@ -1603,8 +1647,10 @@ impl Store {
                  VALUES (?1, ?2, 'draft', ?3, ?4)",
                 params![task_id, next, serde_json::to_string(snapshot)?, ts],
             )?;
+            let rev_id = c.last_insert_rowid();
+            Self::project_workflow_steps_tx(c, task_id, rev_id, snapshot)?;
             Ok(RevisionView {
-                id: c.last_insert_rowid(),
+                id: rev_id,
                 task_id,
                 revision: next,
                 status: RevisionStatus::Draft,
@@ -1619,14 +1665,15 @@ impl Store {
         revision_id: i64,
     ) -> Result<Option<crate::workflow::WorkflowSnapshot>> {
         self.with_conn(|c| {
-            let json: Option<String> = c
+            // 外层 Option:行是否存在;内层 Option:列是否为 NULL(旧 Draft Revision)
+            let json: Option<Option<String>> = c
                 .query_row(
                     "SELECT snapshot_json FROM pipeline_revisions WHERE id = ?1",
                     params![revision_id],
                     |r| r.get(0),
                 )
                 .optional()?;
-            match json {
+            match json.flatten() {
                 Some(json) => {
                     Ok(Some(serde_json::from_str(&json).with_context(|| {
                         format!("Revision {revision_id} 快照损坏")
@@ -1768,20 +1815,36 @@ impl Store {
 
     /// 任务的 Handoff 列表(升序):(行 id, Handoff)。
     pub fn list_handoffs(&self, task_id: i64) -> Result<Vec<(i64, crate::handoff::Handoff)>> {
+        Ok(self
+            .list_handoff_rows(task_id)?
+            .into_iter()
+            .map(|row| (row.id, row.handoff))
+            .collect())
+    }
+
+    /// 任务的 Handoff 行(含 step/run 归属;工作流变量替换按 step 定位)。
+    pub fn list_handoff_rows(&self, task_id: i64) -> Result<Vec<HandoffRow>> {
         self.with_conn(|c| {
-            let mut stmt =
-                c.prepare("SELECT id, handoff_json FROM handoffs WHERE task_id = ?1 ORDER BY id")?;
-            let rows: Vec<(i64, String)> = stmt
+            let mut stmt = c.prepare(
+                "SELECT id, step_id, run_id, handoff_json FROM handoffs
+                 WHERE task_id = ?1 ORDER BY id",
+            )?;
+            let rows: Vec<(i64, Option<i64>, Option<i64>, String)> = stmt
                 .query_map(params![task_id], |r| {
-                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
                 })?
                 .collect::<std::result::Result<_, _>>()?;
             drop(stmt);
             rows.into_iter()
-                .map(|(id, json)| {
+                .map(|(id, step_id, run_id, json)| {
                     let handoff: crate::handoff::Handoff = serde_json::from_str(&json)
                         .with_context(|| format!("handoff 行 {id} 损坏"))?;
-                    Ok((id, handoff))
+                    Ok(HandoffRow {
+                        id,
+                        step_id,
+                        run_id,
+                        handoff,
+                    })
                 })
                 .collect()
         })

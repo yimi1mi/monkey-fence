@@ -10,6 +10,9 @@ fn menu_types() -> Vec<crate::agent_instance_editor::AgentTypeInfo> {
     use mf_agent::RunMode;
     vec![
         crate::agent_instance_editor::AgentTypeInfo {
+            full_contribution_id: format!("monkeyfence.{}", "t"),
+            plugin_version: "0.1.0".into(),
+            content_hash: String::new(),
             id: "codex".into(),
             name: "Codex".into(),
             plugin_name: "monkeyfence.codex".into(),
@@ -20,6 +23,9 @@ fn menu_types() -> Vec<crate::agent_instance_editor::AgentTypeInfo> {
             modes: vec![RunMode::Interactive, RunMode::OneShot],
         },
         crate::agent_instance_editor::AgentTypeInfo {
+            full_contribution_id: format!("monkeyfence.{}", "t"),
+            plugin_version: "0.1.0".into(),
+            content_hash: String::new(),
             id: "gemini".into(),
             name: "Gemini CLI".into(),
             plugin_name: "monkeyfence.gemini".into(),

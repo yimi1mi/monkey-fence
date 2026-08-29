@@ -55,6 +55,14 @@ impl MockHost {
 }
 
 impl RuntimeHost for MockHost {
+    fn launch_workflow(
+        &self,
+        _spec: mf_agent::runtime::WorkflowLaunchSpec,
+        _events: Sender<(i64, RuntimeEvent)>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn launch(&self, _spec: LaunchSpec, _events: Sender<(i64, RuntimeEvent)>) {}
     fn send_prompt(&self, _project: &str, _run_id: i64, _session_id: i64, _text: &str) {}
     fn stop_run(&self, _project: &str, _run_id: i64) {}
@@ -580,3 +588,123 @@ fn mark_launched_only_transitions_from_starting() {
     assert_eq!(marked2.status, SessionStatus::Working);
     assert!(marked2.launched_at.is_some());
 }
+
+// ---------- DB 失败补偿:kill 必须用 display session ID ----------
+
+/// 记录 kill_ad_hoc 参数的宿主;launch 钩子里持有 IMMEDIATE 写锁,
+/// 使"启动成功之后"的状态写入(mark_ad_hoc_launched)必然失败。
+struct KillRecordingHost {
+    inner: MockHost,
+    kills: Mutex<Vec<(String, i64)>>,
+    db_path: std::path::PathBuf,
+    write_lock: Mutex<Option<rusqlite::Connection>>,
+}
+
+impl RuntimeHost for KillRecordingHost {
+    fn launch_workflow(
+        &self,
+        _spec: mf_agent::runtime::WorkflowLaunchSpec,
+        _events: Sender<(i64, RuntimeEvent)>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn launch(&self, _spec: LaunchSpec, _events: Sender<(i64, RuntimeEvent)>) {}
+    fn send_prompt(&self, _p: &str, _r: i64, _s: i64, _t: &str) {}
+    fn stop_run(&self, _p: &str, _r: i64) {}
+    fn kill_session(&self, _p: &str, _s: i64) {}
+    fn kill_ad_hoc(&self, project: &str, display_session_id: i64) {
+        self.kills
+            .lock()
+            .push((project.to_string(), display_session_id));
+    }
+    fn answer_question(&self, _p: &str, _r: i64, _a: &str) {}
+    fn launch_ad_hoc(&self, spec: AdHocLaunchSpec) -> anyhow::Result<()> {
+        // 进程"启动成功"后、DB 状态写入前:锁住写库
+        let conn = rusqlite::Connection::open(&self.db_path)?;
+        conn.pragma_update(None, "busy_timeout", 8000)?;
+        conn.execute("BEGIN IMMEDIATE", [])?;
+        *self.write_lock.lock() = Some(conn);
+        self.inner.launch_ad_hoc(spec)
+    }
+}
+
+#[test]
+fn db_failure_after_launch_kills_process_via_display_id() {
+    // 文件库 + 第二连接持有 IMMEDIATE 写锁:启动后的状态写入必然失败
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("adhoc.db");
+    let store = Store::open(&db).unwrap();
+    let host = Arc::new(KillRecordingHost {
+        inner: MockHost::healthy(),
+        kills: Mutex::new(Vec::new()),
+        db_path: db.clone(),
+        write_lock: Mutex::new(None),
+    });
+    let orch = Orchestrator::start(
+        store.clone(),
+        PathBuf::from("."),
+        mf_agent::Config::default(),
+        host.clone(),
+        Arc::new(parking_lot::RwLock::new(ProfileCatalog::default())),
+        GlobalLimiter::new(4),
+        "test-pipe".into(),
+        Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
+    )
+    .unwrap();
+    let task = orch.create_task("t", "g").unwrap();
+    // 先造一个 decoy 会话,让 agent_sessions 与 ad_hoc_sessions 的
+    // 自增行号错开(避免两边都是 1 导致断言失效)
+    let decoy = orch
+        .store
+        .create_session(None, "pty", "generic-command", "d")
+        .unwrap();
+
+    let err = orch
+        .create_ad_hoc_session(
+            task.id,
+            &snapshot(),
+            RunMode::Interactive,
+            PathBuf::from("C:/tmp/run"),
+            launch_plan(),
+        )
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("已终止进程"),
+        "启动后 DB 写失败必须补偿杀进程: {err:#}"
+    );
+
+    // 补偿 kill 必须传 display session ID(agent_sessions 行),
+    // 不是 ad_hoc_sessions 行号 —— 两者分属两套自增序列。
+    let ad_hoc_row: i64 = store
+        .with_conn(|c| {
+            Ok(c.query_row(
+                "SELECT id FROM ad_hoc_sessions ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    let kills = host.kills.lock().clone();
+    assert_eq!(kills.len(), 1, "必须补偿 kill 恰好一次: {kills:?}");
+    assert_ne!(kills[0].1, decoy.id, "不得误杀 decoy 会话");
+    assert_ne!(kills[0].1, ad_hoc_row, "kill 参数不得是 ad-hoc 行号");
+    // display 行确实存在且不同
+    let display_row: Option<i64> = store
+        .with_conn(|c| {
+            Ok(c.query_row(
+                "SELECT display_session_id FROM ad_hoc_sessions WHERE id = ?1",
+                rusqlite::params![ad_hoc_row],
+                |r| r.get(0),
+            )
+            .optional()?)
+        })
+        .unwrap()
+        .flatten();
+    assert_eq!(
+        kills[0].1,
+        display_row.expect("启动路径应已写 display 行"),
+        "kill 参数必须是 display session ID"
+    );
+}
+
+use rusqlite::OptionalExtension as _;

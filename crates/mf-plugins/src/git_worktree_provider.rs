@@ -50,6 +50,11 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
         PROVIDER_ID
     }
 
+    fn isolates(&self) -> bool {
+        // 非 Git 根回退共享目录(不隔离);Git 根提供独占 worktree
+        self.worktrees_root.is_some()
+    }
+
     fn acquire(&self, ctx: &LeaseContext) -> Result<ExecutionLease> {
         let Some(worktrees_root) = &self.worktrees_root else {
             // 非 Git 根:无法隔离,回退共享项目目录(并行需用户风险开关)
@@ -265,6 +270,7 @@ pub fn contribution() -> crate::manifest::ExecutionDirectoryContribution {
         name: "Git worktree 隔离".into(),
         kind: PROVIDER_ID.into(),
         supports_parallel: true,
+        isolates: true,
         description: "并行 Agent Run 各自获得独立临时 worktree,汇合时按固定顺序无冲突合并".into(),
     }
 }

@@ -145,6 +145,10 @@ pub struct ExecutionDirectoryContribution {
     pub kind: String,
     #[serde(default)]
     pub supports_parallel: bool,
+    /// 提供器是否提供独占隔离租约(worktree 类 = true;共享项目目录 = false)。
+    /// Workflow Compiler 据此判定并行安全(unsafe-parallel 默认拒绝)。
+    #[serde(default)]
+    pub isolates: bool,
     #[serde(default)]
     pub description: String,
 }

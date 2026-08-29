@@ -3,17 +3,61 @@
 //!
 //! 前台只显示一个项目;其他项目的任务和 Agent 在后台继续运行(见 ADR 0001)。
 
+use crate::adapter_launch;
 use crate::pipe_server::{pipe_name_for_current_process, PipeServer};
 use crate::project_overview::{HubCtx, ProjectOverviewHub};
-use crate::runtime_host::{KeepAwake, RuntimeHostImpl, SessionRegistry};
+use crate::runtime_host::{KeepAwake, RuntimeHostImpl, SessionRegistry, WorkflowLauncher};
 use anyhow::{Context as _, Result};
-use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
-use mf_agent::secrets::SecretStore;
+use mf_agent::orchestrator::{
+    GlobalLimiter, Orchestrator, ProfileCatalog, WorkflowKernel, WorkflowPluginPins,
+};
+use mf_agent::workflow::{PluginSourcePin, WorkflowTemplateVersion};
 use mf_agent::{CatalogStore, Store, TaskStatus};
 use mf_plugins::PluginRegistry;
 use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// 生产 pin 生命周期:Plugin Host 内容寻址 pin(内置合成插件走源 pin)。
+struct PluginHostPins {
+    host: Arc<PluginRegistry>,
+}
+
+impl WorkflowPluginPins for PluginHostPins {
+    fn pin_for_run(&self, run_key: &str, pin: &PluginSourcePin) -> Result<()> {
+        self.host
+            .pin_source_for_run(run_key, &pin.full_id, &pin.version, &pin.content_hash)
+    }
+    fn resolve_pin(&self, pin: &PluginSourcePin) -> Result<()> {
+        self.host
+            .resolve_source_pin(&pin.full_id, &pin.version, &pin.content_hash)
+    }
+    fn release_run_pins(&self, run_key: &str) -> Result<()> {
+        self.host.release_run_pins(run_key)
+    }
+}
+
+/// 解析项目的执行目录提供器:插件贡献声明隔离能力的 worktree 优先
+/// (Git 仓库才可创建 worktree),否则回退内核共享项目目录。
+fn directory_provider_for(
+    root: &Path,
+    plugins: &Arc<PluginRegistry>,
+) -> Arc<dyn mf_agent::execution_directory::ExecutionDirectoryProvider> {
+    // 插件贡献的执行目录提供器:声明隔离能力的优先(Git 仓库才可用
+    // worktree);未命中或创建失败回退内核共享项目目录。
+    let directories = plugins.contributions().execution_directories();
+    if directories
+        .iter()
+        .any(|(_, _, contribution)| contribution.isolates && mf_vcs::git::Git::is_repo(root))
+    {
+        if let Ok(provider) =
+            mf_plugins::git_worktree_provider::GitWorktreeProvider::new(root.to_path_buf())
+        {
+            return Arc::new(provider);
+        }
+    }
+    Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default())
+}
 
 pub struct ProjectHandle {
     pub root: PathBuf,
@@ -108,24 +152,10 @@ fn session_path() -> PathBuf {
         .join("session.json")
 }
 
-fn legacy_builtin_adapter_id(agent_type: &str) -> Option<&'static str> {
-    match agent_type {
-        "claude" | "claude-code" => Some("claude-code"),
-        "codex" => Some("codex"),
-        "generic-command" | "opencode" | "cursor" | "gemini" | "copilot" | "qwen" | "iflow"
-        | "aider" | "amp" | "kimi" => Some("generic-command"),
-        _ => None,
-    }
-}
-
-fn contribution_supports_mode(modes: &[String], mode: mf_agent::RunMode) -> bool {
-    modes.iter().any(|declared| declared == mode.as_str())
-}
-
 /// 离散 CLI 会话继承 Task 目标作为初始提示(空白目标不注入)。
-fn apply_task_goal(launch_ctx: &mut mf_agent::LaunchContext, goal: &str) {
+fn apply_task_goal(prompt: &mut Option<String>, goal: &str) {
     if !goal.trim().is_empty() {
-        launch_ctx.prompt = Some(goal.to_string());
+        *prompt = Some(goal.to_string());
     }
 }
 
@@ -244,8 +274,18 @@ impl AppCtx {
         }
         let store = Store::open(&db_path)?;
         let config = self.config.lock().clone();
-        let host = RuntimeHostImpl::new(self.registry.clone());
-        let orch = Orchestrator::start(
+        let host = RuntimeHostImpl::with_launcher(
+            self.registry.clone(),
+            WorkflowLauncher {
+                plugins: self.plugins.clone(),
+                catalog: self.catalog_store.clone(),
+            },
+        );
+        // 目录提供器:Git 仓库 → worktree 隔离(插件贡献解析);
+        // 非 Git 根 → 共享项目目录(并行需显式风险开关,编译器默认拒绝)
+        let directory: Arc<dyn mf_agent::execution_directory::ExecutionDirectoryProvider> =
+            directory_provider_for(&root, &self.plugins);
+        let orch = Orchestrator::start_with(
             store,
             root.clone(),
             config,
@@ -253,7 +293,13 @@ impl AppCtx {
             self.catalog.clone(),
             self.limiter.clone(),
             pipe_name_for_current_process(),
-            Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
+            directory,
+            WorkflowKernel {
+                catalog: self.catalog_store.clone(),
+                pins: Some(Arc::new(PluginHostPins {
+                    host: self.plugins.clone(),
+                })),
+            },
         )?;
         self.projects.lock().push(ProjectHandle {
             root: root.clone(),
@@ -355,14 +401,15 @@ impl AppCtx {
 
     /// 在项目任务下创建离散 CLI 会话(设计 §4.7 / §10):
     /// 不属于 DAG、没有 Step / Agent Run,不改变 Task 状态。
-    /// UI(`+` 菜单)接线在界面里程碑;先落地宿主路由与持久化。
-    #[allow(dead_code)]
+    /// `external_config = true` 表示 Default CLI 只读外部配置意图
+    /// (适配器跳过隔离注入,绝不写用户全局配置)。
     pub fn create_ad_hoc_session(
         &self,
         root: &Path,
         task_id: i64,
         instance_snapshot: &mf_agent::AgentInstanceSnapshot,
         launch_mode: mf_agent::RunMode,
+        external_config: bool,
     ) -> Result<mf_agent::AdHocSessionView> {
         let orch = self
             .orchestrator_of(root)
@@ -374,10 +421,10 @@ impl AppCtx {
             .store
             .task_view(task_id)?
             .ok_or_else(|| anyhow::anyhow!("任务 {task_id} 不存在"))?;
-        let contributions = self.plugins.contributions();
-        let resolved = contributions.find_agent_type(&instance_snapshot.agent_type);
+        let (resolved, _adapter) =
+            adapter_launch::resolve_adapter(&self.plugins, &instance_snapshot.agent_type)?;
         if let Some((_, contribution)) = &resolved {
-            if !contribution_supports_mode(&contribution.modes, launch_mode) {
+            if !adapter_launch::contribution_supports_mode(&contribution.modes, launch_mode) {
                 anyhow::bail!(
                     "Agent Type `{}` 不支持 {} 模式",
                     instance_snapshot.agent_type,
@@ -385,30 +432,6 @@ impl AppCtx {
                 );
             }
         }
-        let adapter_id = match &resolved {
-            Some((_, contribution)) => contribution.adapter.as_str(),
-            None => legacy_builtin_adapter_id(&instance_snapshot.agent_type).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Agent Type `{}` 不存在、已禁用或所属插件未启用",
-                    instance_snapshot.agent_type
-                )
-            })?,
-        };
-        let adapter = mf_plugins::builtin::adapter_for(adapter_id)
-            .ok_or_else(|| anyhow::anyhow!("尚不支持 Agent Adapter: {adapter_id}"))?;
-        let validation_errors = adapter.validate(instance_snapshot);
-        if !validation_errors.is_empty() {
-            anyhow::bail!("Agent Instance 配置无效: {}", validation_errors.join("; "));
-        }
-        let grants_shell = resolved
-            .as_ref()
-            .and_then(|(source, _)| {
-                self.plugins
-                    .summaries()
-                    .into_iter()
-                    .find(|summary| summary.full_id == source.plugin_full_id)
-            })
-            .is_some_and(|summary| summary.enabled && summary.capabilities.shell);
 
         let nonce = chrono::Utc::now()
             .timestamp_nanos_opt()
@@ -417,23 +440,40 @@ impl AppCtx {
             .join("monkeyfence")
             .join("ad-hoc")
             .join(format!("{}-{task_id}-{nonce}", std::process::id()));
-        let mut launch_ctx = mf_agent::LaunchContext::new(run_temp.clone(), root.to_path_buf());
-        launch_ctx.grants_shell = grants_shell;
-        apply_task_goal(&mut launch_ctx, &task.goal);
         let run_token = format!("ad-hoc:{}:{task_id}:{nonce}", root.display());
-        if !instance_snapshot.sealed_secret_ids.is_empty() {
-            let secret_store = mf_plugins::builtin_secret_store::BuiltinSecretStore::open(
-                self.catalog_store.clone(),
-            )?;
-            for secret_id in &instance_snapshot.sealed_secret_ids {
-                let lease = secret_store.unseal_for_run(&run_token, secret_id)?;
-                launch_ctx
-                    .secrets
-                    .insert(secret_id.clone(), Arc::new(lease));
-            }
-        }
-        let plan = adapter.compile_launch(instance_snapshot, &launch_ctx)?;
+        let mut prompt = None;
+        apply_task_goal(&mut prompt, &task.goal);
+        let plan = adapter_launch::compile_instance_launch(
+            &self.plugins,
+            &self.catalog_store,
+            instance_snapshot,
+            run_temp.clone(),
+            root.to_path_buf(),
+            prompt,
+            &run_token,
+            external_config,
+        )?;
         orch.create_ad_hoc_session(task_id, instance_snapshot, launch_mode, run_temp, plan)
+    }
+
+    /// 分配工作流模板给任务(生产入口):插件贡献索引 + 编译 + 冻结 Revision。
+    pub fn assign_workflow(
+        &self,
+        root: &Path,
+        task_id: i64,
+        version_id: i64,
+        allow_unsafe_shared_directory: bool,
+    ) -> Result<i64> {
+        let orch = self
+            .orchestrator_of(root)
+            .ok_or_else(|| anyhow::anyhow!("项目未打开: {}", root.display()))?;
+        let version: WorkflowTemplateVersion = self
+            .catalog_store
+            .template_version(version_id)?
+            .ok_or_else(|| anyhow::anyhow!("模板版本 {version_id} 不存在"))?;
+        let index = adapter_launch::workflow_plugin_index(&self.plugins);
+        let rev = orch.assign_workflow(task_id, &version, &index, allow_unsafe_shared_directory)?;
+        Ok(rev.id)
     }
 
     /// 活动项目数(用于关闭确认)。
@@ -469,35 +509,29 @@ mod agent_launch_selection_tests {
     use super::*;
 
     #[test]
-    fn only_explicit_legacy_builtin_ids_have_adapter_fallbacks() {
-        assert_eq!(legacy_builtin_adapter_id("claude"), Some("claude-code"));
-        assert_eq!(legacy_builtin_adapter_id("codex"), Some("codex"));
-        assert_eq!(
-            legacy_builtin_adapter_id("generic-command"),
-            Some("generic-command")
+    fn directory_provider_prefers_worktree_for_git_repos() {
+        let git_root = tempfile::tempdir().unwrap();
+        mf_vcs::git::Git::init(git_root.path()).unwrap();
+        // load_at_with_catalog 注册内置合成贡献(含 worktree 目录提供器)
+        let host = PluginRegistry::load_at_with_catalog(
+            git_root.path().join("plugins"),
+            mf_agent::CatalogStore::memory().unwrap(),
+            &mf_agent::Config::default(),
+            &[],
         );
-        assert_eq!(legacy_builtin_adapter_id("missing.plugin.agent"), None);
-    }
-
-    #[test]
-    fn contribution_must_declare_requested_run_mode() {
-        let modes = vec!["interactive".to_string()];
-        assert!(contribution_supports_mode(
-            &modes,
-            mf_agent::RunMode::Interactive
-        ));
-        assert!(!contribution_supports_mode(
-            &modes,
-            mf_agent::RunMode::OneShot
-        ));
+        let provider = directory_provider_for(git_root.path(), &host);
+        assert!(provider.isolates(), "Git 仓库应使用 worktree 隔离提供器");
+        let plain = tempfile::tempdir().unwrap();
+        let provider = directory_provider_for(plain.path(), &host);
+        assert!(!provider.isolates(), "非 Git 根应回退共享项目目录");
     }
 
     #[test]
     fn task_goal_becomes_launch_prompt_only_when_meaningful() {
-        let mut ctx = mf_agent::LaunchContext::new(PathBuf::from("C:/t"), PathBuf::from("C:/w"));
-        apply_task_goal(&mut ctx, "  ");
-        assert!(ctx.prompt.is_none(), "空白目标不得注入提示");
-        apply_task_goal(&mut ctx, "修复登录超时");
-        assert_eq!(ctx.prompt.as_deref(), Some("修复登录超时"));
+        let mut prompt = None;
+        apply_task_goal(&mut prompt, "  ");
+        assert!(prompt.is_none(), "空白目标不得注入提示");
+        apply_task_goal(&mut prompt, "修复登录超时");
+        assert_eq!(prompt.as_deref(), Some("修复登录超时"));
     }
 }

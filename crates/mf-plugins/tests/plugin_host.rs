@@ -193,3 +193,46 @@ fn persisted_pin_survives_host_rebuild_and_blocks_uninstall() {
         "released package may be uninstalled"
     );
 }
+
+// ---------- 源 pin(工作流冻结用;内置合成插件无内容寻址包) ----------
+
+#[test]
+fn source_pin_roundtrip_for_builtin_synthetic_plugins() {
+    // load_at_with_catalog 注册内置合成插件(empty_at 不含内置)
+    let host = PluginHost::load_at_with_catalog(
+        tempfile::tempdir().unwrap().path().to_path_buf(),
+        CatalogStore::memory().unwrap(),
+        &mf_agent::Config::default(),
+        &[],
+    );
+    // 内置合成插件:content_hash 为空,无 packages 记录
+    host.pin_source_for_run("run-k", "monkeyfence.codex", "0.1.0", "")
+        .unwrap();
+    assert_eq!(host.active_pin_count(""), 1);
+    // 解析校验通过(内置插件始终在位)
+    host.resolve_source_pin("monkeyfence.codex", "0.1.0", "")
+        .unwrap();
+    // 释放后引用归零
+    host.release_run_pins("run-k").unwrap();
+    assert_eq!(host.active_pin_count(""), 0);
+}
+
+#[test]
+fn source_pin_rejects_unknown_builtin() {
+    let host = PluginHost::empty_at(tempfile::tempdir().unwrap().path().to_path_buf());
+    assert!(host
+        .pin_source_for_run("run-k", "monkeyfence.ghost", "0.1.0", "")
+        .is_err());
+    assert!(host
+        .resolve_source_pin("monkeyfence.ghost", "0.1.0", "")
+        .is_err());
+}
+
+#[test]
+fn source_pin_for_packaged_plugin_requires_resolvable_hash() {
+    let host = PluginHost::empty_at(tempfile::tempdir().unwrap().path().to_path_buf());
+    // 非空 hash 但包不存在:拒绝(不得 pin 不存在的包)
+    assert!(host
+        .pin_source_for_run("run-k", "test.demo", "1.0.0", "sha256:deadbeef")
+        .is_err());
+}

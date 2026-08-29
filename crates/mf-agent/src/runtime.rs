@@ -128,6 +128,36 @@ pub struct AdHocLaunchSpec {
     pub events: crossbeam_channel::Sender<TaggedRuntimeEvent>,
 }
 
+/// 工作流 Step 派发规格(设计 §6.1):Orchestrator 从冻结 Revision
+/// 取出 Agent Instance 快照,交由宿主侧真实 Agent Adapter 编译 LaunchPlan
+/// 后启动。宿主不得改写 `run_temp`(可信物化根由调度器提供)。
+#[derive(Debug, Clone)]
+pub struct WorkflowLaunchSpec {
+    pub run_id: i64,
+    pub step_id: i64,
+    pub task_id: i64,
+    pub session_id: i64,
+    pub session_key: Option<String>,
+    /// 复用已存在(存活)的会话则不再拉起进程。
+    pub attach_existing_session: bool,
+    /// 工作流节点键(快照内稳定标识)。
+    pub node_key: String,
+    pub step_title: String,
+    /// 冻结的 Agent Instance 快照(Revision 时刻的配置)。
+    pub instance: crate::agent_instance::AgentInstanceSnapshot,
+    /// 贡献该节点 Agent Type 的插件包 pin(宿主校验后编译)。
+    pub plugin: Option<crate::workflow::PluginSourcePin>,
+    /// 发给 Agent 的提示(已做变量替换、含 goal/上游 Handoff 与结算纪律)。
+    pub prompt: String,
+    pub capability_token: String,
+    pub pipe_name: String,
+    pub mfctl_hint: Option<String>,
+    /// Execution Lease 提供的工作目录(进程 cwd)。
+    pub workdir: PathBuf,
+    /// 可信 run-temp(临时文件物化根)。
+    pub run_temp: PathBuf,
+}
+
 /// Runtime → Orchestrator 事件。
 #[derive(Debug, Clone)]
 pub enum RuntimeEvent {
@@ -168,6 +198,14 @@ pub type TaggedRuntimeEvent = (i64, RuntimeEvent);
 pub trait RuntimeHost: Send + Sync {
     /// 启动(或复用会话并发送 prompt)。事件通过 `events` 回调(首元素为 run_id)。
     fn launch(&self, spec: LaunchSpec, events: crossbeam_channel::Sender<TaggedRuntimeEvent>);
+    /// 启动工作流 Step:宿主用真实 Agent Adapter 把冻结实例编译为
+    /// LaunchPlan 并启动。同步返回的错误表示编译/启动失败
+    /// (调度方按失败结算,不留 Running)。
+    fn launch_workflow(
+        &self,
+        spec: WorkflowLaunchSpec,
+        events: crossbeam_channel::Sender<TaggedRuntimeEvent>,
+    ) -> Result<()>;
     /// 启动离散 CLI 会话:无 run 事件流,状态由宿主直接管理;
     /// 不得发明 Step / Agent Run,也不得触碰 Task 状态。
     fn launch_ad_hoc(&self, spec: AdHocLaunchSpec) -> Result<()>;
@@ -180,8 +218,10 @@ pub trait RuntimeHost: Send + Sync {
     /// 强制终止整个会话(进程)。
     fn kill_session(&self, project: &str, session_id: i64);
     /// 强制终止离散 CLI 会话(补偿路径:启动后 DB 写失败等场景,
-    /// 必须杀掉进程,不留孤儿)。
-    fn kill_ad_hoc(&self, project: &str, session_id: i64);
+    /// 必须杀掉进程,不留孤儿)。`session_id` 是展示会话行
+    /// (agent_sessions)的编号 —— 进程注册在展示会话键下;
+    /// ad_hoc_sessions 行号只作为事件 tag,不用于进程路由。
+    fn kill_ad_hoc(&self, project: &str, display_session_id: i64);
     /// 回答 Agent 的提问(阻塞等待中的 HTTP Runtime)。
     fn answer_question(&self, project: &str, run_id: i64, answer: &str);
     /// 宿主是否能确认会话仍存活(重启恢复用)。

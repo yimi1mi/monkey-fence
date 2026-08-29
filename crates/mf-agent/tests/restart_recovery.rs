@@ -24,6 +24,14 @@ struct MockHost {
 }
 
 impl RuntimeHost for MockHost {
+    fn launch_workflow(
+        &self,
+        _spec: mf_agent::runtime::WorkflowLaunchSpec,
+        _events: Sender<(i64, RuntimeEvent)>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn launch(&self, spec: LaunchSpec, events: Sender<(i64, RuntimeEvent)>) {
         let run_id = spec.run_id;
         self.senders

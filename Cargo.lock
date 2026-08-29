@@ -2476,6 +2476,7 @@ dependencies = [
  "crossbeam-channel",
  "dirs 5.0.1",
  "log",
+ "mf-plugins",
  "mf-skills",
  "parking_lot",
  "rusqlite",

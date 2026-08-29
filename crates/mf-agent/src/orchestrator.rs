@@ -5,12 +5,13 @@
 
 use crate::config::Config;
 use crate::execution_directory::{
-    ExecutionDirectoryProvider, ExecutionLease, LeaseContext, ProjectDirectoryProvider,
+    ExecutionDirectoryProvider, ExecutionLease, LeaseContext, MergeOutcome,
 };
 use crate::model::*;
 use crate::pipeline::{PipelineDraft, ProfileIndex, SessionPolicy};
-use crate::runtime::{AgentProfileSpec, LaunchSpec, RuntimeEvent, RuntimeHost};
+use crate::runtime::{AgentProfileSpec, LaunchSpec, RuntimeEvent, RuntimeHost, WorkflowLaunchSpec};
 use crate::store::Store;
+use crate::workflow::{PluginSourcePin, WorkflowTemplateVersion};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::{Mutex, RwLock};
@@ -18,6 +19,34 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+/// 工作流运行期的插件 pin 生命周期(生产实现由插件宿主提供:
+/// pin 保护包不被卸载,resolve 校验内容哈希,release 归还引用)。
+pub trait WorkflowPluginPins: Send + Sync {
+    /// 冻结 Revision 时固定插件包(重复 pin 幂等)。
+    fn pin_for_run(&self, run_key: &str, pin: &PluginSourcePin) -> Result<()>;
+    /// 派发前验证 pin 仍可解析(插件在位且内容哈希一致)。
+    fn resolve_pin(&self, pin: &PluginSourcePin) -> Result<()>;
+    /// 任务终态后释放该 run_key 的全部 pin。
+    fn release_run_pins(&self, run_key: &str) -> Result<()>;
+}
+
+/// 工作流内核依赖:实例解析(目录库)与插件 pin。
+/// `pins` 为 None 时跳过 pin 校验(旧项目库/无插件宿主场景)。
+pub struct WorkflowKernel {
+    pub catalog: Arc<crate::catalog_store::CatalogStore>,
+    pub pins: Option<Arc<dyn WorkflowPluginPins>>,
+}
+
+impl WorkflowKernel {
+    /// 无 pin 校验的内核(目录库必须提供;pin 可缺省)。
+    pub fn new(catalog: Arc<crate::catalog_store::CatalogStore>) -> WorkflowKernel {
+        WorkflowKernel {
+            catalog,
+            pins: None,
+        }
+    }
+}
 
 /// 跨项目全局并发限制(默认 4,可在设置中修改)。
 pub struct GlobalLimiter {
@@ -105,6 +134,10 @@ pub struct Orchestrator {
     held_leases: Mutex<HashMap<i64, ExecutionLease>>,
     /// step → 租约(自动重试复用同一目录,保留文件修改)。
     step_leases: Mutex<HashMap<i64, ExecutionLease>>,
+    /// 工作流内核(实例目录库 + 插件 pin)。
+    workflow: WorkflowKernel,
+    /// task → 汇合冲突待处理的隔离租约(NeedsUser;解决前任务保持 needs-you)。
+    pending_merges: Mutex<HashMap<i64, Vec<ExecutionLease>>>,
 }
 
 impl Orchestrator {
@@ -118,6 +151,32 @@ impl Orchestrator {
         global: Arc<GlobalLimiter>,
         pipe_name: String,
         directory: Arc<dyn ExecutionDirectoryProvider>,
+    ) -> Result<Arc<Orchestrator>> {
+        Self::start_with(
+            store,
+            root,
+            config,
+            host,
+            profiles,
+            global,
+            pipe_name,
+            directory,
+            WorkflowKernel::new(crate::catalog_store::CatalogStore::memory()?),
+        )
+    }
+
+    /// 完整启动(带工作流内核:实例目录库 + 插件 pin 生命周期)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with(
+        store: Arc<Store>,
+        root: PathBuf,
+        config: Config,
+        host: Arc<dyn RuntimeHost>,
+        profiles: Arc<RwLock<ProfileCatalog>>,
+        global: Arc<GlobalLimiter>,
+        pipe_name: String,
+        directory: Arc<dyn ExecutionDirectoryProvider>,
+        workflow: WorkflowKernel,
     ) -> Result<Arc<Orchestrator>> {
         // 异常退出恢复(设计 §13):宿主确认存活的会话重连;
         // 未知状态 → interrupted + awaiting-outcome(不判失败)
@@ -156,6 +215,8 @@ impl Orchestrator {
             directory,
             held_leases: Mutex::new(HashMap::new()),
             step_leases: Mutex::new(HashMap::new()),
+            workflow,
+            pending_merges: Mutex::new(HashMap::new()),
         });
         for run in &recovered {
             if let Some(t) = orch.store.task_view(run.task_id)? {
@@ -385,6 +446,13 @@ impl Orchestrator {
                 Ok(())
             })?;
         }
+        // 取消:待决汇合直接丢弃(不合并),隔离租约随取消释放
+        if let Some(pending) = self.pending_merges.lock().remove(&task_id) {
+            for lease in pending {
+                self.release_lease_of_lease(&lease);
+            }
+        }
+        self.release_workflow_pins(task_id);
         let t = self
             .store
             .set_task_status(task_id, TaskStatus::Cancelled)?
@@ -471,6 +539,134 @@ impl Orchestrator {
             .unwrap_or(t);
         self.emit(SchedulerEvent::TaskUpdated(t.clone()));
         Ok(t)
+    }
+
+    // ---------- 工作流分配(模板 → 编译 → 冻结 Revision) ----------
+
+    /// 把工作流模板版本分配给任务:运行 Workflow Compiler 全量校验,
+    /// 冻结实例快照与插件 pin,原子写入 Revision(快照 + Step 投影)。
+    /// `agent_type_plugins` 是当前可用插件贡献的 Agent Type → 插件包身份。
+    pub fn assign_workflow(
+        &self,
+        task_id: i64,
+        version: &WorkflowTemplateVersion,
+        agent_type_plugins: &HashMap<String, PluginSourcePin>,
+        allow_unsafe_shared_directory: bool,
+    ) -> Result<RevisionView> {
+        if let Some(t) = self.store.task_view(task_id)? {
+            if t.status == TaskStatus::Running && !t.paused {
+                anyhow::bail!("运行中的任务必须先暂停才能重新分配工作流");
+            }
+        } else {
+            anyhow::bail!("任务 {task_id} 不存在");
+        }
+        let snapshot = crate::workflow_compiler::WorkflowCompiler::new()
+            .compile(crate::workflow_compiler::CompileInput {
+                template: version,
+                directory_provider_isolates: self.directory.isolates(),
+                allow_unsafe_shared_directory,
+                agent_type_plugins,
+                resolve_instance: &|id| self.workflow.catalog.snapshot_agent_instance(id, None),
+            })
+            .map_err(|errors| {
+                anyhow::anyhow!(
+                    "工作流编译失败:\n{}",
+                    errors
+                        .iter()
+                        .map(|e| format!("- [{}] {}: {}", e.code, e.node, e.message))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            })?;
+        // 先 pin 后写库:Revision 创建失败时回滚 pin,不留悬挂引用
+        let run_key = workflow_pin_key(task_id);
+        let mut pinned: Vec<PluginSourcePin> = Vec::new();
+        if let Some(pins) = &self.workflow.pins {
+            for node in &snapshot.nodes {
+                let Some(pin) = &node.plugin else {
+                    continue;
+                };
+                if pinned.contains(pin) {
+                    continue;
+                }
+                pins.pin_for_run(&run_key, pin)?;
+                pinned.push(pin.clone());
+            }
+        }
+        match self.store.create_workflow_revision(task_id, &snapshot) {
+            Ok(rev) => {
+                self.emit(SchedulerEvent::RevisionCreated(rev.clone()));
+                if let Some(t) = self.store.task_view(task_id)? {
+                    self.emit(SchedulerEvent::TaskUpdated(t));
+                }
+                Ok(rev)
+            }
+            Err(e) => {
+                if let Some(pins) = &self.workflow.pins {
+                    let _ = pins.release_run_pins(&run_key);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// 用户解决汇合冲突后重试:合并仍冲突的隔离租约;全部合并成功则
+    /// 释放租约并重新收敛任务。返回仍存在的冲突(空 = 已全部解决)。
+    pub fn resolve_pending_merges(&self, task_id: i64) -> Result<Vec<String>> {
+        let leases = self
+            .pending_merges
+            .lock()
+            .remove(&task_id)
+            .unwrap_or_default();
+        if leases.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conflicts = self.merge_leases(&leases)?;
+        if conflicts.is_empty() {
+            for lease in &leases {
+                self.release_lease_of_run_by_key(&lease.id);
+            }
+            self.check_convergence(task_id)?;
+        } else {
+            // 仍有冲突:租约继续持有,等待用户再次处理
+            self.pending_merges.lock().insert(task_id, leases);
+        }
+        Ok(conflicts)
+    }
+
+    /// 汇合一批隔离租约;返回冲突列表(空 = 全部合并成功)。
+    fn merge_leases(&self, leases: &[ExecutionLease]) -> Result<Vec<String>> {
+        let isolated: Vec<ExecutionLease> = leases.iter().filter(|l| l.isolated).cloned().collect();
+        if isolated.is_empty() {
+            return Ok(Vec::new());
+        }
+        Ok(match self.directory.merge(&isolated)? {
+            MergeOutcome::NeedsUser { conflicts } => conflicts,
+            MergeOutcome::Merged | MergeOutcome::NotRequired => Vec::new(),
+        })
+    }
+
+    fn release_lease_of_run_by_key(&self, lease_id: &str) {
+        // 先取出并释放锁(if let 条件里的临时 guard 会活到块末,持锁再锁会死锁)
+        let lease = self
+            .held_leases
+            .lock()
+            .values()
+            .find(|l| l.id == lease_id)
+            .cloned();
+        if let Some(lease) = lease {
+            self.release_lease_of_lease(&lease);
+        }
+    }
+
+    /// 释放具体租约对象(进程内映射 + 数据库行)。
+    fn release_lease_of_lease(&self, lease: &ExecutionLease) {
+        if let Err(e) = self.directory.release(lease) {
+            log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
+        }
+        let _ = self.store.release_execution_lease(&lease.id);
+        self.held_leases.lock().retain(|_, l| l.id != lease.id);
+        self.step_leases.lock().retain(|_, l| l.id != lease.id);
     }
 
     /// 失败节点操作:重试。`RetryMode::ContinueSession` 只对存活会话合法,
@@ -674,10 +870,8 @@ impl Orchestrator {
 
     fn after_settlement(&self, run: &RunView, settlement: &Settlement) {
         self.release_slot(run.id);
-        // 成功结算释放租约;失败结算的释放延迟到自动重试判定之后
-        if settlement.kind_str() == "complete" {
-            self.release_lease_of_run(run.id);
-        }
+        // 成功结算的租约在下方 Complete 分支汇合后释放;
+        // 失败结算的释放延迟到自动重试判定之后
         // needs-you 的任务在「需要你」的诱因全部消除后回到 running,下游继续自动派发
         if let Some(t) = self.store.task_view(run.task_id).ok().flatten() {
             if t.status == TaskStatus::NeedsYou && self.task_attention_cleared(run.task_id) {
@@ -697,6 +891,8 @@ impl Orchestrator {
         }
         match settlement {
             Settlement::Complete { .. } => {
+                // 隔离租约先汇合回项目目录;冲突 → needs-you(租约保持持有)
+                self.merge_or_pend(run);
                 if let Some(rev) = self.store.active_revision(run.task_id).ok().flatten() {
                     if let Ok(promoted) = self.store.with_tx(|c| Store::promote_ready_tx(c, rev.id))
                     {
@@ -776,12 +972,81 @@ impl Orchestrator {
         }
     }
 
+    /// 成功结算后的隔离租约汇合:合并成功 → 释放;
+    /// 冲突/合并出错 → 租约保持持有并进入待决列表,任务 → needs-you。
+    fn merge_or_pend(&self, run: &RunView) {
+        let lease = self.held_leases.lock().get(&run.id).cloned();
+        let Some(lease) = lease else {
+            self.release_lease_of_run(run.id);
+            return;
+        };
+        if !lease.isolated {
+            self.release_lease_of_lease(&lease);
+            return;
+        }
+        let conflicts = match self.merge_leases(std::slice::from_ref(&lease)) {
+            Ok(conflicts) => conflicts,
+            Err(e) => vec![format!("汇合执行失败: {e:#}")],
+        };
+        if conflicts.is_empty() {
+            self.release_lease_of_lease(&lease);
+            return;
+        }
+        self.pending_merges
+            .lock()
+            .entry(run.task_id)
+            .or_default()
+            .push(lease);
+        if let Some(t) = self.store.task_view(run.task_id).ok().flatten() {
+            if !t.status.terminal() {
+                if let Some(t) = self
+                    .store
+                    .set_task_status(t.id, TaskStatus::NeedsYou)
+                    .ok()
+                    .flatten()
+                {
+                    self.store.set_task_unread(t.id, true).ok();
+                    self.emit(SchedulerEvent::TaskUpdated(t));
+                }
+            }
+        }
+        self.emit(SchedulerEvent::Log {
+            run_id: run.id,
+            text: format!(
+                "隔离目录汇合存在冲突,等待用户处理:
+{}",
+                conflicts.join(
+                    "
+"
+                )
+            ),
+        });
+    }
+
+    /// 释放任务的插件 pin(成功收敛/取消/归档后;幂等)。
+    fn release_workflow_pins(&self, task_id: i64) {
+        if let Some(pins) = &self.workflow.pins {
+            if let Err(e) = pins.release_run_pins(&workflow_pin_key(task_id)) {
+                log::warn!("释放任务 {task_id} 的插件 pin 失败: {e:#}");
+            }
+        }
+    }
+
     fn check_convergence(&self, task_id: i64) -> Result<()> {
         // 取消/归档的任务不被后续收敛改写;failed 任务在人工 skip 后允许重新收敛
         if let Some(t) = self.store.task_view(task_id)? {
             if matches!(t.status, TaskStatus::Cancelled | TaskStatus::Archived) {
                 return Ok(());
             }
+        }
+        // 汇合冲突未解决:结果尚未回到项目目录,任务不算完成
+        if self
+            .pending_merges
+            .lock()
+            .get(&task_id)
+            .map_or(false, |v| !v.is_empty())
+        {
+            return Ok(());
         }
         let Some(rev) = self.store.active_revision(task_id)? else {
             return Ok(());
@@ -792,6 +1057,7 @@ impl Orchestrator {
                 if let Some(t) = self.store.set_task_status(task_id, TaskStatus::Succeeded)? {
                     self.emit(SchedulerEvent::TaskUpdated(t));
                 }
+                self.release_workflow_pins(task_id);
             }
             Some(false) => {
                 if let Some(t) = self.store.set_task_status(task_id, TaskStatus::Failed)? {
@@ -966,9 +1232,17 @@ impl Orchestrator {
             Ok(Some(view)) => view,
             Ok(None) => anyhow::bail!("离散会话 {} 启动后读取失败", view.id),
             Err(db_error) => {
-                self.host.kill_ad_hoc(&self.root_str, view.id);
-                if let Some(dead) = self.store.set_ad_hoc_status(view.id, SessionStatus::Dead)? {
-                    self.emit(SchedulerEvent::AdHocSessionUpdated(dead));
+                // 进程注册在展示会话键下 —— 补偿 kill 必须用 display ID
+                self.host.kill_ad_hoc(&self.root_str, display.id);
+                // 二次状态写入失败不遮蔽主错误(kill 已执行,必须如实上报)
+                match self.store.set_ad_hoc_status(view.id, SessionStatus::Dead) {
+                    Ok(Some(dead)) => {
+                        self.emit(SchedulerEvent::AdHocSessionUpdated(dead));
+                    }
+                    Ok(None) => {}
+                    Err(secondary) => {
+                        log::warn!("离散会话 {} 补偿置 Dead 失败: {secondary:#}", view.id);
+                    }
                 }
                 return Err(db_error.context(format!(
                     "离散会话 {} 启动后状态写入失败,已终止进程",
@@ -1165,16 +1439,40 @@ impl Orchestrator {
     }
 
     fn dispatch(&self, task: &TaskView, step: &StepView, policy: &SessionPolicy) -> Result<()> {
-        let (spec_profile, runtime) = {
+        // 工作流 Revision:Step 对应快照节点(冻结实例);否则走旧 Profile 路径
+        let snapshot_node = self
+            .store
+            .revision_snapshot(step.revision_id)?
+            .and_then(|s| s.nodes.into_iter().find(|n| n.key == step.step_key));
+        let agent_label = snapshot_node
+            .as_ref()
+            .map(|n| n.instance.agent_type.clone())
+            .unwrap_or_else(|| step.agent_profile.clone());
+        let legacy_profile = if snapshot_node.is_some() {
+            None
+        } else {
             let catalog = self.profiles.read();
-            let spec = catalog
-                .specs
-                .get(&step.agent_profile)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Agent Profile `{}` 未注册", step.agent_profile))?;
-            let runtime = spec.runtime;
-            (spec, runtime)
+            Some(
+                catalog
+                    .specs
+                    .get(&step.agent_profile)
+                    .cloned()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("Agent Profile `{}` 未注册", step.agent_profile)
+                    })?,
+            )
         };
+        // 会话运行时:工作流节点恒为 PTY(Adapter 编译 LaunchPlan);
+        // 旧路径沿用 Profile 声明的运行时
+        let session_runtime = snapshot_node
+            .as_ref()
+            .map(|_| "pty".to_string())
+            .or_else(|| {
+                legacy_profile
+                    .as_ref()
+                    .map(|p| p.runtime.as_str().to_string())
+            })
+            .unwrap_or_else(|| "pty".to_string());
         // 会话:fresh → 新建;reuse → 复用活的,否则新建;
         // 手动"继续会话"重试 → 固定复用指定存活会话(一次性映射)
         let (session, attach_existing) = if let Some(session_id) =
@@ -1187,28 +1485,20 @@ impl Orchestrator {
             match live {
                 Some(s) => (s, true),
                 None => (
-                    self.store.create_session(
-                        None,
-                        runtime.as_str(),
-                        &step.agent_profile,
-                        &step.title,
-                    )?,
+                    self.store
+                        .create_session(None, &session_runtime, &agent_label, &step.title)?,
                     false,
                 ),
             }
         } else {
             match policy {
                 SessionPolicy::Fresh => (
-                    self.store.create_session(
-                        None,
-                        runtime.as_str(),
-                        &step.agent_profile,
-                        &step.title,
-                    )?,
+                    self.store
+                        .create_session(None, &session_runtime, &agent_label, &step.title)?,
                     false,
                 ),
                 SessionPolicy::Reuse { key } => {
-                    match self.store.find_reusable_session(key, &step.agent_profile)? {
+                    match self.store.find_reusable_session(key, &agent_label)? {
                         Some(s)
                             if !matches!(s.status, SessionStatus::Dead | SessionStatus::Hidden) =>
                         {
@@ -1217,8 +1507,8 @@ impl Orchestrator {
                         _ => (
                             self.store.create_session(
                                 Some(key),
-                                runtime.as_str(),
-                                &step.agent_profile,
+                                &session_runtime,
+                                &agent_label,
                                 &step.title,
                             )?,
                             false,
@@ -1239,8 +1529,8 @@ impl Orchestrator {
         let run = self
             .store
             .dispatch_run(task.id, step.id, step.revision_id, session.id)?;
-        // 执行位置租约:同 step 复用(自动重试保留文件修改),新 step acquire;
-        // 派发进程前先持久化
+        // 执行位置租约:同 step 复用(自动重试保留文件修改),新 step acquire。
+        // acquire/持久化失败立即失败结算 —— 绝不留下 Running 的孤儿 run。
         let lease = {
             let mut step_leases = self.step_leases.lock();
             if let Some(existing) = step_leases.get(&step.id) {
@@ -1253,13 +1543,28 @@ impl Orchestrator {
                     project_root: self.root.clone(),
                     step_key: step.step_key.clone(),
                 };
-                let lease = self.directory.acquire(&ctx)?;
+                let lease = match self.directory.acquire(&ctx) {
+                    Ok(lease) => lease,
+                    Err(e) => {
+                        drop(step_leases);
+                        self.settle_dispatch_failure(&run, format!("获取执行目录租约失败: {e:#}"));
+                        return Ok(());
+                    }
+                };
                 step_leases.insert(step.id, lease.clone());
                 lease
             }
         };
-        self.store
-            .insert_execution_lease(&lease, Some(run.id), step.id, task.id)?;
+        if let Err(e) = self
+            .store
+            .insert_execution_lease(&lease, Some(run.id), step.id, task.id)
+        {
+            // 数据库行写入失败:先直接释放刚 acquire 的租约,再失败结算
+            self.step_leases.lock().remove(&step.id);
+            let _ = self.directory.release(&lease);
+            self.settle_dispatch_failure(&run, format!("持久化执行租约失败: {e:#}"));
+            return Ok(());
+        }
         self.held_leases.lock().insert(run.id, lease.clone());
         self.emit(SchedulerEvent::StepUpdated(StepView {
             status: StepStatus::Running,
@@ -1268,7 +1573,49 @@ impl Orchestrator {
         self.active_dispatches.lock().insert(run.id);
         self.emit(SchedulerEvent::RunUpdated(run.clone()));
 
+        if let Some(node) = snapshot_node {
+            // 工作流路径:插件 pin 校验 → 冻结实例经宿主真实 Adapter 编译启动
+            if let (Some(pin), Some(pins)) = (&node.plugin, &self.workflow.pins) {
+                if let Err(e) = pins.resolve_pin(pin) {
+                    self.settle_dispatch_failure(
+                        &run,
+                        format!("插件包 pin 无法解析({}): {e:#}", pin.full_id),
+                    );
+                    return Ok(());
+                }
+            }
+            let upstream = self.upstream_handoffs(step, &node.deps);
+            let prompt = build_workflow_prompt(task, &node, &run.capability_token, &upstream);
+            let run_temp = trusted_run_temp(run.id);
+            let spec = WorkflowLaunchSpec {
+                run_id: run.id,
+                step_id: step.id,
+                task_id: task.id,
+                session_id: session.id,
+                session_key: policy.session_key().map(str::to_string),
+                attach_existing_session: attach_existing,
+                node_key: node.key.clone(),
+                step_title: step.title.clone(),
+                instance: node.instance.clone(),
+                plugin: node.plugin.clone(),
+                prompt,
+                capability_token: run.capability_token.clone(),
+                pipe_name: self.pipe_name.clone(),
+                mfctl_hint: Some(format!(
+                    "mfctl step complete --summary \"...\" / mfctl step fail --reason \"...\""
+                )),
+                workdir: lease.path.clone(),
+                run_temp: run_temp.clone(),
+            };
+            let tx = self.runtime_tx.clone();
+            if let Err(e) = self.host.launch_workflow(spec, tx) {
+                self.settle_dispatch_failure(&run, format!("工作流节点启动失败: {e:#}"));
+            }
+            return Ok(());
+        }
+
         let prompt = build_prompt(task, step, &run.capability_token);
+        let spec_profile = legacy_profile.expect("非工作流路径必然解析出 Profile");
         let spec = LaunchSpec {
             run_id: run.id,
             step_id: step.id,
@@ -1289,6 +1636,46 @@ impl Orchestrator {
         let tx = self.runtime_tx.clone();
         self.host.launch(spec, tx);
         Ok(())
+    }
+
+    /// 派发失败补偿:立即失败结算(释放并发槽/租约,任务进入 needs-you)。
+    fn settle_dispatch_failure(&self, run: &RunView, reason: String) {
+        self.emit(SchedulerEvent::Log {
+            run_id: run.id,
+            text: reason.clone(),
+        });
+        if let Err(e) = self.settle_run(run.id, Settlement::Fail { reason }) {
+            self.emit(SchedulerEvent::Error(format!("派发失败结算出错: {e:#}")));
+        }
+    }
+
+    /// 上游节点(按节点键)最近一次 Handoff;直接依赖且已结算才有输出。
+    fn upstream_handoffs(
+        &self,
+        step: &StepView,
+        deps: &[String],
+    ) -> HashMap<String, crate::handoff::Handoff> {
+        let mut out = HashMap::new();
+        let Ok(steps) = self.store.revision_steps(step.revision_id) else {
+            return out;
+        };
+        let Ok(rows) = self.store.list_handoff_rows(step.task_id) else {
+            return out;
+        };
+        for dep_key in deps {
+            let Some(dep_step) = steps.iter().find(|s| s.step_key == *dep_key) else {
+                continue;
+            };
+            // 同一上游多次尝试:取最新一行(handoffs 按 id 升序)
+            if let Some(row) = rows
+                .iter()
+                .filter(|r| r.step_id == Some(dep_step.id))
+                .next_back()
+            {
+                out.insert(dep_key.clone(), row.handoff.clone());
+            }
+        }
+        out
     }
 
     fn apply_runtime_event(&self, run_id: i64, ev: RuntimeEvent) -> Result<()> {
@@ -1460,6 +1847,14 @@ impl Orchestrator {
 
     /// 「需要你」诱因是否已消除:无失败/阻塞/待结算步骤,无开放问题,无中断运行。
     fn task_attention_cleared(&self, task_id: i64) -> bool {
+        if self
+            .pending_merges
+            .lock()
+            .get(&task_id)
+            .map_or(false, |v| !v.is_empty())
+        {
+            return false;
+        }
         let Ok(steps) = self.store.task_steps(task_id) else {
             return false;
         };
@@ -1635,4 +2030,150 @@ pub fn build_prompt(task: &TaskView, step: &StepView, token: &str) -> String {
             &step.instructions
         },
     )
+}
+
+/// 工作流节点的 run-temp 可信物化根(调度器独占分配;宿主不得改写)。
+fn trusted_run_temp(run_id: i64) -> PathBuf {
+    std::env::temp_dir()
+        .join("monkeyfence")
+        .join("steps")
+        .join(format!("{}-{run_id}", std::process::id()))
+}
+
+/// 任务级插件 pin run_key(任务生命周期内固定)。
+fn workflow_pin_key(task_id: i64) -> String {
+    format!("task-{task_id}")
+}
+
+/// 工作流节点初始提示:Task goal + 上游 Handoff 注入 + `${nodes.*}` 变量替换
+/// + mfctl 结算纪律(与旧路径同一纪律文本)。
+pub fn build_workflow_prompt(
+    task: &TaskView,
+    node: &crate::workflow::WorkflowNodeSnapshot,
+    token: &str,
+    upstream: &HashMap<String, crate::handoff::Handoff>,
+) -> String {
+    let instructions = substitute_node_references(&node.instructions, upstream);
+    let mut sections = vec![format!(
+        "你在 MonkeyFence 中执行工作流节点「{}」(任务: {})。",
+        node.title, task.title
+    )];
+    if !task.goal.trim().is_empty() {
+        sections.push(format!("任务目标:\n{}", task.goal));
+    }
+    if !upstream.is_empty() {
+        let mut keys: Vec<&String> = upstream.keys().collect();
+        keys.sort();
+        let lines: Vec<String> = std::iter::once("上游交接:".to_string())
+            .chain(keys.into_iter().map(|key| {
+                let handoff = &upstream[key];
+                format!(
+                    "- {key}: {}",
+                    if handoff.summary.trim().is_empty() {
+                        "(无摘要)"
+                    } else {
+                        &handoff.summary
+                    }
+                )
+            }))
+            .collect();
+        sections.push(lines.join("\n"));
+    }
+    sections.push(format!(
+        "工作说明:\n{}",
+        if instructions.trim().is_empty() {
+            "(无补充说明)".to_string()
+        } else {
+            instructions
+        }
+    ));
+    format!(
+        "{}\n\n完成后必须显式结算(在你的 shell 中运行以下命令之一,--token 参数必须原样保留):\n- 成功:mfctl --token {token} step complete --summary \"一句话总结\"\n- 失败:mfctl --token {token} step fail --reason \"失败原因\"\n\n规则:\n- 不要提交、推送或搁置任何版本控制变更。\n- 需要用户决策时,直接在终端中说明并等待。\n- 令牌仅对本步骤有效;重复提交相同结算是幂等的,提交冲突结算会被拒绝。",
+        sections.join("\n\n")
+    )
+}
+
+/// 替换 `${nodes.<key>.output...}` 变量:引用上游节点最近一次 Handoff。
+/// 支持的路径:``(整个 Handoff 的 JSON)、`.summary`、`.status`、
+/// `.changed_files`、`.artifacts`、`.blockers`、`.recommendations`、
+/// `.verification`、`.output`(自定义 JSON)与其下的嵌套键。
+/// 上游无输出(跳过/未结算)替换为占位说明,不保留原始变量。
+pub fn substitute_node_references(
+    text: &str,
+    upstream: &HashMap<String, crate::handoff::Handoff>,
+) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("${nodes.") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + "${nodes.".len()..];
+        // 取到最近的 `}` 作为引用结束(引用语法内不嵌套花括号)
+        let Some(end_rel) = after.find('}') else {
+            out.push_str("${nodes.");
+            out.push_str(after);
+            return out;
+        };
+        let reference = &after[..end_rel];
+        let key: String = reference
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        if key.is_empty() {
+            out.push_str(&rest[at..at + "${nodes.".len() + end_rel + 1]);
+            rest = &after[end_rel + 1..];
+            continue;
+        }
+        let path = reference[key.len()..].trim_start_matches('.');
+        match upstream.get(&key) {
+            Some(handoff) => out.push_str(&resolve_handoff_path(handoff, path)),
+            None => out.push_str(&format!("(上游节点 `{key}` 暂无交接输出)")),
+        }
+        rest = &after[end_rel + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// 解析 Handoff 输出路径(`output.` 之后的部分)。
+fn resolve_handoff_path(handoff: &crate::handoff::Handoff, path: &str) -> String {
+    let path = path.trim();
+    if path.is_empty() {
+        return serde_json::to_string_pretty(handoff).unwrap_or_default();
+    }
+    match path {
+        "summary" => return handoff.summary.clone(),
+        "status" => return handoff.status.clone(),
+        "changed_files" => return handoff.changed_files.join("\n"),
+        "artifacts" => return handoff.artifacts.join("\n"),
+        "blockers" => return handoff.blockers.join("\n"),
+        "recommendations" => return handoff.recommendations.join("\n"),
+        _ => {}
+    }
+    // `output` 或 `output.<嵌套键...>`:走自定义 JSON
+    let is_output = path == "output" || path.starts_with("output.");
+    let json_path = if is_output {
+        path["output".len()..].trim_start_matches('.')
+    } else {
+        path
+    };
+    let mut value = if is_output {
+        handoff.output.clone()
+    } else {
+        serde_json::to_value(handoff).unwrap_or(serde_json::Value::Null)
+    };
+    if json_path.is_empty() {
+        return serde_json::to_string_pretty(&value).unwrap_or_default();
+    }
+    for segment in json_path.split('.') {
+        if let serde_json::Value::Object(map) = &value {
+            value = map.get(segment).cloned().unwrap_or(serde_json::Value::Null);
+        } else {
+            value = serde_json::Value::Null;
+        }
+    }
+    match &value {
+        serde_json::Value::Null => format!("(交接输出无字段 `{path}`)"),
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_default(),
+    }
 }

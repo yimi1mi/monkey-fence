@@ -1,0 +1,693 @@
+//! 工作流运行链(独立复审阻塞项 1/4/10):
+//! Task Composer 之外的生产链 —— WorkflowCompiler 冻结插件 pin、
+//! create_workflow_revision 原子投影 Step、Orchestrator 从冻结
+//! Agent Instance 派发(真实 Agent Adapter 编译 LaunchPlan)、
+//! `${nodes.*}` 变量替换、Task goal 与上游 Handoff 注入、
+//! 目录租约失败不留 Running、隔离租约汇合冲突 → needs-you。
+
+use crossbeam_channel::Sender;
+use mf_agent::agent_instance::AgentInstanceDraft;
+use mf_agent::catalog_store::CatalogStore;
+use mf_agent::config::Config;
+use mf_agent::execution_directory::{
+    ExecutionDirectoryProvider, ExecutionLease, LeaseContext, MergeOutcome,
+};
+use mf_agent::model::*;
+use mf_agent::orchestrator::{
+    GlobalLimiter, Orchestrator, ProfileCatalog, WorkflowKernel, WorkflowPluginPins,
+};
+use mf_agent::runtime::{RuntimeEvent, RuntimeHost, WorkflowLaunchSpec};
+use mf_agent::store::Store;
+use mf_agent::workflow::{
+    PluginSourcePin, WorkflowNodeDraft, WorkflowTemplateDraft, WorkflowTemplateVersion,
+};
+use mf_agent::workflow_compiler::{CompileInput, WorkflowCompiler};
+use mf_agent::{InstanceScope, LaunchContext, RunMode};
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+// ---------- Fixture ----------
+
+fn instance_draft(name: &str, executable: &str) -> AgentInstanceDraft {
+    AgentInstanceDraft {
+        name: name.into(),
+        agent_type: "generic-command".into(),
+        scope: InstanceScope::User,
+        project_key: None,
+        enabled: true,
+        run_mode: RunMode::OneShot,
+        executable: executable.into(),
+        argv: vec!["--do".into()],
+        env: vec![("MF_TEST_ENV".into(), "1".into())],
+        config: serde_json::json!({}),
+        execution_contract: serde_json::json!({ "completion": "process-exit" }),
+        sealed_secret_ids: vec![],
+    }
+}
+
+fn plugin_pin(full_id: &str, hash: &str) -> PluginSourcePin {
+    PluginSourcePin {
+        full_id: full_id.into(),
+        version: "1.2.3".into(),
+        content_hash: hash.into(),
+    }
+}
+
+/// 可用 Agent Type → 插件包 pin(生产:AppCtx 从插件贡献构建)。
+fn plugin_index() -> HashMap<String, PluginSourcePin> {
+    let mut map = HashMap::new();
+    map.insert(
+        "generic-command".into(),
+        plugin_pin("builtin.core", "hash-generic"),
+    );
+    map
+}
+
+fn node(key: &str, deps: &[&str], instructions: &str, instance: &str) -> WorkflowNodeDraft {
+    WorkflowNodeDraft {
+        key: key.into(),
+        title: format!("节点 {key}"),
+        instructions: instructions.into(),
+        agent_instance_id: instance.into(),
+        deps: deps.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+struct Fixture {
+    catalog: Arc<CatalogStore>,
+    pins: Arc<FakePins>,
+    directory: Arc<ScriptedDirectory>,
+    host: Arc<RecordingHost>,
+    orch: Arc<Orchestrator>,
+    instance_id: String,
+}
+
+impl Fixture {
+    fn new(dir: &std::path::Path) -> Fixture {
+        let catalog = CatalogStore::memory().unwrap();
+        let instance = catalog
+            .create_agent_instance(instance_draft("worker", "agent.exe"))
+            .unwrap();
+        let pins = Arc::new(FakePins::default());
+        let directory = Arc::new(ScriptedDirectory::new(dir));
+        let host = Arc::new(RecordingHost::default());
+        let store = Store::open(&dir.join("workflow-v1.db")).unwrap();
+        let orch = Orchestrator::start_with(
+            store,
+            dir.to_path_buf(),
+            Config::default(),
+            host.clone(),
+            empty_profiles(),
+            GlobalLimiter::new(4),
+            "pipe".into(),
+            directory.clone(),
+            WorkflowKernel {
+                catalog: catalog.clone(),
+                pins: Some(pins.clone()),
+            },
+        )
+        .unwrap();
+        Fixture {
+            catalog,
+            pins,
+            directory,
+            host,
+            orch,
+            instance_id: instance.id,
+        }
+    }
+
+    fn template(&self, key: &str, nodes: Vec<WorkflowNodeDraft>) -> WorkflowTemplateVersion {
+        self.catalog
+            .save_template(&WorkflowTemplateDraft {
+                key: key.into(),
+                name: format!("模板 {key}"),
+                task_local: false,
+                nodes,
+            })
+            .unwrap()
+    }
+
+    fn assign_and_run(&self, task_id: i64, version: &WorkflowTemplateVersion) {
+        self.orch
+            .assign_workflow(task_id, version, &plugin_index(), false)
+            .unwrap();
+        self.orch.confirm_and_run(task_id).unwrap();
+    }
+}
+
+fn empty_profiles() -> Arc<RwLock<ProfileCatalog>> {
+    Arc::new(RwLock::new(ProfileCatalog::default()))
+}
+
+fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    cond()
+}
+
+/// pin 生命周期假实现:记录调用,可注入 resolve 失败。
+#[derive(Default)]
+struct FakePins {
+    pinned: Mutex<Vec<(String, PluginSourcePin)>>,
+    released: Mutex<Vec<String>>,
+    resolve_ok: AtomicBool,
+}
+
+impl FakePins {
+    fn resolve_ok(&self, ok: bool) {
+        self.resolve_ok.store(ok, Ordering::SeqCst);
+    }
+}
+
+impl WorkflowPluginPins for FakePins {
+    fn pin_for_run(&self, run_key: &str, pin: &PluginSourcePin) -> anyhow::Result<()> {
+        self.pinned.lock().push((run_key.to_string(), pin.clone()));
+        Ok(())
+    }
+    fn resolve_pin(&self, _pin: &PluginSourcePin) -> anyhow::Result<()> {
+        if self.resolve_ok.load(Ordering::SeqCst) {
+            Ok(())
+        } else {
+            anyhow::bail!("插件包已被卸载,无法解析 pin")
+        }
+    }
+    fn release_run_pins(&self, run_key: &str) -> anyhow::Result<()> {
+        self.released.lock().push(run_key.to_string());
+        Ok(())
+    }
+}
+
+/// 可脚本化目录提供器:acquire 可失败、merge 结果可切换、记录 release。
+struct ScriptedDirectory {
+    root: PathBuf,
+    acquire_fails: AtomicBool,
+    /// 隔离能力(编译器输入;默认 true)。
+    isolates: AtomicBool,
+    /// false → 返回 NeedsUser(冲突);true → Merged。
+    merge_ok: AtomicBool,
+    merges: AtomicUsize,
+    released: Mutex<Vec<String>>,
+}
+
+impl ScriptedDirectory {
+    fn new(root: &std::path::Path) -> ScriptedDirectory {
+        ScriptedDirectory {
+            root: root.to_path_buf(),
+            acquire_fails: AtomicBool::new(false),
+            isolates: AtomicBool::new(true),
+            merge_ok: AtomicBool::new(true),
+            merges: AtomicUsize::new(0),
+            released: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn set_isolates(&self, v: bool) {
+        self.isolates.store(v, Ordering::SeqCst);
+    }
+}
+
+impl ExecutionDirectoryProvider for ScriptedDirectory {
+    fn id(&self) -> &str {
+        "scripted"
+    }
+    fn isolates(&self) -> bool {
+        self.isolates.load(Ordering::SeqCst)
+    }
+    fn acquire(&self, ctx: &LeaseContext) -> anyhow::Result<ExecutionLease> {
+        if self.acquire_fails.load(Ordering::SeqCst) {
+            anyhow::bail!("目录租约获取失败(脚本)");
+        }
+        Ok(ExecutionLease {
+            id: format!("lease-{}-{}", ctx.task_id, ctx.step_key),
+            path: self.root.clone(),
+            isolated: true,
+            provider: "scripted".into(),
+            metadata: serde_json::json!({ "step_key": ctx.step_key }),
+        })
+    }
+    fn merge(&self, _leases: &[ExecutionLease]) -> anyhow::Result<MergeOutcome> {
+        self.merges.fetch_add(1, Ordering::SeqCst);
+        if self.merge_ok.load(Ordering::SeqCst) {
+            Ok(MergeOutcome::Merged)
+        } else {
+            Ok(MergeOutcome::NeedsUser {
+                conflicts: vec!["src/conflict.rs(修改者: a 与 b)".into()],
+            })
+        }
+    }
+    fn release(&self, lease: &ExecutionLease) -> anyhow::Result<()> {
+        self.released.lock().push(lease.id.clone());
+        Ok(())
+    }
+}
+
+/// 宿主:launch_workflow 用真实 GenericCommandAdapter 编译冻结实例。
+#[derive(Default)]
+struct RecordingHost {
+    workflow: Mutex<Vec<(WorkflowLaunchSpec, mf_agent::LaunchPlan)>>,
+    senders: Mutex<HashMap<String, Sender<(i64, RuntimeEvent)>>>,
+}
+
+impl RuntimeHost for RecordingHost {
+    fn launch(&self, _spec: mf_agent::LaunchSpec, _events: Sender<(i64, RuntimeEvent)>) {}
+    fn launch_workflow(
+        &self,
+        spec: WorkflowLaunchSpec,
+        events: Sender<(i64, RuntimeEvent)>,
+    ) -> anyhow::Result<()> {
+        // 真实适配器路径:与生产一致的 Adapter → LaunchPlan 编译
+        let adapter = mf_plugins::builtin::adapter_for("generic-command")
+            .ok_or_else(|| anyhow::anyhow!("generic-command 适配器不存在"))?;
+        let mut ctx = LaunchContext::new(spec.run_temp.clone(), spec.workdir.clone());
+        ctx.prompt = Some(spec.prompt.clone());
+        let plan = adapter.compile_launch(&spec.instance, &ctx)?;
+        self.senders
+            .lock()
+            .insert(spec.capability_token.clone(), events.clone());
+        let run_id = spec.run_id;
+        self.workflow.lock().push((spec, plan));
+        let _ = events.send((run_id, RuntimeEvent::Launched));
+        Ok(())
+    }
+    fn send_prompt(&self, _project: &str, _run_id: i64, _session_id: i64, _text: &str) {}
+    fn stop_run(&self, _project: &str, _run_id: i64) {}
+    fn kill_session(&self, _project: &str, _session_id: i64) {}
+    fn kill_ad_hoc(&self, _project: &str, _display_session_id: i64) {}
+    fn answer_question(&self, _project: &str, _run_id: i64, _answer: &str) {}
+    fn launch_ad_hoc(&self, _spec: mf_agent::AdHocLaunchSpec) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+// ---------- 编译器冻结插件 pin ----------
+
+#[test]
+fn compiler_freezes_plugin_pin_per_node() {
+    let catalog = CatalogStore::memory().unwrap();
+    let instance = catalog
+        .create_agent_instance(instance_draft("worker", "agent.exe"))
+        .unwrap();
+    let template = WorkflowTemplateVersion {
+        version_id: 0,
+        template_key: "t".into(),
+        version: 1,
+        created_at: String::new(),
+        nodes: vec![node("a", &[], "做 A", &instance.id)],
+    };
+    let pin = plugin_pin("builtin.core", "hash-generic");
+    let mut plugins = HashMap::new();
+    plugins.insert("generic-command".to_string(), pin.clone());
+    let snapshot = WorkflowCompiler::new()
+        .compile(CompileInput {
+            template: &template,
+            directory_provider_isolates: true,
+            allow_unsafe_shared_directory: false,
+            agent_type_plugins: &plugins,
+            resolve_instance: &|id| catalog.snapshot_agent_instance(id, None),
+        })
+        .unwrap();
+    assert_eq!(snapshot.nodes[0].plugin.as_ref(), Some(&pin));
+}
+
+#[test]
+fn compiler_rejects_agent_type_without_plugin() {
+    let catalog = CatalogStore::memory().unwrap();
+    let instance = catalog
+        .create_agent_instance(instance_draft("worker", "agent.exe"))
+        .unwrap();
+    let template = WorkflowTemplateVersion {
+        version_id: 0,
+        template_key: "t".into(),
+        version: 1,
+        created_at: String::new(),
+        nodes: vec![node("a", &[], "做 A", &instance.id)],
+    };
+    let empty: HashMap<String, PluginSourcePin> = HashMap::new();
+    let errors = WorkflowCompiler::new()
+        .compile(CompileInput {
+            template: &template,
+            directory_provider_isolates: true,
+            allow_unsafe_shared_directory: false,
+            agent_type_plugins: &empty,
+            resolve_instance: &|id| catalog.snapshot_agent_instance(id, None),
+        })
+        .unwrap_err();
+    assert!(
+        errors.iter().any(|e| e.code == "plugin-missing"),
+        "{errors:?}"
+    );
+}
+
+// ---------- Revision 原子投影 ----------
+
+#[test]
+fn workflow_revision_projects_steps_with_deps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    let version = fx.template(
+        "t",
+        vec![
+            node("a", &[], "做 A", &fx.instance_id),
+            node("b", &["a"], "看 ${nodes.a.output.summary}", &fx.instance_id),
+        ],
+    );
+    let task = fx.orch.create_task("标题", "目标").unwrap();
+    let snapshot = mf_agent::workflow::freeze_workflow(&fx.catalog, &version).unwrap();
+    let rev = fx
+        .orch
+        .store
+        .create_workflow_revision(task.id, &snapshot)
+        .unwrap();
+
+    // 投影的 Step 与快照节点一致(键/标题/说明/依赖),
+    // 且 revision 快照可整体读回(同一原子事务写入)
+    let steps = fx.orch.store.revision_steps(rev.id).unwrap();
+    assert_eq!(steps.len(), 2);
+    assert_eq!(steps[0].step_key, "a");
+    assert_eq!(steps[1].step_key, "b");
+    assert_eq!(steps[1].title, "节点 b");
+    assert!(steps[1].instructions.contains("${nodes.a.output.summary}"));
+    let dep_step = steps.iter().find(|s| s.step_key == "a").unwrap();
+    assert!(steps[1].deps.contains(&dep_step.id));
+    // 工作流 Step 的 agent_profile 投影为冻结实例的 Agent Type
+    assert_eq!(steps[0].agent_profile, "generic-command");
+    assert_eq!(
+        fx.orch.store.revision_snapshot(rev.id).unwrap().unwrap(),
+        snapshot
+    );
+}
+
+// ---------- assign_workflow:编译 + pin + Revision ----------
+
+#[test]
+fn assign_workflow_compiles_pins_and_creates_active_revision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    let version = fx.template("t", vec![node("a", &[], "做 A", &fx.instance_id)]);
+    let task = fx.orch.create_task("标题", "").unwrap();
+
+    let rev = fx
+        .orch
+        .assign_workflow(task.id, &version, &plugin_index(), false)
+        .unwrap();
+    // 插件 pin 已按任务 run_key 固定
+    let pinned = fx.pins.pinned.lock().clone();
+    assert_eq!(pinned.len(), 1, "去重后每个插件只 pin 一次");
+    assert_eq!(pinned[0].0, format!("task-{}", task.id));
+    assert_eq!(pinned[0].1.full_id, "builtin.core");
+    assert_eq!(pinned[0].1.content_hash, "hash-generic");
+    // Step 已投影,快照含插件 pin
+    let steps = fx.orch.store.revision_steps(rev.id).unwrap();
+    assert_eq!(steps.len(), 1);
+    let snapshot = fx.orch.store.revision_snapshot(rev.id).unwrap().unwrap();
+    assert_eq!(
+        snapshot.nodes[0].plugin.as_ref().unwrap().full_id,
+        "builtin.core"
+    );
+}
+
+#[test]
+fn assign_workflow_rejects_invalid_template_without_side_effects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    // 环:a → b → a
+    let version = fx.template(
+        "t",
+        vec![
+            node("a", &["b"], "做 A", &fx.instance_id),
+            node("b", &["a"], "做 B", &fx.instance_id),
+        ],
+    );
+    let task = fx.orch.create_task("标题", "").unwrap();
+    let err = fx
+        .orch
+        .assign_workflow(task.id, &version, &plugin_index(), false)
+        .unwrap_err();
+    assert!(err.to_string().contains("cycle"), "{err:#}");
+    assert!(fx.pins.pinned.lock().is_empty(), "编译失败不得写 pin");
+    assert!(
+        fx.orch.store.active_revision(task.id).unwrap().is_none(),
+        "编译失败不得创建 Revision"
+    );
+}
+
+#[test]
+fn parallel_without_isolation_defaults_to_reject() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    // 共享目录提供器(ScriptedDirectory 声明隔离,先关掉隔离能力)
+    fx.directory.set_isolates(false);
+    let version = fx.template(
+        "t",
+        vec![
+            node("a", &[], "做 A", &fx.instance_id),
+            node("b", &[], "做 B", &fx.instance_id),
+        ],
+    );
+    let task = fx.orch.create_task("标题", "").unwrap();
+    let err = fx
+        .orch
+        .assign_workflow(task.id, &version, &plugin_index(), false)
+        .unwrap_err();
+    assert!(err.to_string().contains("unsafe-parallel"), "{err:#}");
+    // 显式风险开关后放行
+    fx.orch
+        .assign_workflow(task.id, &version, &plugin_index(), true)
+        .unwrap();
+}
+
+// ---------- 两节点端到端(冻结实例派发 + goal/Handoff 注入 + 变量替换) ----------
+
+#[test]
+fn two_node_workflow_dispatches_frozen_instance_end_to_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    fx.pins.resolve_ok(true);
+    let version = fx.template(
+        "two",
+        vec![
+            node("a", &[], "先完成 A", &fx.instance_id),
+            node(
+                "b",
+                &["a"],
+                "阅读 ${nodes.a.output.summary} 后执行 B",
+                &fx.instance_id,
+            ),
+        ],
+    );
+    let task = fx
+        .orch
+        .create_task("发布预检", "把发布检查清单跑一遍")
+        .unwrap();
+    fx.assign_and_run(task.id, &version);
+
+    // 节点 a 派发:冻结实例 + goal 注入
+    assert!(wait_until(Duration::from_secs(5), || {
+        fx.host.workflow.lock().len() >= 1
+    }));
+    {
+        let guard = fx.host.workflow.lock();
+        let (spec, plan) = &guard[0];
+        assert_eq!(spec.node_key, "a");
+        assert_eq!(spec.instance.id, fx.instance_id, "必须派发冻结实例");
+        assert_eq!(spec.instance.executable, "agent.exe");
+        assert_eq!(spec.instance.argv, vec!["--do".to_string()]);
+        assert!(
+            spec.prompt.contains("把发布检查清单跑一遍"),
+            "Task goal 未注入"
+        );
+        assert!(spec.prompt.contains("先完成 A"));
+        assert!(spec.prompt.contains("mfctl"), "结算纪律必须在提示中");
+        // 真实适配器编译出的计划:可执行文件与实例一致,prompt 进入输入注入
+        assert_eq!(plan.executable.to_string_lossy(), "agent.exe");
+        assert!(
+            matches!(&plan.input, mf_agent::InputInjection::Argv(text) if text.contains("先完成 A")),
+            "prompt 必须经 LaunchPlan 输入注入进入真实 CLI"
+        );
+    }
+
+    // 结算 a(带 summary,落 Handoff)→ 解锁 b
+    let token_a = {
+        let guard = fx.host.workflow.lock();
+        guard[0].0.capability_token.clone()
+    };
+    fx.orch
+        .settle_by_token(
+            &token_a,
+            Settlement::Complete {
+                summary: "A 的检查结论全部通过".into(),
+            },
+        )
+        .unwrap();
+
+    assert!(wait_until(Duration::from_secs(5), || {
+        fx.host.workflow.lock().len() >= 2
+    }));
+    {
+        let guard = fx.host.workflow.lock();
+        let (spec_b, _) = &guard[1];
+        assert_eq!(spec_b.node_key, "b");
+        assert!(
+            spec_b.prompt.contains("A 的检查结论全部通过"),
+            "上游 Handoff 未注入/变量未替换: {}",
+            spec_b.prompt
+        );
+        assert!(
+            !spec_b.prompt.contains("${nodes."),
+            "变量引用必须被替换: {}",
+            spec_b.prompt
+        );
+        assert!(spec_b.prompt.contains("上游交接"), "应显式携带上游交接段落");
+    }
+
+    // 结算 b → 任务收敛成功;成功后释放插件 pin
+    let token_b = {
+        let guard = fx.host.workflow.lock();
+        guard[1].0.capability_token.clone()
+    };
+    fx.orch
+        .settle_by_token(
+            &token_b,
+            Settlement::Complete {
+                summary: "B 完成".into(),
+            },
+        )
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        fx.orch.store.task_view(task.id).unwrap().unwrap().status == TaskStatus::Succeeded
+    }));
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            fx.pins
+                .released
+                .lock()
+                .contains(&format!("task-{}", task.id))
+        }),
+        "任务成功后应释放插件 pin"
+    );
+}
+
+#[test]
+fn unresolvable_plugin_pin_fails_run_without_launch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    fx.pins.resolve_ok(false); // 插件包被卸载
+    let version = fx.template("t", vec![node("a", &[], "做 A", &fx.instance_id)]);
+    let task = fx.orch.create_task("标题", "").unwrap();
+    fx.assign_and_run(task.id, &version);
+
+    // 派发时 resolve_pin 失败 → run 失败结算(不是永远 Running)
+    assert!(wait_until(Duration::from_secs(5), || {
+        fx.orch
+            .store
+            .list_runs_of_task(task.id)
+            .unwrap()
+            .iter()
+            .any(|r| r.status == RunStatus::Failed)
+    }));
+    assert!(
+        fx.host.workflow.lock().is_empty(),
+        "pin 解析失败不得启动进程"
+    );
+    let task_view = fx.orch.store.task_view(task.id).unwrap().unwrap();
+    assert!(
+        matches!(task_view.status, TaskStatus::NeedsYou | TaskStatus::Failed),
+        "任务应进入需要人工处理的状态,实际 {:?}",
+        task_view.status
+    );
+}
+
+// ---------- 目录租约失败不留 Running ----------
+
+#[test]
+fn directory_acquire_failure_settles_run_not_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    fx.pins.resolve_ok(true);
+    fx.directory.acquire_fails.store(true, Ordering::SeqCst);
+    let version = fx.template("t", vec![node("a", &[], "做 A", &fx.instance_id)]);
+    let task = fx.orch.create_task("标题", "").unwrap();
+    fx.assign_and_run(task.id, &version);
+
+    // acquire 失败必须结算为 Failed(含原因),不得留下 Running 行
+    assert!(wait_until(Duration::from_secs(5), || {
+        let runs = fx.orch.store.list_runs_of_task(task.id).unwrap();
+        runs.iter().any(|r| r.status == RunStatus::Failed)
+    }));
+    let runs = fx.orch.store.list_runs_of_task(task.id).unwrap();
+    assert!(
+        runs.iter().all(|r| r.status != RunStatus::Running),
+        "不得留下 Running 的孤儿 run"
+    );
+    assert!(fx.host.workflow.lock().is_empty());
+    let task_view = fx.orch.store.task_view(task.id).unwrap().unwrap();
+    assert!(
+        matches!(task_view.status, TaskStatus::NeedsYou | TaskStatus::Failed),
+        "任务应进入需要人工处理的状态,实际 {:?}",
+        task_view.status
+    );
+}
+
+// ---------- 隔离租约汇合:冲突 → needs-you → 解决后释放 ----------
+
+#[test]
+fn isolated_merge_conflict_moves_task_to_needs_you_then_release() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = Fixture::new(tmp.path());
+    fx.pins.resolve_ok(true);
+    let version = fx.template("t", vec![node("a", &[], "做 A", &fx.instance_id)]);
+    let task = fx.orch.create_task("标题", "").unwrap();
+    fx.assign_and_run(task.id, &version);
+
+    assert!(wait_until(Duration::from_secs(5), || {
+        fx.host.workflow.lock().len() == 1
+    }));
+    let token = {
+        let guard = fx.host.workflow.lock();
+        guard[0].0.capability_token.clone()
+    };
+
+    // 汇合冲突:成功结算不直接收敛,任务进入 needs-you,租约保持持有
+    fx.directory.merge_ok.store(false, Ordering::SeqCst);
+    fx.orch
+        .settle_by_token(
+            &token,
+            Settlement::Complete {
+                summary: "A 完成".into(),
+            },
+        )
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        fx.orch.store.task_view(task.id).unwrap().unwrap().status == TaskStatus::NeedsYou
+    }));
+    assert_eq!(
+        fx.directory.merges.load(Ordering::SeqCst),
+        1,
+        "必须调用汇合"
+    );
+    assert!(
+        fx.directory.released.lock().is_empty(),
+        "冲突时不得释放隔离租约"
+    );
+    // 步骤已成功,但任务不得被收敛覆盖为 Succeeded
+    let steps = fx.orch.store.task_steps(task.id).unwrap();
+    assert_eq!(steps[0].status, StepStatus::Succeeded);
+
+    // 用户解决冲突后重试汇合 → 合并成功、释放租约、任务收敛
+    fx.directory.merge_ok.store(true, Ordering::SeqCst);
+    fx.orch.resolve_pending_merges(task.id).unwrap();
+    assert_eq!(fx.directory.released.lock().len(), 1, "解决后释放租约");
+    assert!(wait_until(Duration::from_secs(5), || {
+        fx.orch.store.task_view(task.id).unwrap().unwrap().status == TaskStatus::Succeeded
+    }));
+}

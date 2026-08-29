@@ -188,13 +188,18 @@ impl AgentInstancesPage {
         let mut types: Vec<crate::agent_instance_editor::AgentTypeInfo> = contributions
             .agent_types()
             .into_iter()
-            .map(|(src, a)| {
+            .map(|(full_contribution_id, src, a)| {
                 let detected = mf_plugins::builtin::detect_on_path(&a.command).is_some()
                     || a.command.is_empty();
                 crate::agent_instance_editor::AgentTypeInfo {
                     id: a.id.clone(),
+                    // 完整贡献 ID(publisher.plugin.agent-type):
+                    // 列表/编辑器的身份与 pin 解析都用它
+                    full_contribution_id: full_contribution_id.clone(),
                     name: a.name.clone(),
                     plugin_name: src.plugin_full_id.clone(),
+                    plugin_version: src.plugin_version.clone(),
+                    content_hash: src.content_hash.clone(),
                     detected,
                     supports_isolated_config: a.supports_isolated_config,
                     default_command: a.command.clone(),
@@ -269,6 +274,8 @@ impl AgentInstancesPage {
             task_id,
             &snapshot,
             mf_agent::RunMode::Interactive,
+            // 默认 CLI 启动:只读外部已有配置
+            true,
         ) {
             Ok(view) => self.status = format!("已在任务 {task_id} 下启动 {}", view.title),
             Err(e) => self.status = format!("启动失败: {e:#}"),
@@ -461,8 +468,11 @@ fn push_field(
 fn fallback_type_info(agent_type: &str) -> crate::agent_instance_editor::AgentTypeInfo {
     crate::agent_instance_editor::AgentTypeInfo {
         id: agent_type.to_string(),
+        full_contribution_id: agent_type.to_string(),
         name: agent_type.to_string(),
         plugin_name: "未知来源".into(),
+        plugin_version: String::new(),
+        content_hash: String::new(),
         detected: false,
         supports_isolated_config: false,
         default_command: String::new(),

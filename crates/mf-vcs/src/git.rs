@@ -42,6 +42,14 @@ pub struct GitLogEntry {
 }
 
 impl Git {
+    /// 初始化新仓库(测试与隔离目录场景;工作目录等同 open)。
+    pub fn init(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        let repo = git2::Repository::init(root)
+            .with_context(|| format!("初始化 git 仓库失败: {}", root.display()))?;
+        Ok(Self { repo })
+    }
+
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         let repo = git2::Repository::discover(root)

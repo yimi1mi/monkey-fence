@@ -1,5 +1,6 @@
 #![recursion_limit = "256"]
 
+mod adapter_launch;
 mod agent_instance_editor;
 #[cfg(test)]
 mod agent_instance_tests;

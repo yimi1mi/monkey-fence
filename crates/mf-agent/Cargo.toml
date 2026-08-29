@@ -22,3 +22,5 @@ mf-skills = { path = "../mf-skills" }
 
 [dev-dependencies]
 tempfile = "3"
+# 集成测试用真实内置适配器验证 Adapter → LaunchPlan 编译链
+mf-plugins = { path = "../mf-plugins" }

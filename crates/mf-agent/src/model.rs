@@ -263,6 +263,15 @@ pub struct ExecutionLeaseRow {
     pub released_at: Option<String>,
 }
 
+/// handoffs 行(含 step/run 归属;工作流变量替换按 step 定位上游输出)。
+#[derive(Debug, Clone)]
+pub struct HandoffRow {
+    pub id: i64,
+    pub step_id: Option<i64>,
+    pub run_id: Option<i64>,
+    pub handoff: crate::handoff::Handoff,
+}
+
 /// 手动重试模式(设计 §9.6):继续仍存活的交互式会话,或创建新会话。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryMode {

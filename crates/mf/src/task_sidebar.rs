@@ -36,6 +36,8 @@ pub struct TaskSidebar {
     composer: Option<Entity<TaskComposer>>,
     /// `+` 菜单:当前打开的任务 (root, task_id)。
     cli_menu_task: Option<(PathBuf, i64)>,
+    /// 一次性临时实例编辑器(`+` 菜单「临时实例…」;不落目录库)。
+    temp_editor: Option<Entity<TempInstanceComposer>>,
     /// Composer 提交失败的用户可见提示。
     composer_error: Option<String>,
     focus_handle: FocusHandle,
@@ -50,6 +52,7 @@ impl TaskSidebar {
             foreground: None,
             composer: None,
             cli_menu_task: None,
+            temp_editor: None,
             composer_error: None,
             focus_handle: cx.focus_handle(),
         }
@@ -320,20 +323,25 @@ impl TaskSidebar {
         let types: Vec<crate::agent_instance_editor::AgentTypeInfo> = contributions
             .agent_types()
             .into_iter()
-            .map(|(src, a)| crate::agent_instance_editor::AgentTypeInfo {
-                id: a.id.clone(),
-                name: a.name.clone(),
-                plugin_name: src.plugin_full_id.clone(),
-                detected: mf_plugins::builtin::detect_on_path(&a.command).is_some(),
-                supports_isolated_config: a.supports_isolated_config,
-                default_command: a.command.clone(),
-                adapter: a.adapter.clone(),
-                modes: a
-                    .modes
-                    .iter()
-                    .filter_map(|m| mf_agent::RunMode::parse(m))
-                    .collect(),
-            })
+            .map(
+                |(full_contribution_id, src, a)| crate::agent_instance_editor::AgentTypeInfo {
+                    id: a.id.clone(),
+                    full_contribution_id: full_contribution_id.clone(),
+                    name: a.name.clone(),
+                    plugin_name: src.plugin_full_id.clone(),
+                    plugin_version: src.plugin_version.clone(),
+                    content_hash: src.content_hash.clone(),
+                    detected: mf_plugins::builtin::detect_on_path(&a.command).is_some(),
+                    supports_isolated_config: a.supports_isolated_config,
+                    default_command: a.command.clone(),
+                    adapter: a.adapter.clone(),
+                    modes: a
+                        .modes
+                        .iter()
+                        .filter_map(|m| mf_agent::RunMode::parse(m))
+                        .collect(),
+                },
+            )
             .collect();
         let instances = self
             .app
@@ -358,7 +366,8 @@ impl TaskSidebar {
         crate::task_cli_menu::build_task_cli_menu(&types, &instances)
     }
 
-    /// 启动 `+` 菜单条目(终端/默认 CLI/实例)。
+    /// 启动 `+` 菜单条目(终端/默认 CLI/实例/临时实例)。
+    /// 全部走真实生产链:AppCtx → Agent Adapter → LaunchPlan → PTY。
     fn launch_menu_entry(
         &mut self,
         entry: &crate::task_cli_menu::MenuEntry,
@@ -370,11 +379,12 @@ impl TaskSidebar {
         };
         let launch = |snapshot: mf_agent::AgentInstanceSnapshot,
                       mode: mf_agent::RunMode,
+                      external_config: bool,
                       slf: &mut TaskSidebar,
                       cx: &mut Context<TaskSidebar>| {
             match slf
                 .app
-                .create_ad_hoc_session(&root, task_id, &snapshot, mode)
+                .create_ad_hoc_session(&root, task_id, &snapshot, mode, external_config)
             {
                 Ok(view) => log::info!("离散会话已启动: {}", view.title),
                 Err(e) => log::warn!("离散会话启动失败: {e:#}"),
@@ -384,11 +394,12 @@ impl TaskSidebar {
         };
         match entry.kind {
             MenuKind::Terminal => {
+                // 普通终端同样经 generic-command 适配器编译 LaunchPlan
                 let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
-                let snapshot = ad_hoc_snapshot_for("terminal", "任务终端", &shell);
-                launch(snapshot, mf_agent::RunMode::Interactive, self, cx);
+                let snapshot = ad_hoc_snapshot_for("generic-command", "任务终端", &shell);
+                launch(snapshot, mf_agent::RunMode::Interactive, false, self, cx);
             }
-            MenuKind::DefaultCli | MenuKind::TemporaryInstance => {
+            MenuKind::DefaultCli => {
                 let Some(agent_ref) = entry.agent_ref.clone() else {
                     self.cli_menu_task = None;
                     cx.notify();
@@ -396,7 +407,30 @@ impl TaskSidebar {
                 };
                 let command = default_command_of(&self.app, &agent_ref);
                 let snapshot = ad_hoc_snapshot_for(&agent_ref, &entry.label, &command);
-                launch(snapshot, mf_agent::RunMode::Interactive, self, cx);
+                // Default CLI 显式意图:只读外部已有配置,绝不写入
+                launch(snapshot, mf_agent::RunMode::Interactive, true, self, cx);
+            }
+            MenuKind::TemporaryInstance => {
+                // 一次性编辑器:确认后以临时快照启动,不进入全局实例列表
+                let composer = cx.new(|cx| {
+                    TempInstanceComposer::new(
+                        crate::agent_instance_editor::AgentInstanceEditorState::new(
+                            temp_generic_type_info(),
+                        ),
+                        cx,
+                    )
+                });
+                cx.subscribe(&composer, |s, _, ev: &TempComposerUiEvent, cx| match ev {
+                    TempComposerUiEvent::Submit => s.launch_temp_instance(cx),
+                    TempComposerUiEvent::Cancel => {
+                        s.temp_editor = None;
+                        s.cli_menu_task = None;
+                        cx.notify();
+                    }
+                })
+                .detach();
+                self.temp_editor = Some(composer);
+                cx.notify();
             }
             MenuKind::AgentInstance => {
                 let Some(instance_id) = entry.agent_ref.clone() else {
@@ -411,7 +445,8 @@ impl TaskSidebar {
                 {
                     Ok(snapshot) => {
                         let mode = snapshot.run_mode;
-                        launch(snapshot, mode, self, cx);
+                        // 已保存实例:隔离启动(冻结配置),不受外部配置影响
+                        launch(snapshot, mode, false, self, cx);
                     }
                     Err(e) => {
                         log::warn!("读取实例失败: {e:#}");
@@ -421,6 +456,36 @@ impl TaskSidebar {
                 }
             }
         }
+    }
+
+    /// 提交临时实例:一次性快照直启(不落目录库)。
+    fn launch_temp_instance(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = self.temp_editor.clone() else {
+            return;
+        };
+        let (state, valid) = {
+            let e = editor.read(cx);
+            (e.state.clone(), e.can_launch())
+        };
+        let Some((root, task_id)) = self.cli_menu_task.clone() else {
+            self.temp_editor = None;
+            return;
+        };
+        if !valid {
+            return;
+        }
+        let snapshot =
+            state.to_launch_snapshot(&format!("temp-{}", chrono::Utc::now().timestamp()));
+        match self
+            .app
+            .create_ad_hoc_session(&root, task_id, &snapshot, snapshot.run_mode, false)
+        {
+            Ok(view) => log::info!("临时实例已启动: {}", view.title),
+            Err(e) => log::warn!("临时实例启动失败: {e:#}"),
+        }
+        self.temp_editor = None;
+        self.cli_menu_task = None;
+        cx.notify();
     }
 
     fn render_cli_menu(&self, cx: &Context<Self>) -> AnyElement {
@@ -673,6 +738,7 @@ impl Render for TaskSidebar {
                     ),
             )
             .when_some(self.composer.clone(), |d, composer| d.child(composer))
+            .when_some(self.temp_editor.clone(), |d, editor| d.child(editor))
             .when_some(self.composer_error.clone(), |d, err| {
                 d.child(
                     div()
@@ -720,7 +786,304 @@ fn default_command_of(app: &std::sync::Arc<crate::app_ctx::AppCtx>, agent_type: 
         .contributions()
         .agent_types()
         .into_iter()
-        .find(|(_, a)| a.id == agent_type)
-        .map(|(_, a)| a.command)
+        .find(|(_, _, a)| a.id == agent_type)
+        .map(|(_, _, a)| a.command)
         .unwrap_or_default()
+}
+
+// ---------- 一次性临时实例编辑器(`+` 菜单) ----------
+
+/// 临时实例的通用类型投影:任意可执行文件,经 generic-command 适配器
+/// 编译 LaunchPlan 后启动;不要求 PATH 检测(executable 由用户填写)。
+fn temp_generic_type_info() -> crate::agent_instance_editor::AgentTypeInfo {
+    crate::agent_instance_editor::AgentTypeInfo {
+        id: "generic-command".into(),
+        full_contribution_id: "generic-command".into(),
+        name: "临时实例".into(),
+        plugin_name: "内置".into(),
+        plugin_version: String::new(),
+        content_hash: String::new(),
+        detected: true,
+        supports_isolated_config: false,
+        default_command: String::new(),
+        adapter: "generic-command".into(),
+        modes: vec![mf_agent::RunMode::Interactive, mf_agent::RunMode::OneShot],
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TempField {
+    Name,
+    Executable,
+    Argv,
+    Env,
+}
+
+/// 一次性编辑器:确认后以临时快照直启,不写目录库。
+pub struct TempInstanceComposer {
+    pub state: crate::agent_instance_editor::AgentInstanceEditorState,
+    active_field: TempField,
+    focus_handle: FocusHandle,
+    pending_focus: bool,
+}
+
+pub enum TempComposerUiEvent {
+    Submit,
+    Cancel,
+}
+
+impl gpui::EventEmitter<TempComposerUiEvent> for TempInstanceComposer {}
+
+impl TempInstanceComposer {
+    pub fn new(
+        state: crate::agent_instance_editor::AgentInstanceEditorState,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            state,
+            active_field: TempField::Name,
+            focus_handle: cx.focus_handle(),
+            pending_focus: true,
+        }
+    }
+
+    pub fn can_launch(&self) -> bool {
+        !self.state.name.trim().is_empty() && !self.state.executable.trim().is_empty()
+    }
+
+    fn field_text(&self, f: TempField) -> String {
+        match f {
+            TempField::Name => self.state.name.clone(),
+            TempField::Executable => self.state.executable.clone(),
+            TempField::Argv => self.state.argv_text.clone(),
+            TempField::Env => self.state.env_text.clone(),
+        }
+    }
+
+    fn set_field_text(&mut self, f: TempField, text: &str) {
+        match f {
+            TempField::Name => self.state.set_name(text),
+            TempField::Executable => self.state.set_executable(text),
+            TempField::Argv => self.state.set_argv(text),
+            TempField::Env => self.state.set_env_lines(text),
+        }
+    }
+
+    fn next_field(&mut self) {
+        self.active_field = match self.active_field {
+            TempField::Name => TempField::Executable,
+            TempField::Executable => TempField::Argv,
+            TempField::Argv => TempField::Env,
+            TempField::Env => TempField::Name,
+        };
+    }
+
+    fn handle_key(&mut self, ev: &gpui::KeyDownEvent) -> bool {
+        if ev.keystroke.key.as_str() == "escape" {
+            return false; // Cancel
+        }
+        if ev.keystroke.key.as_str() == "enter" {
+            self.next_field();
+            return true;
+        }
+        if ev.keystroke.key.as_str() == "tab" {
+            self.next_field();
+            return true;
+        }
+        if ev.keystroke.key.as_str() == "backspace" {
+            let mut t = self.field_text(self.active_field);
+            t.pop();
+            let f = self.active_field;
+            self.set_field_text(f, &t);
+            return true;
+        }
+        if let Some(ch) = ev.keystroke.key_char.as_ref() {
+            let mut t = self.field_text(self.active_field);
+            if ev.keystroke.key.as_str() == "space" && ch != " " {
+                t.push(' ');
+            } else {
+                t.push_str(ch);
+            }
+            let f = self.active_field;
+            self.set_field_text(f, &t);
+        }
+        true
+    }
+
+    fn field_el(
+        &self,
+        f: TempField,
+        id: &'static str,
+        placeholder: &str,
+        cx: &Context<Self>,
+        window: &Window,
+    ) -> gpui::Stateful<gpui::Div> {
+        let focused = self.focus_handle.is_focused(window) && self.active_field == f;
+        let text = self.field_text(f);
+        div()
+            .id(id)
+            .h(px(22.))
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(if focused {
+                crate::theme::Theme::accent()
+            } else {
+                crate::theme::Theme::border()
+            }))
+            .text_size(px(10.5))
+            .cursor_pointer()
+            .on_click(
+                cx.listener(move |c: &mut TempInstanceComposer, _, window, cx| {
+                    c.active_field = f;
+                    window.focus(&c.focus_handle, cx);
+                    cx.notify();
+                }),
+            )
+            .child(if text.is_empty() {
+                div()
+                    .text_color(rgb(crate::theme::Theme::fg_faint()))
+                    .child(placeholder.to_string())
+            } else {
+                div().text_color(rgb(crate::theme::Theme::fg())).child(text)
+            })
+    }
+}
+
+impl Render for TempInstanceComposer {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.pending_focus {
+            self.pending_focus = false;
+            window.focus(&self.focus_handle, cx);
+        }
+        let valid = self.can_launch();
+        div()
+            .id("temp-instance-composer")
+            .absolute()
+            .left(px(56.))
+            .top(px(120.))
+            .w(px(340.))
+            .p_2()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(crate::theme::Theme::accent_dim()))
+            .bg(rgb(crate::theme::Theme::bg_elevated()))
+            .shadow_md()
+            .track_focus(&self.focus_handle)
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .child("临时实例(仅本次任务,不保存)"),
+            )
+            .child(self.field_el(TempField::Name, "temp-name", "名称(必填)", cx, window))
+            .child(self.field_el(
+                TempField::Executable,
+                "temp-executable",
+                "可执行文件(必填,如 cmd.exe / claude)",
+                cx,
+                window,
+            ))
+            .child(self.field_el(TempField::Argv, "temp-argv", "参数(空格分隔)", cx, window))
+            .child(self.field_el(
+                TempField::Env,
+                "temp-env",
+                "环境变量 KEY=VALUE(每行一个)",
+                cx,
+                window,
+            ))
+            .child(
+                div()
+                    .id("temp-run-mode")
+                    .h(px(20.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(crate::theme::Theme::border()))
+                    .text_size(px(10.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                    .child(format!(
+                        "运行模式:{}(点击切换)",
+                        match self.state.run_mode {
+                            mf_agent::RunMode::Interactive => "交互",
+                            mf_agent::RunMode::OneShot => "一次性",
+                        }
+                    ))
+                    .on_click(cx.listener(|c: &mut TempInstanceComposer, _, _, cx| {
+                        c.state.run_mode = match c.state.run_mode {
+                            mf_agent::RunMode::Interactive => mf_agent::RunMode::OneShot,
+                            mf_agent::RunMode::OneShot => mf_agent::RunMode::Interactive,
+                        };
+                        cx.notify();
+                    })),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .justify_end()
+                    .child(
+                        div()
+                            .id("temp-cancel")
+                            .px_2()
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(crate::theme::Theme::border()))
+                            .text_size(px(10.))
+                            .cursor_pointer()
+                            .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                            .child("取消(Esc)")
+                            .on_click(cx.listener(|_: &mut TempInstanceComposer, _, _, cx| {
+                                cx.emit(TempComposerUiEvent::Cancel);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("temp-launch")
+                            .px_2()
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .rounded_md()
+                            .text_size(px(10.))
+                            .cursor_pointer()
+                            .when(valid, |d| {
+                                d.bg(rgb(crate::theme::Theme::accent()))
+                                    .text_color(rgb(crate::theme::Theme::bg()))
+                            })
+                            .when(!valid, |d| {
+                                d.border_1()
+                                    .border_color(rgb(crate::theme::Theme::border()))
+                                    .text_color(rgb(crate::theme::Theme::fg_faint()))
+                            })
+                            .child("启动")
+                            .on_click(cx.listener(|c: &mut TempInstanceComposer, _, _, cx| {
+                                if c.can_launch() {
+                                    cx.emit(TempComposerUiEvent::Submit);
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .on_key_down(cx.listener(
+                |c: &mut TempInstanceComposer, ev: &gpui::KeyDownEvent, _, cx| {
+                    if !c.handle_key(ev) {
+                        cx.emit(TempComposerUiEvent::Cancel);
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                },
+            ))
+    }
 }

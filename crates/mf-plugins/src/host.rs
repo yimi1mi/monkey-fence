@@ -204,6 +204,48 @@ impl PluginHost {
             });
         }
 
+        // 执行目录提供器(内置合成:项目目录 + Git worktree 隔离)
+        {
+            let m = PluginManifest {
+                manifest: crate::manifest::ManifestHeader {
+                    version: crate::manifest::MANIFEST_VERSION,
+                    publisher: "monkeyfence".into(),
+                    id: "directories".into(),
+                    name: "执行目录提供器(内置)".into(),
+                    version_str: "0.1.0".into(),
+                    min_app_version: String::new(),
+                    description: "项目目录共享租约与 Git worktree 隔离租约".into(),
+                    homepage: String::new(),
+                    icon: String::new(),
+                },
+                capabilities: crate::manifest::Capabilities::default(),
+                worker: None,
+                agent_types: vec![],
+                node_types: vec![],
+                execution_directory_providers: vec![
+                    crate::project_directory_provider::contribution(),
+                    crate::git_worktree_provider::contribution(),
+                ],
+                secret_stores: vec![],
+                workflow_templates: vec![],
+                skills: vec![],
+                tools: vec![],
+                ui_schemas: vec![],
+            };
+            plugins.push(PluginEntry {
+                content_hash: String::new(),
+                permission_fingerprint: m.permission_fingerprint("builtin"),
+                full_id: m.full_id(),
+                manifest: m,
+                root: None,
+                source: InstallSource::Bundled,
+                enabled: true,
+                authorized_at: Some(chrono::Utc::now().to_rfc3339()),
+                builtin: true,
+                detected: HashMap::new(),
+            });
+        }
+
         // 现有技能 → 兼容合成插件
         {
             let m = PluginManifest {
@@ -645,6 +687,56 @@ impl PluginHost {
     pub fn release_run_pins(&self, run_key: &str) -> Result<()> {
         self.catalog.remove_plugin_pins_for_run(run_key)?;
         self.refresh_pin_state()
+    }
+
+    /// 按插件包身份 pin(工作流冻结用):
+    /// - 非空 content_hash:走内容寻址包解析(pin 期间不可清理/卸载);
+    /// - 空 content_hash:内置合成插件(不可卸载,无 packages 记录),
+    ///   校验插件在位后仅记录 pin 引用。
+    pub fn pin_source_for_run(
+        &self,
+        run_key: &str,
+        full_id: &str,
+        version: &str,
+        content_hash: &str,
+    ) -> Result<()> {
+        if !content_hash.is_empty() {
+            let resolved = self.resolve(full_id, version, content_hash)?;
+            self.pin_for_run(run_key, &resolved)?;
+            return Ok(());
+        }
+        self.ensure_builtin_plugin(full_id, version)?;
+        self.catalog.record_plugin_pin(&PluginPinRecord {
+            run_key: run_key.to_string(),
+            full_id: full_id.to_string(),
+            version: version.to_string(),
+            content_hash: content_hash.to_string(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+        })?;
+        self.refresh_pin_state()?;
+        Ok(())
+    }
+
+    /// 校验插件包身份可解析(工作流派发前):内容哈希不一致/插件缺失时报错。
+    pub fn resolve_source_pin(
+        &self,
+        full_id: &str,
+        version: &str,
+        content_hash: &str,
+    ) -> Result<()> {
+        if content_hash.is_empty() {
+            return self.ensure_builtin_plugin(full_id, version);
+        }
+        self.resolve(full_id, version, content_hash)?;
+        Ok(())
+    }
+
+    fn ensure_builtin_plugin(&self, full_id: &str, version: &str) -> Result<()> {
+        let found = self.plugins.read().iter().any(|p| {
+            p.builtin && p.full_id == full_id && p.manifest.manifest.version_str == version
+        });
+        anyhow::ensure!(found, "内置插件 {full_id} @ {version} 不存在或版本不符");
+        Ok(())
     }
 
     /// 某哈希包的当前活动引用数(0 = 可清理)。

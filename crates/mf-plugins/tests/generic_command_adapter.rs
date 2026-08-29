@@ -3,7 +3,7 @@
 //! Shell 模式必须权限门控(设计 §6.1 / §8)。
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mf_agent::agent_adapter::{
@@ -261,4 +261,83 @@ fn cwd_defaults_to_workdir() {
         .compile_launch(&snapshot_with_args(&[]), &ctx())
         .unwrap();
     assert_eq!(plan.cwd, Some(PathBuf::from("C:/tmp/work")));
+}
+
+// ---------- 外部配置只读意图(Default CLI) ----------
+
+#[test]
+fn external_config_intent_skips_isolation_and_rejects_config_files() {
+    use mf_plugins::claude_adapter::ClaudeCodeAdapter;
+
+    // claude 适配器:external_config = true 时不改写 CLAUDE_CONFIG_DIR
+    let mut ctx = ctx();
+    ctx.prompt = Some("hi".into());
+    ctx.external_config = true;
+    let claude = ClaudeCodeAdapter::new();
+    let plan = claude
+        .compile_launch(&snapshot_with_args(&["-p"]), &ctx)
+        .unwrap();
+    assert!(
+        !plan.env.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"),
+        "外部配置意图下不得注入隔离配置目录: {:?}",
+        plan.env
+    );
+    assert!(
+        plan.temp_files.is_empty(),
+        "外部配置意图下不得物化任何配置文件"
+    );
+
+    // 显式声明 config_files 与只读意图冲突:拒绝,绝不写入外部配置
+    let mut snapshot = snapshot_with_args(&[]);
+    snapshot.config = serde_json::json!({
+        "config_files": { "settings.json": "{\"x\":1}" }
+    });
+    let err = claude.compile_launch(&snapshot, &ctx).unwrap_err();
+    assert!(format!("{err:#}").contains("config_files"), "{err:#}");
+
+    // 默认(false)保持既有隔离语义
+    let isolated = claude
+        .compile_launch(&snapshot_with_args(&["-p"]), &ctx_with_prompt(false))
+        .unwrap();
+    assert!(isolated.env.iter().any(|(k, _)| k == "CLAUDE_CONFIG_DIR"));
+}
+
+fn ctx_with_prompt(external: bool) -> LaunchContext {
+    let mut ctx = ctx();
+    ctx.prompt = Some("hi".into());
+    ctx.external_config = external;
+    ctx
+}
+
+// ---------- PromptFile 输入注入 ----------
+
+#[test]
+fn prompt_file_injection_yields_trusted_absolute_path() {
+    let mut snapshot = snapshot_with_args(&["run"]);
+    snapshot.execution_contract = serde_json::json!({
+        "input": "prompt-file",
+        "completion": "process-exit"
+    });
+    let mut ctx = ctx();
+    ctx.prompt = Some("长提示内容".into());
+    let plan = adapter().compile_launch(&snapshot, &ctx).unwrap();
+
+    match &plan.input {
+        mf_agent::InputInjection::PromptFile(path) => {
+            assert!(
+                path.is_absolute(),
+                "PromptFile 必须给出可信绝对路径: {}",
+                path.display()
+            );
+            assert_eq!(path, &ctx.run_temp.join("prompt.txt"));
+            // 内容同时进 temp_files,由 Runtime Host 在 run_temp 下物化
+            assert!(plan
+                .temp_files
+                .iter()
+                .any(|f| f.path == Path::new("prompt.txt")));
+        }
+        other => panic!("期望 PromptFile 注入,实际 {other:?}"),
+    }
+    // argv 不带提示文本(由文件承载)
+    assert!(!plan.argv.iter().any(|a| a.contains("长提示内容")));
 }
