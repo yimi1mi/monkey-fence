@@ -396,9 +396,11 @@ fn project_directory_provider_defaults_to_project_root() {
         .acquire(&LeaseContext {
             task_id: 1,
             step_id: 2,
+            revision_id: 1,
             attempt: 1,
             project_root: PathBuf::from("C:/proj"),
             step_key: "build".into(),
+            deps: vec![],
         })
         .unwrap();
     assert_eq!(lease.path, PathBuf::from("C:/proj"));

@@ -37,10 +37,14 @@ pub enum MergeOutcome {
 pub struct LeaseContext {
     pub task_id: i64,
     pub step_id: i64,
+    /// 活动流水线 Revision(worktree 集成基线按 task+rev 维护)。
+    pub revision_id: i64,
     /// 第几次尝试(1 起;自动重试递增)。
     pub attempt: u32,
     pub project_root: PathBuf,
     pub step_key: String,
+    /// 上游节点键(拓扑合并顺序;无依赖时为空)。
+    pub deps: Vec<String>,
 }
 
 /// 执行目录提供器接口(设计 §6.3)。
@@ -57,6 +61,12 @@ pub trait ExecutionDirectoryProvider: Send + Sync {
     fn merge(&self, leases: &[ExecutionLease]) -> Result<MergeOutcome>;
     /// 释放租约(终态结算/取消后;未知状态保持持有)。
     fn release(&self, lease: &ExecutionLease) -> Result<()>;
+    /// 任务终态(成功/取消/归档)后丢弃该任务的集成基线等持久痕迹。
+    /// 默认无操作(不维护基线的提供器)。
+    fn discard_task_baselines(&self, task_id: i64) -> Result<()> {
+        let _ = task_id;
+        Ok(())
+    }
 }
 
 /// 默认提供器:项目目录本身,不隔离;

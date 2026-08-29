@@ -86,9 +86,11 @@ mod tests {
             .acquire(&LeaseContext {
                 task_id: 7,
                 step_id: 8,
+                revision_id: 1,
                 attempt: 1,
                 project_root: PathBuf::from("."),
                 step_key: "build".into(),
+                deps: vec![],
             })
             .unwrap();
         assert_eq!(lease.provider, PROVIDER_ID);

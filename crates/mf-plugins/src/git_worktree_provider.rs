@@ -1,10 +1,12 @@
 //! Git worktree Execution Directory Provider(设计 §6.3 / §9.4 / ADR 0003)。
 //!
-//! - acquire:`.worktrees/mf-run-<task>-<step>-<attempt>` 独立 worktree
-//!   (从当前 HEAD 创建;目录已存在时幂等复用 —— 自动重试同目录)。
-//! - merge:按"拓扑依赖序 + 稳定节点键"确定顺序;逐个把 worktree 的
-//!   工作区变更(相对基线)应用到项目目录。任一文件被多个租约同时修改
-//!   → `NeedsUser { conflicts }`,不覆盖任何一方,项目目录保持原样。
+//! - 集成基线:每个 Task/Revision 维护 hidden ref
+//!   `refs/mf/integration/task-<t>-rev-<r>`(初值 = 仓库 HEAD)。
+//!   acquire 从基线检出 worktree;merge 把变更复制回项目目录后把基线
+//!   推进到汇合结果 —— 串行下游从汇合结果建租约,天然看见上游修改。
+//! - merge:按"拓扑依赖序 + 稳定节点键"排序;第一遍批量预检所有租约
+//!   相对各自主基线的变更集,任一文件被多个租约修改 → `NeedsUser`,
+//!   项目目录零部分写;第二遍才按序复制并推进基线。
 //! - release:校验路径位于 `.worktrees` 之下后删除 worktree
 //!   (绝不触碰仓库根或仓库元数据)。非 Git 根回退共享目录(不隔离)。
 
@@ -43,6 +45,18 @@ impl GitWorktreeProvider {
     fn worktree_name(ctx: &LeaseContext) -> String {
         format!("mf-run-{}-{}-{}", ctx.task_id, ctx.step_key, ctx.attempt)
     }
+
+    /// Task/Revision 集成基线提交(无基线 ref 时为当前 HEAD)。
+    fn integration_baseline(&self, ctx: &LeaseContext) -> Result<git2::Oid> {
+        let git = Git::open(&self.repo_root)?;
+        let refname = Git::integration_ref(ctx.task_id, ctx.revision_id);
+        if let Some(oid) = git.read_ref(&refname)? {
+            return Ok(oid);
+        }
+        let repo = git2::Repository::open(&self.repo_root)?;
+        let head = repo.head()?.peel_to_commit()?.id();
+        Ok(head)
+    }
 }
 
 impl ExecutionDirectoryProvider for GitWorktreeProvider {
@@ -69,9 +83,11 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
         let name = Self::worktree_name(ctx);
         let path = worktrees_root.join(&name);
         ensure_lease_under_root(worktrees_root, &path)?;
+        // 基线 = Task/Revision 集成基线(上游已汇合的修改对下游可见)
+        let baseline = self.integration_baseline(ctx)?;
         if !path.exists() {
             let git = Git::open(&self.repo_root)?;
-            git.worktree_create(&name)
+            git.worktree_create_at(&name, Some(baseline))
                 .with_context(|| format!("创建隔离 worktree `{name}` 失败"))?;
         }
         Ok(ExecutionLease {
@@ -81,8 +97,12 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
             provider: PROVIDER_ID.into(),
             metadata: serde_json::json!({
                 "worktree": name,
+                "task_id": ctx.task_id,
+                "revision_id": ctx.revision_id,
                 "step_key": ctx.step_key,
                 "attempt": ctx.attempt,
+                "deps": ctx.deps,
+                "baseline": baseline.to_string(),
             }),
         })
     }
@@ -101,28 +121,30 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
         }
         deterministic_merge_order(&mut worktree_leases);
 
-        let main_repo = git2::Repository::open(&self.repo_root)
+        let repo = git2::Repository::open(&self.repo_root)
             .with_context(|| format!("打开仓库失败: {}", self.repo_root.display()))?;
-        let head_tree_id = main_repo.head()?.peel_to_commit()?.tree_id();
+        let head_tree_id = repo.head()?.peel_to_commit()?.tree_id();
 
-        // 1. 第一遍:只收集各租约相对基线的变更文件集
-        //    (不持有 Diff —— git2 的 Diff 借用其所属 Repository)
-        let mut changed_by_lease: Vec<(String, HashSet<String>)> = Vec::new();
+        // 1. 第一遍:批量预检 —— 各租约相对"各自基线"的变更文件集
+        //    (不持有 Diff —— git2 的 Diff 借用其所属 Repository)。
+        //    任一重叠 → NeedsUser;此时项目目录零写入。
+        let mut changed_by_lease: Vec<(String, HashSet<String>, git2::Oid)> = Vec::new();
         for lease in &worktree_leases {
-            let files = changed_files(&lease.path, head_tree_id)?;
+            let baseline_tree = lease_baseline_tree(&repo, lease, head_tree_id);
+            let files = changed_files(&repo, &lease.path, baseline_tree)?;
             let label = lease
                 .metadata
                 .get("step_key")
                 .and_then(|v| v.as_str())
                 .unwrap_or(&lease.id)
                 .to_string();
-            changed_by_lease.push((label, files));
+            changed_by_lease.push((label, files, baseline_tree));
         }
         let mut conflicts: Vec<String> = Vec::new();
         for i in 0..changed_by_lease.len() {
             for j in (i + 1)..changed_by_lease.len() {
-                let (a, files_a) = &changed_by_lease[i];
-                let (b, files_b) = &changed_by_lease[j];
+                let (a, files_a, _) = &changed_by_lease[i];
+                let (b, files_b, _) = &changed_by_lease[j];
                 for file in files_a.intersection(files_b) {
                     conflicts.push(format!("{file}(修改者: {a} 与 {b})"));
                 }
@@ -134,13 +156,13 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
             return Ok(MergeOutcome::NeedsUser { conflicts });
         }
 
-        let _ = &main_repo;
         // 2. 第二遍:无重叠时按确定顺序把变更复制回项目工作目录。
         //    不用 git apply:工作区 diff 里的 untracked 新文件没有 blob 内容,
         //    apply 无法重建;文件级复制对已跟踪修改与新建文件同样成立。
+        let mut applied: Vec<(String, bool)> = Vec::new();
         for lease in &worktree_leases {
-            let files = changed_files_with_status(&lease.path, head_tree_id)?;
-            for (path, deleted) in files {
+            let baseline_tree = lease_baseline_tree(&repo, lease, head_tree_id);
+            for (path, deleted) in changed_files_with_status(&repo, &lease.path, baseline_tree)? {
                 let src = lease.path.join(&path);
                 let dst = self.repo_root.join(&path);
                 if deleted {
@@ -157,8 +179,33 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
                         format!("合并复制失败: {} -> {}", src.display(), dst.display())
                     })?;
                 }
+                applied.push((path, deleted));
             }
         }
+
+        // 3. 推进 Task/Revision 集成基线:下游 acquire 从汇合结果检出。
+        //    批内租约共享同一集成 ref(同 task+rev);从首个租约的基线树
+        //    叠加全部已应用变更(预检保证无重叠,叠加序无关)。
+        let refname = merge_integration_ref(&worktree_leases)?;
+        let base_tree = changed_by_lease
+            .first()
+            .map(|(_, _, t)| *t)
+            .unwrap_or(head_tree_id);
+        let tree_id = build_merged_tree(&repo, self.repo_root.clone(), base_tree, &applied)?;
+        let git = Git::open(&self.repo_root)?;
+        let step_label = worktree_leases
+            .first()
+            .and_then(|l| l.metadata.get("step_key"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("step");
+        git.advance_integration_ref(
+            &refname,
+            tree_id,
+            &format!(
+                "mf: integrate {step_label} (+{} batch)",
+                worktree_leases.len()
+            ),
+        )?;
         Ok(MergeOutcome::Merged)
     }
 
@@ -192,21 +239,102 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
             }
         }
     }
+
+    fn discard_task_baselines(&self, task_id: i64) -> Result<()> {
+        if self.worktrees_root.is_none() {
+            return Ok(());
+        }
+        let git = Git::open(&self.repo_root)?;
+        git.delete_integration_refs(task_id)?;
+        Ok(())
+    }
 }
 
 use std::path::PathBuf;
 
+/// 租约创建时的基线树(metadata.baseline 的提交剥出树;旧租约回退主仓库 HEAD)。
+/// 基线提交/树在主仓库对象库中,worktree 共享同一对象库,直接用主仓库解析。
+fn lease_baseline_tree(
+    repo: &git2::Repository,
+    lease: &ExecutionLease,
+    head_tree_id: git2::Oid,
+) -> git2::Oid {
+    lease
+        .metadata
+        .get("baseline")
+        .and_then(|v| v.as_str())
+        .and_then(|s| git2::Oid::from_str(s).ok())
+        .and_then(|commit_oid| repo.find_commit(commit_oid).ok())
+        .map(|c| c.tree_id())
+        .unwrap_or(head_tree_id)
+}
+
+/// 批次对应的集成基线 ref 名:批内全部租约必须同 task+rev。
+fn merge_integration_ref(leases: &[ExecutionLease]) -> Result<String> {
+    let id_of = |l: &ExecutionLease| -> (i64, i64) {
+        (
+            l.metadata
+                .get("task_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1),
+            l.metadata
+                .get("revision_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(-1),
+        )
+    };
+    let first = id_of(&leases[0]);
+    anyhow::ensure!(
+        leases.iter().all(|l| id_of(l) == first),
+        "汇合批次混入不同 Task/Revision 的租约"
+    );
+    anyhow::ensure!(
+        first.0 >= 0 && first.1 >= 0,
+        "租约缺少 task/revision 元数据"
+    );
+    Ok(Git::integration_ref(first.0, first.1))
+}
+
+/// 从基线树叠加已应用变更,构造汇合结果树(冲突已在预检排除,叠加序无关)。
+fn build_merged_tree(
+    repo: &git2::Repository,
+    project_root: PathBuf,
+    base_tree_id: git2::Oid,
+    applied: &[(String, bool)],
+) -> Result<git2::Oid> {
+    let base_tree = repo.find_tree(base_tree_id)?;
+    let mut builder = repo.treebuilder(Some(&base_tree))?;
+    for (path, deleted) in applied {
+        if *deleted {
+            // remove 对不存在的路径是 no-op(前序租约已删)
+            let _ = builder.remove(path);
+            continue;
+        }
+        let content = std::fs::read(project_root.join(path))
+            .with_context(|| format!("读取已合并文件失败: {path}"))?;
+        let blob = repo.blob(&content)?;
+        // 保留基线中的可执行位(新文件按普通文件)
+        let mode = base_tree
+            .get_path(std::path::Path::new(path))
+            .map(|e| e.filemode())
+            .unwrap_or(0o100644);
+        builder.insert(path, blob, mode)?;
+    }
+    Ok(builder.write()?)
+}
+
 /// worktree 相对基线的变更:(路径, 是否删除)。
 fn changed_files_with_status(
+    repo: &git2::Repository,
     worktree: &std::path::Path,
     base_tree_id: git2::Oid,
 ) -> Result<Vec<(String, bool)>> {
-    let repo = git2::Repository::open(worktree)
-        .with_context(|| format!("打开 worktree 失败: {}", worktree.display()))?;
     let base_tree = repo.find_tree(base_tree_id)?;
+    let wt_repo = git2::Repository::open(worktree)
+        .with_context(|| format!("打开 worktree 失败: {}", worktree.display()))?;
     let mut options = git2::DiffOptions::new();
     options.include_untracked(true).recurse_untracked_dirs(true);
-    let diff = repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut options))?;
+    let diff = wt_repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut options))?;
     let mut out = Vec::new();
     for delta in diff.deltas() {
         let deleted = delta.status() == git2::Delta::Deleted;
@@ -226,23 +354,14 @@ fn changed_files_with_status(
 }
 
 /// worktree 相对基线的变更文件集(正斜杠规范化)。
-fn changed_files(worktree: &std::path::Path, base_tree_id: git2::Oid) -> Result<HashSet<String>> {
-    let repo = git2::Repository::open(worktree)
-        .with_context(|| format!("打开 worktree 失败: {}", worktree.display()))?;
-    let base_tree = repo.find_tree(base_tree_id)?;
-    let mut options = git2::DiffOptions::new();
-    options.include_untracked(true).recurse_untracked_dirs(true);
-    let diff = repo.diff_tree_to_workdir_with_index(Some(&base_tree), Some(&mut options))?;
-    Ok(diff
-        .deltas()
-        .map(|d| {
-            d.new_file()
-                .path()
-                .or_else(|| d.old_file().path())
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-                .unwrap_or_default()
-        })
-        .filter(|p| !p.is_empty())
+fn changed_files(
+    repo: &git2::Repository,
+    worktree: &std::path::Path,
+    base_tree_id: git2::Oid,
+) -> Result<HashSet<String>> {
+    Ok(changed_files_with_status(repo, worktree, base_tree_id)?
+        .into_iter()
+        .map(|(path, _)| path)
         .collect())
 }
 

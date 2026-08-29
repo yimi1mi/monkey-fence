@@ -41,12 +41,25 @@ impl RepoFixture {
     }
 
     fn ctx(&self, task: i64, step: &str, attempt: u32) -> LeaseContext {
+        self.ctx_rev(task, step, attempt, 1, &[])
+    }
+
+    fn ctx_rev(
+        &self,
+        task: i64,
+        step: &str,
+        attempt: u32,
+        revision: i64,
+        deps: &[&str],
+    ) -> LeaseContext {
         LeaseContext {
             task_id: task,
             step_id: 0,
+            revision_id: revision,
             attempt,
             project_root: self.root.clone(),
             step_key: step.into(),
+            deps: deps.iter().map(|s| s.to_string()).collect(),
         }
     }
 }
@@ -190,9 +203,11 @@ fn non_git_root_falls_back_to_shared_project_directory() {
         .acquire(&LeaseContext {
             task_id: 9,
             step_id: 0,
+            revision_id: 1,
             attempt: 1,
             project_root: dir.path().to_path_buf(),
             step_key: "solo".into(),
+            deps: vec![],
         })
         .unwrap();
     assert!(!lease.isolated, "非 Git 根不隔离,需风险开关才能并行");
@@ -201,5 +216,174 @@ fn non_git_root_falls_back_to_shared_project_directory() {
         provider.merge(&[lease.clone()]).unwrap(),
         MergeOutcome::NotRequired
     ));
+    provider.release(&lease).unwrap();
+}
+
+// ---------- Task/Revision 集成基线(串行下游 / 并行序无关 / 冲突零覆盖) ----------
+
+fn norm(p: std::path::PathBuf) -> String {
+    std::fs::read_to_string(p).unwrap().replace("\r\n", "\n")
+}
+
+#[test]
+fn serial_downstream_worktree_sees_upstream_merged_changes() {
+    let fx = RepoFixture::with_base_files();
+    let provider = fx.provider();
+    // 串行链 build → package(同 task/rev;package 依赖 build)
+    let up = provider
+        .acquire(&fx.ctx_rev(11, "build", 1, 1, &[]))
+        .unwrap();
+    std::fs::write(up.path.join("a.txt"), "from-build\n").unwrap();
+    assert_eq!(provider.merge(&[up.clone()]).unwrap(), MergeOutcome::Merged);
+    assert_eq!(norm(fx.root.join("a.txt")), "from-build\n");
+    provider.release(&up).unwrap();
+
+    // 下游 acquire:必须从汇合结果(集成基线)检出,看得见上游修改
+    let down = provider
+        .acquire(&fx.ctx_rev(11, "package", 1, 1, &["build"]))
+        .unwrap();
+    assert_eq!(
+        norm(down.path.join("a.txt")),
+        "from-build\n",
+        "串行下游 worktree 必须包含上游已汇合的修改"
+    );
+    // 下游继续修改并汇合:项目目录拿到叠加结果
+    std::fs::write(down.path.join("b.txt"), "from-package\n").unwrap();
+    assert_eq!(
+        provider.merge(&[down.clone()]).unwrap(),
+        MergeOutcome::Merged
+    );
+    assert_eq!(norm(fx.root.join("a.txt")), "from-build\n");
+    assert_eq!(norm(fx.root.join("b.txt")), "from-package\n");
+    provider.release(&down).unwrap();
+
+    // 任务终态:集成基线 ref 清理(hidden ref 不残留)
+    let git = mf_vcs::git::Git::open(&fx.root).unwrap();
+    assert_eq!(
+        git.delete_integration_refs(11).unwrap(),
+        1,
+        "任务终态应清理集成基线 ref"
+    );
+}
+
+#[test]
+fn parallel_disjoint_merge_is_order_independent() {
+    let run = |merge_order: &[&str]| {
+        let fx = RepoFixture::with_base_files();
+        let provider = fx.provider();
+        let build = provider
+            .acquire(&fx.ctx_rev(12, "build", 1, 1, &[]))
+            .unwrap();
+        let docs = provider
+            .acquire(&fx.ctx_rev(12, "docs", 1, 1, &[]))
+            .unwrap();
+        std::fs::write(build.path.join("a.txt"), "by-build\n").unwrap();
+        std::fs::write(build.path.join("new-build.txt"), "new\n").unwrap();
+        std::fs::write(docs.path.join("b.txt"), "by-docs\n").unwrap();
+        let by_key = |k: &str| {
+            if k == "build" {
+                build.clone()
+            } else {
+                docs.clone()
+            }
+        };
+        let leases: Vec<_> = merge_order.iter().map(|k| by_key(k)).collect();
+        assert_eq!(provider.merge(&leases).unwrap(), MergeOutcome::Merged);
+        let _ = provider.release(&build);
+        let _ = provider.release(&docs);
+        (
+            norm(fx.root.join("a.txt")),
+            norm(fx.root.join("b.txt")),
+            norm(fx.root.join("new-build.txt")),
+        )
+    };
+    let ab = run(&["build", "docs"]);
+    let ba = run(&["docs", "build"]);
+    assert_eq!(
+        ab, ba,
+        "无重叠并行合并必须与顺序无关(实际 {ab:?} vs {ba:?})"
+    );
+    assert_eq!(ab.0, "by-build\n");
+    assert_eq!(ab.1, "by-docs\n");
+    assert_eq!(ab.2, "new\n");
+}
+
+#[test]
+fn conflict_batch_precheck_leaves_project_dir_untouched() {
+    let fx = RepoFixture::with_base_files();
+    let provider = fx.provider();
+    let build = provider
+        .acquire(&fx.ctx_rev(13, "build", 1, 1, &[]))
+        .unwrap();
+    let docs = provider
+        .acquire(&fx.ctx_rev(13, "docs", 1, 1, &[]))
+        .unwrap();
+    // build 同时改了独占文件 + 冲突文件;docs 改冲突文件
+    std::fs::write(build.path.join("a.txt"), "by-build\n").unwrap();
+    std::fs::write(build.path.join("shared.txt"), "from-build\n").unwrap();
+    let docs_baseline_bytes = std::fs::read(docs.path.join("shared.txt")).unwrap();
+    std::fs::write(docs.path.join("shared.txt"), "from-docs\n").unwrap();
+
+    match provider.merge(&[build.clone(), docs.clone()]).unwrap() {
+        MergeOutcome::NeedsUser { conflicts } => {
+            assert!(
+                conflicts.iter().any(|c| c.contains("shared.txt")),
+                "{conflicts:?}"
+            );
+        }
+        other => panic!("应为 NeedsUser,得到 {other:?}"),
+    }
+    // 冲突前置预检:项目目录零部分写(独占文件也不得提前落盘)
+    assert_eq!(norm(fx.root.join("shared.txt")), "base\n");
+    assert_eq!(norm(fx.root.join("a.txt")), "aaa\n");
+
+    // 冲突解决:docs 放弃对 shared.txt 的修改(恢复基线字节)后整批重试,
+    // 汇合成功且 build 的修改全部落地
+    std::fs::write(docs.path.join("shared.txt"), docs_baseline_bytes).unwrap();
+    assert_eq!(
+        provider.merge(&[build.clone(), docs.clone()]).unwrap(),
+        MergeOutcome::Merged
+    );
+    assert_eq!(norm(fx.root.join("a.txt")), "by-build\n");
+    assert_eq!(norm(fx.root.join("shared.txt")), "from-build\n");
+    let _ = provider.release(&build);
+    let _ = provider.release(&docs);
+}
+
+#[test]
+fn acquire_records_deps_and_baseline_in_lease_metadata() {
+    // 拓扑合并顺序的前提:acquire 把上游 deps 与基线 oid 落进租约元数据;
+    // deterministic_merge_order 按 metadata.deps 排序(见上方纯函数测试)
+    let fx = RepoFixture::with_base_files();
+    let provider = fx.provider();
+    let lease = provider
+        .acquire(&fx.ctx_rev(14, "package", 1, 1, &["build", "docs"]))
+        .unwrap();
+    let deps: Vec<&str> = lease.metadata["deps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(deps, vec!["build", "docs"], "deps 必须进租约元数据");
+    let baseline = lease.metadata["baseline"].as_str().unwrap().to_string();
+    assert_eq!(baseline.len(), 40, "基线 oid(40 hex)必须记录: {baseline}");
+    let mut ordered = vec![lease.clone()];
+    let mut other = ExecutionLease {
+        id: "x".into(),
+        path: lease.path.clone(),
+        isolated: true,
+        provider: "worktree".into(),
+        metadata: serde_json::json!({ "step_key": "build", "deps": [] }),
+    };
+    // 与真实租约混排:build(无依赖)排在 package 之前
+    std::mem::swap(&mut other, &mut ordered[0]);
+    ordered.push(lease.clone());
+    deterministic_merge_order(&mut ordered);
+    let keys: Vec<&str> = ordered
+        .iter()
+        .map(|l| l.metadata["step_key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, vec!["build", "package"]);
     provider.release(&lease).unwrap();
 }

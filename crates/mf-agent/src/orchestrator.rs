@@ -1573,12 +1573,30 @@ impl Orchestrator {
             if let Some(existing) = step_leases.get(&step.id) {
                 existing.clone()
             } else {
+                // 上游节点键(worktree 合并的拓扑顺序;工作流节点取快照 deps,
+                // 旧流水线把 step 依赖 id 映射回节点键)
+                let deps = match &snapshot_node {
+                    Some(node) => node.deps.clone(),
+                    None => {
+                        let all = self.store.task_steps(task.id).unwrap_or_default();
+                        step.deps
+                            .iter()
+                            .filter_map(|dep_id| {
+                                all.iter()
+                                    .find(|s| s.id == *dep_id)
+                                    .map(|s| s.step_key.clone())
+                            })
+                            .collect()
+                    }
+                };
                 let ctx = LeaseContext {
                     task_id: task.id,
                     step_id: step.id,
+                    revision_id: step.revision_id,
                     attempt: (step.attempts as u32) + 1,
                     project_root: self.root.clone(),
                     step_key: step.step_key.clone(),
+                    deps,
                 };
                 let lease = match self.directory.acquire(&ctx) {
                     Ok(lease) => lease,
