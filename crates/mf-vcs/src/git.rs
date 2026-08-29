@@ -261,6 +261,13 @@ impl Git {
 
     /// 在 `<root>/../.worktrees/<name>` 创建 worktree + 同名新分支(基于当前 HEAD)
     pub fn worktree_create(&self, name: &str) -> Result<PathBuf> {
+        self.worktree_create_at(name, None)
+    }
+
+    /// 在指定基线提交创建 worktree(基线 None = 当前 HEAD)。
+    /// worktree 隔离的 Task/Revision 集成基线由此进入:下游 worktree
+    /// 从汇合结果(而非仓库 HEAD)检出,串行下游天然看见上游修改。
+    pub fn worktree_create_at(&self, name: &str, baseline: Option<git2::Oid>) -> Result<PathBuf> {
         let parent = self
             .root()
             .parent()
@@ -269,17 +276,86 @@ impl Git {
         let dir = parent.join(".worktrees").join(name);
         anyhow::ensure!(!dir.exists(), "worktree 目录已存在: {}", dir.display());
         std::fs::create_dir_all(dir.parent().unwrap_or(&parent))?;
-        let head = self.repo.head()?.peel_to_commit()?;
+        let base = match baseline {
+            Some(oid) => oid,
+            None => self.repo.head()?.peel_to_commit()?.id(),
+        };
+        let base_commit = self.repo.find_commit(base)?;
         let branch_ref = format!("refs/heads/{}", name);
         let mut opts = git2::WorktreeAddOptions::new();
         let reference = self
             .repo
-            .reference(&branch_ref, head.id(), false, "mf worktree create")
+            .reference(&branch_ref, base_commit.id(), false, "mf worktree create")
             .with_context(|| format!("创建分支失败: {}", branch_ref))?;
         opts.reference(Some(&reference));
         let wt = self.repo.worktree(name, &dir, Some(&opts))?;
         let _ = wt;
         Ok(dir)
+    }
+
+    // ---------- Task/Revision 集成基线(hidden ref;worktree 提供器维护) ----------
+
+    /// 集成基线 ref 名:`refs/mf/integration/task-<t>-rev-<r>`。
+    /// 不在 refs/heads 下,普通分支列表/工具不显示;任务终态时整体删除。
+    pub fn integration_ref(task_id: i64, revision_id: i64) -> String {
+        format!("refs/mf/integration/task-{task_id}-rev-{revision_id}")
+    }
+
+    /// 读取 ref 目标(ref 不存在为 None)。
+    pub fn read_ref(&self, refname: &str) -> Result<Option<git2::Oid>> {
+        Ok(self
+            .repo
+            .find_reference(refname)
+            .ok()
+            .and_then(|r| r.target()))
+    }
+
+    /// 把 tree 提交到集成基线 ref 上并前移 ref(父提交 = ref 当前目标,
+    /// 无 ref 时为 HEAD)。返回新提交 oid。
+    pub fn advance_integration_ref(
+        &self,
+        refname: &str,
+        tree_id: git2::Oid,
+        message: &str,
+    ) -> Result<git2::Oid> {
+        let sig = self
+            .repo
+            .signature()
+            .or_else(|_| git2::Signature::now("MonkeyFence", "monkeyfence@local"))?;
+        let parent = match self.read_ref(refname)? {
+            Some(oid) => vec![self.repo.find_commit(oid)?],
+            None => match self.repo.head() {
+                Ok(h) => vec![h.peel_to_commit()?],
+                Err(_) => Vec::new(),
+            },
+        };
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        let tree = self.repo.find_tree(tree_id)?;
+        let oid = self
+            .repo
+            .commit(Some(refname), &sig, &sig, message, &tree, &parents)?;
+        Ok(oid)
+    }
+
+    /// 删除任务全部集成基线 ref(任务终态清理);返回删除数。
+    pub fn delete_integration_refs(&self, task_id: i64) -> Result<usize> {
+        let prefix = format!("refs/mf/integration/task-{task_id}-");
+        let mut removed = 0;
+        let refs: Vec<String> = self
+            .repo
+            .references_glob("refs/mf/integration/*")?
+            .filter_map(|r| r.ok())
+            .filter_map(|r| r.name().map(str::to_string))
+            .collect();
+        for name in refs {
+            if name.starts_with(&prefix) {
+                if let Some(mut r) = self.repo.find_reference(&name).ok() {
+                    r.delete()?;
+                    removed += 1;
+                }
+            }
+        }
+        Ok(removed)
     }
 
     /// 删除 worktree(prune 元数据 + 移除目录 + 删除同名分支)
@@ -379,5 +455,72 @@ mod tests {
             !list.iter().any(|(n, _)| n == "demo-wt"),
             "remove 后不应残留: {list:?}"
         );
+    }
+
+    #[test]
+    fn worktree_created_at_baseline_commit_carries_baseline_content() {
+        let (tmp, git) = init_repo();
+        std::fs::write(tmp.path().join("a.txt"), "v1\n").unwrap();
+        git.stage(&[PathBuf::from("a.txt")]).unwrap();
+        let first = {
+            // 直接用 git2 拿第一个提交 oid(Git::commit 只能追加到 HEAD)
+            let repo = git2::Repository::open(tmp.path()).unwrap();
+            let sig = repo.signature().unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("a.txt")).unwrap();
+            index.write().unwrap();
+            let tree_id = index.write_tree().unwrap();
+            let tree = repo.find_tree(tree_id).unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "v1", &tree, &[])
+                .unwrap()
+        };
+        std::fs::write(tmp.path().join("a.txt"), "v2\n").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "only-in-v2\n").unwrap();
+        git.stage(&[PathBuf::from("a.txt"), PathBuf::from("b.txt")])
+            .unwrap();
+        git.commit("v2").unwrap();
+
+        // 基线 = 第一个提交:worktree 只包含 v1 内容
+        let wt = git.worktree_create_at("baseline-wt", Some(first)).unwrap();
+        let norm = |p: PathBuf| std::fs::read_to_string(p).unwrap().replace("\r\n", "\n");
+        assert_eq!(norm(wt.join("a.txt")), "v1\n");
+        assert!(!wt.join("b.txt").exists(), "基线外文件不得出现");
+        git.worktree_remove("baseline-wt").unwrap();
+    }
+
+    #[test]
+    fn integration_ref_advance_read_and_cleanup() {
+        let (tmp, git) = init_repo();
+        std::fs::write(tmp.path().join("f"), "1").unwrap();
+        git.stage(&[PathBuf::from("f")]).unwrap();
+        git.commit("base").unwrap();
+        let repo = git2::Repository::open(tmp.path()).unwrap();
+        let head_tree = repo.head().unwrap().peel_to_commit().unwrap().tree_id();
+
+        let refname = Git::integration_ref(7, 3);
+        assert!(git.read_ref(&refname).unwrap().is_none());
+        let c1 = git
+            .advance_integration_ref(&refname, head_tree, "int-1")
+            .unwrap();
+        assert_eq!(git.read_ref(&refname).unwrap(), Some(c1));
+        // 第二次推进:父提交是 ref 当前目标(线性集成历史)
+        let c2 = git
+            .advance_integration_ref(&refname, head_tree, "int-2")
+            .unwrap();
+        assert_eq!(git.read_ref(&refname).unwrap(), Some(c2));
+        let commit = repo.find_commit(c2).unwrap();
+        assert_eq!(commit.parent_count(), 1);
+        assert_eq!(commit.parent_id(0).unwrap(), c1);
+
+        // 同任务另一 revision 的 ref 不被误删
+        let other = Git::integration_ref(7, 9);
+        git.advance_integration_ref(&other, head_tree, "keep")
+            .unwrap();
+        assert_eq!(git.delete_integration_refs(7).unwrap(), 2);
+        assert!(git.read_ref(&refname).unwrap().is_none());
+        assert!(git.read_ref(&other).unwrap().is_none());
+        // 不存在于 refs/heads:普通分支列表看不到
+        let branch = git.branch().unwrap();
+        assert!(!branch.contains("mf/integration"));
     }
 }
