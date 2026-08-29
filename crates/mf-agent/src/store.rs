@@ -1323,13 +1323,19 @@ impl Store {
                 return Ok(Vec::new());
             }
             let mut interrupted_ids = Vec::new();
+            let mut reattached_sessions: Vec<i64> = Vec::new();
             for (id, session_id, status) in &rows {
                 let reattach = match session_id {
                     Some(sid) if status == "running" => session_alive(*sid),
                     _ => false,
                 };
                 if reattach {
-                    continue; // 宿主确认存活:重连,状态原样
+                    // 宿主确认存活:重连,状态原样;其会话进程仍在运行,
+                    // 不得被下方批量恢复标死
+                    if let Some(sid) = session_id {
+                        reattached_sessions.push(*sid);
+                    }
+                    continue;
                 }
                 if status == "awaiting-outcome" {
                     // 已退出未结算:等待人工确认,状态原样,任务提示
@@ -1360,12 +1366,27 @@ impl Store {
                     params![id, ts],
                 )?;
             }
-            // 只有真正活动的会话进程才随崩溃消失;done/idle 保留
-            tx.execute(
-                "UPDATE agent_sessions SET status = 'dead', updated_at = ?1
-                 WHERE status IN ('starting','working','waiting','blocked')",
-                params![ts],
-            )?;
+            // 只有真正活动的会话进程才随崩溃消失;done/idle 保留,
+            // reattached(宿主确认存活)的会话排除在批量标死之外
+            {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM agent_sessions
+                     WHERE status IN ('starting','working','waiting','blocked')",
+                )?;
+                let active: Vec<i64> = stmt
+                    .query_map([], |r| r.get(0))?
+                    .collect::<std::result::Result<Vec<i64>, _>>()?;
+                drop(stmt);
+                for sid in active {
+                    if reattached_sessions.contains(&sid) {
+                        continue;
+                    }
+                    tx.execute(
+                        "UPDATE agent_sessions SET status = 'dead', updated_at = ?2 WHERE id = ?1",
+                        params![sid, ts],
+                    )?;
+                }
+            }
             let mut out = Vec::new();
             for id in &interrupted_ids {
                 if let Some(r) = Self::run_view_by_id_tx(tx, *id)? {

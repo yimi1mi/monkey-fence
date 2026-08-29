@@ -64,6 +64,7 @@ struct Recovered {
     step_id: i64,
     run_id: i64,
     token: String,
+    session_id: i64,
 }
 
 /// 建库 → 运行一个 step → 崩溃(直接 stop)→ 按 session_alive 重启恢复。
@@ -151,6 +152,7 @@ fn recover_fixture(session_alive: bool, pre_exit_code: Option<i32>) -> Recovered
         step_id,
         run_id,
         token,
+        session_id,
     }
 }
 
@@ -241,6 +243,14 @@ fn reattached_run_keeps_running() {
     assert_eq!(step.status, StepStatus::Running);
     let task = fx.store.task_view(fx.task_id).unwrap().unwrap();
     assert_eq!(task.status, TaskStatus::Running);
+    // 重连的会话进程仍在运行:不得被恢复逻辑批量标记为 dead
+    let session = fx.store.session_view(fx.session_id).unwrap().unwrap();
+    assert_ne!(
+        session.status,
+        mf_agent::model::SessionStatus::Dead,
+        "reattached 会话不得被标记 dead(实际 {:?})",
+        session.status
+    );
     fx.orch.stop();
 }
 

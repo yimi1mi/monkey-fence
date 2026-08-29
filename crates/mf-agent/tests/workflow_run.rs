@@ -653,6 +653,22 @@ fn directory_acquire_failure_settles_run_not_running() {
         "任务应进入需要人工处理的状态,实际 {:?}",
         task_view.status
     );
+    // 派发失败必须归还全局并发槽(tick 预占的槽不得泄漏)
+    let failed_run = runs.iter().find(|r| r.status == RunStatus::Failed).unwrap();
+    assert_eq!(
+        fx.orch.global_limiter().active(),
+        0,
+        "派发失败后全局并发槽必须归还"
+    );
+    // 派发失败必须收口 Session(不得留 Working 的悬挂会话)
+    if let Some(session_id) = failed_run.session_id {
+        let session = fx.orch.store.session_view(session_id).unwrap().unwrap();
+        assert!(
+            matches!(session.status, mf_agent::model::SessionStatus::Dead),
+            "失败 run 的会话应收口为 Dead,实际 {:?}",
+            session.status
+        );
+    }
 }
 
 // ---------- 隔离租约汇合:冲突 → needs-you → 解决后释放 ----------

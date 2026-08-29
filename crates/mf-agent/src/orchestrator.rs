@@ -1659,6 +1659,9 @@ impl Orchestrator {
         let run = self
             .store
             .dispatch_run(task.id, step.id, step.revision_id, session.id)?;
+        // 并发槽登记先于租约获取:后续任何失败路径(租约/持久化/pin/启动)
+        // 经失败结算归还全局槽,不会泄漏 tick 预占的额度
+        self.active_dispatches.lock().insert(run.id);
         // 执行位置租约:同 step 复用(自动重试保留文件修改),新 step acquire。
         // acquire/持久化失败立即失败结算 —— 绝不留下 Running 的孤儿 run。
         let lease = {
@@ -1718,7 +1721,6 @@ impl Orchestrator {
             status: StepStatus::Running,
             ..step.clone()
         }));
-        self.active_dispatches.lock().insert(run.id);
         self.emit(SchedulerEvent::RunUpdated(run.clone()));
 
         if let Some(node) = snapshot_node {
@@ -1786,12 +1788,21 @@ impl Orchestrator {
         Ok(())
     }
 
-    /// 派发失败补偿:立即失败结算(释放并发槽/租约,任务进入 needs-you)。
+    /// 派发失败补偿:收口会话(无进程存活,不留 Working 悬挂行)、
+    /// 立即失败结算(归还并发槽/租约,任务进入 needs-you)。
     fn settle_dispatch_failure(&self, run: &RunView, reason: String) {
         self.emit(SchedulerEvent::Log {
             run_id: run.id,
             text: reason.clone(),
         });
+        if let Some(session_id) = run.session_id {
+            if let Ok(Some(s)) =
+                self.store
+                    .update_session(session_id, Some(SessionStatus::Dead), None, None)
+            {
+                self.emit(SchedulerEvent::SessionUpdated(s));
+            }
+        }
         if let Err(e) = self.settle_run(run.id, Settlement::Fail { reason }) {
             self.emit(SchedulerEvent::Error(format!("派发失败结算出错: {e:#}")));
         }
@@ -1868,6 +1879,17 @@ impl Orchestrator {
                 }
             }
             RuntimeEvent::SpawnError(msg) => {
+                // 启动失败:无进程存活,会话收口为 Dead(不留 Working 悬挂行)
+                if let Some(session_id) = run.session_id {
+                    if let Some(s) = self.store.update_session(
+                        session_id,
+                        Some(SessionStatus::Dead),
+                        None,
+                        None,
+                    )? {
+                        self.emit(SchedulerEvent::SessionUpdated(s));
+                    }
+                }
                 self.settle_run(
                     run.id,
                     Settlement::Fail {
