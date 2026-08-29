@@ -28,6 +28,8 @@ pub struct TaskComposerState {
     goal_follows_title: bool,
     /// 工作流分配选择(模板键或任务本地新建;设计 §11.3)。
     workflow_choice: WorkflowChoice,
+    /// 可分配的全局模板 (key, 名称);由宿主从目录库注入。
+    templates: Vec<(String, String)>,
 }
 
 /// 任务创建的工作流分配。
@@ -50,7 +52,54 @@ impl TaskComposerState {
             goal: String::new(),
             goal_follows_title: true,
             workflow_choice: WorkflowChoice::TaskLocal,
+            templates: Vec::new(),
         }
+    }
+
+    /// 注入可分配模板(渲染选项;提交校验只认已注入的模板)。
+    pub fn set_templates(&mut self, templates: Vec<(String, String)>) {
+        // 选择失效时回落任务本地
+        if let WorkflowChoice::Template(key) = &self.workflow_choice {
+            if !templates.iter().any(|(k, _)| k == key) {
+                self.workflow_choice = WorkflowChoice::TaskLocal;
+            }
+        }
+        self.templates = templates;
+    }
+
+    /// 渲染标签(工作流行)。
+    pub fn workflow_choice_label(&self) -> String {
+        match &self.workflow_choice {
+            WorkflowChoice::TaskLocal => "工作流:任务本地(新建,默认私有)".into(),
+            WorkflowChoice::Template(key) => {
+                let name = self
+                    .templates
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, n)| n.clone())
+                    .unwrap_or_else(|| key.clone());
+                format!("工作流:模板 {name}")
+            }
+        }
+    }
+
+    /// 点击循环:任务本地 → 各模板 → 任务本地。
+    pub fn cycle_workflow(&mut self) {
+        self.workflow_choice = match &self.workflow_choice {
+            WorkflowChoice::TaskLocal => self
+                .templates
+                .first()
+                .map(|(k, _)| WorkflowChoice::Template(k.clone()))
+                .unwrap_or(WorkflowChoice::TaskLocal),
+            WorkflowChoice::Template(key) => {
+                match self.templates.iter().position(|(k, _)| k == key) {
+                    Some(i) if i + 1 < self.templates.len() => {
+                        WorkflowChoice::Template(self.templates[i + 1].0.clone())
+                    }
+                    _ => WorkflowChoice::TaskLocal,
+                }
+            }
+        };
     }
 
     pub fn select_next_project(&mut self) {
@@ -131,6 +180,21 @@ impl TaskComposerState {
     where
         F: Fn(&PathBuf) -> Option<Arc<mf_agent::orchestrator::Orchestrator>>,
     {
+        self.submit_with_workflow(resolve, |_, _, _| Ok(()))
+    }
+
+    /// 创建任务后按工作流选择持久化:`Template(key)` 时由 assign 回调
+    /// 解析模板当前版本并分配(编译 + 插件 pin + Revision);
+    /// `TaskLocal` 完全不触发分配(画布稍后创建任务本地草稿)。
+    pub fn submit_with_workflow<F, A>(
+        &self,
+        resolve: F,
+        mut assign: A,
+    ) -> anyhow::Result<ActivationTarget>
+    where
+        F: Fn(&PathBuf) -> Option<Arc<mf_agent::orchestrator::Orchestrator>>,
+        A: FnMut(&PathBuf, i64, &WorkflowChoice) -> anyhow::Result<()>,
+    {
         let Some(root) = self.selected_project() else {
             anyhow::bail!("必须先选择项目");
         };
@@ -143,10 +207,14 @@ impl TaskComposerState {
             resolve(root).ok_or_else(|| anyhow::anyhow!("项目未打开: {}", root.display()))?;
         let task = orch.create_task(title, goal)?;
         let (pid, _) = normalize_project_path(root);
-        Ok(ActivationTarget::Task {
+        let target = ActivationTarget::Task {
             project: pid,
             task_id: task.id,
-        })
+        };
+        if let WorkflowChoice::Template(_) = &self.workflow_choice {
+            assign(root, task.id, &self.workflow_choice)?;
+        }
+        Ok(target)
     }
 }
 
@@ -294,6 +362,25 @@ impl TaskComposer {
                             .text_color(rgb(crate::theme::Theme::fg()))
                             .child(self.state.title().to_string())
                     }),
+            )
+            .child(
+                div()
+                    .id("composer-workflow")
+                    .h(px(22.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(crate::theme::Theme::border()))
+                    .text_size(px(10.5))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                    .child(self.state.workflow_choice_label())
+                    .on_click(cx.listener(|c: &mut TaskComposer, _, _, cx| {
+                        c.state.cycle_workflow();
+                        cx.notify();
+                    })),
             )
             .child(
                 div()

@@ -223,3 +223,148 @@ fn workflow_options_list_global_templates_only() {
     ]);
     assert_eq!(options, vec!["全局A".to_string(), "全局B".to_string()]);
 }
+
+// ---------- 工作流选择:渲染选项 + 持久化 ----------
+
+#[test]
+fn workflow_choice_renders_task_local_and_templates() {
+    let mut c = TaskComposerState::new(fake_projects(), None);
+    assert_eq!(c.workflow_choice(), &WorkflowChoice::TaskLocal);
+    assert_eq!(c.workflow_choice_label(), "工作流:任务本地(新建,默认私有)");
+    c.set_templates(vec![("t-release".into(), "发布检查".into())]);
+    c.select_workflow("t-release");
+    assert_eq!(
+        c.workflow_choice(),
+        &WorkflowChoice::Template("t-release".into())
+    );
+    assert_eq!(c.workflow_choice_label(), "工作流:模板 发布检查");
+    c.cycle_workflow();
+    assert_eq!(c.workflow_choice(), &WorkflowChoice::TaskLocal);
+    c.cycle_workflow();
+    assert_eq!(
+        c.workflow_choice(),
+        &WorkflowChoice::Template("t-release".into())
+    );
+}
+
+#[test]
+fn submit_assigns_selected_template_to_new_task() {
+    let dir = scratch("assign");
+    let catalog = mf_agent::CatalogStore::memory().unwrap();
+    let db_dir = dir.join(".mf-agent");
+    std::fs::create_dir_all(&db_dir).unwrap();
+    let orch = Orchestrator::start_with(
+        mf_agent::Store::open(&db_dir.join("orchestration.db")).unwrap(),
+        dir.clone(),
+        Config::default(),
+        Arc::new(NoopHost),
+        Arc::new(RwLock::new(ProfileCatalog::default())),
+        GlobalLimiter::new(4),
+        "test-pipe".into(),
+        Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
+        mf_agent::orchestrator::WorkflowKernel::new(catalog.clone()),
+    )
+    .unwrap();
+    // 模板引用一个可用实例
+    let instance = catalog
+        .create_agent_instance(mf_agent::AgentInstanceDraft {
+            name: "worker".into(),
+            agent_type: "generic-command".into(),
+            scope: mf_agent::InstanceScope::User,
+            project_key: None,
+            enabled: true,
+            run_mode: mf_agent::RunMode::OneShot,
+            executable: "agent.exe".into(),
+            argv: vec![],
+            env: vec![],
+            config: serde_json::json!({}),
+            execution_contract: serde_json::json!({ "completion": "process-exit" }),
+            sealed_secret_ids: vec![],
+        })
+        .unwrap();
+    let version = catalog
+        .save_template(&mf_agent::workflow::WorkflowTemplateDraft {
+            key: "t-release".into(),
+            name: "发布检查".into(),
+            task_local: false,
+            nodes: vec![mf_agent::workflow::WorkflowNodeDraft {
+                key: "a".into(),
+                title: "A".into(),
+                instructions: "做 A".into(),
+                agent_instance_id: instance.id.clone(),
+                deps: vec![],
+            }],
+        })
+        .unwrap();
+
+    let mut c = TaskComposerState::new(vec![(dir.clone(), "scratch".into())], Some(&dir));
+    c.set_title("发布任务");
+    c.set_templates(vec![("t-release".into(), "发布检查".into())]);
+    c.select_workflow("t-release");
+
+    // 生产同款分配闭包:模板 key → 当前版本 → assign_workflow(编译+pin+Revision)
+    let catalog_for_assign = catalog.clone();
+    let mut assigned: Vec<(PathBuf, i64)> = Vec::new();
+    let target = c
+        .submit_with_workflow(
+            |root| (root == &dir).then(|| orch.clone()),
+            |root, task_id, choice| {
+                let WorkflowChoice::Template(key) = choice else {
+                    return Ok(());
+                };
+                let current = catalog_for_assign
+                    .template_versions(key)?
+                    .into_iter()
+                    .next_back()
+                    .ok_or_else(|| anyhow::anyhow!("模板 {key} 不存在"))?;
+                let _ = &dir;
+                let mut plugins = std::collections::HashMap::new();
+                plugins.insert(
+                    "generic-command".to_string(),
+                    mf_agent::workflow::PluginSourcePin {
+                        full_id: "monkeyfence.generic-command".into(),
+                        version: "0.1.0".into(),
+                        content_hash: String::new(),
+                    },
+                );
+                orch.assign_workflow(task_id, &current, &plugins, false)?;
+                assigned.push((root.to_path_buf(), task_id));
+                Ok(())
+            },
+        )
+        .unwrap();
+    let _ = orch.stop();
+    assert!(matches!(target, ActivationTarget::Task { task_id: 1, .. }));
+    assert_eq!(assigned.len(), 1, "模板选择必须触发分配");
+    // 分配结果:任务有了带快照的 draft Revision(确认运行时激活)
+    let orch2 = start_orch(&dir);
+    let steps = orch2.store.task_steps(1).unwrap();
+    assert_eq!(steps.len(), 1, "Step 投影必须随分配落库");
+    assert!(
+        orch2
+            .store
+            .revision_snapshot(steps[0].revision_id)
+            .unwrap()
+            .is_some(),
+        "分配必须冻结工作流快照"
+    );
+    orch2.stop();
+}
+
+#[test]
+fn submit_with_task_local_choice_skips_assignment() {
+    let dir = scratch("local");
+    let mut c = TaskComposerState::new(vec![(dir.clone(), "scratch".into())], Some(&dir));
+    c.set_title("本地工作流任务");
+    let mut assigned = 0;
+    let dir_orch = start_orch(&dir);
+    c.submit_with_workflow(
+        |root| (root == &dir).then(|| dir_orch.clone()),
+        |_root, _task, _choice| {
+            assigned += 1;
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(assigned, 0, "任务本地选择不触发模板分配");
+}

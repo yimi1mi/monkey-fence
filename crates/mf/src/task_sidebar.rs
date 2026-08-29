@@ -107,7 +107,11 @@ impl TaskSidebar {
                     .collect()
             })
             .unwrap_or_default();
-        let state = TaskComposerState::new(projects, self.foreground.as_ref());
+        let mut state = TaskComposerState::new(projects, self.foreground.as_ref());
+        // 可分配的全局模板(任务本地默认私有,不进选择列表)
+        if let Ok(templates) = self.app.catalog_store.list_templates(false) {
+            state.set_templates(templates.into_iter().map(|t| (t.key, t.name)).collect());
+        }
         let composer = cx.new(|cx| TaskComposer::new(state, cx));
         cx.subscribe(&composer, |s, _, ev: &ComposerUiEvent, cx| match ev {
             ComposerUiEvent::Submit => s.submit_composer(cx),
@@ -129,7 +133,23 @@ impl TaskSidebar {
         };
         let state = composer.read(cx).state.clone();
         let app = self.app.clone();
-        match state.submit(move |root| app.orchestrator_of(root)) {
+        // 生产分配链:模板选择 → 当前版本 → assign_workflow(编译+pin+Revision)
+        let assign_app = self.app.clone();
+        let assign =
+            move |root: &PathBuf, task_id: i64, choice: &crate::task_composer::WorkflowChoice| {
+                let crate::task_composer::WorkflowChoice::Template(key) = choice else {
+                    return Ok(()); // 任务本地:画布稍后创建草稿
+                };
+                let version = assign_app
+                    .catalog_store
+                    .template_versions(key)?
+                    .into_iter()
+                    .next_back()
+                    .ok_or_else(|| anyhow::anyhow!("模板 {key} 不存在"))?;
+                assign_app.assign_workflow(root, task_id, version.version_id, false)?;
+                Ok(())
+            };
+        match state.submit_with_workflow(move |root| app.orchestrator_of(root), assign) {
             Ok(target) => {
                 self.composer = None;
                 self.composer_error = None;
