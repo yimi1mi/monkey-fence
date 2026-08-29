@@ -22,6 +22,7 @@ mod project_context;
 mod project_overview;
 #[cfg(test)]
 mod project_overview_tests;
+mod pty_spawn;
 mod quick_open;
 #[cfg(test)]
 mod quick_open_input_tests;

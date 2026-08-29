@@ -1,6 +1,6 @@
+use crate::pty_spawn::{self as pty, SpawnCommand};
 use gpui::prelude::*;
 use gpui::*;
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -46,9 +46,9 @@ pub struct ConsolePane {
     fallback_title: SharedString,
     screen: Screen,
     focus_handle: FocusHandle,
-    writer: Option<Box<dyn Write + Send>>,
-    child: Option<Box<dyn Child + Send + Sync>>,
-    master: Option<Box<dyn MasterPty + Send>>,
+    writer: Option<pty::PtyWriter>,
+    child: Option<pty::PtyChild>,
+    master: Option<pty::PtyMaster>,
     dead: bool,
 }
 
@@ -64,17 +64,13 @@ impl ConsolePane {
         cwd: &Path,
         cx: &mut Context<Self>,
     ) -> Result<Self, anyhow::Error> {
-        let pty_system = native_pty_system();
-        let pair = pty_system.openpty(PtySize {
+        let mut pair = pty::openpty(pty::PtySize {
             rows: TERM_ROWS as u16,
             cols: TERM_COLS as u16,
-            pixel_width: 0,
-            pixel_height: 0,
         })?;
-        let mut cmd = CommandBuilder::new(shell);
+        let mut cmd = SpawnCommand::new(shell);
         cmd.cwd(cwd);
-        let child = pair.slave.spawn_command(cmd)?;
-        drop(pair.slave);
+        let child = pair.spawn_command(&cmd)?;
         let mut reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
 
@@ -300,7 +296,12 @@ enum TermMsg {
 
 impl Drop for ConsolePane {
     fn drop(&mut self) {
-        if let Some(mut child) = self.child.take() {
+        // 终端窗格关闭:终止整棵进程树(job),再收口 PTY
+        if let Some(child) = self.child.take() {
+            if let Some(job) = child.job() {
+                let _ = job.terminate();
+                job.wait_empty(std::time::Duration::from_secs(3));
+            }
             let _ = child.kill();
         }
         drop(self.master.take());

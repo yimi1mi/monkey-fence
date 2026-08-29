@@ -33,7 +33,7 @@ regex.workspace = true
 crossbeam-channel.workspace = true
 portable-pty = "0.8"
 dirs.workspace = true
-windows-sys = { version = "0.59", features = ["Win32_System_Power", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Foundation", "Win32_System_IO"] }
+windows-sys = { version = "0.59", features = ["Win32_System_Power", "Win32_System_Pipes", "Win32_Storage_FileSystem", "Win32_Security", "Win32_Foundation", "Win32_System_IO", "Win32_System_Console", "Win32_System_JobObjects", "Win32_System_Threading"] }
 notify.workspace = true
 
 [dev-dependencies]

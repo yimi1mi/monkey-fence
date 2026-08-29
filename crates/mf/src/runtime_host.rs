@@ -10,6 +10,7 @@ use crate::term::Screen;
 
 const TERM_ROWS: usize = 26;
 const TERM_COLS: usize = 120;
+use crate::pty_spawn::{self as pty, SpawnCommand};
 use anyhow::{anyhow, Context as _, Result};
 use crossbeam_channel::Sender;
 use mf_agent::provider::{complete, AssistantBlock, ChatMessage, ToolDef};
@@ -19,7 +20,6 @@ use mf_agent::runtime::{
 use mf_agent::Settlement;
 use mf_agent::{InputInjection, TempFileSpec};
 use parking_lot::Mutex;
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -41,12 +41,14 @@ pub struct SessionSnapshot {
 
 struct PtySession {
     session_id: i64,
-    master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
-    writer: Mutex<Option<Box<dyn Write + Send>>>,
-    child: Mutex<Option<Box<dyn portable_pty::Child + Send + Sync>>>,
+    master: Mutex<Option<pty::PtyMaster>>,
+    writer: Mutex<Option<pty::PtyWriter>>,
+    child: Mutex<Option<pty::PtyChild>>,
     /// 独立 kill 句柄(离散会话:child 由 waiter 线程持有等待,
-    /// kill 经此克隆执行,避免跨线程争抢 Child)。
-    killer: Mutex<Option<Box<dyn portable_pty::ChildKiller + Send>>>,
+    /// kill 经此克隆执行,避免跨线程争抢)。
+    killer: Mutex<Option<pty::PtyChildKiller>>,
+    /// 进程树守卫(Windows Job Object):stop 时 terminate 整树并等清空。
+    job: Mutex<Option<pty::JobGuard>>,
     screen: Mutex<Screen>,
     title: Mutex<String>,
     output_tail: Mutex<Vec<u8>>,
@@ -266,16 +268,30 @@ impl SessionRegistry {
                 Ok(())
             }
             SessionInner::Pty(p) => {
-                // 停止输入;请求进程终止。真实终止由 reader/waiter 线程
-                // child.wait() 确认后 mark_terminated —— 不在 kill 后
-                // 立刻谎报 alive=false。
+                // 拥有并等待**整个进程树**(Windows Job Object):
+                // cmd/npm 风格父进程派生的孙进程一并终止,job 清空
+                // (全部派生进程消失)才算停止确认。
+                if let Some(job) = p.job.lock().take() {
+                    if let Err(e) = job.terminate() {
+                        log::warn!("run {run_id} 进程树 terminate 请求失败: {e}");
+                    }
+                    let empty = job.wait_empty(std::time::Duration::from_secs(10));
+                    drop(job);
+                    if !empty {
+                        // 树未清空:进程可能仍在写执行目录 → 不确认、不释放
+                        return Err(anyhow!("run {run_id} 进程树未在 10s 内清空(孙进程仍存活)"));
+                    }
+                }
+                // 停止输入;请求直接子进程终止(树 terminate 的兜底)。
+                // 真实终止由 reader/waiter 线程 child.wait() 确认后
+                // mark_terminated —— 不在 kill 后立刻谎报 alive=false。
                 p.writer.lock().take();
-                if let Some(mut killer) = p.killer.lock().take() {
+                if let Some(killer) = p.killer.lock().take() {
                     if let Err(e) = killer.kill() {
                         log::warn!("run {run_id} 会话进程 kill 请求失败: {e}");
                     }
                 }
-                if let Some(mut child) = p.child.lock().take() {
+                if let Some(child) = p.child.lock().take() {
                     // reader/waiter 尚未接管 child:直接终止并同步 reap
                     let _ = child.kill();
                     let _ = child.wait();
@@ -315,10 +331,16 @@ impl SessionRegistry {
             match &s {
                 SessionInner::Pty(p) => {
                     p.writer.lock().take();
-                    if let Some(mut killer) = p.killer.lock().take() {
+                    // 进程树终止(尽力而为;不等待,此处绝不伪造"进程已死")
+                    if let Some(job) = p.job.lock().take() {
+                        if let Err(e) = job.terminate() {
+                            log::warn!("进程树 terminate 请求失败: {e}");
+                        }
+                    }
+                    if let Some(killer) = p.killer.lock().take() {
                         let _ = killer.kill();
                     }
-                    if let Some(mut child) = p.child.lock().take() {
+                    if let Some(child) = p.child.lock().take() {
                         // reader/waiter 未接管 child:直接终止并同步 reap,
                         // 终止已确认
                         let _ = child.kill();
@@ -331,7 +353,6 @@ impl SessionRegistry {
                         // 由 reader wait 后收口;waiter 模式则交给 waiter
                         p.master.lock().take();
                     }
-                    // 此处绝不伪造"进程已死"(alive 由 reap 方维护)
                 }
                 SessionInner::Http(h) => {
                     h.cancel.store(true, Ordering::SeqCst);
@@ -426,12 +447,9 @@ fn launch_pty(
     }
     registry.kill_session(&project, spec.session_id); // 同键旧会话清理
 
-    let pty_system: Box<dyn portable_pty::PtySystem> = Box::new(NativePtySystem::default());
-    let pair = match pty_system.openpty(PtySize {
+    let mut pair = match pty::openpty(pty::PtySize {
         rows: TERM_ROWS as u16,
         cols: TERM_COLS as u16,
-        pixel_width: 0,
-        pixel_height: 0,
     }) {
         Ok(p) => p,
         Err(e) => {
@@ -443,7 +461,7 @@ fn launch_pty(
         }
     };
 
-    let mut cmd = CommandBuilder::new(&spec.profile.command);
+    let mut cmd = SpawnCommand::new(&spec.profile.command);
     // yolo 模式追加权限参数;manual 模式不附加(用户在终端里手动批准)
     let yolo = {
         let cfg = registry.config.lock();
@@ -491,7 +509,7 @@ fn launch_pty(
             return;
         }
     };
-    let mut child = match pair.slave.spawn_command(cmd) {
+    let child = match pair.spawn_command(&cmd) {
         Ok(c) => c,
         Err(e) => {
             let _ = events.send((
@@ -504,8 +522,17 @@ fn launch_pty(
             return;
         }
     };
-    drop(pair.slave);
-    let killer = child.clone_killer();
+    let killer = match child.clone_killer() {
+        Ok(k) => k,
+        Err(e) => {
+            let _ = events.send((
+                spec.run_id,
+                RuntimeEvent::SpawnError(format!("克隆 kill 句柄失败: {e}")),
+            ));
+            return;
+        }
+    };
+    let job = child.job();
     let pid = child.process_id();
 
     let session = Arc::new(PtySession {
@@ -515,11 +542,12 @@ fn launch_pty(
         // child 由 reader 线程持有并 wait;kill 经 killer 克隆执行
         child: Mutex::new(None),
         killer: Mutex::new(Some(killer)),
+        job: Mutex::new(job),
         screen: Mutex::new(Screen::new(TERM_ROWS, TERM_COLS)),
         title: Mutex::new(spec.profile.display_name.clone()),
         output_tail: Mutex::new(Vec::new()),
         alive: AtomicBool::new(true),
-        pid,
+        pid: Some(pid),
         reader_owns_reap: true,
         terminated: Mutex::new(false),
         terminated_cv: parking_lot::Condvar::new(),
@@ -723,25 +751,22 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
     }
     materialize_temp_files(&spec.run_temp, &spec.plan.temp_files)?;
 
-    let pty_system: Box<dyn portable_pty::PtySystem> = Box::new(NativePtySystem::default());
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: TERM_ROWS as u16,
-            cols: TERM_COLS as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .context("离散会话 openpty 失败")?;
+    let mut pair = pty::openpty(pty::PtySize {
+        rows: TERM_ROWS as u16,
+        cols: TERM_COLS as u16,
+    })
+    .context("离散会话 openpty 失败")?;
 
     let mut argv = spec.plan.argv.clone();
     apply_prompt_file_argv(&mut argv, &spec.plan.input)?;
-    let mut cmd = CommandBuilder::new(&spec.plan.executable);
+    let mut cmd = SpawnCommand::new(&spec.plan.executable);
     cmd.args(&argv);
     for (k, v) in &spec.plan.env {
         cmd.env(k, v);
     }
-    // Secret 值只进入 spawn 调用的环境块;脱敏器共享 zeroizing 租约
-    // (不复制明文副本),流结束即释放 —— 不随会话长期持明文
+    // Secret 值只进入 spawn 调用的一次性 zeroize 环境块;脱敏器共享
+    // zeroizing 租约(不复制明文副本),流结束即释放 —— 不随会话长期
+    // 持明文。与工作流路径统一走 pty_spawn(宿主侧零普通 OsString 副本)
     let mut redactor = mf_agent::secrets::StreamingRedactor::from_leases(
         spec.plan
             .secret_env
@@ -750,13 +775,7 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
             .collect(),
     );
     for (key, lease) in &spec.plan.secret_env {
-        let value = std::str::from_utf8(lease.as_slice()).with_context(|| {
-            format!(
-                "Secret `{}` 不是有效 UTF-8,无法注入环境变量 {key}",
-                lease.id()
-            )
-        })?;
-        cmd.env(key, value);
+        cmd.env_secret(key, lease);
     }
     cmd.cwd(spec.plan.cwd.as_deref().unwrap_or(&spec.workdir));
 
@@ -768,14 +787,14 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
         .master
         .take_writer()
         .context("离散会话 take_writer 失败")?;
-    let mut child = pair.slave.spawn_command(cmd).with_context(|| {
+    let child = pair.spawn_command(&cmd).with_context(|| {
         format!(
             "离散会话启动 `{}` 失败(CLI 未安装或配置无效)",
             spec.plan.executable.display()
         )
     })?;
-    drop(pair.slave);
-    let killer = child.clone_killer();
+    let killer = child.clone_killer().context("离散会话克隆 kill 句柄失败")?;
+    let job = child.job();
     let pid = child.process_id();
 
     let session = Arc::new(PtySession {
@@ -785,11 +804,12 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
         // child 由 waiter 线程持有并 wait;kill 经 killer 克隆执行
         child: Mutex::new(None),
         killer: Mutex::new(Some(killer)),
+        job: Mutex::new(job),
         screen: Mutex::new(Screen::new(TERM_ROWS, TERM_COLS)),
         title: Mutex::new(spec.title.clone()),
         output_tail: Mutex::new(Vec::new()),
         alive: AtomicBool::new(true),
-        pid,
+        pid: Some(pid),
         reader_owns_reap: false,
         terminated: Mutex::new(false),
         terminated_cv: parking_lot::Condvar::new(),
@@ -966,33 +986,27 @@ fn launch_workflow_pty(
     }
     materialize_temp_files(&spec.run_temp, &plan.temp_files)?;
 
-    let pty_system: Box<dyn portable_pty::PtySystem> = Box::new(NativePtySystem::default());
-    let pair = pty_system
-        .openpty(PtySize {
-            rows: TERM_ROWS as u16,
-            cols: TERM_COLS as u16,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .context("工作流节点 openpty 失败")?;
+    let mut pair = pty::openpty(pty::PtySize {
+        rows: TERM_ROWS as u16,
+        cols: TERM_COLS as u16,
+    })
+    .context("工作流节点 openpty 失败")?;
 
     let mut argv = plan.argv.clone();
     apply_prompt_file_argv(&mut argv, &plan.input)?;
-    let mut cmd = CommandBuilder::new(&plan.executable);
+    let mut cmd = SpawnCommand::new(&plan.executable);
     cmd.args(&argv);
     for (k, v) in &plan.env {
         cmd.env(k, v);
     }
-    // Secret 值只进入 spawn 调用的环境块;脱敏器共享 zeroizing 租约
-    // (不复制明文副本),流结束即释放 —— 不随会话长期持明文。
-    // 环境值经 SecretEnvBlock(Zeroizing 缓冲,drop 擦除)注入,
-    // 不以普通 String/OsString 副本长期存在。
+    // Secret 值只进入 spawn 调用的一次性 zeroize 环境块(pty_spawn 统一
+    // 注入点,宿主侧不产生普通 String/OsString 副本);脱敏器共享
+    // zeroizing 租约,流结束即释放 —— 不随会话长期持明文。
     let mut redactor = mf_agent::secrets::StreamingRedactor::from_leases(
         plan.secret_env.iter().map(|(_, l)| l.clone()).collect(),
     );
-    let secret_env = mf_agent::secrets::SecretEnvBlock::from_leases(&plan.secret_env)?;
-    for (key, value) in secret_env.iter() {
-        cmd.env(key, value);
+    for (key, lease) in &plan.secret_env {
+        cmd.env_secret(key, lease);
     }
     // 能力令牌 + 管道名注入环境(mfctl 结算纪律在提示文本中)
     cmd.env("MF_RUN_TOKEN", &spec.capability_token);
@@ -1011,14 +1025,16 @@ fn launch_workflow_pty(
         .master
         .take_writer()
         .context("工作流节点 take_writer 失败")?;
-    let mut child = pair.slave.spawn_command(cmd).with_context(|| {
+    let child = pair.spawn_command(&cmd).with_context(|| {
         format!(
             "工作流节点启动 `{}` 失败(CLI 未安装或配置无效)",
             plan.executable.display()
         )
     })?;
-    drop(pair.slave);
-    let killer = child.clone_killer();
+    let killer = child
+        .clone_killer()
+        .context("工作流节点克隆 kill 句柄失败")?;
+    let job = child.job();
     let pid = child.process_id();
 
     let session = Arc::new(PtySession {
@@ -1028,11 +1044,12 @@ fn launch_workflow_pty(
         // child 由 waiter 线程持有等待;kill 经 killer 克隆执行
         child: Mutex::new(None),
         killer: Mutex::new(Some(killer)),
+        job: Mutex::new(job),
         screen: Mutex::new(Screen::new(TERM_ROWS, TERM_COLS)),
         title: Mutex::new(spec.step_title.clone()),
         output_tail: Mutex::new(Vec::new()),
         alive: AtomicBool::new(true),
-        pid,
+        pid: Some(pid),
         reader_owns_reap: true,
         terminated: Mutex::new(false),
         terminated_cv: parking_lot::Condvar::new(),
@@ -2217,5 +2234,111 @@ mod tests {
         assert!(registry.snapshot(&project, 7).is_none());
         // 二次停止幂等
         host.stop_run(&project, 42).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn stop_run_terminates_entire_process_tree_including_grandchildren() {
+        // C5 回归:cmd /c "ping … > growing.txt" 直接子 cmd.exe 派生孙进程
+        // ping.exe 持续写执行目录。停止必须拥有并等待**整棵进程树**:
+        // 父+孙进程都消失、文件停止增长,stop_run 才允许返回 Ok
+        //(之后才能安全 release/delete 执行租约)。
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path().join("wt");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let growing = workdir.join("growing.txt");
+        let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        let host = RuntimeHostImpl::new(registry.clone());
+        let (events, _rx) = crossbeam_channel::bounded(64);
+        let spec = LaunchSpec {
+            project_root: workdir.clone(),
+            run_id: 4242,
+            step_id: 1,
+            task_id: 1,
+            session_id: 77,
+            session_key: None,
+            attach_existing_session: false,
+            profile: AgentProfileSpec {
+                id: "cmd".into(),
+                display_name: "cmd".into(),
+                runtime: RuntimeKind::Pty,
+                command: cmd,
+                // /c 单命令:cmd.exe 直接 CreateProcess ping.exe(孙进程),
+                // 输出重定向持续写 worktree 内文件(相对路径:cwd 即 workdir,
+                // 避免引号/空格路径干扰 cmd 的重定向解析)
+                args: vec!["/c".into(), "ping -n 600 127.0.0.1 > growing.txt".into()],
+                env: vec![],
+                permission_args: vec![],
+                provider: None,
+                icon: None,
+                homepage: None,
+                hook: None,
+            },
+            step_title: "t".into(),
+            prompt: String::new(),
+            capability_token: "tok".into(),
+            pipe_name: "pipe".into(),
+            mfctl_hint: None,
+            workdir: workdir.clone(),
+        };
+        let project = workdir.to_string_lossy().to_string();
+        host.launch(spec, events);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            if registry.session_alive(&project, 77)
+                && growing.is_file()
+                && std::fs::metadata(&growing)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            growing.is_file() && std::fs::metadata(&growing).unwrap().len() > 0,
+            "前置:孙进程(ping)应已在执行目录持续写文件"
+        );
+        let pid = registry
+            .session_pid(&project, 77)
+            .expect("PTY 会话必须可观测 OS PID");
+        // 前置:写入正在进行(文件仍在增长 → 孙进程活着)
+        let size_a = std::fs::metadata(&growing).unwrap().len();
+        // ping 约每秒写一行:窗口放宽到覆盖多次回复
+        std::thread::sleep(std::time::Duration::from_millis(2600));
+        let size_b = std::fs::metadata(&growing).unwrap().len();
+        assert!(
+            size_b > size_a,
+            "前置:孙进程持续写入(size {size_a}→{size_b})"
+        );
+
+        host.stop_run(&project, 4242)
+            .expect("整棵进程树终止并确认后 stop_run 才返回 Ok");
+
+        // 父进程消失
+        assert!(
+            !tasklist_has_pid(pid),
+            "直接子进程(cmd.exe,PID {pid})必须消失"
+        );
+        // 孙进程消失:进程表无 PING.EXE
+        let ping_alive = std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq PING.EXE", "/FO", "CSV", "/NH"])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .to_uppercase()
+                    .contains("PING.EXE")
+            })
+            .unwrap_or(false);
+        assert!(!ping_alive, "孙进程(ping.exe)必须随进程树终止");
+        // 文件停止增长(写者已死,即使进程表查询受环境干扰这也是硬证据)
+        let size_c = std::fs::metadata(&growing).unwrap().len();
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        let size_d = std::fs::metadata(&growing).unwrap().len();
+        assert_eq!(
+            size_c, size_d,
+            "孙进程死后执行目录文件必须停止增长(size {size_c}→{size_d})"
+        );
     }
 }
