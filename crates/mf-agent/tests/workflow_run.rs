@@ -691,3 +691,109 @@ fn isolated_merge_conflict_moves_task_to_needs_you_then_release() {
         fx.orch.store.task_view(task.id).unwrap().unwrap().status == TaskStatus::Succeeded
     }));
 }
+
+#[test]
+fn merge_conflicts_persist_across_restart_and_resolve() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut fx = Fixture::new(tmp.path());
+    fx.pins.resolve_ok(true);
+    let version = fx.template("t", vec![node("a", &[], "做 A", &fx.instance_id)]);
+    let task = fx.orch.create_task("标题", "").unwrap();
+    fx.assign_and_run(task.id, &version);
+    assert!(wait_until(Duration::from_secs(5), || {
+        fx.host.workflow.lock().len() == 1
+    }));
+    let token = {
+        let guard = fx.host.workflow.lock();
+        guard[0].0.capability_token.clone()
+    };
+    // 汇合冲突 → needs-you + 持久化待决行
+    fx.directory.merge_ok.store(false, Ordering::SeqCst);
+    fx.orch
+        .settle_by_token(
+            &token,
+            Settlement::Complete {
+                summary: "A 完成".into(),
+            },
+        )
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || {
+        fx.orch.store.task_view(task.id).unwrap().unwrap().status == TaskStatus::NeedsYou
+    }));
+    assert_eq!(
+        fx.orch
+            .store
+            .list_pending_merges(Some(task.id))
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // 重启:同一 Store/目录提供器重建 Orchestrator,待决汇合恢复
+    fx.orch.stop();
+    let store = mf_agent::store::Store::open(&tmp.path().join("workflow-v1.db")).unwrap();
+    let orch2 = Orchestrator::start_with(
+        store,
+        tmp.path().to_path_buf(),
+        Config::default(),
+        Arc::new(RecordingHost::default()),
+        empty_profiles(),
+        GlobalLimiter::new(4),
+        "pipe".into(),
+        fx.directory.clone(),
+        WorkflowKernel {
+            catalog: fx.catalog.clone(),
+            pins: Some(fx.pins.clone()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        orch2.pending_merge_conflicts(task.id).len(),
+        1,
+        "重启后待决冲突必须可查"
+    );
+    // 恢复的待决汇合把任务留在 needs-you(不被收敛覆盖)
+    assert_eq!(
+        orch2.store.task_view(task.id).unwrap().unwrap().status,
+        TaskStatus::NeedsYou
+    );
+
+    // 用户解决后重试:整批汇合、释放租约、任务收敛、持久化行清空
+    fx.directory.merge_ok.store(true, Ordering::SeqCst);
+    let remaining = orch2.resolve_pending_merges(task.id).unwrap();
+    assert!(remaining.is_empty(), "仍冲突: {remaining:?}");
+    assert!(fx.directory.released.lock().len() >= 1);
+    assert!(orch2
+        .store
+        .list_pending_merges(Some(task.id))
+        .unwrap()
+        .is_empty());
+    assert!(wait_until(Duration::from_secs(5), || {
+        orch2.store.task_view(task.id).unwrap().unwrap().status == TaskStatus::Succeeded
+    }));
+    orch2.stop();
+
+    // 再次重启:无待决行,任务保持 Succeeded(不复活)
+    let store3 = mf_agent::store::Store::open(&tmp.path().join("workflow-v1.db")).unwrap();
+    let orch3 = Orchestrator::start_with(
+        store3,
+        tmp.path().to_path_buf(),
+        Config::default(),
+        Arc::new(RecordingHost::default()),
+        empty_profiles(),
+        GlobalLimiter::new(4),
+        "pipe".into(),
+        fx.directory.clone(),
+        WorkflowKernel {
+            catalog: fx.catalog.clone(),
+            pins: Some(fx.pins.clone()),
+        },
+    )
+    .unwrap();
+    assert!(orch3.pending_merge_conflicts(task.id).is_empty());
+    assert_eq!(
+        orch3.store.task_view(task.id).unwrap().unwrap().status,
+        TaskStatus::Succeeded
+    );
+    orch3.stop();
+}

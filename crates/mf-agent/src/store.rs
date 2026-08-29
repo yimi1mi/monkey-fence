@@ -1774,13 +1774,28 @@ impl Store {
 
     /// run 当前持有的租约(重启恢复后释放用)。
     pub fn held_lease_of_run(&self, run_id: i64) -> Result<Option<ExecutionLeaseRow>> {
+        self.held_lease_where("run_id = ?1", params![run_id])
+    }
+
+    /// 按租约键查持有中的租约(待决汇合重启后按 lease id 释放用)。
+    pub fn held_lease_by_key(&self, lease_key: &str) -> Result<Option<ExecutionLeaseRow>> {
+        self.held_lease_where("lease_key = ?1", params![lease_key])
+    }
+
+    fn held_lease_where(
+        &self,
+        condition: &str,
+        params: impl rusqlite::Params,
+    ) -> Result<Option<ExecutionLeaseRow>> {
         self.with_conn(|c| {
             c.query_row(
-                "SELECT lease_key, run_id, step_id, task_id, provider, path, isolated,
-                        metadata_json, status, created_at, released_at
-                 FROM execution_leases WHERE run_id = ?1 AND status = 'held'
-                 ORDER BY id DESC LIMIT 1",
-                params![run_id],
+                &format!(
+                    "SELECT lease_key, run_id, step_id, task_id, provider, path, isolated,
+                            metadata_json, status, created_at, released_at
+                     FROM execution_leases WHERE {condition} AND status = 'held'
+                     ORDER BY id DESC LIMIT 1"
+                ),
+                params,
                 |r| {
                     Ok(ExecutionLeaseRow {
                         lease_key: r.get(0)?,
@@ -1840,6 +1855,97 @@ impl Store {
                 })?
                 .collect::<std::result::Result<_, _>>()?;
             Ok(rows)
+        })
+    }
+
+    /// 记录一条待决汇合(汇合冲突 → needs-you 时写入)。
+    pub fn insert_pending_merge(
+        &self,
+        task_id: i64,
+        lease: &crate::execution_directory::ExecutionLease,
+        conflicts: &[String],
+    ) -> Result<i64> {
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO pending_merges (task_id, lease_id, lease_json, conflicts_json, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    task_id,
+                    lease.id,
+                    serde_json::to_string(lease)?,
+                    serde_json::to_string(conflicts)?,
+                    now()
+                ],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    /// 待决汇合列表;`task_id = None` 返回全部任务(重启恢复用)。
+    pub fn list_pending_merges(&self, task_id: Option<i64>) -> Result<Vec<PendingMergeRow>> {
+        self.with_conn(|c| {
+            let sql = match task_id {
+                Some(_) => {
+                    "SELECT id, task_id, lease_json, conflicts_json FROM pending_merges
+                     WHERE task_id = ?1 ORDER BY id"
+                }
+                None => {
+                    "SELECT id, task_id, lease_json, conflicts_json FROM pending_merges
+                         ORDER BY id"
+                }
+            };
+            let mut stmt = c.prepare(sql)?;
+            let map_row =
+                |r: &rusqlite::Row<'_>| -> std::result::Result<PendingMergeRow, rusqlite::Error> {
+                    let lease_json: String = r.get(2)?;
+                    let conflicts_json: String = r.get(3)?;
+                    let id: i64 = r.get(0)?;
+                    let lease: crate::execution_directory::ExecutionLease =
+                        serde_json::from_str(&lease_json).map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                lease_json.len(),
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
+                    Ok(PendingMergeRow {
+                        id,
+                        task_id: r.get(1)?,
+                        lease,
+                        conflicts: serde_json::from_str(&conflicts_json).unwrap_or_default(),
+                    })
+                };
+            let rows = match task_id {
+                Some(id) => stmt
+                    .query_map(params![id], map_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+                None => stmt
+                    .query_map([], map_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            };
+            Ok(rows)
+        })
+    }
+
+    /// 更新待决汇合的冲突列表(重试后仍冲突时刷新)。
+    pub fn update_pending_merge_conflicts(&self, id: i64, conflicts: &[String]) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE pending_merges SET conflicts_json = ?2 WHERE id = ?1",
+                params![id, serde_json::to_string(conflicts)?],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// 清空任务的待决汇合(全部解决/取消);返回删除行数。
+    pub fn clear_pending_merges(&self, task_id: i64) -> Result<usize> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "DELETE FROM pending_merges WHERE task_id = ?1",
+                params![task_id],
+            )?;
+            Ok(n)
         })
     }
 

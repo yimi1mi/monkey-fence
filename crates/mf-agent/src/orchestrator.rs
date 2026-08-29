@@ -233,6 +233,8 @@ impl Orchestrator {
                 ),
             });
         }
+        // 待决汇合恢复:持久化的冲突行装回内存,任务保持 needs-you
+        orch.restore_pending_merges();
         std::thread::Builder::new()
             .name("mf-dispatch".into())
             .spawn({
@@ -333,6 +335,11 @@ impl Orchestrator {
         if self.task_has_active_runs(task_id)? {
             anyhow::bail!("任务仍有活动 Agent Run,请先停止");
         }
+        self.release_workflow_pins(task_id);
+        let _ = self.store.clear_pending_merges(task_id)?;
+        if let Err(e) = self.directory.discard_task_baselines(task_id) {
+            log::warn!("清理任务 {task_id} 集成基线失败: {e:#}");
+        }
         self.store.set_task_status(task_id, TaskStatus::Archived)?;
         self.emit(SchedulerEvent::TaskRemoved(task_id));
         Ok(())
@@ -354,16 +361,7 @@ impl Orchestrator {
             return;
         }
         if let Ok(Some(row)) = self.store.held_lease_of_run(run_id) {
-            let lease = ExecutionLease {
-                id: row.lease_key.clone(),
-                path: PathBuf::from(&row.path),
-                isolated: row.isolated,
-                provider: row.provider.clone(),
-                metadata: row
-                    .metadata_json
-                    .and_then(|json| serde_json::from_str(&json).ok())
-                    .unwrap_or(serde_json::Value::Null),
-            };
+            let lease = lease_from_row(&row);
             if let Err(e) = self.directory.release(&lease) {
                 log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
             }
@@ -446,13 +444,18 @@ impl Orchestrator {
                 Ok(())
             })?;
         }
-        // 取消:待决汇合直接丢弃(不合并),隔离租约随取消释放
+        // 取消:待决汇合直接丢弃(不合并),隔离租约随取消释放;
+        // 持久化行与集成基线一并清理
         if let Some(pending) = self.pending_merges.lock().remove(&task_id) {
             for lease in pending {
                 self.release_lease_of_lease(&lease);
             }
         }
+        let _ = self.store.clear_pending_merges(task_id)?;
         self.release_workflow_pins(task_id);
+        if let Err(e) = self.directory.discard_task_baselines(task_id) {
+            log::warn!("清理任务 {task_id} 集成基线失败: {e:#}");
+        }
         let t = self
             .store
             .set_task_status(task_id, TaskStatus::Cancelled)?
@@ -610,28 +613,65 @@ impl Orchestrator {
         }
     }
 
-    /// 用户解决汇合冲突后重试:合并仍冲突的隔离租约;全部合并成功则
-    /// 释放租约并重新收敛任务。返回仍存在的冲突(空 = 已全部解决)。
+    /// 用户解决汇合冲突后重试:以持久化行为源整批重新汇合(批量预检 +
+    /// 原子应用);全部合并成功则释放租约、删除待决行并重新收敛任务。
+    /// 返回仍存在的冲突(空 = 已全部解决)。
     pub fn resolve_pending_merges(&self, task_id: i64) -> Result<Vec<String>> {
-        let leases = self
-            .pending_merges
-            .lock()
-            .remove(&task_id)
-            .unwrap_or_default();
-        if leases.is_empty() {
+        let rows = self.store.list_pending_merges(Some(task_id))?;
+        if rows.is_empty() {
             return Ok(Vec::new());
         }
+        let leases: Vec<ExecutionLease> = rows.iter().map(|r| r.lease.clone()).collect();
         let conflicts = self.merge_leases(&leases)?;
         if conflicts.is_empty() {
             for lease in &leases {
                 self.release_lease_of_run_by_key(&lease.id);
             }
+            self.store.clear_pending_merges(task_id)?;
+            self.pending_merges.lock().remove(&task_id);
             self.check_convergence(task_id)?;
         } else {
-            // 仍有冲突:租约继续持有,等待用户再次处理
+            // 仍有冲突:刷新持久化冲突列表,租约继续持有等待再次处理
+            for row in &rows {
+                self.store
+                    .update_pending_merge_conflicts(row.id, &conflicts)?;
+            }
             self.pending_merges.lock().insert(task_id, leases);
         }
         Ok(conflicts)
+    }
+
+    /// 任务当前的待决汇合冲突(持久化行投影;Run Monitor 展示用)。
+    pub fn pending_merge_conflicts(&self, task_id: i64) -> Vec<String> {
+        self.store
+            .list_pending_merges(Some(task_id))
+            .map(|rows| rows.into_iter().flat_map(|r| r.conflicts).collect())
+            .unwrap_or_default()
+    }
+
+    /// 重启恢复:把持久化的待决汇合装回内存映射,任务回到 needs-you。
+    fn restore_pending_merges(&self) {
+        let Ok(rows) = self.store.list_pending_merges(None) else {
+            return;
+        };
+        let mut by_task: HashMap<i64, Vec<ExecutionLease>> = HashMap::new();
+        for row in rows {
+            if let Some(t) = self.store.task_view(row.task_id).ok().flatten() {
+                if !t.status.terminal() {
+                    if let Some(t) = self
+                        .store
+                        .set_task_status(row.task_id, TaskStatus::NeedsYou)
+                        .ok()
+                        .flatten()
+                    {
+                        self.store.set_task_unread(row.task_id, true).ok();
+                        self.emit(SchedulerEvent::TaskUpdated(t));
+                    }
+                }
+            }
+            by_task.entry(row.task_id).or_default().push(row.lease);
+        }
+        *self.pending_merges.lock() = by_task;
     }
 
     /// 汇合一批隔离租约;返回冲突列表(空 = 全部合并成功)。
@@ -655,6 +695,12 @@ impl Orchestrator {
             .find(|l| l.id == lease_id)
             .cloned();
         if let Some(lease) = lease {
+            self.release_lease_of_lease(&lease);
+            return;
+        }
+        // 重启恢复的待决汇合不在内存映射:按租约键从数据库兜底
+        if let Ok(Some(row)) = self.store.held_lease_by_key(lease_id) {
+            let lease = lease_from_row(&row);
             self.release_lease_of_lease(&lease);
         }
     }
@@ -1029,6 +1075,13 @@ impl Orchestrator {
             self.release_lease_of_lease(&lease);
             return;
         }
+        // 冲突持久化(重启后仍可恢复:任务保持 needs-you,租约保持持有)
+        if let Err(e) = self
+            .store
+            .insert_pending_merge(run.task_id, &lease, &conflicts)
+        {
+            log::error!("持久化待决汇合失败: {e:#}");
+        }
         self.pending_merges
             .lock()
             .entry(run.task_id)
@@ -1095,6 +1148,9 @@ impl Orchestrator {
                     self.emit(SchedulerEvent::TaskUpdated(t));
                 }
                 self.release_workflow_pins(task_id);
+                if let Err(e) = self.directory.discard_task_baselines(task_id) {
+                    log::warn!("清理任务 {task_id} 集成基线失败: {e:#}");
+                }
             }
             Some(false) => {
                 if let Some(t) = self.store.set_task_status(task_id, TaskStatus::Failed)? {
@@ -2098,6 +2154,21 @@ fn trusted_run_temp(run_id: i64) -> PathBuf {
 /// 任务级插件 pin run_key(任务生命周期内固定)。
 fn workflow_pin_key(task_id: i64) -> String {
     format!("task-{task_id}")
+}
+
+/// 从数据库行重建租约对象(重启恢复路径)。
+fn lease_from_row(row: &ExecutionLeaseRow) -> ExecutionLease {
+    ExecutionLease {
+        id: row.lease_key.clone(),
+        path: PathBuf::from(&row.path),
+        isolated: row.isolated,
+        provider: row.provider.clone(),
+        metadata: row
+            .metadata_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or(serde_json::Value::Null),
+    }
 }
 
 /// 工作流节点初始提示:Task goal + 上游 Handoff 注入 + `${nodes.*}` 变量替换

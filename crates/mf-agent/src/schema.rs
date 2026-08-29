@@ -199,6 +199,15 @@ CREATE TABLE IF NOT EXISTS execution_leases (
 );
 CREATE INDEX IF NOT EXISTS idx_execution_leases_task ON execution_leases(task_id);
 CREATE INDEX IF NOT EXISTS idx_execution_leases_run ON execution_leases(run_id);
+CREATE TABLE IF NOT EXISTS pending_merges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES agent_tasks(id),
+    lease_id TEXT NOT NULL,
+    lease_json TEXT NOT NULL,
+    conflicts_json TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pending_merges_task ON pending_merges(task_id);
 ";
 
 /// 目录库 v1 DDL:仅空表地基(字段随后续里程碑补全);
