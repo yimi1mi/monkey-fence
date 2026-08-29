@@ -138,6 +138,9 @@ pub struct Orchestrator {
     workflow: WorkflowKernel,
     /// task → 汇合冲突待处理的隔离租约(NeedsUser;解决前任务保持 needs-you)。
     pending_merges: Mutex<HashMap<i64, Vec<ExecutionLease>>>,
+    /// 进程内目录提供器的插件包身份(分配时冻结进 Revision 快照,
+    /// 派发时强校验一致;None = 内核默认共享目录)。
+    directory_pin: Mutex<Option<PluginSourcePin>>,
 }
 
 impl Orchestrator {
@@ -222,6 +225,7 @@ impl Orchestrator {
             step_leases: Mutex::new(HashMap::new()),
             workflow,
             pending_merges: Mutex::new(HashMap::new()),
+            directory_pin: Mutex::new(None),
         });
         for run in &recovered {
             if let Some(t) = orch.store.task_view(run.task_id)? {
@@ -279,6 +283,16 @@ impl Orchestrator {
                 }
             })?;
         Ok(orch)
+    }
+
+    /// 设置进程内目录提供器的插件包身份(项目打开时由宿主解析注入;
+    /// 分配时冻结进 Revision,派发时强校验一致)。
+    pub fn set_directory_provider_pin(&self, pin: Option<PluginSourcePin>) {
+        *self.directory_pin.lock() = pin;
+    }
+
+    fn directory_provider_pin(&self) -> Option<PluginSourcePin> {
+        self.directory_pin.lock().clone()
     }
 
     pub fn stop(&self) {
@@ -695,6 +709,7 @@ impl Orchestrator {
             .compile(crate::workflow_compiler::CompileInput {
                 template: version,
                 directory_provider_isolates: self.directory.isolates(),
+                directory_provider: self.directory_provider_pin(),
                 allow_unsafe_shared_directory,
                 agent_type_plugins,
                 resolve_instance: &|id| self.workflow.catalog.snapshot_agent_instance(id, None),
@@ -736,6 +751,7 @@ impl Orchestrator {
             .compile(crate::workflow_compiler::CompileInput {
                 template: version,
                 directory_provider_isolates: self.directory.isolates(),
+                directory_provider: self.directory_provider_pin(),
                 allow_unsafe_shared_directory,
                 agent_type_plugins,
                 resolve_instance: &|id| self.workflow.catalog.snapshot_agent_instance(id, None),
@@ -753,6 +769,16 @@ impl Orchestrator {
         // 预编译通过才写库(pin key 含 revision id,必须先建 Revision);
         // pin 失败 → 精确回滚:释放本次 run_key 已 pin 引用 + 删除刚建的 draft Revision
         let rev = self.store.create_workflow_revision(task_id, &snapshot)?;
+        // 目录提供器 pin 同随 Revision 固定:pin 期间插件包不可清理/卸载
+        if let Some(dir_pin) = &snapshot.directory_provider {
+            if let Some(pins) = &self.workflow.pins {
+                if let Err(e) =
+                    pins.pin_for_run(&workflow_pin_key(&self.root, task_id, rev.id), dir_pin)
+                {
+                    log::warn!("固定目录提供器 pin 失败: {e:#}");
+                }
+            }
+        }
         let run_key = workflow_pin_key(&self.root, task_id, rev.id);
         if let Some(pins) = &self.workflow.pins {
             let mut pinned: Vec<PluginSourcePin> = Vec::new();
@@ -2220,6 +2246,24 @@ impl Orchestrator {
         // 并发槽登记先于租约获取:后续任何失败路径(租约/持久化/pin/启动)
         // 经失败结算归还全局槽,不会泄漏 tick 预占的额度
         self.active_dispatches.lock().insert(run.id);
+        // 目录提供器 pin 强校验(I7):Revision 冻结的提供器身份必须与
+        // 进程内当前提供器一致 —— 插件升级/换提供器后旧 Revision 不得
+        // 静默换用新提供器运行(需重新分配)
+        if snapshot_node.is_some() {
+            if let Some(snapshot) = self.store.revision_snapshot(step.revision_id)? {
+                if snapshot.directory_provider != self.directory_provider_pin() {
+                    self.settle_dispatch_failure(
+                        &run,
+                        format!(
+                            "目录提供器 pin 与 Revision 冻结时不一致(冻结 {:?},当前 {:?}):插件已升级或更换提供器,请重新分配工作流",
+                            snapshot.directory_provider,
+                            self.directory_provider_pin()
+                        ),
+                    );
+                    return Ok(());
+                }
+            }
+        }
         // 执行位置租约:同 step 复用(自动重试保留文件修改),新 step acquire。
         // acquire/持久化失败立即失败结算 —— 绝不留下 Running 的孤儿 run。
         let lease = {
@@ -2264,6 +2308,22 @@ impl Orchestrator {
                 lease
             }
         };
+        // 租约固定提供器 pin(审计/恢复时可见;与 Revision 冻结一致)
+        let mut lease = lease;
+        if let Some(pin) = self.directory_provider_pin() {
+            if lease.metadata.get("provider_pin").is_none() {
+                if let Some(obj) = lease.metadata.as_object_mut() {
+                    obj.insert(
+                        "provider_pin".into(),
+                        serde_json::json!({
+                            "full_id": pin.full_id,
+                            "version": pin.version,
+                            "content_hash": pin.content_hash,
+                        }),
+                    );
+                }
+            }
+        }
         if let Err(e) = self
             .store
             .insert_execution_lease(&lease, Some(run.id), step.id, task.id)

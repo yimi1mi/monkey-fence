@@ -45,6 +45,36 @@ struct PackageRecord {
     manifest: PluginManifest,
 }
 
+/// 内置合成目录插件身份(进程内 worktree 实现的唯一归属)。
+pub const BUILTIN_DIRECTORIES_PLUGIN_ID: &str = "monkeyfence.directories";
+/// 内置合成目录插件版本(与合成清单 version_str 一致)。
+pub const BUILTIN_DIRECTORIES_VERSION: &str = "0.1.0";
+
+/// 目录提供器工厂:内置进程内实现或第三方 worker 进程驱动。
+#[derive(Clone, Debug)]
+pub enum DirectoryProviderFactory {
+    /// 内置合成插件的 worktree 进程内实现(GitWorktreeProvider)。
+    BuiltinWorktree,
+    /// 第三方:worker 进程驱动(命令相对插件包根或绝对路径)。
+    Worker {
+        command: String,
+        args: Vec<String>,
+        plugin_root: PathBuf,
+    },
+}
+
+/// 按「完整贡献 ID + 版本 + 内容哈希」解析出的目录提供器。
+#[derive(Clone, Debug)]
+pub struct DirectoryProviderResolution {
+    /// 完整贡献 ID(plugin_full_id.contribution_id)。
+    pub full_contribution_id: String,
+    /// 策略实现标识(清单声明)。
+    pub kind: String,
+    pub isolates: bool,
+    pub supports_parallel: bool,
+    pub factory: DirectoryProviderFactory,
+}
+
 pub struct PluginHost {
     /// 插件根目录(包与锁文件都位于其下)。
     root: PathBuf,
@@ -738,6 +768,129 @@ impl PluginHost {
         })?;
         self.refresh_pin_state()?;
         Ok(())
+    }
+
+    // ---------- 目录提供器解析(I7)----------
+
+    /// 按完整 pinned 身份(完整贡献 ID + 版本 + 内容哈希)解析目录
+    /// 提供器(I7):
+    /// - 空哈希 = 内置合成插件:身份必须**精确**等于内置 worktree 贡献
+    ///   (monkeyfence.directories.worktree)才映射到进程内实现;
+    ///   任何其他内置贡献(即便同名)都没有进程内实现 → 拒绝;
+    /// - 非空哈希 = 第三方:不得冒充内置身份;内容寻址包解析校验
+    ///   版本/哈希/防篡改;贡献 kind 非空;能力校验 fs_read+fs_write
+    ///   (隔离类还需 vcs);插件启用且已授权;必须声明 worker。
+    pub fn resolve_directory_provider(
+        &self,
+        full_contribution_id: &str,
+        version: &str,
+        content_hash: &str,
+    ) -> Result<DirectoryProviderResolution> {
+        let (plugin_full_id, contribution_id) = full_contribution_id
+            .rsplit_once('.')
+            .ok_or_else(|| anyhow::anyhow!("完整贡献 ID 非法(缺贡献段): {full_contribution_id}"))?;
+        if content_hash.is_empty() {
+            // 内置合成插件:精确身份 → 进程内 worktree 工厂
+            anyhow::ensure!(
+                plugin_full_id == BUILTIN_DIRECTORIES_PLUGIN_ID,
+                "内置空哈希身份只属于 {BUILTIN_DIRECTORIES_PLUGIN_ID}(请求 {plugin_full_id})"
+            );
+            self.ensure_builtin_plugin(plugin_full_id, version)?;
+            let contribution = {
+                let plugins = self.plugins.read();
+                let plugin = plugins
+                    .iter()
+                    .find(|p| p.builtin && p.full_id == plugin_full_id)
+                    .ok_or_else(|| anyhow::anyhow!("内置插件不存在: {plugin_full_id}"))?;
+                plugin
+                    .manifest
+                    .execution_directory_providers
+                    .iter()
+                    .find(|c| c.id == contribution_id)
+                    .cloned()
+            }
+            .ok_or_else(|| anyhow::anyhow!("内置插件不贡献目录提供器 `{contribution_id}`"))?;
+            anyhow::ensure!(
+                contribution.id == "worktree"
+                    && contribution.kind == "worktree"
+                    && contribution.isolates
+                    && contribution.supports_parallel,
+                "内置目录贡献 `{contribution_id}` 与进程内 worktree 身份不符(借名拒绝)"
+            );
+            return Ok(DirectoryProviderResolution {
+                full_contribution_id: full_contribution_id.to_string(),
+                kind: contribution.kind.clone(),
+                isolates: contribution.isolates,
+                supports_parallel: contribution.supports_parallel,
+                factory: DirectoryProviderFactory::BuiltinWorktree,
+            });
+        }
+        // 第三方:内容寻址包解析(版本/哈希/防篡改),身份校验在内
+        anyhow::ensure!(
+            plugin_full_id != BUILTIN_DIRECTORIES_PLUGIN_ID,
+            "第三方内容不得冒充内置目录插件身份({plugin_full_id})"
+        );
+        let resolved = self.resolve(plugin_full_id, version, content_hash)?;
+        let contribution = resolved
+            .manifest
+            .execution_directory_providers
+            .iter()
+            .find(|c| c.id == contribution_id)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "插件包 {}@{} 不贡献目录提供器 `{contribution_id}`",
+                    plugin_full_id,
+                    version
+                )
+            })?;
+        anyhow::ensure!(
+            !contribution.kind.trim().is_empty(),
+            "目录提供器 `{full_contribution_id}` 未声明 kind"
+        );
+        // 启用 + 授权 + 能力(隔离类需要 vcs)
+        // 启用/授权按插件身份(升级后最新安装条目);内容真实性由
+        // resolve() 的内容寻址哈希校验保证(旧 pin 指向旧包仍可解析)
+        let (enabled, authorized) = {
+            let plugins = self.plugins.read();
+            plugins
+                .iter()
+                .find(|p| p.full_id == plugin_full_id && !p.builtin)
+                .map(|p| (p.enabled, p.authorized_at.is_some()))
+                .ok_or_else(|| anyhow::anyhow!("插件 {plugin_full_id} 未安装"))?
+        };
+        anyhow::ensure!(enabled, "插件已禁用,不得解析目录提供器: {plugin_full_id}");
+        anyhow::ensure!(
+            authorized,
+            "插件未授权,不得解析目录提供器: {plugin_full_id}"
+        );
+        let caps = &resolved.manifest.capabilities;
+        anyhow::ensure!(
+            caps.fs_read && caps.fs_write,
+            "目录提供器能力不足:需要 fs_read+fs_write(声明 fs_read={} fs_write={})",
+            caps.fs_read,
+            caps.fs_write
+        );
+        if contribution.isolates {
+            anyhow::ensure!(
+                caps.vcs,
+                "隔离类目录提供器(kind={})需要 vcs 能力",
+                contribution.kind
+            );
+        }
+        let worker = resolved.manifest.worker.clone().ok_or_else(|| {
+            anyhow::anyhow!("第三方目录提供器必须声明 worker(插件 {plugin_full_id})")
+        })?;
+        Ok(DirectoryProviderResolution {
+            full_contribution_id: full_contribution_id.to_string(),
+            kind: contribution.kind.clone(),
+            isolates: contribution.isolates,
+            supports_parallel: contribution.supports_parallel,
+            factory: DirectoryProviderFactory::Worker {
+                command: worker.command,
+                args: worker.args,
+                plugin_root: resolved.root.clone(),
+            },
+        })
     }
 
     /// 校验插件包身份可解析(工作流派发前):内容哈希不一致/插件缺失时报错。

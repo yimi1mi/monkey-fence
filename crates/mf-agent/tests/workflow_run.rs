@@ -330,6 +330,7 @@ fn compiler_freezes_plugin_pin_per_node() {
     let snapshot = WorkflowCompiler::new()
         .compile(CompileInput {
             template: &template,
+            directory_provider: None,
             directory_provider_isolates: true,
             allow_unsafe_shared_directory: false,
             agent_type_plugins: &plugins,
@@ -356,6 +357,7 @@ fn compiler_rejects_agent_type_without_plugin() {
     let errors = WorkflowCompiler::new()
         .compile(CompileInput {
             template: &template,
+            directory_provider: None,
             directory_provider_isolates: true,
             allow_unsafe_shared_directory: false,
             agent_type_plugins: &empty,

@@ -68,39 +68,91 @@ pub fn worktree_contribution_id(
         .map(|(full_id, _, _)| full_id.clone())
 }
 
-/// 解析项目的执行目录提供器:按完整 pinned 身份(内置
-/// monkeyfence.directories.worktree)且来源插件授予所需能力
-/// (fs_read/fs_write/vcs:检出、汇合写回、refs 操作)才使用 worktree
-/// 隔离(Git 仓库才可创建),否则回退内核共享项目目录。
+/// 解析项目的执行目录提供器(I7:统一经 Plugin Host 的
+/// 「完整贡献 ID + 版本 + 内容哈希」解析,不再各自硬编码):
+/// - 内置 pinned 身份(monkeyfence.directories.worktree,空哈希)→
+///   进程内 GitWorktreeProvider(Git 仓库才可创建);
+/// - 第三方目录贡献(内容寻址哈希,按完整贡献 ID 稳定排序取第一个
+///   可解析且授权的)→ WorkerDirectoryProvider(worker 进程驱动);
+/// - 都不可用 → 内核共享项目目录(并行需显式风险开关)。
+/// 返回 (提供器, 其插件包 pin);pin 随 Revision 冻结、派发强校验。
 fn directory_provider_for(
     root: &Path,
     plugins: &Arc<PluginRegistry>,
-) -> Arc<dyn mf_agent::execution_directory::ExecutionDirectoryProvider> {
-    let directories = plugins.contributions().execution_directories();
-    if let Some(contribution_id) = worktree_contribution_id(&directories) {
-        // pinned 权限校验:来源插件启用,且清单声明 worktree 所需能力
-        let authorized = plugins.summaries().into_iter().any(|summary| {
-            summary.full_id == WORKTREE_PLUGIN_FULL_ID
-                && summary.enabled
-                && summary.capabilities.fs_read
-                && summary.capabilities.fs_write
-                && summary.capabilities.vcs
-        });
-        if !authorized {
-            log::warn!(
-                "贡献 {contribution_id} 命中但来源插件未启用或缺worktree 所需能力                 (fs_read/fs_write/vcs),回退共享目录"
-            );
-        } else if mf_vcs::git::Git::is_repo(root) {
+) -> (
+    Arc<dyn mf_agent::execution_directory::ExecutionDirectoryProvider>,
+    Option<mf_agent::workflow::PluginSourcePin>,
+) {
+    // 1) 内置 worktree pinned 身份(解析层做精确身份/能力校验)
+    let builtin_full = format!("{WORKTREE_PLUGIN_FULL_ID}.{WORKTREE_CONTRIBUTION_ID}");
+    if let Ok(res) = plugins.resolve_directory_provider(
+        &builtin_full,
+        mf_plugins::host::BUILTIN_DIRECTORIES_VERSION,
+        "",
+    ) {
+        if mf_vcs::git::Git::is_repo(root) {
             match mf_plugins::git_worktree_provider::GitWorktreeProvider::new(root.to_path_buf()) {
                 Ok(provider) => {
-                    log::info!("执行目录提供器:{contribution_id}(worktree 隔离)");
-                    return Arc::new(provider);
+                    log::info!("执行目录提供器:{builtin_full}(worktree 隔离)");
+                    return (
+                        Arc::new(provider),
+                        Some(mf_agent::workflow::PluginSourcePin {
+                            full_id: WORKTREE_PLUGIN_FULL_ID.into(),
+                            version: mf_plugins::host::BUILTIN_DIRECTORIES_VERSION.into(),
+                            content_hash: String::new(),
+                        }),
+                    );
                 }
                 Err(e) => log::warn!("worktree 提供器初始化失败,回退共享目录: {e:#}"),
             }
         }
     }
-    Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default())
+    // 2) 第三方目录提供器:worker 解析(kind/能力/启用/授权在解析层校验)
+    let mut candidates = plugins.contributions().execution_directories();
+    candidates.sort_by(|a, b| a.0.cmp(&b.0));
+    for (full_contribution_id, source, contribution) in candidates {
+        if source.plugin_full_id == WORKTREE_PLUGIN_FULL_ID {
+            continue; // 内置身份只走上面的进程内路径
+        }
+        match plugins.resolve_directory_provider(
+            &full_contribution_id,
+            &source.plugin_version,
+            &source.content_hash,
+        ) {
+            Ok(res) => {
+                match mf_plugins::worker_directory_provider::WorkerDirectoryProvider::from_resolution(&res) {
+                    Ok(provider) => {
+                        log::info!(
+                            "执行目录提供器:{full_contribution_id}(worker 驱动,kind {})",
+                            contribution.kind
+                        );
+                        return (
+                            Arc::new(provider),
+                            Some(mf_agent::workflow::PluginSourcePin {
+                                full_id: source.plugin_full_id.clone(),
+                                version: source.plugin_version.clone(),
+                                content_hash: source.content_hash.clone(),
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "第三方目录提供器 {full_contribution_id} worker 启动失败,尝试下一候选: {e:#}"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "第三方目录提供器 {full_contribution_id} 解析未通过,尝试下一候选: {e:#}"
+                );
+            }
+        }
+    }
+    (
+        Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
+        None,
+    )
 }
 
 pub struct ProjectHandle {
@@ -363,10 +415,9 @@ impl AppCtx {
                 secret_master_key: *self.secret_master_key.lock(),
             },
         );
-        // 目录提供器:Git 仓库 → worktree 隔离(插件贡献解析);
-        // 非 Git 根 → 共享项目目录(并行需显式风险开关,编译器默认拒绝)
-        let directory: Arc<dyn mf_agent::execution_directory::ExecutionDirectoryProvider> =
-            directory_provider_for(&root, &self.plugins);
+        // 目录提供器:统一经 Plugin Host 解析(内置 worktree / 第三方
+        // worker / 共享目录);pin 随 Revision 冻结、派发强校验
+        let (directory, directory_pin) = directory_provider_for(&root, &self.plugins);
         let orch = Orchestrator::start_with(
             store,
             root.clone(),
@@ -383,6 +434,7 @@ impl AppCtx {
                 })),
             },
         )?;
+        orch.set_directory_provider_pin(directory_pin);
         self.projects.lock().push(ProjectHandle {
             root: root.clone(),
             orchestrator: orch.clone(),
@@ -730,11 +782,17 @@ mod agent_launch_selection_tests {
             &mf_agent::Config::default(),
             &[],
         );
-        let provider = directory_provider_for(git_root.path(), &host);
+        let (provider, pin) = directory_provider_for(git_root.path(), &host);
         assert!(provider.isolates(), "Git 仓库应使用 worktree 隔离提供器");
+        assert!(
+            pin.as_ref()
+                .is_some_and(|p| p.full_id == WORKTREE_PLUGIN_FULL_ID),
+            "Git 仓库的提供器必须携带内置 pinned 身份: {pin:?}"
+        );
         let plain = tempfile::tempdir().unwrap();
-        let provider = directory_provider_for(plain.path(), &host);
+        let (provider, plain_pin) = directory_provider_for(plain.path(), &host);
         assert!(!provider.isolates(), "非 Git 根应回退共享项目目录");
+        assert!(plain_pin.is_none(), "共享目录回退不带插件 pin");
     }
 
     #[test]

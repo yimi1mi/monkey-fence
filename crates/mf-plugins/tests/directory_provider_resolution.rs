@@ -1,0 +1,341 @@
+//! 第三方目录提供器解析(I7):Plugin Host 按「完整贡献 ID + 版本 +
+//! 内容哈希」解析 → 工厂/worker 驱动;名称相似的第三方贡献绝不借名
+//! 内置进程内实现;版本/哈希不匹配、能力缺失、未授权一律拒绝;
+//! 插件升级后旧 pin 仍按内容寻址解析。
+
+use mf_agent::execution_directory::{ExecutionDirectoryProvider, LeaseContext, MergeOutcome};
+use mf_plugins::host::{
+    DirectoryProviderFactory, PluginHost, BUILTIN_DIRECTORIES_PLUGIN_ID,
+    BUILTIN_DIRECTORIES_VERSION,
+};
+use mf_plugins::install::InstallSource;
+use mf_plugins::worker_directory_provider::{DirectoryWorkerTransport, WorkerDirectoryProvider};
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+fn fixtures_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+}
+
+fn fixture_host() -> Arc<PluginHost> {
+    let tmp = tempfile::tempdir().unwrap();
+    let catalog = mf_agent::CatalogStore::memory().unwrap();
+    let host = PluginHost::load_at_with_catalog(
+        tmp.path().to_path_buf(),
+        catalog,
+        &mf_agent::Config::default(),
+        &[],
+    );
+    // 宿主内部持有插件根目录路径;泄漏 TempDir 使其存活到测试结束
+    std::mem::forget(tmp);
+    host
+}
+
+/// 在临时目录构造一个第三方目录提供器插件并安装(默认禁用)。
+fn install_dir_plugin(
+    host: &PluginHost,
+    publisher: &str,
+    id: &str,
+    version: &str,
+    extra: &str,
+) -> (String, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let worker_script = dir.path().join("provider-worker.cmd");
+    std::fs::write(&worker_script, "@echo off\r\n").unwrap();
+    let manifest = format!(
+        r#"[manifest]
+version = 2
+publisher = "{publisher}"
+id = "{id}"
+name = "{id} provider"
+version_str = "{version}"
+description = "third-party directory provider"
+
+[capabilities]
+fs_read = true
+fs_write = true
+vcs = true
+
+[worker]
+command = "provider-worker.cmd"
+
+[[execution_directory_providers]]
+id = "worktree"
+name = "Namesake worktree"
+kind = "worktree"
+supports_parallel = true
+isolates = true
+{extra}
+"#
+    );
+    std::fs::write(dir.path().join("monkeyfence-plugin.toml"), manifest).unwrap();
+    let resolved = host
+        .install_package(
+            &dir.path(),
+            InstallSource::Local {
+                path: dir.path().display().to_string(),
+            },
+        )
+        .unwrap();
+    std::mem::forget(dir);
+    (resolved.version, resolved.content_hash)
+}
+
+#[test]
+fn namesake_builtin_identity_is_not_hijackable() {
+    // 第三方插件贡献 id/kind 都叫 worktree:
+    // 1) 内置身份解析不受影响(仍是 BuiltinWorktree 工厂);
+    // 2) 第三方贡献解析为 Worker 工厂 —— 绝不借名进程内实现。
+    let host = fixture_host();
+    let (version, hash) = install_dir_plugin(&host, "evil", "corp", "1.0.0", "");
+    host.enable("evil.corp", true).unwrap();
+
+    let builtin = host
+        .resolve_directory_provider(
+            "monkeyfence.directories.worktree",
+            BUILTIN_DIRECTORIES_VERSION,
+            "",
+        )
+        .expect("内置身份解析不受 namesake 影响");
+    assert!(matches!(
+        builtin.factory,
+        DirectoryProviderFactory::BuiltinWorktree
+    ));
+
+    let third = host
+        .resolve_directory_provider("evil.corp.worktree", &version, &hash)
+        .expect("第三方贡献按自身身份解析");
+    match third.factory {
+        DirectoryProviderFactory::Worker { command, .. } => {
+            assert_eq!(command, "provider-worker.cmd");
+        }
+        other => panic!("第三方目录提供器必须经 worker 驱动,实际 {other:?}"),
+    }
+    assert_eq!(third.full_contribution_id, "evil.corp.worktree");
+    assert_eq!(third.kind, "worktree");
+    assert!(third.isolates);
+
+    // 第三方哈希试图冒充内置身份(空哈希 + 内置 full_id)→ 拒绝
+    assert!(
+        host.resolve_directory_provider(
+            "monkeyfence.directories.worktree",
+            &version, // 非内置版本
+            &hash,    // 非空哈希(第三方)
+        )
+        .is_err(),
+        "第三方内容不得借内置空哈希身份"
+    );
+}
+
+#[test]
+fn version_or_hash_mismatch_rejected() {
+    let host = fixture_host();
+    let (version, hash) = install_dir_plugin(&host, "acme", "dirs", "2.0.0", "");
+    host.enable("acme.dirs", true).unwrap();
+    let err = host
+        .resolve_directory_provider("acme.dirs.worktree", "9.9.9", &hash)
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("版本"), "{err:#}");
+    let err = host
+        .resolve_directory_provider("acme.dirs.worktree", &version, "deadbeef")
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("哈希") || format!("{err:#}").contains("不存在"),
+        "{err:#}"
+    );
+}
+
+#[test]
+fn upgraded_plugin_old_pin_still_resolves() {
+    // 插件升级(v2 安装新包):旧 Revision pin 的 v1 哈希仍按内容寻址
+    // 解析(不随最新安装漂移);v2 以新哈希解析。
+    let host = fixture_host();
+    let (v1_version, v1_hash) = install_dir_plugin(&host, "up", "grade", "1.0.0", "");
+    host.enable("up.grade", true).unwrap();
+    host.resolve_directory_provider("up.grade.worktree", &v1_version, &v1_hash)
+        .unwrap();
+
+    let (v2_version, v2_hash) = install_dir_plugin(&host, "up", "grade", "1.1.0", "");
+    host.enable("up.grade", true).unwrap();
+    assert_ne!(v1_hash, v2_hash);
+    // 旧 pin:仍可解析
+    host.resolve_directory_provider("up.grade.worktree", &v1_version, &v1_hash)
+        .expect("插件升级后旧 Revision 的 pin 必须仍可解析");
+    // 新版本:以新哈希解析
+    host.resolve_directory_provider("up.grade.worktree", &v2_version, &v2_hash)
+        .expect("新版本以新哈希解析");
+    // 新版本号 + 旧哈希 → 拒绝
+    assert!(host
+        .resolve_directory_provider("up.grade.worktree", &v2_version, &v1_hash)
+        .is_err());
+}
+
+#[test]
+fn unauthorized_or_missing_capabilities_rejected() {
+    let host = fixture_host();
+    // 隔离类提供器声明缺 vcs 能力 → 拒绝
+    let manifest_no_vcs = tempfile::tempdir().unwrap();
+    std::fs::write(
+        manifest_no_vcs.path().join("provider-worker.cmd"),
+        "@echo off\r\n",
+    )
+    .unwrap();
+    std::fs::write(
+        manifest_no_vcs.path().join("monkeyfence-plugin.toml"),
+        r#"[manifest]
+version = 2
+publisher = "weak"
+id = "caps"
+name = "weak caps"
+version_str = "1.0.0"
+description = "no vcs"
+
+[capabilities]
+fs_read = true
+fs_write = true
+
+[worker]
+command = "provider-worker.cmd"
+
+[[execution_directory_providers]]
+id = "wt"
+name = "wt"
+kind = "worktree"
+supports_parallel = true
+isolates = true
+"#,
+    )
+    .unwrap();
+    let resolved = host
+        .install_package(
+            &manifest_no_vcs.path(),
+            InstallSource::Local {
+                path: manifest_no_vcs.path().display().to_string(),
+            },
+        )
+        .unwrap();
+    std::mem::forget(manifest_no_vcs);
+    host.enable("weak.caps", true).unwrap();
+    let err = host
+        .resolve_directory_provider("weak.caps.wt", &resolved.version, &resolved.content_hash)
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("能力") || format!("{err:#}").contains("vcs"),
+        "隔离类提供器必须要求 vcs 能力: {err:#}"
+    );
+
+    // 未启用 → 拒绝
+    let (version, hash) = install_dir_plugin(&host, "disabled", "inc", "1.0.0", "");
+    let err = host
+        .resolve_directory_provider("disabled.inc.worktree", &version, &hash)
+        .unwrap_err();
+    assert!(
+        format!("{err:#}").contains("禁用") || format!("{err:#}").contains("未启用"),
+        "禁用插件不得解析目录提供器: {err:#}"
+    );
+}
+
+// ---------- worker 驱动的提供器(内存传输) ----------
+
+/// 记录请求并按脚本回应的内存传输(协议行为回归)。
+struct ScriptedTransport {
+    calls: Mutex<Vec<(String, Value)>>,
+}
+
+impl DirectoryWorkerTransport for ScriptedTransport {
+    fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((method.to_string(), params.clone()));
+        Ok(match method {
+            "dir.acquire" => serde_json::json!({
+                "id": "lease-x",
+                "path": "C:/tmp/wt-x",
+                "isolated": true,
+                "provider": "third.party.wt",
+                "metadata": { "step_key": "a" },
+            }),
+            "dir.merge" => serde_json::json!({
+                "type": "needs_user",
+                "conflicts": ["src/a.rs(修改者: a 与 b)"],
+            }),
+            "dir.release" => serde_json::Value::Null,
+            "dir.discard_baselines" => serde_json::Value::Null,
+            other => anyhow::bail!("未知方法: {other}"),
+        })
+    }
+}
+
+#[test]
+fn worker_directory_provider_drives_protocol() {
+    let transport = Arc::new(ScriptedTransport {
+        calls: Mutex::new(Vec::new()),
+    });
+    let provider = WorkerDirectoryProvider::new(
+        "third.party.wt",
+        "worktree",
+        true,
+        Box::new(TransportShare(transport.clone())),
+    );
+    assert_eq!(provider.id(), "third.party.wt");
+    assert!(provider.isolates());
+
+    let ctx = LeaseContext {
+        task_id: 7,
+        step_id: 3,
+        revision_id: 2,
+        attempt: 1,
+        project_root: PathBuf::from("C:/proj"),
+        step_key: "a".into(),
+        deps: vec!["b".into()],
+    };
+    let lease = provider.acquire(&ctx).unwrap();
+    assert_eq!(lease.id, "lease-x");
+    assert!(lease.isolated);
+
+    let outcome = provider.merge(&[lease.clone()]).unwrap();
+    assert_eq!(
+        outcome,
+        MergeOutcome::NeedsUser {
+            conflicts: vec!["src/a.rs(修改者: a 与 b)".into()],
+        }
+    );
+    provider.release(&lease).unwrap();
+    provider.discard_task_baselines(7).unwrap();
+
+    let calls = transport.calls.lock().unwrap();
+    let methods: Vec<&str> = calls.iter().map(|(m, _)| m.as_str()).collect();
+    assert_eq!(
+        methods,
+        vec![
+            "dir.acquire",
+            "dir.merge",
+            "dir.release",
+            "dir.discard_baselines"
+        ]
+    );
+    // acquire 参数携带完整 LeaseContext(project_root 序列化为字符串)
+    let acquire_params = &calls[0].1;
+    assert_eq!(acquire_params["step_key"], "a");
+    assert_eq!(acquire_params["project_root"], "C:/proj");
+    assert_eq!(acquire_params["revision_id"], 2);
+}
+
+/// 共享 Arc 传输的转发包装。
+struct TransportShare(Arc<ScriptedTransport>);
+impl DirectoryWorkerTransport for TransportShare {
+    fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+        self.0.request(method, params)
+    }
+}
+
+#[test]
+fn builtin_directories_constants_match_synthesis() {
+    // 内置合成插件身份常量与合成清单一致(解析层的 namesake 基准)
+    assert_eq!(BUILTIN_DIRECTORIES_PLUGIN_ID, "monkeyfence.directories");
+    assert!(!BUILTIN_DIRECTORIES_VERSION.is_empty());
+    // fixtures 目录仍存在(避免误删测试资产)
+    assert!(fixtures_dir().is_dir());
+}

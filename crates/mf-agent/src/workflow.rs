@@ -83,6 +83,10 @@ pub struct WorkflowSnapshot {
     pub template_key: String,
     pub template_version: i64,
     pub nodes: Vec<WorkflowNodeSnapshot>,
+    /// 目录提供器的插件包身份(分配时冻结;派发时与进程内当前提供器
+    /// pin 一致才运行 —— 插件升级换提供器后旧 Revision 不静默换用)。
+    #[serde(default)]
+    pub directory_provider: Option<PluginSourcePin>,
 }
 
 /// 冻结(最小编译):模板版本 + 实例当前配置 → 不可变快照。
@@ -109,5 +113,6 @@ pub fn freeze_workflow(
         template_key: version.template_key.clone(),
         template_version: version.version,
         nodes,
+        directory_provider: None,
     })
 }

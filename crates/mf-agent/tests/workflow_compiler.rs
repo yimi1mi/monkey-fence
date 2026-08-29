@@ -102,6 +102,7 @@ fn input<'a>(
 ) -> CompileInput<'a> {
     CompileInput {
         template,
+        directory_provider: None,
         directory_provider_isolates: true,
         allow_unsafe_shared_directory: false,
         agent_type_plugins: agent_types(),

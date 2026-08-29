@@ -48,6 +48,8 @@ pub struct CompileInput<'a> {
     pub agent_type_plugins: &'a HashMap<String, PluginSourcePin>,
     /// Agent Instance 解析器:错误表示实例不存在或不可读。
     pub resolve_instance: &'a dyn Fn(&str) -> anyhow::Result<AgentInstanceSnapshot>,
+    /// 进程内当前目录提供器的插件包身份(None = 内核默认共享目录)。
+    pub directory_provider: Option<PluginSourcePin>,
 }
 
 pub struct WorkflowCompiler;
@@ -217,6 +219,7 @@ impl WorkflowCompiler {
             template_key: input.template.template_key.clone(),
             template_version: input.template.version,
             nodes: frozen,
+            directory_provider: input.directory_provider.clone(),
         })
     }
 
