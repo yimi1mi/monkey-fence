@@ -20,6 +20,7 @@ pub mod git_worktree_provider;
 pub mod hooks;
 pub mod host;
 pub mod install;
+pub mod proc_tree;
 pub mod manifest;
 pub mod project_directory_provider;
 pub mod worker;

@@ -3,7 +3,14 @@
 //! 权限模型:worker 是否允许运行由插件的 enabled/授权状态决定(宿主把门);
 //! 权限只约束 MonkeyFence 宿主接口 —— worker 进程本身仍以当前用户权限运行。
 //! 诊断文本(stderr、未匹配的 stdout 行)入库前按敏感 key 脱敏,上限 500 行。
+//!
+//! F11:**总 deadline 覆盖 stdin 写入与 stdout 读取全程** —— 写入在
+//! 独立线程执行(worker 停读且管道缓冲写满时 `write_all` 会无限阻塞),
+//! 超时先终止整棵 worker 进程树(管道断裂解除写阻塞)再返回错误;
+//! 终止/整树清空/reap 全部有界且检查结果(Windows Job Object /
+//! Unix PGID,见 `proc_tree`)。
 
+use crate::proc_tree::{kill_tree_bounded, ProcTreeGuard};
 use crate::worker_protocol::{
     ensure_matches, redact_text, WorkerHealth, WorkerRequest, WorkerResponse, STDERR_LOG_LIMIT,
     WORKER_PROTOCOL_VERSION,
@@ -16,8 +23,11 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// 单次请求的默认超时(I9)。
+/// 单次请求的默认超时(I9)。写入与读取共享同一个总预算(F11)。
 pub const WORKER_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 整树终止/清空的有界等待(F11)。
+const TREE_KILL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// reader 线程 → request 的行消息(EOF 单独报告)。
 enum WorkerLine {
@@ -28,7 +38,8 @@ enum WorkerLine {
 pub struct WorkerClient {
     child: parking_lot::Mutex<Child>,
     child_pid: u32,
-    stdin: parking_lot::Mutex<std::process::ChildStdin>,
+    /// stdin 移出期间为 None(F11:写入线程持有;返回后放回)。
+    stdin: parking_lot::Mutex<Option<std::process::ChildStdin>>,
     /// stdout 读取线程的输出通道:阻塞读完全在后台线程,
     /// request 用 `recv_timeout` 实现真超时(I9:同步 read_line 的
     /// deadline 只能在两次读之间检查,worker 活着不换行时永远挂住)。
@@ -37,6 +48,8 @@ pub struct WorkerClient {
     next_id: AtomicI64,
     logs: Arc<parking_lot::Mutex<Vec<String>>>,
     capability_token: parking_lot::Mutex<String>,
+    /// 进程树守卫(Windows Job Object / Unix PGID;F11)。
+    tree: Option<ProcTreeGuard>,
 }
 
 impl WorkerClient {
@@ -61,7 +74,7 @@ impl WorkerClient {
         if let Some(c) = cwd {
             cmd.current_dir(c);
         }
-        // Unix:独立进程组(杀树按 -pgid;Windows 用 taskkill /T)
+        // Unix:独立进程组(杀树按 -pgid;Windows 用 Job Object)
         #[cfg(not(windows))]
         {
             use std::os::unix::process::CommandExt;
@@ -71,6 +84,14 @@ impl WorkerClient {
             .spawn()
             .with_context(|| format!("启动 worker 失败: {}", exe.display()))?;
         let child_pid = child.id();
+        // F11:立即挂进程树守卫(Windows Job Object KILL_ON_JOB_CLOSE)
+        let tree = ProcTreeGuard::attach(&mut child)
+            .map_err(|e| {
+                let _ = child.kill();
+                let _ = child.wait();
+                e
+            })
+            .ok();
         let stdin = child.stdin.take().context("worker stdin 不可用")?;
         let stdout = child.stdout.take().context("worker stdout 不可用")?;
         // stderr → 日志缓冲(脱敏 + 有界)
@@ -103,12 +124,13 @@ impl WorkerClient {
         Ok(WorkerClient {
             child: parking_lot::Mutex::new(child),
             child_pid,
-            stdin: parking_lot::Mutex::new(stdin),
+            stdin: parking_lot::Mutex::new(Some(stdin)),
             lines: rx,
             request_timeout: parking_lot::Mutex::new(WORKER_REQUEST_TIMEOUT),
             next_id: AtomicI64::new(1),
             logs,
             capability_token: parking_lot::Mutex::new(String::new()),
+            tree,
         })
     }
 
@@ -123,23 +145,71 @@ impl WorkerClient {
     }
 
     /// NDJSON 版本化请求(协议同前)。
-    /// I9:阻塞读在 reader 线程,request 用 `recv_timeout` 实现真超时;
-    /// 超时杀 worker **整棵进程树**(Windows taskkill /T;Unix 按 -pgid)
-    /// 后返回错误(绝不留挂死 worker)。
+    /// F11:**总 deadline 覆盖 stdin 写入 + stdout 读取**:
+    /// - 写入在独立线程(worker 停读、管道写满时 `write_all` 无限阻塞)——
+    ///   由同一 deadline 看守,超时先杀整棵进程树(写线程随管道断裂
+    ///   解除并退出),再返回错误(写入可取消);
+    /// - 读取沿用 reader 线程 + `recv_timeout`;
+    /// - 任一超时都杀 worker **整棵进程树**后返回错误(绝不留挂死 worker)。
     pub fn request(&self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let req = WorkerRequest::new(id, method, &self.capability_token.lock(), params);
         let line = req.to_line()?;
-        {
-            let mut stdin = self.stdin.lock();
-            stdin
-                .write_all(line.as_bytes())
-                .and_then(|_| stdin.flush())
-                .context("向 worker 写入失败(进程已退出?)")?;
-        }
-        // 逐行消费通道,直到拿到协议版本与 id 都匹配的响应或超时
         let timeout = *self.request_timeout.lock();
         let deadline = std::time::Instant::now() + timeout;
+
+        // ---- 写入(独立线程 + 总 deadline 看守;可取消:超时杀树) ----
+        let (write_tx, write_rx) = std::sync::mpsc::channel::<
+            std::result::Result<std::process::ChildStdin, (std::process::ChildStdin, anyhow::Error)>,
+        >();
+        let stdin_taken = self.stdin.lock().take();
+        let Some(stdin) = stdin_taken else {
+            bail!("worker stdin 已不可用(此前超时已终止)");
+        };
+        let line_for_write = line.clone();
+        let writer = std::thread::Builder::new()
+            .name("mf-worker-write".into())
+            .spawn(move || {
+                let mut stdin = stdin;
+                let result = (|| -> Result<()> {
+                    stdin
+                        .write_all(line_for_write.as_bytes())
+                        .and_then(|_| stdin.flush())?;
+                    Ok(())
+                })();
+                match result {
+                    Ok(()) => {
+                        let _ = write_tx.send(Ok(stdin));
+                    }
+                    Err(e) => {
+                        let _ = write_tx.send(Err((stdin, e)));
+                    }
+                }
+            })
+            .context("启动 worker 写入线程失败")?;
+        match write_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            Ok(Ok(stdin)) => {
+                *self.stdin.lock() = Some(stdin);
+            }
+            Ok(Err((_stdin, e))) => {
+                // 写失败(进程退出/管道断):如实上抛
+                return Err(e).context("向 worker 写入失败(进程已退出?)");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.kill();
+                let _ = writer.join();
+                bail!(
+                    "worker 写入超时({method},上限 {timeout:?}):已终止 worker 进程树\
+                     (写入已取消)"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = writer.join();
+                bail!("worker 写入线程已结束(进程已退出?)");
+            }
+        }
+
+        // ---- 读取(同一 deadline 的剩余预算) ----
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -192,29 +262,15 @@ impl WorkerClient {
         self.logs.lock().clone()
     }
 
-    /// 杀 worker **整棵进程树**(Windows `taskkill /T /F`;
-    /// Unix 按 -pgid SIGKILL —— 启动时已 setsid 独立进程组),
-    /// 再 reap 直接子进程。
+    /// 杀 worker **整棵进程树**(Windows Job Object;Unix 按 -pgid
+    /// SIGKILL),再 reap 直接子进程 —— 全部有界且检查结果(F11)。
     pub fn kill(&self) {
-        #[cfg(windows)]
-        {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/PID", &self.child_pid.to_string(), "/T", "/F"])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-        #[cfg(not(windows))]
-        {
-            let pgid = self.child_pid as libc::pid_t;
-            let r = unsafe { libc::kill(-pgid, libc::SIGKILL) };
-            if r != 0 {
-                let _ = unsafe { libc::kill(pgid, libc::SIGKILL) };
-            }
-        }
         let mut child = self.child.lock();
-        let _ = child.kill();
-        let _ = child.wait();
+        if let Err(e) = kill_tree_bounded(&mut child, self.tree.as_ref(), TREE_KILL_TIMEOUT) {
+            log::warn!("终止 worker 进程树(pid {})未完全成功: {e:#}", self.child_pid);
+        }
+        // stdin 归还写入线程/丢弃:进程已死,写端关闭即 EOF
+        *self.stdin.lock() = None;
     }
 
     pub fn is_alive(&self) -> bool {
@@ -347,6 +403,52 @@ while ($line = [Console]::In.ReadLine()) {
         );
         // 超时杀树后 client 不可再用(通道已关)
         assert!(client.lock().request("ping", json!({})).is_err());
+    }
+
+    /// F11:worker 从不读 stdin —— 大请求写满管道后 `write_all` 无限阻塞;
+    /// 总 deadline 必须覆盖写入:超时杀树、写入取消、返回明确错误。
+    #[test]
+    fn blocked_stdin_write_is_covered_by_total_deadline() {
+        if !cfg!(windows) {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        // 不读 stdin、不输出:PowerShell 只睡眠
+        let script = "Start-Sleep -Seconds 600";
+        let ps1 = tmp.path().join("blocked-stdin-worker.ps1");
+        std::fs::write(&ps1, script).unwrap();
+        let args = vec![
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-ExecutionPolicy".to_string(),
+            "Bypass".to_string(),
+            "-File".to_string(),
+            ps1.to_string_lossy().to_string(),
+        ];
+        let client = Arc::new(parking_lot::Mutex::new(
+            WorkerClient::start(&std::path::PathBuf::from("powershell.exe"), &args, None)
+                .expect("powershell 可用"),
+        ));
+        client.lock().set_request_timeout(Duration::from_millis(900));
+        // 2MB 参数:远超匿名管道缓冲(64KB),write_all 必然阻塞
+        let big = "x".repeat(2 * 1024 * 1024);
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Value>>();
+        let c2 = client.clone();
+        let handle = std::thread::spawn(move || {
+            let _ = tx.send(c2.lock().request("echo", json!({ "blob": big })));
+        });
+        match rx.recv_timeout(Duration::from_secs(8)) {
+            Ok(Err(e)) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("写入超时") && msg.contains("取消"),
+                    "写入超时错误必须明示写入已取消: {msg}"
+                );
+            }
+            Ok(Ok(v)) => panic!("阻塞 stdin 的请求不得成功: {v}"),
+            Err(_) => panic!("阻塞的 stdin 写入必须被总 deadline 取消,而不是无限阻塞"),
+        }
+        handle.join().unwrap();
     }
 
     #[test]
