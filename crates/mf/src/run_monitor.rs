@@ -331,6 +331,21 @@ impl RunMonitor {
         self.snapshot.node_details().len()
     }
 
+    /// 状态栏文本(测试/诊断)。
+    pub fn status_text(&self) -> &str {
+        &self.status
+    }
+
+    /// 是否存在待确认的危险动作(测试/诊断)。
+    pub fn has_pending_confirm(&self) -> bool {
+        self.pending_confirm.is_some()
+    }
+
+    /// 投影节点详情(测试/诊断)。
+    pub fn node_details_for_test(&self) -> Vec<crate::run_node_details::RunNodeDetails> {
+        self.snapshot.node_details()
+    }
+
     /// 概览事件到达时刷新(后台运行持续可见)。
     pub fn refresh_snapshot(&mut self, cx: &mut Context<Self>) {
         self.refresh();

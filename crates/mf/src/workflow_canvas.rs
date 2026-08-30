@@ -793,7 +793,8 @@ impl Render for WorkflowCanvas {
                             .cursor_pointer()
                             .child("保存草稿(任务本地)")
                             .on_click(cx.listener(|canvas: &mut WorkflowCanvas, _ev, _w, cx| {
-                                canvas.save_draft(cx);
+                                // 保存结果已由 save_draft 写入状态栏展示
+                                let _ = canvas.save_draft(cx);
                             })),
                     )
                     .child(
