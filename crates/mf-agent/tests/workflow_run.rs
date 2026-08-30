@@ -58,6 +58,7 @@ fn plugin_pin(full_id: &str, hash: &str) -> PluginSourcePin {
         full_id: full_id.into(),
         version: "1.2.3".into(),
         content_hash: hash.into(),
+        contribution_id: full_id.into(),
     }
 }
 
@@ -213,6 +214,7 @@ struct ScriptedDirectory {
     /// 每次调用的批大小(leases.len()),按调用顺序。
     merge_batches: Mutex<Vec<usize>>,
     released: Mutex<Vec<String>>,
+    release_fails: AtomicBool,
 }
 
 impl ScriptedDirectory {
@@ -225,6 +227,7 @@ impl ScriptedDirectory {
             merges: AtomicUsize::new(0),
             merge_batches: Mutex::new(Vec::new()),
             released: Mutex::new(Vec::new()),
+            release_fails: AtomicBool::new(false),
         }
     }
 
@@ -264,6 +267,9 @@ impl ExecutionDirectoryProvider for ScriptedDirectory {
         }
     }
     fn release(&self, lease: &ExecutionLease) -> anyhow::Result<()> {
+        if self.release_fails.load(Ordering::SeqCst) {
+            anyhow::bail!("释放执行租约失败(脚本注入)");
+        }
         self.released.lock().push(lease.id.clone());
         Ok(())
     }
@@ -663,7 +669,9 @@ fn directory_acquire_failure_settles_run_not_running() {
     // acquire 失败必须结算为 Failed(含原因),不得留下 Running 行
     assert!(wait_until(Duration::from_secs(5), || {
         let runs = fx.orch.store.list_runs_of_task(task.id).unwrap();
+        let task_status = fx.orch.store.task_view(task.id).unwrap().unwrap().status;
         runs.iter().any(|r| r.status == RunStatus::Failed)
+            && matches!(task_status, TaskStatus::NeedsYou | TaskStatus::Failed)
     }));
     let runs = fx.orch.store.list_runs_of_task(task.id).unwrap();
     assert!(
@@ -1295,7 +1303,7 @@ fn parallel_siblings_same_file_conflict_needs_user_with_real_worktrees() {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
         },
-        scripted_routing(),
+        pinned_routing("builtin.core", "hash-worktree"),
     )
     .unwrap();
 
@@ -1590,8 +1598,40 @@ fn join_batch_conflict_pends_both_leases_and_resolve_resumes_scheduling() {
         "needs-you 期间下游不派发"
     );
 
-    // 用户解决后重试:整批合并成功 → 双租约释放、任务回 Running、c 派发
+    // 用户解决后重试时，如果任一 release 失败，必须保持整批待决，
+    // 不得清 pending / 恢复下游调度。
     fx.directory.merge_ok.store(true, Ordering::SeqCst);
+    fx.directory.release_fails.store(true, Ordering::SeqCst);
+    assert!(
+        fx.orch.resolve_pending_merges(task.id).is_err(),
+        "release 失败必须向调用方返回错误"
+    );
+    assert_eq!(
+        fx.orch
+            .store
+            .list_pending_merges(Some(task.id))
+            .unwrap()
+            .len(),
+        2,
+        "release 失败时完整 pending 批必须保留"
+    );
+    assert_eq!(
+        fx.orch.store.task_view(task.id).unwrap().unwrap().status,
+        TaskStatus::NeedsYou,
+        "release 失败时任务必须保持 needs-you"
+    );
+    assert!(
+        fx.orch
+            .store
+            .list_execution_leases(task.id)
+            .unwrap()
+            .iter()
+            .all(|row| row.status == "held"),
+        "release 失败时租约必须保持 held"
+    );
+
+    // 清障后再次重试:整批合并成功 → 双租约释放、任务回 Running、c 派发
+    fx.directory.release_fails.store(false, Ordering::SeqCst);
     let remaining = fx.orch.resolve_pending_merges(task.id).unwrap();
     assert!(remaining.is_empty(), "{remaining:?}");
     assert_eq!(fx.directory.released.lock().len(), 2);

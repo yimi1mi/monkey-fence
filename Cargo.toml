@@ -60,6 +60,7 @@ rand = "0.8"
 zeroize = "1"
 sha2 = "0.10"
 keyring = "3"
+errno = "0.3"
 
 [profile.dev]
 opt-level = 0

@@ -96,6 +96,10 @@ pub struct PluginSourcePin {
     pub full_id: String,
     pub version: String,
     pub content_hash: String,
+    /// 目录提供器 pin 的完整贡献 ID（如 `acme.dirs.worktree`）。普通
+    /// Agent Type 插件留空；旧快照反序列化为空并按安全兼容规则处理。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub contribution_id: String,
 }
 
 /// 冻结的节点:节点数据 + 编译时刻的实例配置快照。

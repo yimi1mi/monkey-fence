@@ -536,11 +536,13 @@ fn merge_failure_mid_apply_rolls_back_project_dir_and_ref() {
     let git = mf_vcs::git::Git::open(&fx.root).unwrap();
     let refname = mf_vcs::git::Git::integration_ref(32, 1);
     let ref_before = git.read_ref(&refname).unwrap();
-    let err = provider.merge(&[lease.clone()]).unwrap_err();
-    assert!(
-        err.to_string().contains("目录") || format!("{err:#}").contains("dir"),
-        "失败原因应指向目录创建: {err:#}"
-    );
+    match provider.merge(&[lease.clone()]).unwrap() {
+        MergeOutcome::NeedsUser { conflicts } => assert!(
+            conflicts.iter().any(|c| c.contains("docs/new.md")),
+            "父路径被用户文件占用时必须明确指出冲突路径:{conflicts:?}"
+        ),
+        other => panic!("父路径目录项冲突必须进入 NeedsUser，得到 {other:?}"),
+    }
     // 失败必须整体回滚:项目目录与集成 ref 都回到合并前(零部分写)
     assert_eq!(
         norm(fx.root.join("a.txt")),

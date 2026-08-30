@@ -86,15 +86,10 @@ impl ProcTreeGuard {
         }
     }
 
-    /// 终止整棵进程树并等待其消失(有界;超时返回 Err,不谎报成功)。
-    /// 返回后由调用方 reap 直接子进程。
-    pub fn terminate_tree(&self, timeout: Duration) -> Result<()> {
+    fn signal_tree(&self) -> Result<()> {
         #[cfg(windows)]
         {
-            use windows_sys::Win32::System::JobObjects::{
-                JobObjectBasicProcessIdList, QueryInformationJobObject, TerminateJobObject,
-                JOBOBJECT_BASIC_PROCESS_ID_LIST,
-            };
+            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
             if let Some(handle) = &self.job {
                 let ok = unsafe { TerminateJobObject(handle.0, 1) };
                 anyhow::ensure!(
@@ -102,26 +97,6 @@ impl ProcTreeGuard {
                     "TerminateJobObject 失败: {}",
                     std::io::Error::last_os_error()
                 );
-                let deadline = std::time::Instant::now() + timeout;
-                loop {
-                    let mut list: JOBOBJECT_BASIC_PROCESS_ID_LIST = unsafe { core::mem::zeroed() };
-                    let ok = unsafe {
-                        QueryInformationJobObject(
-                            handle.0,
-                            JobObjectBasicProcessIdList,
-                            &mut list as *mut _ as *mut core::ffi::c_void,
-                            core::mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() as u32,
-                            core::ptr::null_mut(),
-                        )
-                    };
-                    if ok != 0 && list.NumberOfProcessIdsInList == 0 {
-                        return Ok(());
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        anyhow::bail!("worker 进程树未在 {timeout:?} 内清空(孙进程存活)");
-                    }
-                    std::thread::sleep(Duration::from_millis(25));
-                }
             }
             Ok(())
         }
@@ -135,6 +110,44 @@ impl ProcTreeGuard {
                     std::io::Error::last_os_error()
                 );
             }
+            Ok(())
+        }
+    }
+
+    fn wait_tree_empty(&self, timeout: Duration) -> Result<()> {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::System::JobObjects::{
+                JobObjectBasicProcessIdList, QueryInformationJobObject,
+                JOBOBJECT_BASIC_PROCESS_ID_LIST,
+            };
+            let Some(handle) = &self.job else {
+                return Ok(());
+            };
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                let mut list: JOBOBJECT_BASIC_PROCESS_ID_LIST = unsafe { core::mem::zeroed() };
+                let ok = unsafe {
+                    QueryInformationJobObject(
+                        handle.0,
+                        JobObjectBasicProcessIdList,
+                        &mut list as *mut _ as *mut core::ffi::c_void,
+                        core::mem::size_of::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() as u32,
+                        core::ptr::null_mut(),
+                    )
+                };
+                if ok != 0 && list.NumberOfProcessIdsInList == 0 {
+                    return Ok(());
+                }
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!("worker 进程树未在 {timeout:?} 内清空");
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let pgid = self.child_pid as libc::pid_t;
             let deadline = std::time::Instant::now() + timeout;
             loop {
                 let r = unsafe { libc::kill(-pgid, 0) };
@@ -148,6 +161,13 @@ impl ProcTreeGuard {
             }
         }
     }
+
+    /// 兼容入口：发整树信号并等待。需要持有直接子进程的调用方应使用
+    /// `kill_tree_bounded`，它会先 reap 组长再等待 PGID 清空。
+    pub fn terminate_tree(&self, timeout: Duration) -> Result<()> {
+        self.signal_tree()?;
+        self.wait_tree_empty(timeout)
+    }
 }
 
 /// 终止整树 + reap 直接子进程,全部有界且检查结果(F11)。
@@ -156,24 +176,53 @@ pub fn kill_tree_bounded(
     guard: Option<&ProcTreeGuard>,
     tree_timeout: Duration,
 ) -> Result<()> {
+    let deadline = std::time::Instant::now() + tree_timeout;
+    let mut errors = Vec::new();
     if let Some(guard) = guard {
-        guard
-            .terminate_tree(tree_timeout)
-            .context("终止 worker 进程树失败")?;
+        if let Err(e) = guard
+            .signal_tree()
+            .context("向 worker 进程树发终止信号失败")
+        {
+            errors.push(format!("{e:#}"));
+        }
     }
-    // reap 直接子进程(进程已终止;NotFound 视为已被 reap)
+    // 无论整树信号是否成功，都尝试杀/有界 reap 直接子进程。Unix zombie
+    // 在 wait 之前仍属于 PGID，必须先 reap 再等组清空。
     match child.kill() {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {} // 已退出(std kill 语义)
         Err(e) => {
             use std::io::ErrorKind;
             if e.raw_os_error().is_none_or(|c| c != 0) && e.kind() != ErrorKind::NotFound {
-                return Err(anyhow::anyhow!("kill worker 子进程失败: {e}"));
+                errors.push(format!("kill worker 子进程失败: {e}"));
             }
         }
     }
-    match child.wait() {
-        Ok(_) => Ok(()),
-        Err(e) => Err(anyhow::anyhow!("reap worker 子进程失败: {e}")),
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(None) => {
+                errors.push("reap worker 子进程超时".into());
+                break;
+            }
+            Err(e) => {
+                errors.push(format!("reap worker 子进程失败: {e}"));
+                break;
+            }
+        }
+    }
+    if let Some(guard) = guard {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if let Err(e) = guard.wait_tree_empty(remaining) {
+            errors.push(format!("{e:#}"));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!("{}", errors.join("; "))
     }
 }

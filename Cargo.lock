@@ -2484,6 +2484,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "dirs 5.0.1",
+ "errno",
  "git2",
  "keyring",
  "libc",

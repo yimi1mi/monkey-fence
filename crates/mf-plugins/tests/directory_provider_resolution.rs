@@ -41,6 +41,7 @@ fn install_dir_plugin(
     extra: &str,
 ) -> (String, String) {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".wt")).unwrap();
     let worker_script = dir.path().join("provider-worker.cmd");
     std::fs::write(&worker_script, "@echo off\r\n").unwrap();
     let manifest = format!(
@@ -113,6 +114,7 @@ fn namesake_builtin_identity_is_not_hijackable() {
         other => panic!("第三方目录提供器必须经 worker 驱动,实际 {other:?}"),
     }
     assert_eq!(third.full_contribution_id, "evil.corp.worktree");
+    assert_eq!(third.pin.contribution_id, "evil.corp.worktree");
     assert_eq!(third.kind, "worktree");
     assert!(third.isolates);
 
@@ -125,6 +127,65 @@ fn namesake_builtin_identity_is_not_hijackable() {
         )
         .is_err(),
         "第三方内容不得借内置空哈希身份"
+    );
+}
+
+#[test]
+fn contribution_id_may_contain_dots_without_misparsing_plugin_identity() {
+    let host = fixture_host();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("provider-worker.cmd"), "@echo off\r\n").unwrap();
+    std::fs::write(
+        dir.path().join("monkeyfence-plugin.toml"),
+        r#"[manifest]
+version = 2
+publisher = "dots"
+id = "provider"
+name = "dotted contribution"
+version_str = "1.0.0"
+description = "dotted contribution"
+
+[capabilities]
+fs_read = true
+fs_write = true
+vcs = true
+
+[worker]
+command = "provider-worker.cmd"
+
+[[execution_directory_providers]]
+id = "nested.worktree"
+name = "Nested"
+kind = "worktree"
+supports_parallel = true
+isolates = true
+"#,
+    )
+    .unwrap();
+    let installed = host
+        .install_package(
+            dir.path(),
+            InstallSource::Local {
+                path: dir.path().display().to_string(),
+            },
+        )
+        .unwrap();
+    host.enable("dots.provider", true).unwrap();
+    let resolved = host
+        .resolve_directory_provider(
+            "dots.provider.nested.worktree",
+            &installed.version,
+            &installed.content_hash,
+        )
+        .unwrap();
+    assert_eq!(
+        resolved.full_contribution_id,
+        "dots.provider.nested.worktree"
+    );
+    assert_eq!(resolved.pin.full_id, "dots.provider");
+    assert_eq!(
+        resolved.pin.contribution_id,
+        "dots.provider.nested.worktree"
     );
 }
 
@@ -241,6 +302,7 @@ isolates = true
 /// 记录请求并按脚本回应的内存传输(协议行为回归)。
 struct ScriptedTransport {
     calls: Mutex<Vec<(String, Value)>>,
+    lease_path: PathBuf,
 }
 
 impl DirectoryWorkerTransport for ScriptedTransport {
@@ -252,7 +314,7 @@ impl DirectoryWorkerTransport for ScriptedTransport {
         Ok(match method {
             "dir.acquire" => serde_json::json!({
                 "id": "lease-x",
-                "path": "C:/proj/.wt-x",
+                "path": self.lease_path,
                 "isolated": true,
                 "provider": "third.party.wt",
                 "metadata": { "step_key": "a" },
@@ -270,15 +332,27 @@ impl DirectoryWorkerTransport for ScriptedTransport {
 
 #[test]
 fn worker_directory_provider_drives_protocol() {
+    let root = tempfile::tempdir().unwrap();
+    let lease_path = root.path().join(".wt-x");
+    std::fs::create_dir(&lease_path).unwrap();
     let transport = Arc::new(ScriptedTransport {
         calls: Mutex::new(Vec::new()),
+        lease_path,
     });
-    let provider = WorkerDirectoryProvider::new(
+    let provider = WorkerDirectoryProvider::new_production(
         "third.party.wt",
         "worktree",
         true,
         Box::new(TransportShare(transport.clone())),
-    );
+        mf_agent::workflow::PluginSourcePin {
+            full_id: "third.party".into(),
+            version: "1.0.0".into(),
+            content_hash: "test-hash".into(),
+            contribution_id: "third.party.wt".into(),
+        },
+        root.path().to_path_buf(),
+    )
+    .unwrap();
     assert_eq!(provider.id(), "third.party.wt");
     assert!(provider.isolates());
 
@@ -287,7 +361,7 @@ fn worker_directory_provider_drives_protocol() {
         step_id: 3,
         revision_id: 2,
         attempt: 1,
-        project_root: PathBuf::from("C:/proj"),
+        project_root: root.path().to_path_buf(),
         step_key: "a".into(),
         deps: vec!["b".into()],
     };
@@ -319,7 +393,10 @@ fn worker_directory_provider_drives_protocol() {
     // acquire 参数携带完整 LeaseContext(project_root 序列化为字符串)
     let acquire_params = &calls[0].1;
     assert_eq!(acquire_params["step_key"], "a");
-    assert_eq!(acquire_params["project_root"], "C:/proj");
+    assert_eq!(
+        acquire_params["project_root"],
+        root.path().to_string_lossy().as_ref()
+    );
     assert_eq!(acquire_params["revision_id"], 2);
 }
 
@@ -354,16 +431,36 @@ impl DirectoryWorkerTransport for CannedTransport {
     }
 }
 
-fn ctx_for(root: &str) -> LeaseContext {
+fn ctx_for(root: &Path) -> LeaseContext {
     LeaseContext {
         task_id: 7,
         step_id: 3,
         revision_id: 2,
         attempt: 1,
-        project_root: PathBuf::from(root),
+        project_root: root.to_path_buf(),
         step_key: "a".into(),
         deps: vec![],
     }
+}
+
+fn provider_for_test(
+    root: &Path,
+    transport: Box<dyn DirectoryWorkerTransport>,
+) -> WorkerDirectoryProvider {
+    WorkerDirectoryProvider::new_production(
+        "third.party.wt",
+        "worktree",
+        true,
+        transport,
+        mf_agent::workflow::PluginSourcePin {
+            full_id: "third.party".into(),
+            version: "1.0.0".into(),
+            content_hash: "test-hash".into(),
+            contribution_id: "third.party.wt".into(),
+        },
+        root.to_path_buf(),
+    )
+    .unwrap()
 }
 
 fn valid_lease_json(path: &str, provider: &str) -> serde_json::Value {
@@ -379,20 +476,16 @@ fn valid_lease_json(path: &str, provider: &str) -> serde_json::Value {
 /// I8:worker 返回的租约 provider 身份必须与解析层一致(伪造拒绝)。
 #[test]
 fn acquire_rejects_forged_provider_identity() {
+    let root = tempfile::tempdir().unwrap();
     let transport = Arc::new(CannedTransport {
         responses: Mutex::new(vec![valid_lease_json(
-            "C:/proj/.wt-1",
+            &root.path().join(".wt-1").to_string_lossy(),
             "evil.other.provider",
         )]),
         calls: Mutex::new(Vec::new()),
     });
-    let provider = WorkerDirectoryProvider::new(
-        "third.party.wt",
-        "worktree",
-        true,
-        Box::new(TransportShare2(transport.clone())),
-    );
-    let err = provider.acquire(&ctx_for("C:/proj")).unwrap_err();
+    let provider = provider_for_test(root.path(), Box::new(TransportShare2(transport.clone())));
+    let err = provider.acquire(&ctx_for(root.path())).unwrap_err();
     assert!(
         format!("{err:#}").contains("provider"),
         "伪造 provider 身份必须拒绝: {err:#}"
@@ -403,6 +496,7 @@ fn acquire_rejects_forged_provider_identity() {
 /// 前缀相似、相对路径、.. 穿越全部拒绝。
 #[test]
 fn acquire_rejects_paths_outside_granted_project_root() {
+    let root = tempfile::tempdir().unwrap();
     for bad in [
         "C:/tmp/wt-x",
         "C:/proj-evil/wt",
@@ -414,13 +508,8 @@ fn acquire_rejects_paths_outside_granted_project_root() {
             responses: Mutex::new(vec![valid_lease_json(bad, "third.party.wt")]),
             calls: Mutex::new(Vec::new()),
         });
-        let provider = WorkerDirectoryProvider::new(
-            "third.party.wt",
-            "worktree",
-            true,
-            Box::new(TransportShare2(transport)),
-        );
-        let err = provider.acquire(&ctx_for("C:/proj")).unwrap_err();
+        let provider = provider_for_test(root.path(), Box::new(TransportShare2(transport)));
+        let err = provider.acquire(&ctx_for(root.path())).unwrap_err();
         assert!(
             format!("{err:#}").contains("项目根") || format!("{err:#}").contains("租约路径"),
             "越界路径 {bad} 必须拒绝: {err:#}"
@@ -431,23 +520,19 @@ fn acquire_rejects_paths_outside_granted_project_root() {
 /// I8:isolated 能力必须与清单声明一致(worker 不得自封/自降)。
 #[test]
 fn acquire_rejects_isolated_capability_mismatch() {
+    let root = tempfile::tempdir().unwrap();
     let transport = Arc::new(CannedTransport {
         responses: Mutex::new(vec![serde_json::json!({
             "id": "lease-x",
-            "path": "C:/proj/.wt-1",
+            "path": root.path().join(".wt-1"),
             "isolated": false,
             "provider": "third.party.wt",
             "metadata": {},
         })]),
         calls: Mutex::new(Vec::new()),
     });
-    let provider = WorkerDirectoryProvider::new(
-        "third.party.wt",
-        "worktree",
-        true,
-        Box::new(TransportShare2(transport)),
-    );
-    let err = provider.acquire(&ctx_for("C:/proj")).unwrap_err();
+    let provider = provider_for_test(root.path(), Box::new(TransportShare2(transport)));
+    let err = provider.acquire(&ctx_for(root.path())).unwrap_err();
     assert!(
         format!("{err:#}").contains("isolated"),
         "isolated 能力不一致必须拒绝: {err:#}"
@@ -457,24 +542,20 @@ fn acquire_rejects_isolated_capability_mismatch() {
 /// I8:租约 id 必须稳定可用(非空、无路径分隔/穿越、长度有界)。
 #[test]
 fn acquire_rejects_unstable_lease_ids() {
+    let root = tempfile::tempdir().unwrap();
     for bad_id in ["", "a/b", "a\\b", "..", "C:", &"x".repeat(300)] {
         let transport = Arc::new(CannedTransport {
             responses: Mutex::new(vec![serde_json::json!({
                 "id": bad_id,
-                "path": "C:/proj/.wt-1",
+                "path": root.path().join(".wt-1"),
                 "isolated": true,
                 "provider": "third.party.wt",
                 "metadata": {},
             })]),
             calls: Mutex::new(Vec::new()),
         });
-        let provider = WorkerDirectoryProvider::new(
-            "third.party.wt",
-            "worktree",
-            true,
-            Box::new(TransportShare2(transport)),
-        );
-        let err = provider.acquire(&ctx_for("C:/proj")).unwrap_err();
+        let provider = provider_for_test(root.path(), Box::new(TransportShare2(transport)));
+        let err = provider.acquire(&ctx_for(root.path())).unwrap_err();
         assert!(
             format!("{err:#}").contains("租约 ID") || format!("{err:#}").contains("id"),
             "非法租约 id {bad_id:?} 必须拒绝: {err:#}"
@@ -486,23 +567,32 @@ fn acquire_rejects_unstable_lease_ids() {
 /// worker 自带的伪造 pin 拒绝。
 #[test]
 fn acquire_stamps_provider_pin_and_rejects_forged_pin() {
+    let root = tempfile::tempdir().unwrap();
+    let lease_path = root.path().join(".wt-1");
+    std::fs::create_dir(&lease_path).unwrap();
     let pin = mf_agent::workflow::PluginSourcePin {
         full_id: "third.party".into(),
         version: "1.0.0".into(),
         content_hash: "h1".into(),
+        contribution_id: "third.party.wt".into(),
     };
     let transport = Arc::new(CannedTransport {
-        responses: Mutex::new(vec![valid_lease_json("C:/proj/.wt-1", "third.party.wt")]),
+        responses: Mutex::new(vec![valid_lease_json(
+            &lease_path.to_string_lossy(),
+            "third.party.wt",
+        )]),
         calls: Mutex::new(Vec::new()),
     });
-    let provider = WorkerDirectoryProvider::new_with_pin(
+    let provider = WorkerDirectoryProvider::new_production(
         "third.party.wt",
         "worktree",
         true,
         Box::new(TransportShare2(transport)),
         pin.clone(),
-    );
-    let lease = provider.acquire(&ctx_for("C:/proj")).unwrap();
+        root.path().to_path_buf(),
+    )
+    .unwrap();
+    let lease = provider.acquire(&ctx_for(root.path())).unwrap();
     let stamped = lease.metadata.get("provider_pin").cloned().unwrap();
     assert_eq!(stamped["full_id"], "third.party");
     assert_eq!(stamped["version"], "1.0.0");
@@ -511,7 +601,7 @@ fn acquire_stamps_provider_pin_and_rejects_forged_pin() {
     let transport = Arc::new(CannedTransport {
         responses: Mutex::new(vec![serde_json::json!({
             "id": "lease-ok",
-            "path": "C:/proj/.wt-1",
+            "path": lease_path,
             "isolated": true,
             "provider": "third.party.wt",
             "metadata": {
@@ -519,19 +609,22 @@ fn acquire_stamps_provider_pin_and_rejects_forged_pin() {
                     "full_id": "third.party",
                     "version": "9.9.9",
                     "content_hash": "evil",
+                    "contribution_id": "third.party.wt",
                 },
             },
         })]),
         calls: Mutex::new(Vec::new()),
     });
-    let provider = WorkerDirectoryProvider::new_with_pin(
+    let provider = WorkerDirectoryProvider::new_production(
         "third.party.wt",
         "worktree",
         true,
         Box::new(TransportShare2(transport)),
         pin,
-    );
-    let err = provider.acquire(&ctx_for("C:/proj")).unwrap_err();
+        root.path().to_path_buf(),
+    )
+    .unwrap();
+    let err = provider.acquire(&ctx_for(root.path())).unwrap_err();
     assert!(
         format!("{err:#}").contains("pin"),
         "伪造 provider pin 必须拒绝: {err:#}"
@@ -541,19 +634,15 @@ fn acquire_stamps_provider_pin_and_rejects_forged_pin() {
 /// I8:release 拒绝伪造 provider 的租约(传输层零调用)。
 #[test]
 fn release_rejects_forged_lease_provider() {
+    let root = tempfile::tempdir().unwrap();
     let transport = Arc::new(CannedTransport {
         responses: Mutex::new(Vec::new()),
         calls: Mutex::new(Vec::new()),
     });
-    let provider = WorkerDirectoryProvider::new(
-        "third.party.wt",
-        "worktree",
-        true,
-        Box::new(TransportShare2(transport.clone())),
-    );
+    let provider = provider_for_test(root.path(), Box::new(TransportShare2(transport.clone())));
     let forged = mf_agent::execution_directory::ExecutionLease {
         id: "lease-x".into(),
-        path: PathBuf::from("C:/proj/.wt-1"),
+        path: root.path().join(".wt-1"),
         isolated: true,
         provider: "someone.else".into(),
         metadata: serde_json::json!({}),
@@ -623,6 +712,7 @@ fn f10_provider(
             full_id: "third.party".into(),
             version: "2.0.0".into(),
             content_hash: "hash-f10".into(),
+            contribution_id: "third.party.wt".into(),
         },
         dir.path().to_path_buf(),
     )
@@ -650,6 +740,46 @@ fn f10_ctx(root: &std::path::Path) -> mf_agent::execution_directory::LeaseContex
     }
 }
 
+#[test]
+fn production_constructor_rejects_incomplete_or_misowned_pin() {
+    let root = tempfile::tempdir().unwrap();
+    let make_transport = || {
+        Box::new(CannedTransport2 {
+            acquire_reply: Mutex::new(serde_json::json!({})),
+        }) as Box<dyn DirectoryWorkerTransport>
+    };
+    let empty_hash = mf_agent::workflow::PluginSourcePin {
+        full_id: "third.party".into(),
+        version: "1.0.0".into(),
+        content_hash: String::new(),
+        contribution_id: "third.party.wt".into(),
+    };
+    assert!(WorkerDirectoryProvider::new_production(
+        "third.party.wt",
+        "worktree",
+        true,
+        make_transport(),
+        empty_hash,
+        root.path().to_path_buf(),
+    )
+    .is_err());
+    let wrong_owner = mf_agent::workflow::PluginSourcePin {
+        full_id: "third.party".into(),
+        version: "1.0.0".into(),
+        content_hash: "hash".into(),
+        contribution_id: "other.party.wt".into(),
+    };
+    assert!(WorkerDirectoryProvider::new_production(
+        "other.party.wt",
+        "worktree",
+        true,
+        make_transport(),
+        wrong_owner,
+        root.path().to_path_buf(),
+    )
+    .is_err());
+}
+
 /// F10:worker 返回的租约 metadata 不是 JSON object → 拒绝
 /// (无结构可盖 provider_pin/归属,协议违规)。
 #[test]
@@ -673,30 +803,23 @@ fn non_object_metadata_lease_is_rejected() {
 /// 携带不同 pin 的租约都拒绝,绝不再发给 worker。
 #[test]
 fn merge_validates_every_lease_provider_pin_root_id() {
-    use mf_agent::execution_directory::ExecutionLease;
     let pin = mf_agent::workflow::PluginSourcePin {
         full_id: "third.party".into(),
         version: "2.0.0".into(),
         content_hash: "hash-f10".into(),
-    };
-    let make = |id: &str, provider: &str, path: std::path::PathBuf, with_pin: bool| {
-        ExecutionLease {
-            id: id.into(),
-            path,
-            isolated: true,
-            provider: provider.into(),
-            metadata: if with_pin {
-                serde_json::json!({ "step_key": "a", "provider_pin": {
-                    "full_id": pin.full_id, "version": pin.version, "content_hash": pin.content_hash,
-                }})
-            } else {
-                serde_json::json!({ "step_key": "a" })
-            },
-        }
+        contribution_id: "third.party.wt".into(),
     };
     let dir = tempfile::tempdir().unwrap();
+    let in_root = dir.path().join("wt-a");
+    std::fs::create_dir(&in_root).unwrap();
     let transport = std::sync::Arc::new(CannedTransport2 {
-        acquire_reply: Mutex::new(serde_json::json!({})),
+        acquire_reply: Mutex::new(serde_json::json!({
+            "id": "l1",
+            "path": in_root,
+            "isolated": true,
+            "provider": "third.party.wt",
+            "metadata": { "step_key": "a" }
+        })),
     });
     let provider = WorkerDirectoryProvider::new_production(
         "third.party.wt",
@@ -707,35 +830,58 @@ fn merge_validates_every_lease_provider_pin_root_id() {
         dir.path().to_path_buf(),
     )
     .unwrap();
-    let in_root = dir.path().join("wt-a");
     // 合法批:同提供器、授权根内、pin 一致 → 通过
-    let ok = make("l1", "third.party.wt", in_root.clone(), true);
-    provider.merge(&[ok]).unwrap();
+    let ok = provider.acquire(&f10_ctx(dir.path())).unwrap();
+    provider.merge(&[ok.clone()]).unwrap();
     // 他人提供器 → 拒绝
-    let foreign = make("l2", "other.provider", in_root.clone(), true);
+    let mut foreign = ok.clone();
+    foreign.id = "l2".into();
+    foreign.provider = "other.provider".into();
     let err = provider.merge(&[foreign]).unwrap_err();
     assert!(format!("{err:#}").contains("提供器"), "{err:#}");
     // 越出授权根 → 拒绝
-    let escaped = make(
-        "l3",
-        "third.party.wt",
-        std::env::temp_dir().join("outside"),
-        true,
-    );
+    let mut escaped = ok.clone();
+    escaped.id = "l3".into();
+    escaped.path = std::env::temp_dir().join("outside");
     let err = provider.merge(&[escaped]).unwrap_err();
     assert!(
         format!("{err:#}").contains("根") || format!("{err:#}").contains("越"),
         "{err:#}"
     );
     // 不同 pin → 拒绝
-    let mut wrong_pin = make("l4", "third.party.wt", in_root.clone(), true);
+    let mut wrong_pin = ok.clone();
+    wrong_pin.id = "l4".into();
     wrong_pin.metadata["provider_pin"]["content_hash"] = serde_json::json!("hash-OTHER");
     let err = provider.merge(&[wrong_pin]).unwrap_err();
     assert!(format!("{err:#}").contains("pin"), "{err:#}");
     // 非法租约 ID(路径语义)→ 拒绝
-    let bad_id = make("../evil", "third.party.wt", in_root.clone(), true);
+    let mut bad_id = ok.clone();
+    bad_id.id = "../evil".into();
     let err = provider.merge(&[bad_id]).unwrap_err();
     assert!(format!("{err:#}").contains("ID"), "{err:#}");
+    // 缺 pin / 非 object / isolated 漂移都不得借生产 provider 放行。
+    let mut missing_pin = ok.clone();
+    missing_pin
+        .metadata
+        .as_object_mut()
+        .unwrap()
+        .remove("provider_pin");
+    assert!(provider.merge(&[missing_pin]).is_err(), "缺 pin 必须拒绝");
+    let mut wrong_isolated = ok.clone();
+    wrong_isolated.isolated = false;
+    assert!(
+        provider.merge(&[wrong_isolated]).is_err(),
+        "isolated 漂移必须拒绝"
+    );
+
+    // 路径字符串未变但目录对象被替换，文件身份必须让下一使用点拒绝。
+    std::fs::remove_dir(&in_root).unwrap();
+    std::fs::create_dir(&in_root).unwrap();
+    let err = provider.merge(&[ok]).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("身份") || format!("{err:#}").contains("变化"),
+        "同路径换对象必须拒绝:{err:#}"
+    );
 }
 
 /// F10:release 逐租约校验(他人提供器/越根/pin 不符拒绝)。
@@ -746,10 +892,19 @@ fn release_validates_lease_identity() {
         full_id: "third.party".into(),
         version: "2.0.0".into(),
         content_hash: "hash-f10".into(),
+        contribution_id: "third.party.wt".into(),
     };
     let dir = tempfile::tempdir().unwrap();
+    let lease_path = dir.path().join("wt-a");
+    std::fs::create_dir(&lease_path).unwrap();
     let transport = std::sync::Arc::new(CannedTransport2 {
-        acquire_reply: Mutex::new(serde_json::json!({})),
+        acquire_reply: Mutex::new(serde_json::json!({
+            "id": "l1",
+            "path": lease_path,
+            "isolated": true,
+            "provider": "third.party.wt",
+            "metadata": { "step_key": "a" }
+        })),
     });
     let provider = WorkerDirectoryProvider::new_production(
         "third.party.wt",
@@ -760,16 +915,7 @@ fn release_validates_lease_identity() {
         dir.path().to_path_buf(),
     )
     .unwrap();
-    let lease = ExecutionLease {
-        id: "l1".into(),
-        path: dir.path().join("wt-a"),
-        isolated: true,
-        provider: "third.party.wt".into(),
-        metadata: serde_json::json!({
-            "step_key": "a",
-            "provider_pin": { "full_id": "third.party", "version": "2.0.0", "content_hash": "hash-f10" },
-        }),
-    };
+    let lease: ExecutionLease = provider.acquire(&f10_ctx(dir.path())).unwrap();
     provider.release(&lease).unwrap();
     let mut foreign = lease.clone();
     foreign.provider = "other.provider".into();

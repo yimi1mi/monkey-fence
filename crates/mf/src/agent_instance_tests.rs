@@ -316,6 +316,7 @@ mod pinned_adapter_tests {
                 .map(str::to_string)
                 .unwrap_or_else(|| source.plugin_version.clone()),
             content_hash: String::new(), // 内置合成插件:无内容寻址哈希
+            contribution_id: String::new(),
         }
     }
 

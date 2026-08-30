@@ -68,15 +68,18 @@ fn legacy_v1_database_is_migrated_with_data_intact() {
     let tables = store.table_names().unwrap();
     assert!(tables.contains(&"merge_batches".to_string()));
     assert!(tables.contains(&"join_deferrals".to_string()));
-    // 迁移后的库可正常写入新状态
-    assert!(store
-        .claim_merge_batch(1, "j", 1, &["l1".into()], "txn-x")
-        .unwrap());
-    assert!(!store
-        .claim_merge_batch(1, "j", 1, &["l1".into()], "txn-y")
-        .unwrap());
-    store.complete_merge_batch("txn-x", false, &[]).unwrap();
-    assert_eq!(store.list_merge_batches(1).unwrap()[0].status, "merged");
+    let columns = store
+        .with_conn(|c| {
+            let mut stmt = c.prepare("PRAGMA table_info(merge_batches)")?;
+            let names = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(names)
+        })
+        .unwrap();
+    assert!(columns.contains(&"lease_digest".to_string()));
+    assert!(columns.contains(&"owner_id".to_string()));
+    assert!(columns.contains(&"owner_expires_at".to_string()));
 }
 
 /// 版本高于程序支持的库必须拒绝打开(禁止隐式降级)。
@@ -97,6 +100,55 @@ fn future_schema_version_is_rejected() {
         format!("{err:#}").contains("高于程序支持"),
         "错误必须明示版本不兼容: {err:#}"
     );
+}
+
+#[test]
+fn v4_active_merge_batch_migrates_to_v5_without_state_loss() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("workflow-v1.db");
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE merge_batches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                join_step_key TEXT NOT NULL,
+                revision_id INTEGER NOT NULL,
+                lease_keys_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ready',
+                transaction_id TEXT NOT NULL DEFAULT '',
+                lease_digest TEXT NOT NULL DEFAULT '',
+                conflicts_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(task_id, join_step_key, revision_id)
+             );
+             INSERT INTO merge_batches
+                (task_id, join_step_key, revision_id, lease_keys_json, status,
+                 transaction_id, lease_digest, conflicts_json, created_at, updated_at)
+             VALUES (7, 'j', 3, '[\"lease-a\"]', 'merging', 'txn-v4',
+                     'digest-v4', '[]', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z');
+             PRAGMA user_version = 4;",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&db).unwrap();
+    assert_eq!(store.schema_version().unwrap(), PROJECT_SCHEMA_VERSION);
+    let rows = store.list_merge_batches(7).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, "merging");
+    assert_eq!(rows[0].lease_keys, vec!["lease-a"]);
+    let columns = store
+        .with_conn(|c| {
+            let mut stmt = c.prepare("PRAGMA table_info(merge_batches)")?;
+            let names = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(names)
+        })
+        .unwrap();
+    assert!(columns.contains(&"owner_id".to_string()));
+    assert!(columns.contains(&"owner_expires_at".to_string()));
 }
 
 /// F-附带:**真实完整 v1 DDL** fixture(`PROJECT_SCHEMA_V1` 原文)+
@@ -170,7 +222,7 @@ fn full_v1_ddl_fixture_migrates_all_tables_with_data() {
     assert!(draft.is_some(), "任务本地工作流草稿迁移保留");
     // merge_batches 表经 v2+v4 迁移可用(新列 lease_digest 就位):
     // held 租约可被权威领取并离开 ready
-    match store.claim_single_merge_batch(1, "lease-v1", "a", 1, "txn-f1") {
+    match store.claim_single_merge_batch(1, "lease-v1", "a", 1, "txn-f1", "owner-f1") {
         Ok(mf_agent::store::JoinMergeClaim::Claimed { leases, .. }) => {
             assert_eq!(leases.len(), 1);
             assert_eq!(leases[0].lease_key, "lease-v1");

@@ -85,13 +85,14 @@ impl WorkerClient {
             .with_context(|| format!("启动 worker 失败: {}", exe.display()))?;
         let child_pid = child.id();
         // F11:立即挂进程树守卫(Windows Job Object KILL_ON_JOB_CLOSE)
-        let tree = ProcTreeGuard::attach(&mut child)
-            .map_err(|e| {
+        let tree = match ProcTreeGuard::attach(&mut child) {
+            Ok(tree) => tree,
+            Err(e) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                e
-            })
-            .ok();
+                return Err(e).context("worker 进程树守卫 attach 失败");
+            }
+        };
         let stdin = child.stdin.take().context("worker stdin 不可用")?;
         let stdout = child.stdout.take().context("worker stdout 不可用")?;
         // stderr → 日志缓冲(脱敏 + 有界)
@@ -130,7 +131,7 @@ impl WorkerClient {
             next_id: AtomicI64::new(1),
             logs,
             capability_token: parking_lot::Mutex::new(String::new()),
-            tree,
+            tree: Some(tree),
         })
     }
 
@@ -200,7 +201,11 @@ impl WorkerClient {
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 self.kill();
-                let _ = writer.join();
+                // 二次有界确认写线程已因管道关闭退出；逃逸进程仍持读端
+                // 时绝不无界 join 卡死调用方。
+                if write_rx.recv_timeout(Duration::from_secs(1)).is_ok() {
+                    let _ = writer.join();
+                }
                 bail!(
                     "worker 写入超时({method},上限 {timeout:?}):已终止 worker 进程树\
                      (写入已取消)"

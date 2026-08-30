@@ -65,6 +65,7 @@ pub fn plugin_pin(full_id: &str, hash: &str) -> PluginSourcePin {
         full_id: full_id.into(),
         version: "1.2.3".into(),
         content_hash: hash.into(),
+        contribution_id: full_id.into(),
     }
 }
 
@@ -164,8 +165,10 @@ pub fn scripted_routing() -> mf_agent::orchestrator::DirectoryRouting {
 
 /// F4:任意测试提供器的 pinned 路由。
 pub fn pinned_routing(full_id: &str, hash: &str) -> mf_agent::orchestrator::DirectoryRouting {
+    let mut pin = plugin_pin(full_id, hash);
+    pin.contribution_id = "worktree".into();
     mf_agent::orchestrator::DirectoryRouting {
-        current_pin: Some(plugin_pin(full_id, hash)),
+        current_pin: Some(pin),
         resolver: None,
     }
 }
@@ -237,6 +240,8 @@ pub struct ScriptedDirectory {
     pub released: Mutex<Vec<String>>,
     /// F4:release 可注入失败(验证"release 成功后才标 released")。
     pub release_fails: AtomicBool,
+    pub block_merge: AtomicBool,
+    pub merge_entered: AtomicBool,
 }
 
 impl ScriptedDirectory {
@@ -250,6 +255,8 @@ impl ScriptedDirectory {
             merge_batches: Mutex::new(Vec::new()),
             released: Mutex::new(Vec::new()),
             release_fails: AtomicBool::new(false),
+            block_merge: AtomicBool::new(false),
+            merge_entered: AtomicBool::new(false),
         }
     }
 
@@ -280,6 +287,10 @@ impl ExecutionDirectoryProvider for ScriptedDirectory {
     fn merge(&self, leases: &[ExecutionLease]) -> anyhow::Result<MergeOutcome> {
         self.merges.fetch_add(1, Ordering::SeqCst);
         self.merge_batches.lock().push(leases.len());
+        self.merge_entered.store(true, Ordering::SeqCst);
+        while self.block_merge.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         if self.merge_ok.load(Ordering::SeqCst) {
             Ok(MergeOutcome::Merged)
         } else {

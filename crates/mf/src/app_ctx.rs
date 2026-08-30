@@ -94,14 +94,7 @@ fn directory_provider_for(
             match mf_plugins::git_worktree_provider::GitWorktreeProvider::new(root.to_path_buf()) {
                 Ok(provider) => {
                     log::info!("执行目录提供器:{builtin_full}(worktree 隔离)");
-                    return (
-                        Arc::new(provider),
-                        Some(mf_agent::workflow::PluginSourcePin {
-                            full_id: WORKTREE_PLUGIN_FULL_ID.into(),
-                            version: mf_plugins::host::BUILTIN_DIRECTORIES_VERSION.into(),
-                            content_hash: String::new(),
-                        }),
-                    );
+                    return (Arc::new(provider), Some(res.pin.clone()));
                 }
                 Err(e) => log::warn!("worktree 提供器初始化失败,回退共享目录: {e:#}"),
             }
@@ -128,11 +121,7 @@ fn directory_provider_for(
                         );
                         return (
                             Arc::new(provider),
-                            Some(mf_agent::workflow::PluginSourcePin {
-                                full_id: source.plugin_full_id.clone(),
-                                version: source.plugin_version.clone(),
-                                content_hash: source.content_hash.clone(),
-                            }),
+                            Some(res.pin.clone()),
                         );
                     }
                     Err(e) => {
@@ -171,7 +160,12 @@ impl mf_agent::execution_directory::DirectoryProviderResolver for PluginDirector
         pin: &mf_agent::workflow::PluginSourcePin,
     ) -> Option<Arc<dyn mf_agent::execution_directory::ExecutionDirectoryProvider>> {
         // 内置 worktree pinned 身份(空哈希)
-        if pin.full_id == WORKTREE_PLUGIN_FULL_ID && pin.content_hash.is_empty() {
+        if pin.full_id == WORKTREE_PLUGIN_FULL_ID
+            && pin.version == mf_plugins::host::BUILTIN_DIRECTORIES_VERSION
+            && pin.content_hash.is_empty()
+            && pin.contribution_id
+                == format!("{WORKTREE_PLUGIN_FULL_ID}.{WORKTREE_CONTRIBUTION_ID}")
+        {
             if mf_vcs::git::Git::is_repo(&self.root) {
                 if let Ok(provider) =
                     mf_plugins::git_worktree_provider::GitWorktreeProvider::new(self.root.clone())
@@ -182,27 +176,11 @@ impl mf_agent::execution_directory::DirectoryProviderResolver for PluginDirector
             return None;
         }
         // 第三方:内容寻址解析(版本+哈希都由 Plugin Host 校验)
-        let contributions = self.plugins.contributions().execution_directories();
-        let full_contribution_id = format!("{}.{}", pin.full_id, {
-            // 贡献 ID 不在 pin 里:按插件 full_id 找其目录贡献(取匹配哈希者)
-            let mut found = String::new();
-            for (cid, source, _) in &contributions {
-                if source.plugin_full_id == pin.full_id
-                    && source.content_hash == pin.content_hash
-                    && source.plugin_version == pin.version
-                {
-                    found = cid
-                        .rsplit('.')
-                        .next()
-                        .map(|s| s.to_string())
-                        .unwrap_or_default();
-                    break;
-                }
-            }
-            found
-        });
-        if full_contribution_id.ends_with('.') || full_contribution_id.is_empty() {
-            log::warn!("目录提供器 pin({:?})在已安装贡献中找不到匹配版本", pin);
+        let full_contribution_id = pin.contribution_id.clone();
+        if full_contribution_id.is_empty()
+            || !full_contribution_id.starts_with(&format!("{}.", pin.full_id))
+        {
+            log::warn!("目录提供器 pin({pin:?})缺少或伪造完整贡献 ID");
             return None;
         }
         match self.plugins.resolve_directory_provider(

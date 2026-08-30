@@ -20,6 +20,12 @@ pub fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+const MERGE_OWNER_TTL_SECS: i64 = 10;
+
+fn merge_owner_expiry() -> String {
+    (chrono::Utc::now() + chrono::Duration::seconds(MERGE_OWNER_TTL_SECS)).to_rfc3339()
+}
+
 /// 一次性能力令牌:仅对一个 Agent Run 有效。
 use std::collections::HashSet;
 
@@ -59,7 +65,7 @@ fn join_parents_tx(
     task_id: i64,
     join_step_key: &str,
     revision_id: i64,
-) -> Result<(Vec<(String, String)>, bool)> {
+) -> Result<(Vec<(i64, String, String)>, bool)> {
     let join_id: Option<i64> = tx
         .query_row(
             "SELECT id FROM steps WHERE revision_id = ?1 AND task_id = ?2 AND step_key = ?3",
@@ -75,7 +81,7 @@ fn join_parents_tx(
         .query_map(params![join_id], |r| r.get(0))?
         .collect::<std::result::Result<_, _>>()?;
     drop(stmt);
-    let mut parents: Vec<(String, String)> = Vec::with_capacity(parent_ids.len());
+    let mut parents: Vec<(i64, String, String)> = Vec::with_capacity(parent_ids.len());
     for pid in &parent_ids {
         let row: Option<(String, String)> = tx
             .query_row(
@@ -85,7 +91,7 @@ fn join_parents_tx(
             )
             .optional()?;
         if let Some(pair) = row {
-            parents.push(pair);
+            parents.push((*pid, pair.0, pair.1));
         }
     }
     anyhow::ensure!(
@@ -95,7 +101,7 @@ fn join_parents_tx(
     const TERMINAL: [&str; 4] = ["succeeded", "failed", "skipped", "cancelled"];
     let complete = parents
         .iter()
-        .all(|(_, st)| TERMINAL.contains(&st.as_str()));
+        .all(|(_, _, st)| TERMINAL.contains(&st.as_str()));
     Ok((parents, complete))
 }
 
@@ -104,7 +110,7 @@ fn join_parents_tx(
 fn held_leases_of_steps_tx(
     tx: &Transaction,
     task_id: i64,
-    succeeded_keys: &HashSet<String>,
+    succeeded_step_ids: &HashSet<i64>,
 ) -> Result<Vec<ExecutionLeaseRow>> {
     let mut pending_ids: HashSet<String> = HashSet::new();
     {
@@ -146,19 +152,7 @@ fn held_leases_of_steps_tx(
         if pending_ids.contains(&row.lease_key) {
             continue;
         }
-        let step_key = row
-            .metadata_json
-            .as_deref()
-            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-            .and_then(|v| {
-                v.get("step_key")
-                    .and_then(|s| s.as_str())
-                    .map(str::to_string)
-            });
-        if !step_key
-            .as_ref()
-            .is_some_and(|k| succeeded_keys.contains(k))
-        {
+        if !succeeded_step_ids.contains(&row.step_id) {
             continue;
         }
         match by_key.get(&row.lease_key) {
@@ -182,7 +176,8 @@ fn claim_merge_batch_tx(
     keys: &[String],
     digest: &str,
     transaction_id: &str,
-) -> Result<()> {
+    owner_id: &str,
+) -> Result<bool> {
     let existing: Option<(String, String)> = tx
         .query_row(
             "SELECT status, lease_digest FROM merge_batches
@@ -192,22 +187,21 @@ fn claim_merge_batch_tx(
         )
         .optional()?;
     if let Some((status, stored_digest)) = &existing {
-        anyhow::ensure!(
-            status == "ready",
-            "合并批已被其他领取者持有或已有结论(状态 {status}):本调用方放弃"
-        );
         if !stored_digest.is_empty() && stored_digest != digest {
             anyhow::bail!(
                 "合并批租约集在领取之间发生变化(任务 {task_id} `{join_step_key}`):\
                  持久 digest {stored_digest} ≠ 权威 digest {digest},拒绝换批"
             );
         }
+        if status != "ready" {
+            return Ok(false);
+        }
     }
     tx.execute(
         "INSERT INTO merge_batches
              (task_id, join_step_key, revision_id, lease_keys_json, status,
-              transaction_id, lease_digest, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, 'ready', '', ?5, ?6, ?6)
+            transaction_id, owner_id, owner_expires_at, lease_digest, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'ready', '', '', '', ?5, ?6, ?6)
          ON CONFLICT(task_id, join_step_key, revision_id) DO NOTHING",
         params![
             task_id,
@@ -221,7 +215,8 @@ fn claim_merge_batch_tx(
     let n = tx.execute(
         "UPDATE merge_batches
             SET status = 'merging', transaction_id = ?5, lease_keys_json = ?4,
-                lease_digest = ?6, updated_at = ?7
+                lease_digest = ?6, owner_id = ?7, owner_expires_at = ?8,
+                updated_at = ?9
          WHERE task_id = ?1 AND join_step_key = ?2 AND revision_id = ?3
            AND status = 'ready'",
         params![
@@ -231,11 +226,12 @@ fn claim_merge_batch_tx(
             serde_json::to_string(keys)?,
             transaction_id,
             digest,
-            now()
+            owner_id,
+            merge_owner_expiry(),
+            now(),
         ],
     )?;
-    anyhow::ensure!(n == 1, "合并批领取 CAS 未命中(并发领取者已推进)");
-    Ok(())
+    Ok(n == 1)
 }
 
 /// 按 (lease_key, id) 回读租约行。
@@ -2318,25 +2314,66 @@ impl Store {
         step_id: i64,
         task_id: i64,
     ) -> Result<()> {
-        self.with_conn(|c| {
-            c.execute(
-                "INSERT INTO execution_leases
-                    (lease_key, run_id, step_id, task_id, provider, path, isolated, metadata_json, status, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'held', ?9)
-                 ON CONFLICT(lease_key) DO UPDATE SET
-                    run_id = excluded.run_id, status = 'held', released_at = NULL",
-                params![
-                    lease.id,
-                    run_id,
-                    step_id,
-                    task_id,
-                    lease.provider,
-                    lease.path.to_string_lossy(),
-                    lease.isolated as i64,
-                    lease.metadata.to_string(),
-                    now()
-                ],
-            )?;
+        let path = lease.path.to_string_lossy().to_string();
+        let metadata = lease.metadata.to_string();
+        self.with_tx(|tx| {
+            let existing: Option<(i64, i64, String, String, i64, String)> = tx
+                .query_row(
+                    "SELECT step_id, task_id, provider, path, isolated, metadata_json
+                     FROM execution_leases WHERE lease_key = ?1",
+                    params![lease.id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+                )
+                .optional()?;
+            if let Some((old_step, old_task, old_provider, old_path, old_isolated, old_metadata)) =
+                existing
+            {
+                let old_metadata_value: serde_json::Value = serde_json::from_str(&old_metadata)
+                    .context("既有 execution lease metadata JSON 损坏")?;
+                let immutable_metadata = |mut value: serde_json::Value| {
+                    if let Some(object) = value.as_object_mut() {
+                        // 合法重试唯一允许变化的 metadata 字段。
+                        object.remove("attempt");
+                    }
+                    value
+                };
+                let immutable_metadata_matches = immutable_metadata(old_metadata_value)
+                    == immutable_metadata(lease.metadata.clone());
+                anyhow::ensure!(
+                    old_step == step_id
+                        && old_task == task_id
+                        && old_provider == lease.provider
+                        && old_path == path
+                        && old_isolated == lease.isolated as i64
+                        && immutable_metadata_matches,
+                    "lease.id `{}` 已绑定不同不可变身份，拒绝换绑",
+                    lease.id
+                );
+                let n = tx.execute(
+                    "UPDATE execution_leases
+                     SET run_id = ?2, metadata_json = ?3, status = 'held', released_at = NULL
+                     WHERE lease_key = ?1",
+                    params![lease.id, run_id, metadata],
+                )?;
+                anyhow::ensure!(n == 1, "复用 lease `{}` 更新未命中", lease.id);
+            } else {
+                tx.execute(
+                    "INSERT INTO execution_leases
+                        (lease_key, run_id, step_id, task_id, provider, path, isolated, metadata_json, status, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'held', ?9)",
+                    params![
+                        lease.id,
+                        run_id,
+                        step_id,
+                        task_id,
+                        lease.provider,
+                        path,
+                        lease.isolated as i64,
+                        metadata,
+                        now()
+                    ],
+                )?;
+            }
             Ok(())
         })
     }
@@ -2669,55 +2706,6 @@ impl Store {
         })
     }
 
-    // ---------- join 批持久状态(C1:ready → merging → merged/needs_you) ----------
-
-    /// 声明并领取一个合并批(事务内 CAS:仅当行不存在或 status='ready'
-    /// 时推进到 'merging')。并发 complete 同一批只有一个线程拿到
-    /// `true`;其余看到 merging/merged/needs_you → `false`(放弃执行)。
-    /// `transaction_id` 唯一标识领取者,结论回写按它 CAS。
-    pub fn claim_merge_batch(
-        &self,
-        task_id: i64,
-        join_step_key: &str,
-        revision_id: i64,
-        lease_keys: &[String],
-        transaction_id: &str,
-    ) -> Result<bool> {
-        let ts = now();
-        self.with_tx(|c| {
-            c.execute(
-                "INSERT INTO merge_batches
-                     (task_id, join_step_key, revision_id, lease_keys_json, status,
-                      transaction_id, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'ready', '', ?5, ?5)
-                 ON CONFLICT(task_id, join_step_key, revision_id) DO NOTHING",
-                params![
-                    task_id,
-                    join_step_key,
-                    revision_id,
-                    serde_json::to_string(lease_keys)?,
-                    ts
-                ],
-            )?;
-            let n = c.execute(
-                "UPDATE merge_batches
-                    SET status = 'merging', transaction_id = ?5, lease_keys_json = ?4,
-                        updated_at = ?6
-                 WHERE task_id = ?1 AND join_step_key = ?2 AND revision_id = ?3
-                   AND status = 'ready'",
-                params![
-                    task_id,
-                    join_step_key,
-                    revision_id,
-                    serde_json::to_string(lease_keys)?,
-                    transaction_id,
-                    now()
-                ],
-            )?;
-            Ok(n == 1)
-        })
-    }
-
     // ---------- F1:join 批权威领取(跨实例/跨进程半批防线) ----------
 
     /// join 合并批权威领取(F1):**同一事务内**从修订的 join 父步骤与
@@ -2735,6 +2723,7 @@ impl Store {
         revision_id: i64,
         caller_lease_keys: &[String],
         transaction_id: &str,
+        owner_id: &str,
     ) -> Result<JoinMergeClaim> {
         self.with_tx(|tx| {
             let (parents, complete) =
@@ -2747,10 +2736,10 @@ impl Store {
             if !complete {
                 return Ok(JoinMergeClaim::NotComplete);
             }
-            let succeeded: HashSet<String> = parents
+            let succeeded: HashSet<i64> = parents
                 .iter()
-                .filter(|(_, st)| st == "succeeded")
-                .map(|(k, _)| k.clone())
+                .filter(|(_, _, st)| st == "succeeded")
+                .map(|(id, _, _)| *id)
                 .collect();
             let authoritative =
                 held_leases_of_steps_tx(tx, task_id, &succeeded)?;
@@ -2771,7 +2760,7 @@ impl Store {
                 );
             }
             let digest = lease_set_digest(&keys);
-            claim_merge_batch_tx(
+            let claimed = claim_merge_batch_tx(
                 tx,
                 task_id,
                 join_step_key,
@@ -2779,7 +2768,11 @@ impl Store {
                 &keys,
                 &digest,
                 transaction_id,
+                owner_id,
             )?;
+            if !claimed {
+                return Ok(JoinMergeClaim::Taken);
+            }
             Ok(JoinMergeClaim::Claimed {
                 transaction_id: transaction_id.to_string(),
                 leases: authoritative,
@@ -2796,6 +2789,7 @@ impl Store {
         step_key: &str,
         revision_id: i64,
         transaction_id: &str,
+        owner_id: &str,
     ) -> Result<JoinMergeClaim> {
         self.with_tx(|tx| {
             let row: Option<(String, String, i64)> = tx
@@ -2827,7 +2821,7 @@ impl Store {
             let keys = vec![lease_key.to_string()];
             let digest = lease_set_digest(&keys);
             let join_step_key = format!("__single__:{step_key}");
-            claim_merge_batch_tx(
+            let claimed = claim_merge_batch_tx(
                 tx,
                 task_id,
                 &join_step_key,
@@ -2835,7 +2829,11 @@ impl Store {
                 &keys,
                 &digest,
                 transaction_id,
+                owner_id,
             )?;
+            if !claimed {
+                return Ok(JoinMergeClaim::Taken);
+            }
             let row: ExecutionLeaseRow = lease_row_by_key_tx(tx, lease_key, row_id)?
                 .ok_or_else(|| anyhow::anyhow!("租约 `{lease_key}` 回读失败"))?;
             Ok(JoinMergeClaim::Claimed {
@@ -2852,6 +2850,7 @@ impl Store {
     pub fn complete_merge_batch(
         &self,
         transaction_id: &str,
+        owner_id: &str,
         needs_user: bool,
         conflicts: &[String],
     ) -> Result<()> {
@@ -2861,12 +2860,13 @@ impl Store {
                     SET status = CASE ?2 WHEN 1 THEN 'needs_user' ELSE 'merged' END,
                         conflicts_json = ?4,
                         updated_at = ?3
-                 WHERE transaction_id = ?1 AND status = 'merging'",
+                 WHERE transaction_id = ?1 AND owner_id = ?5 AND status = 'merging'",
                 params![
                     transaction_id,
                     needs_user as i64,
                     now(),
-                    serde_json::to_string(conflicts)?
+                    serde_json::to_string(conflicts)?,
+                    owner_id,
                 ],
             )
             .map_err(anyhow::Error::from)
@@ -2886,21 +2886,131 @@ impl Store {
                 "SELECT task_id, join_step_key, revision_id, lease_keys_json, status, conflicts_json
                  FROM merge_batches WHERE status IN ('merged','needs_user') ORDER BY id",
             )?;
-            let rows = stmt
+            let raw: Vec<(i64, String, i64, String, String, String)> = stmt
                 .query_map([], |r| {
-                    let keys_json: String = r.get(3)?;
-                    let conflicts_json: String = r.get(5)?;
-                    Ok(MergeBatchRecovery {
-                        task_id: r.get(0)?,
-                        join_step_key: r.get(1)?,
-                        revision_id: r.get(2)?,
-                        lease_keys: serde_json::from_str(&keys_json).unwrap_or_default(),
-                        status: r.get(4)?,
-                        conflicts: serde_json::from_str(&conflicts_json).unwrap_or_default(),
-                    })
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, String>(4)?,
+                        r.get::<_, String>(5)?,
+                    ))
                 })?
                 .collect::<std::result::Result<_, _>>()?;
+            let mut rows = Vec::new();
+            for (task_id, join_step_key, revision_id, keys_json, status, conflicts_json) in raw {
+                rows.push(MergeBatchRecovery {
+                    task_id,
+                    join_step_key,
+                    revision_id,
+                    lease_keys: serde_json::from_str(&keys_json)
+                        .with_context(|| format!("合并批租约键 JSON 损坏(task {task_id})"))?,
+                    status,
+                    conflicts: serde_json::from_str(&conflicts_json)
+                        .with_context(|| format!("合并批冲突 JSON 损坏(task {task_id})"))?,
+                });
+            }
             Ok(rows)
+        })
+    }
+
+    /// 用户处理 needs-user 时领取任务下的待决批。CAS 防止两个
+    /// Orchestrator 同时重复执行 provider merge。
+    pub fn claim_pending_merge_resolution(
+        &self,
+        task_id: i64,
+        join_step_key: &str,
+        revision_id: i64,
+        transaction_id: &str,
+        owner_id: &str,
+    ) -> Result<bool> {
+        self.with_tx(|tx| {
+            let n = tx.execute(
+                "UPDATE merge_batches
+                 SET status = 'resolving', transaction_id = ?4, owner_id = ?5,
+                     owner_expires_at = ?6, updated_at = ?7
+                 WHERE task_id = ?1 AND join_step_key = ?2 AND revision_id = ?3
+                   AND status = 'needs_user'",
+                params![
+                    task_id,
+                    join_step_key,
+                    revision_id,
+                    transaction_id,
+                    owner_id,
+                    merge_owner_expiry(),
+                    now()
+                ],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// `resolving -> merged/needs_user`，按 transaction_id CAS。
+    pub fn complete_pending_merge_resolution(
+        &self,
+        transaction_id: &str,
+        owner_id: &str,
+        conflicts: &[String],
+    ) -> Result<()> {
+        let n = self.with_conn(|c| {
+            c.execute(
+                "UPDATE merge_batches
+                 SET status = CASE WHEN ?2 = 1 THEN 'merged' ELSE 'needs_user' END,
+                     conflicts_json = ?3, owner_id = '', owner_expires_at = '', updated_at = ?4
+                 WHERE transaction_id = ?1 AND owner_id = ?5 AND status = 'resolving'",
+                params![
+                    transaction_id,
+                    conflicts.is_empty() as i64,
+                    serde_json::to_string(conflicts)?,
+                    now(),
+                    owner_id,
+                ],
+            )
+            .map_err(anyhow::Error::from)
+        })?;
+        anyhow::ensure!(n == 1, "待决批结论回写未唯一命中(事务 {transaction_id})");
+        Ok(())
+    }
+
+    /// provider release 全部成功且相应 lease 已不再 held 后，在同一事务
+    /// 中清 pending 投影并把任务的 merged 批推进 released。
+    pub fn finish_resolved_merge_batch(
+        &self,
+        task_id: i64,
+        join_step_key: &str,
+        revision_id: i64,
+        lease_keys: &[String],
+    ) -> Result<()> {
+        self.with_tx(|tx| {
+            for key in lease_keys {
+                let status: Option<String> = tx
+                    .query_row(
+                        "SELECT status FROM execution_leases
+                         WHERE lease_key = ?1 ORDER BY id DESC LIMIT 1",
+                        params![key],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                anyhow::ensure!(
+                    status.as_deref() == Some("released"),
+                    "租约 `{key}` 尚未确认 released({status:?})，拒绝清理待决批"
+                );
+            }
+            let n = tx.execute(
+                "UPDATE merge_batches SET status = 'released', updated_at = ?4
+                 WHERE task_id = ?1 AND join_step_key = ?2 AND revision_id = ?3
+                   AND status = 'merged'",
+                params![task_id, join_step_key, revision_id, now()],
+            )?;
+            anyhow::ensure!(n == 1, "批 `{join_step_key}` 推进 released 未命中");
+            for key in lease_keys {
+                tx.execute(
+                    "DELETE FROM pending_merges WHERE task_id = ?1 AND lease_id = ?2",
+                    params![task_id, key],
+                )?;
+            }
+            Ok(())
         })
     }
 
@@ -2924,42 +3034,42 @@ impl Store {
         Ok(())
     }
 
-    /// F2:按租约键批量回读 held 行(恢复释放/投影用)。
-    pub fn held_lease_rows_by_keys(&self, keys: &[String]) -> Result<Vec<ExecutionLeaseRow>> {
-        if keys.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.with_conn(|c| {
-            let placeholders = vec!["?"; keys.len()].join(",");
-            let sql = format!(
-                "SELECT lease_key, run_id, step_id, task_id, provider, path, isolated,
-                        metadata_json, status, created_at, released_at
-                 FROM execution_leases
-                 WHERE status = 'held' AND lease_key IN ({placeholders})
-                 ORDER BY id"
-            );
-            let params: Vec<&dyn rusqlite::ToSql> =
-                keys.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
-            let mut stmt = c.prepare(&sql)?;
-            let rows = stmt
-                .query_map(params.as_slice(), |r| {
-                    Ok(ExecutionLeaseRow {
-                        lease_key: r.get(0)?,
-                        run_id: r.get(1)?,
-                        step_id: r.get(2)?,
-                        task_id: r.get(3)?,
-                        provider: r.get(4)?,
-                        path: r.get(5)?,
-                        isolated: r.get::<_, i64>(6)? != 0,
-                        metadata_json: r.get(7)?,
-                        status: r.get(8)?,
-                        created_at: r.get(9)?,
-                        released_at: r.get(10)?,
-                    })
+    /// 按键读取每个租约的最新一行，并严格要求键集合完整。恢复逻辑不能
+    /// 把查询/JSON 损坏误解释成“没有 held lease”。
+    pub fn latest_lease_rows_by_keys(&self, keys: &[String]) -> Result<Vec<ExecutionLeaseRow>> {
+        let mut out = Vec::with_capacity(keys.len());
+        for key in keys {
+            let row = self
+                .with_conn(|c| {
+                    c.query_row(
+                        "SELECT lease_key, run_id, step_id, task_id, provider, path, isolated,
+                                metadata_json, status, created_at, released_at
+                         FROM execution_leases WHERE lease_key = ?1 ORDER BY id DESC LIMIT 1",
+                        params![key],
+                        |r| {
+                            Ok(ExecutionLeaseRow {
+                                lease_key: r.get(0)?,
+                                run_id: r.get(1)?,
+                                step_id: r.get(2)?,
+                                task_id: r.get(3)?,
+                                provider: r.get(4)?,
+                                path: r.get(5)?,
+                                isolated: r.get::<_, i64>(6)? != 0,
+                                metadata_json: r.get(7)?,
+                                status: r.get(8)?,
+                                created_at: r.get(9)?,
+                                released_at: r.get(10)?,
+                            })
+                        },
+                    )
+                    .optional()
+                    .map_err(anyhow::Error::from)
                 })?
-                .collect::<std::result::Result<_, _>>()?;
-            Ok(rows)
-        })
+                .ok_or_else(|| anyhow::anyhow!("合并批引用的租约 `{key}` 不存在"))?;
+            out.push(row);
+        }
+        anyhow::ensure!(out.len() == keys.len(), "合并批租约集合读取不完整");
+        Ok(out)
     }
 
     /// 任务的合并批行(测试/审计投影)。
@@ -2969,32 +3079,77 @@ impl Store {
                 "SELECT task_id, join_step_key, revision_id, lease_keys_json, status
                  FROM merge_batches WHERE task_id = ?1 ORDER BY id",
             )?;
-            let rows = stmt
+            let raw: Vec<(i64, String, i64, String, String)> = stmt
                 .query_map(params![task_id], |r| {
-                    let lease_keys_json: String = r.get(3)?;
-                    Ok(MergeBatchRow {
-                        task_id: r.get(0)?,
-                        join_step_key: r.get(1)?,
-                        revision_id: r.get(2)?,
-                        lease_keys: serde_json::from_str(&lease_keys_json).unwrap_or_default(),
-                        status: r.get(4)?,
-                    })
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
                 })?
                 .collect::<std::result::Result<_, _>>()?;
-            Ok(rows)
+            raw.into_iter()
+                .map(|(task_id, join_step_key, revision_id, keys_json, status)| {
+                    Ok(MergeBatchRow {
+                        task_id,
+                        join_step_key,
+                        revision_id,
+                        lease_keys: serde_json::from_str(&keys_json)
+                            .context("合并批租约键 JSON 损坏")?,
+                        status,
+                    })
+                })
+                .collect()
         })
     }
 
-    /// 重启恢复:领取者在崩溃窗口中消失,把遗留的 merging 批重置为
-    /// ready(批可重冲;提供器侧合并事务日志保证重放幂等)。
-    pub fn reset_merging_batches(&self) -> Result<usize> {
+    /// 活跃 Orchestrator 周期续租其正在处理的批。
+    pub fn heartbeat_merge_owner(&self, owner_id: &str) -> Result<usize> {
         self.with_conn(|c| {
-            let n = c.execute(
-                "UPDATE merge_batches SET status = 'ready', transaction_id = '', updated_at = ?1
-                 WHERE status = 'merging'",
-                params![now()],
+            Ok(c.execute(
+                "UPDATE merge_batches SET owner_expires_at = ?2, updated_at = ?3
+                 WHERE owner_id = ?1 AND status IN ('merging','resolving')",
+                params![owner_id, merge_owner_expiry(), now()],
+            )?)
+        })
+    }
+
+    /// 外部 provider 调用专用心跳；transaction+owner 双重绑定，避免给
+    /// 已换领批续租。
+    pub fn heartbeat_merge_transaction(
+        &self,
+        transaction_id: &str,
+        owner_id: &str,
+    ) -> Result<usize> {
+        self.with_conn(|c| {
+            Ok(c.execute(
+                "UPDATE merge_batches SET owner_expires_at = ?3, updated_at = ?4
+                 WHERE transaction_id = ?1 AND owner_id = ?2
+                   AND status IN ('merging','resolving')",
+                params![transaction_id, owner_id, merge_owner_expiry(), now()],
+            )?)
+        })
+    }
+
+    /// 仅回收 owner 租期已明确过期的批；活跃 owner 的新鲜批不动。
+    /// 返回受影响任务，调用方据此重新冲刷。
+    pub fn reset_expired_merge_batches(&self) -> Result<Vec<i64>> {
+        self.with_tx(|tx| {
+            let ts = now();
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT task_id FROM merge_batches
+                 WHERE status IN ('merging','resolving')
+                   AND (owner_expires_at = '' OR owner_expires_at <= ?1)",
             )?;
-            Ok(n)
+            let tasks: Vec<i64> = stmt
+                .query_map(params![ts.clone()], |r| r.get(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            drop(stmt);
+            tx.execute(
+                "UPDATE merge_batches
+                 SET status = CASE status WHEN 'resolving' THEN 'needs_user' ELSE 'ready' END,
+                     transaction_id = '', owner_id = '', owner_expires_at = '', updated_at = ?1
+                 WHERE status IN ('merging','resolving')
+                   AND (owner_expires_at = '' OR owner_expires_at <= ?1)",
+                params![ts],
+            )?;
+            Ok(tasks)
         })
     }
 
@@ -3007,9 +3162,35 @@ impl Store {
     ) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
-                "UPDATE merge_batches SET status = 'merging', transaction_id = 'forced', updated_at = ?4
+                "UPDATE merge_batches SET status = 'merging', transaction_id = 'forced',
+                     owner_id = 'dead-owner', owner_expires_at = '1970-01-01T00:00:00+00:00',
+                     updated_at = ?4
                  WHERE task_id = ?1 AND join_step_key = ?2 AND revision_id = ?3",
                 params![task_id, join_step_key, revision_id, now()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// 测试注入:模拟仍在有效租期内的活跃领取者。
+    pub fn force_merge_batch_active(
+        &self,
+        task_id: i64,
+        join_step_key: &str,
+        revision_id: i64,
+    ) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE merge_batches SET status = 'merging', transaction_id = 'forced-active',
+                     owner_id = 'active-owner', owner_expires_at = ?4, updated_at = ?5
+                 WHERE task_id = ?1 AND join_step_key = ?2 AND revision_id = ?3",
+                params![
+                    task_id,
+                    join_step_key,
+                    revision_id,
+                    merge_owner_expiry(),
+                    now()
+                ],
             )?;
             Ok(())
         })

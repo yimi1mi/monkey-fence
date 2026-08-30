@@ -13,7 +13,7 @@ use crate::pipeline::{PipelineDraft, ProfileIndex, SessionPolicy};
 use crate::runtime::{AgentProfileSpec, LaunchSpec, RuntimeEvent, RuntimeHost, WorkflowLaunchSpec};
 use crate::store::Store;
 use crate::workflow::{PluginSourcePin, WorkflowTemplateVersion};
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
@@ -120,6 +120,67 @@ pub struct ProfileCatalog {
     pub specs: HashMap<String, AgentProfileSpec>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LeaseProviderPin {
+    Absent,
+    Valid(PluginSourcePin),
+    Invalid,
+}
+
+/// 外部 provider merge 可能长于 owner TTL；独立线程覆盖整个阻塞调用，
+/// 不依赖调度 tick。Drop 会停止并 join，随后结论以 transaction+owner CAS。
+struct MergeOwnerHeartbeat {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl MergeOwnerHeartbeat {
+    fn start(store: Arc<Store>, transaction_id: String, owner_id: String) -> Result<Self> {
+        anyhow::ensure!(
+            store.heartbeat_merge_transaction(&transaction_id, &owner_id)? > 0,
+            "合并批 owner 心跳未命中，批可能已被换领"
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let thread = std::thread::Builder::new()
+            .name("mf-merge-heartbeat".into())
+            .spawn(move || {
+                while !stop_thread.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    if stop_thread.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    if let Err(e) = store.heartbeat_merge_transaction(&transaction_id, &owner_id) {
+                        log::error!("合并批 owner 独立心跳失败: {e:#}");
+                    }
+                }
+            })?;
+        Ok(Self {
+            stop,
+            thread: Some(thread),
+        })
+    }
+}
+
+impl Drop for MergeOwnerHeartbeat {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn parse_lease_provider_pin(metadata: &serde_json::Value) -> LeaseProviderPin {
+    match metadata.get("provider_pin") {
+        None => LeaseProviderPin::Absent,
+        Some(value) => match serde_json::from_value::<PluginSourcePin>(value.clone()) {
+            Ok(pin) => LeaseProviderPin::Valid(pin),
+            Err(_) => LeaseProviderPin::Invalid,
+        },
+    }
+}
+
 pub struct Orchestrator {
     pub store: Arc<Store>,
     pub root: PathBuf,
@@ -160,6 +221,9 @@ pub struct Orchestrator {
     /// 路由到租约冻结的提供器版本;None 时仅当租约 pin 与当前提供器
     /// pin 相同才放行(绝不静默顶替)。
     directory_resolver: Mutex<Option<Arc<dyn DirectoryProviderResolver>>>,
+    /// 跨 Orchestrator 合并批 owner。Store 以短租期+心跳判断是否可回收，
+    /// 新实例不得无条件重置另一个活跃实例的 `merging/resolving`。
+    merge_owner_id: String,
 }
 
 impl Orchestrator {
@@ -248,39 +312,61 @@ impl Orchestrator {
         // F4:**所有 held pin 提供器**都要恢复,不只当前提供器 ——
         // 跨版本持有的租约(旧插件版本)同样可能留有未收敛的合并痕迹;
         // 失败如实上报并保持可恢复状态,不阻塞启动(后续合并前会再试)
-        let mut recovered_pins: Vec<Option<PluginSourcePin>> = vec![routing.current_pin.clone()];
+        let mut recovered_pins: Vec<PluginSourcePin> = Vec::new();
+        // 当前提供器自身的持久痕迹始终先恢复。
+        if let Err(e) = directory.recover_interrupted() {
+            log::error!("当前执行目录提供器崩溃恢复失败(保留可恢复状态): {e:#}");
+        }
         if let Ok(held) = store.list_held_execution_leases() {
             for row in &held {
-                let pin = row
-                    .metadata_json
-                    .as_deref()
-                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
-                    .and_then(|v| {
-                        serde_json::from_value::<PluginSourcePin>(v.get("provider_pin")?.clone())
-                            .ok()
-                    });
-                if !recovered_pins.contains(&pin) {
-                    recovered_pins.push(pin);
+                let metadata = match row.metadata_json.as_deref() {
+                    Some(json) => match serde_json::from_str::<serde_json::Value>(json) {
+                        Ok(value) => value,
+                        Err(e) => {
+                            log::error!(
+                                "held 租约 `{}` metadata JSON 损坏，拒绝路由: {e}",
+                                row.lease_key
+                            );
+                            continue;
+                        }
+                    },
+                    None => serde_json::Value::Null,
+                };
+                let pin = match parse_lease_provider_pin(&metadata) {
+                    LeaseProviderPin::Valid(pin) => pin,
+                    LeaseProviderPin::Absent if !row.isolated && row.provider == "project-dir" => {
+                        continue
+                    }
+                    LeaseProviderPin::Absent => {
+                        log::error!(
+                            "隔离 held 租约 `{}` 缺少 provider pin，拒绝用当前实现恢复",
+                            row.lease_key
+                        );
+                        continue;
+                    }
+                    LeaseProviderPin::Invalid => {
+                        log::error!(
+                            "held 租约 `{}` provider pin 非法，拒绝用当前实现恢复",
+                            row.lease_key
+                        );
+                        continue;
+                    }
+                };
+                if recovered_pins.contains(&pin) || routing.current_pin.as_ref() == Some(&pin) {
+                    continue;
                 }
-            }
-        }
-        for pin in recovered_pins {
-            let provider = match &pin {
-                None => Some(directory.clone()),
-                Some(p) => match &routing.resolver {
-                    Some(r) => r.resolve(p),
-                    None if routing.current_pin.as_ref() == Some(p) => Some(directory.clone()),
+                recovered_pins.push(pin.clone());
+                let provider = match &routing.resolver {
+                    Some(r) => r.resolve(&pin),
                     None => None,
-                },
-            };
-            let Some(provider) = provider else {
-                log::error!(
-                    "held 租约的提供器 pin({pin:?})无法解析,跳过其崩溃恢复(保持可恢复状态)"
-                );
-                continue;
-            };
-            if let Err(e) = provider.recover_interrupted() {
-                log::error!("执行目录提供器(pin {pin:?})崩溃恢复失败(保留可恢复状态): {e:#}");
+                };
+                let Some(provider) = provider else {
+                    log::error!("held 租约的提供器 pin({pin:?})无法解析，保持可恢复状态");
+                    continue;
+                };
+                if let Err(e) = provider.recover_interrupted() {
+                    log::error!("执行目录提供器(pin {pin:?})崩溃恢复失败: {e:#}");
+                }
             }
         }
         let (events_tx, events_rx) = crossbeam_channel::bounded(8192);
@@ -311,6 +397,7 @@ impl Orchestrator {
             settlement_locks: Mutex::new(HashMap::new()),
             directory_resolver: Mutex::new(routing.resolver),
             directory_pin: Mutex::new(routing.current_pin),
+            merge_owner_id: format!("mfo-{}", crate::store::gen_capability_token()),
         });
         for run in &recovered {
             if let Some(t) = orch.store.task_view(run.task_id)? {
@@ -424,6 +511,27 @@ impl Orchestrator {
         }
     }
 
+    /// 多实例下本地 lease 缓存只是投影；Store 的 held 行才是行为源。
+    /// 赢家完成 release 后，败方必须及时移除陈旧门控。
+    fn reconcile_lease_cache(&self) {
+        let held = match self.store.list_held_execution_leases() {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|row| row.lease_key)
+                .collect::<HashSet<_>>(),
+            Err(e) => {
+                log::warn!("刷新 held 租约投影失败，保留本地门控: {e:#}");
+                return;
+            }
+        };
+        self.held_leases
+            .lock()
+            .retain(|_, lease| held.contains(&lease.id));
+        self.step_leases
+            .lock()
+            .retain(|_, lease| held.contains(&lease.id));
+    }
+
     // ---------- Task 生命周期 ----------
 
     pub fn create_task(&self, title: &str, goal: &str) -> Result<TaskView> {
@@ -478,7 +586,10 @@ impl Orchestrator {
     // 警告,不阻塞 —— 基线清理是尽力而为的收尾,不改变正确性)。
     fn discard_task_baselines_routed(&self, task_id: i64) {
         let mut providers: Vec<Arc<dyn ExecutionDirectoryProvider>> = vec![self.directory.clone()];
-        let mut seen_pins: Vec<Option<PluginSourcePin>> = vec![self.directory_provider_pin()];
+        let mut seen_pins: Vec<LeaseProviderPin> = vec![match self.directory_provider_pin() {
+            Some(pin) => LeaseProviderPin::Valid(pin),
+            None => LeaseProviderPin::Absent,
+        }];
         let lease_rows = self
             .store
             .list_execution_leases(task_id)
@@ -486,7 +597,9 @@ impl Orchestrator {
         for row in &lease_rows {
             let lease = lease_from_row(row);
             let pin = Self::lease_provider_pin(&lease);
-            if pin.is_none() || seen_pins.contains(&pin) {
+            if matches!(pin, LeaseProviderPin::Absent | LeaseProviderPin::Invalid)
+                || seen_pins.contains(&pin)
+            {
                 continue;
             }
             seen_pins.push(pin.clone());
@@ -650,12 +763,16 @@ impl Orchestrator {
         // 里的临时 guard 会活到块末,持锁再锁 held_leases 会死锁
         let lease = self.held_leases.lock().remove(&run_id);
         if let Some(lease) = lease {
-            self.release_lease_of_lease(&lease);
+            if let Err(e) = self.release_lease_of_lease(&lease) {
+                log::warn!("释放 run {run_id} 的租约失败: {e:#}");
+            }
             return;
         }
         if let Ok(Some(row)) = self.store.held_lease_of_run(run_id) {
             let lease = lease_from_row(&row);
-            self.release_lease_of_lease(&lease);
+            if let Err(e) = self.release_lease_of_lease(&lease) {
+                log::warn!("释放 run {run_id} 的持久租约失败: {e:#}");
+            }
         }
     }
 
@@ -1119,14 +1236,107 @@ impl Orchestrator {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
-        let leases: Vec<ExecutionLease> = rows.iter().map(|r| r.lease.clone()).collect();
-        let conflicts = self.merge_leases(&leases)?;
-        if conflicts.is_empty() {
-            for lease in &leases {
-                self.release_lease_of_run_by_key(&lease.id);
+        let batches = self.store.list_merge_batches_for_recovery()?;
+        let task_batches: Vec<_> = batches
+            .into_iter()
+            .filter(|b| b.task_id == task_id)
+            .collect();
+        anyhow::ensure!(
+            !task_batches.is_empty(),
+            "任务 {task_id} 的 pending 投影没有对应 merge batch"
+        );
+        let by_lease: HashMap<&str, &PendingMergeRow> = rows
+            .iter()
+            .map(|row| (row.lease.id.as_str(), row))
+            .collect();
+        let mut unresolved = Vec::new();
+        for batch in &task_batches {
+            let (leases, batch_rows, conflicts) = match batch.status.as_str() {
+                "merged" => {
+                    let lease_rows = self.store.latest_lease_rows_by_keys(&batch.lease_keys)?;
+                    let leases = lease_rows
+                        .iter()
+                        .filter(|row| row.status == "held")
+                        .map(lease_from_row)
+                        .collect();
+                    (leases, Vec::new(), Vec::new())
+                }
+                "needs_user" => {
+                    let batch_rows: Vec<&PendingMergeRow> = batch
+                        .lease_keys
+                        .iter()
+                        .map(|key| {
+                            by_lease.get(key.as_str()).copied().ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "批 `{}` 的 pending lease `{key}` 缺失",
+                                    batch.join_step_key
+                                )
+                            })
+                        })
+                        .collect::<Result<_>>()?;
+                    let leases: Vec<ExecutionLease> =
+                        batch_rows.iter().map(|row| row.lease.clone()).collect();
+                    let transaction_id = format!("mfr-{}", crate::store::gen_capability_token());
+                    if !self.store.claim_pending_merge_resolution(
+                        task_id,
+                        &batch.join_step_key,
+                        batch.revision_id,
+                        &transaction_id,
+                        &self.merge_owner_id,
+                    )? {
+                        anyhow::bail!(
+                            "任务 {task_id} 的批 `{}` 正由另一个实例处理，请稍后重试",
+                            batch.join_step_key
+                        );
+                    }
+                    let _heartbeat = MergeOwnerHeartbeat::start(
+                        self.store.clone(),
+                        transaction_id.clone(),
+                        self.merge_owner_id.clone(),
+                    )?;
+                    let conflicts = match self.merge_leases(&leases) {
+                        Ok(conflicts) => conflicts,
+                        Err(e) => vec![format!("汇合执行失败: {e:#}")],
+                    };
+                    self.store.complete_pending_merge_resolution(
+                        &transaction_id,
+                        &self.merge_owner_id,
+                        &conflicts,
+                    )?;
+                    (leases, batch_rows, conflicts)
+                }
+                other => anyhow::bail!("待决批 `{}` 状态非法:{other}", batch.join_step_key),
+            };
+            if !conflicts.is_empty() {
+                for row in &batch_rows {
+                    self.store
+                        .update_pending_merge_conflicts(row.id, &conflicts)?;
+                }
+                unresolved.extend(conflicts);
+                continue;
             }
-            self.store.clear_pending_merges(task_id)?;
-            self.pending_merges.lock().remove(&task_id);
+            let mut release_errors = Vec::new();
+            for lease in &leases {
+                if let Err(e) = self.release_lease_of_run_by_key(&lease.id) {
+                    release_errors.push(format!("{}: {e:#}", lease.id));
+                }
+            }
+            if !release_errors.is_empty() {
+                self.refresh_pending_merge_cache(task_id)?;
+                anyhow::bail!(
+                    "待决汇合已应用，但租约释放未完成；保持 needs-you 可重试: {}",
+                    release_errors.join("; ")
+                );
+            }
+            self.store.finish_resolved_merge_batch(
+                task_id,
+                &batch.join_step_key,
+                batch.revision_id,
+                &batch.lease_keys,
+            )?;
+        }
+        let remaining = self.refresh_pending_merge_cache(task_id)?;
+        if remaining.is_empty() {
             // 待决清除后恢复调度(不能只做收敛检查):重新计算就绪步骤,
             // 注意力全部消除 → 任务回 Running,下游继续自动派发
             if let Some(rev) = self.store.active_revision(task_id)? {
@@ -1149,15 +1359,20 @@ impl Orchestrator {
                 }
             }
             self.check_convergence(task_id)?;
-        } else {
-            // 仍有冲突:刷新持久化冲突列表,租约继续持有等待再次处理
-            for row in &rows {
-                self.store
-                    .update_pending_merge_conflicts(row.id, &conflicts)?;
-            }
-            self.pending_merges.lock().insert(task_id, leases);
         }
-        Ok(conflicts)
+        Ok(unresolved)
+    }
+
+    fn refresh_pending_merge_cache(&self, task_id: i64) -> Result<Vec<PendingMergeRow>> {
+        let rows = self.store.list_pending_merges(Some(task_id))?;
+        if rows.is_empty() {
+            self.pending_merges.lock().remove(&task_id);
+        } else {
+            self.pending_merges
+                .lock()
+                .insert(task_id, rows.iter().map(|row| row.lease.clone()).collect());
+        }
+        Ok(rows)
     }
 
     /// 任务当前的待决汇合冲突(持久化行投影;Run Monitor 展示用)。
@@ -1216,7 +1431,13 @@ impl Orchestrator {
                 self.held_leases.lock().insert(run_id, lease);
             }
         }
-        let deferrals = self.store.list_join_deferrals(None).unwrap_or_default();
+        let deferrals = match self.store.list_join_deferrals(None) {
+            Ok(rows) => rows,
+            Err(e) => {
+                log::error!("重启恢复 join 暂缓失败，保留持久状态: {e:#}");
+                return;
+            }
+        };
         let stale: Vec<String> = deferrals
             .iter()
             .filter(|d| !self.step_leases.lock().values().any(|l| l.id == d.lease.id))
@@ -1227,9 +1448,10 @@ impl Orchestrator {
                 log::warn!("清理失效 join 暂缓行失败: {e:#}");
             }
         }
-        // 崩溃窗口中领取者消失:遗留的 merging 批重置为 ready,可重冲
-        if let Err(e) = self.store.reset_merging_batches() {
-            log::warn!("重置遗留 merging 批失败: {e:#}");
+        // 只回收租期已过期的 owner；另一个活跃实例的新鲜批绝不能抢。
+        match self.store.reset_expired_merge_batches() {
+            Ok(reclaim_tasks) => tasks.extend(reclaim_tasks),
+            Err(e) => log::warn!("回收过期合并批失败: {e:#}"),
         }
         // F2:合并后处理阶段恢复 ——
         // - merged(provider 已应用)但租约未释放 → 只补释放,不再 merge;
@@ -1257,10 +1479,25 @@ impl Orchestrator {
             match batch.status.as_str() {
                 "merged" => {
                     // 提供器已应用:补齐租约释放(C7 按租约 pin 路由)
-                    let held = self
-                        .store
-                        .held_lease_rows_by_keys(&batch.lease_keys)
-                        .unwrap_or_default();
+                    let all = match self.store.latest_lease_rows_by_keys(&batch.lease_keys) {
+                        Ok(rows) => rows,
+                        Err(e) => {
+                            log::error!("恢复 merged 批读取租约失败，保持原阶段: {e:#}");
+                            continue;
+                        }
+                    };
+                    let held: Vec<_> = all
+                        .iter()
+                        .filter(|row| row.status == "held")
+                        .cloned()
+                        .collect();
+                    if all
+                        .iter()
+                        .any(|row| row.status != "held" && row.status != "released")
+                    {
+                        log::error!("恢复 merged 批遇到非法租约阶段，保持原状态: {all:?}");
+                        continue;
+                    }
                     if !held.is_empty() {
                         log::warn!(
                             "恢复:批 `{}`({} 个租约)provider 已应用但未释放,补释放",
@@ -1271,31 +1508,9 @@ impl Orchestrator {
                     let mut failed = false;
                     for row in &held {
                         let lease = lease_from_row(row);
-                        match self.lease_provider(&lease) {
-                            Some(provider) => {
-                                if let Err(e) = provider.release(&lease) {
-                                    log::error!(
-                                        "恢复释放租约 `{}` 失败(下次启动重试): {e:#}",
-                                        lease.id
-                                    );
-                                    failed = true;
-                                    continue;
-                                }
-                                if let Err(e) = self.store.release_execution_lease(&lease.id) {
-                                    log::error!("恢复释放租约 `{}` 落库失败: {e:#}", lease.id);
-                                    failed = true;
-                                    continue;
-                                }
-                                self.held_leases.lock().retain(|_, l| l.id != lease.id);
-                                self.step_leases.lock().retain(|_, l| l.id != lease.id);
-                            }
-                            None => {
-                                log::error!(
-                                    "恢复:租约 `{}` 的提供器 pin 无法解析,保持持有待下次启动",
-                                    lease.id
-                                );
-                                failed = true;
-                            }
+                        if let Err(e) = self.release_lease_of_lease(&lease) {
+                            log::error!("恢复释放租约 `{}` 失败(保留批阶段): {e:#}", lease.id);
+                            failed = true;
                         }
                     }
                     if !failed {
@@ -1310,15 +1525,25 @@ impl Orchestrator {
                 }
                 "needs_user" => {
                     // 冲突已判定:重建投影(pending 行 + needs-you)
-                    let existing: HashSet<String> = self
-                        .store
-                        .list_pending_merges(Some(batch.task_id))
-                        .map(|rows| rows.into_iter().map(|r| r.lease.id).collect())
-                        .unwrap_or_default();
-                    let held = self
-                        .store
-                        .held_lease_rows_by_keys(&batch.lease_keys)
-                        .unwrap_or_default();
+                    let existing: HashSet<String> =
+                        match self.store.list_pending_merges(Some(batch.task_id)) {
+                            Ok(rows) => rows.into_iter().map(|r| r.lease.id).collect(),
+                            Err(e) => {
+                                log::error!("恢复 needs_user 批读取投影失败，保持原阶段: {e:#}");
+                                continue;
+                            }
+                        };
+                    let held = match self.store.latest_lease_rows_by_keys(&batch.lease_keys) {
+                        Ok(rows) if rows.iter().all(|row| row.status == "held") => rows,
+                        Ok(rows) => {
+                            log::error!("needs_user 批租约不再全部 held，拒绝错误投影: {rows:?}");
+                            continue;
+                        }
+                        Err(e) => {
+                            log::error!("恢复 needs_user 批读取租约失败，保持原阶段: {e:#}");
+                            continue;
+                        }
+                    };
                     let mut projected = Vec::new();
                     for row in &held {
                         if existing.contains(&row.lease_key) {
@@ -1419,12 +1644,8 @@ impl Orchestrator {
     }
 
     /// 租约 metadata 里的提供器 pin(dispatch 时冻结;旧租约可能无)。
-    fn lease_provider_pin(lease: &ExecutionLease) -> Option<PluginSourcePin> {
-        lease
-            .metadata
-            .get("provider_pin")
-            .cloned()
-            .and_then(|v| serde_json::from_value(v).ok())
+    fn lease_provider_pin(lease: &ExecutionLease) -> LeaseProviderPin {
+        parse_lease_provider_pin(&lease.metadata)
     }
 
     /// C7 提供器路由:按租约冻结的完整 pin 解析提供器 ——
@@ -1442,9 +1663,25 @@ impl Orchestrator {
             // F4 三态之 Absent:只放行**非隔离**的内核默认共享目录
             //(project-dir 语义);隔离提供器(worktree/worker)下无法
             // 归属租约版本 → None(NeedsYou),绝不静默顶替
-            None if !self.directory.isolates() => Some(self.directory.clone()),
-            None => None,
-            Some(lease_pin) => {
+            LeaseProviderPin::Absent
+                if !lease.isolated
+                    && lease.provider == "project-dir"
+                    && !self.directory.isolates() =>
+            {
+                Some(self.directory.clone())
+            }
+            LeaseProviderPin::Absent | LeaseProviderPin::Invalid => None,
+            LeaseProviderPin::Valid(lease_pin) => {
+                let contribution_matches = !lease_pin.contribution_id.is_empty()
+                    && (lease_pin.contribution_id == lease.provider
+                        || lease_pin
+                            .contribution_id
+                            .rsplit('.')
+                            .next()
+                            .is_some_and(|id| id == lease.provider));
+                if !contribution_matches {
+                    return None;
+                }
                 let resolver = self.directory_resolver.lock().clone();
                 match resolver {
                     Some(r) => r.resolve(&lease_pin),
@@ -1504,7 +1741,7 @@ impl Orchestrator {
         })
     }
 
-    fn release_lease_of_run_by_key(&self, lease_id: &str) {
+    fn release_lease_of_run_by_key(&self, lease_id: &str) -> Result<()> {
         // 先取出并释放锁(if let 条件里的临时 guard 会活到块末,持锁再锁会死锁)
         let lease = self
             .held_leases
@@ -1513,42 +1750,38 @@ impl Orchestrator {
             .find(|l| l.id == lease_id)
             .cloned();
         if let Some(lease) = lease {
-            self.release_lease_of_lease(&lease);
-            return;
+            return self.release_lease_of_lease(&lease);
         }
         // 重启恢复的待决汇合不在内存映射:按租约键从数据库兜底
         if let Ok(Some(row)) = self.store.held_lease_by_key(lease_id) {
             let lease = lease_from_row(&row);
-            self.release_lease_of_lease(&lease);
+            return self.release_lease_of_lease(&lease);
         }
+        Ok(())
     }
 
     /// 释放具体租约对象(进程内映射 + 数据库行 + join 暂缓行)。
     /// C7:按租约 pin 路由到对应提供器;pin 无法解析时保持持有并
     /// 把任务转 needs-you(绝不用当前提供器顶替释放旧版本租约)。
-    fn release_lease_of_lease(&self, lease: &ExecutionLease) {
+    fn release_lease_of_lease(&self, lease: &ExecutionLease) -> Result<()> {
         let routed = self.lease_provider(lease);
         match routed {
             Some(provider) => {
                 // F4:release 成功后才标 released/清内存 —— 提供器释放
                 // 失败时租约保持 held(可重试;启动恢复按 merged 批补释放),
                 // 绝不谎报已释放
-                if let Err(e) = provider.release(lease) {
-                    log::warn!(
-                        "释放执行租约 `{}` 失败(保持持有,恢复/重试补释放): {e:#}",
-                        lease.id
-                    );
-                    return;
-                }
-                if let Err(e) = self.store.release_execution_lease(&lease.id) {
-                    log::error!("释放租约 `{}` 落库失败: {e:#}", lease.id);
-                    return;
-                }
+                provider.release(lease).with_context(|| {
+                    format!("释放执行租约 `{}` 失败(保持持有,恢复/重试补释放)", lease.id)
+                })?;
+                self.store
+                    .release_execution_lease(&lease.id)
+                    .with_context(|| format!("释放租约 `{}` 落库失败", lease.id))?;
                 let _ = self
                     .store
                     .delete_join_deferrals_for_leases(&[lease.id.clone()]);
                 self.held_leases.lock().retain(|_, l| l.id != lease.id);
                 self.step_leases.lock().retain(|_, l| l.id != lease.id);
+                Ok(())
             }
             None => {
                 log::error!(
@@ -1568,6 +1801,11 @@ impl Orchestrator {
                         }
                     }
                 }
+                anyhow::bail!(
+                    "租约 `{}` 的提供器 pin({:?})无法解析",
+                    lease.id,
+                    Self::lease_provider_pin(lease)
+                )
             }
         }
     }
@@ -1984,7 +2222,9 @@ impl Orchestrator {
             return;
         };
         if !lease.isolated {
-            self.release_lease_of_lease(&lease);
+            if let Err(e) = self.release_lease_of_lease(&lease) {
+                log::warn!("释放共享目录租约失败: {e:#}");
+            }
             return;
         }
         let Some((steps, me_id)) = self.active_steps_of_run(run) else {
@@ -2137,6 +2377,7 @@ impl Orchestrator {
                 step_key,
                 revision_id,
                 &transaction_id,
+                &self.merge_owner_id,
             )
         } else {
             self.store.claim_join_merge_batch(
@@ -2145,6 +2386,7 @@ impl Orchestrator {
                 revision_id,
                 &caller_keys,
                 &transaction_id,
+                &self.merge_owner_id,
             )
         };
         let authoritative = match claim {
@@ -2165,16 +2407,24 @@ impl Orchestrator {
                 return;
             }
             Ok(crate::store::JoinMergeClaim::Taken) => {
-                // 其他领取者(线程/实例)负责本批:清理本进程内存映射,
-                // 避免陈旧租约继续阻塞 join 下游派发
-                for lease in &leases {
-                    self.held_leases.lock().retain(|_, l| l.id != lease.id);
-                    self.step_leases.lock().retain(|_, l| l.id != lease.id);
-                }
+                // 其他实例负责本批。以 DB held 状态刷新本地缓存：合并
+                // 尚未完成时继续门控下游，赢家释放后下一 tick 自动清除。
+                self.reconcile_lease_cache();
                 return;
             }
             Err(e) => {
                 log::error!("领取合并批失败(保持持有待重试): {e:#}");
+                return;
+            }
+        };
+        let _owner_heartbeat = match MergeOwnerHeartbeat::start(
+            self.store.clone(),
+            transaction_id.clone(),
+            self.merge_owner_id.clone(),
+        ) {
+            Ok(guard) => guard,
+            Err(e) => {
+                log::error!("启动合并批独立 owner 心跳失败，保持批可恢复: {e:#}");
                 return;
             }
         };
@@ -2188,19 +2438,74 @@ impl Orchestrator {
             Err(e) => vec![format!("汇合执行失败: {e:#}")],
         };
         if conflicts.is_empty() {
-            if let Err(e) = self.store.complete_merge_batch(&transaction_id, false, &[]) {
-                log::error!("合并批结论回写失败(批状态可能停留 merging,启动恢复会重置): {e:#}");
+            if let Err(e) =
+                self.store
+                    .complete_merge_batch(&transaction_id, &self.merge_owner_id, false, &[])
+            {
+                log::error!("合并批结论回写失败，停止后处理并保持租约 held: {e:#}");
+                return;
             }
+            let mut release_failed: Vec<(ExecutionLease, String)> = Vec::new();
             for lease in &authoritative {
-                self.release_lease_of_lease(lease);
+                if let Err(e) = self.release_lease_of_lease(lease) {
+                    log::error!("合并后释放租约 `{}` 失败，批保持 merged: {e:#}", lease.id);
+                    release_failed.push((lease.clone(), format!("{e:#}")));
+                }
+            }
+            if release_failed.is_empty() {
+                if let Err(e) =
+                    self.store
+                        .mark_merge_batch_released(task_id, join_step_key, revision_id)
+                {
+                    log::error!("合并批推进 released 失败，将由恢复补齐: {e:#}");
+                }
+            } else {
+                let reasons: Vec<String> = release_failed
+                    .iter()
+                    .map(|(lease, error)| {
+                        format!("租约 `{}` 汇合已应用但释放失败:{error}", lease.id)
+                    })
+                    .collect();
+                let mut projected = Vec::new();
+                for (lease, _) in &release_failed {
+                    match self.store.insert_pending_merge(task_id, lease, &reasons) {
+                        Ok(_) => projected.push(lease.clone()),
+                        Err(e) => log::error!("持久化 release 失败 attention 失败: {e:#}"),
+                    }
+                }
+                if !projected.is_empty() {
+                    self.pending_merges
+                        .lock()
+                        .entry(task_id)
+                        .or_default()
+                        .extend(projected);
+                }
+                if let Some(t) = self.store.task_view(task_id).ok().flatten() {
+                    if !t.status.terminal() {
+                        if let Some(t) = self
+                            .store
+                            .set_task_status(t.id, TaskStatus::NeedsYou)
+                            .ok()
+                            .flatten()
+                        {
+                            self.store.set_task_unread(t.id, true).ok();
+                            self.emit(SchedulerEvent::TaskUpdated(t));
+                        }
+                    }
+                }
+                self.emit(SchedulerEvent::Log {
+                    run_id: trigger_run,
+                    text: reasons.join("\n"),
+                });
             }
             return;
         }
-        if let Err(e) = self
-            .store
-            .complete_merge_batch(&transaction_id, true, &conflicts)
+        if let Err(e) =
+            self.store
+                .complete_merge_batch(&transaction_id, &self.merge_owner_id, true, &conflicts)
         {
-            log::error!("合并批结论回写失败(批状态可能停留 merging,启动恢复会重置): {e:#}");
+            log::error!("合并批 needs_user 结论回写失败，停止投影并保持租约 held: {e:#}");
+            return;
         }
         // 冲突持久化(重启后仍可恢复:任务保持 needs-you,租约保持持有)
         for lease in &authoritative {
@@ -2634,6 +2939,13 @@ impl Orchestrator {
     // ---------- 调度 ----------
 
     fn tick(&self) -> Result<()> {
+        self.store.heartbeat_merge_owner(&self.merge_owner_id)?;
+        let reclaimed = self.store.reset_expired_merge_batches()?;
+        for task_id in reclaimed {
+            self.flush_completed_join_batches(task_id);
+            self.flush_settled_single_leases(task_id);
+        }
+        self.reconcile_lease_cache();
         let running_count = {
             let active = self.active_dispatches.lock();
             active.len()
@@ -2898,16 +3210,15 @@ impl Orchestrator {
         if let Some(pin) = self.directory_provider_pin() {
             if lease.metadata.get("provider_pin").is_none() {
                 if let Some(obj) = lease.metadata.as_object_mut() {
-                    obj.insert(
-                        "provider_pin".into(),
-                        serde_json::json!({
-                            "full_id": pin.full_id,
-                            "version": pin.version,
-                            "content_hash": pin.content_hash,
-                        }),
-                    );
+                    obj.insert("provider_pin".into(), serde_json::to_value(&pin)?);
                 }
             }
+        }
+        if let Err(e) = self.directory.validate_for_use(&lease) {
+            self.step_leases.lock().remove(&step.id);
+            let _ = self.directory.release(&lease);
+            self.settle_dispatch_failure(&run, format!("执行目录身份复验失败: {e:#}"));
+            return Ok(());
         }
         if let Err(e) = self
             .store

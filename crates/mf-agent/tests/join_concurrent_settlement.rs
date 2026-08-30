@@ -126,7 +126,7 @@ fn merge_batch_state_is_persisted_and_recovered_on_restart() {
     let batches = fx.orch.store.list_merge_batches(task.id).unwrap();
     assert_eq!(batches.len(), 1, "join 批持久化恰好一行: {batches:?}");
     assert_eq!(batches[0].join_step_key, "j");
-    assert_eq!(batches[0].status, "merged");
+    assert_eq!(batches[0].status, "released");
     assert_eq!(batches[0].lease_keys.len(), 2);
 
     // 模拟崩溃窗口:手动把批置回 merging,重启恢复必须重置为 ready

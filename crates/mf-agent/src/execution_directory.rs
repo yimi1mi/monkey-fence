@@ -61,6 +61,11 @@ pub trait ExecutionDirectoryProvider: Send + Sync {
     fn merge(&self, leases: &[ExecutionLease]) -> Result<MergeOutcome>;
     /// 释放租约(终态结算/取消后;未知状态保持持有)。
     fn release(&self, lease: &ExecutionLease) -> Result<()>;
+    /// 在每个真实使用点（启动/merge/release）复验租约身份。需要绑定
+    /// 目录对象身份的第三方 provider 应覆盖；默认内置实现无需额外状态。
+    fn validate_for_use(&self, _lease: &ExecutionLease) -> Result<()> {
+        Ok(())
+    }
     /// 任务终态(成功/取消/归档)后丢弃该任务的集成基线等持久痕迹。
     /// 默认无操作(不维护基线的提供器)。
     fn discard_task_baselines(&self, task_id: i64) -> Result<()> {

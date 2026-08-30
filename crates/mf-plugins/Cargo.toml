@@ -13,6 +13,7 @@ toml.workspace = true
 chrono.workspace = true
 parking_lot.workspace = true
 libc = "0.2"
+errno.workspace = true
 dirs.workspace = true
 sha2 = "0.10"
 aes-gcm.workspace = true

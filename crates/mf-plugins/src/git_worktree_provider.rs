@@ -43,6 +43,11 @@ pub(crate) enum MergeFault {
     /// 应用前暂停(测试注入:模拟 snapshot→apply 窗口内的并发用户编辑;
     /// 测试清掉 fault 后继续)。
     WaitBeforeApply,
+    /// CAS 已读取当前内容、尚未执行替换时暂停；仅用于证明 read→rename
+    /// 窗口内的用户编辑不会被覆盖。
+    WaitAfterCasRead,
+    /// 幂等原子验证已把 name 移到 verify 后模拟进程死亡。
+    CrashAfterVerifyMove,
 }
 
 pub struct GitWorktreeProvider {
@@ -365,10 +370,8 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
         //    逐文件 CAS 检测到用户窗口内编辑 → 整体回滚 + NeedsUser。
         match self.apply_journal_with_rollback(&journal) {
             ApplyOutcome::Applied => {
-                // 应用已成功:日志清理由幂等恢复兜底(重放安全),
-                // 清理失败不谎报合并失败
-                let _ = std::fs::remove_file(&journal_path);
-                let _ = sync_dir_of(&journal_path);
+                remove_journal_file(&repo, &journal_file_name)
+                    .context("合并已应用，但事务日志清理/目录同步失败；保留租约待恢复确认")?;
                 Ok(MergeOutcome::Merged)
             }
             ApplyOutcome::Crashed(msg) => Err(anyhow::anyhow!("(测试注入){msg}")),
@@ -381,13 +384,12 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
                 if let Err(ref_err) =
                     git.reset_integration_ref(&refname, ref_before, Some(advanced))
                 {
-                    let _ = std::fs::remove_file(&journal_path);
                     return Err(anyhow::anyhow!(
-                        "用户编辑冲突且回滚集成 ref 失败(项目目录已回滚): {ref_err:#}"
+                        "用户编辑冲突且回滚集成 ref 失败(事务日志保留): {ref_err:#}"
                     ));
                 }
-                let _ = std::fs::remove_file(&journal_path);
-                let _ = sync_dir_of(&journal_path);
+                remove_journal_file(&repo, &journal_file_name)
+                    .context("用户冲突已回滚，但事务日志清理失败")?;
                 Ok(MergeOutcome::NeedsUser { conflicts })
             }
             ApplyOutcome::UserConflict {
@@ -412,7 +414,8 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
                         "合并应用失败且回滚集成 ref 失败(已保留合并事务日志,恢复将重放): {ref_err:#}"
                     )));
                 }
-                let _ = std::fs::remove_file(&journal_path);
+                remove_journal_file(&repo, &journal_file_name)
+                    .context("应用失败已回滚，但事务日志清理失败")?;
                 Err(error.context("合并应用失败,项目目录与集成 ref 已回滚"))
             }
             ApplyOutcome::Failed {
@@ -634,13 +637,20 @@ fn write_journal_atomic(
         .with_context(|| format!("写入事务日志失败: {file_name}"))
 }
 
-/// 目录 fsync(让其中刚创建/改名/删除的目录项掉电后可见)。
-/// F12:错误如实传播 —— 持久化边界的同步失败不得静默吞掉。
-fn sync_dir_of(file: &std::path::Path) -> Result<()> {
-    match file.parent() {
-        Some(parent) => crate::fs_atomic::sync_dir(parent).map(|_| ()),
-        None => Ok(()),
-    }
+fn open_journal_dir(repo: &git2::Repository, create: bool) -> Result<crate::fs_safe::SafeDir> {
+    let git_root = repo.path().to_path_buf();
+    crate::fs_safe::SafeDir::open_root(&git_root)
+        .with_context(|| format!("打开 .git 失败: {}", git_root.display()))?
+        .child(JOURNAL_DIR, create)
+        .context("打开事务日志目录失败(符号链接/junction/reparse 一律拒绝)")
+}
+
+fn remove_journal_file(repo: &git2::Repository, file_name: &str) -> Result<()> {
+    let dir = open_journal_dir(repo, false)?;
+    dir.remove_file(file_name)
+        .with_context(|| format!("删除事务日志失败: {file_name}"))?;
+    dir.sync()
+        .with_context(|| format!("同步事务日志目录失败: {file_name}"))
 }
 
 /// C6:校验事务日志/合并的变更路径 —— 纯 relative、全 Normal 分量
@@ -717,19 +727,214 @@ impl GitWorktreeProvider {
         }
     }
 
-    /// F6:变更路径的句柄相对原子写入(必要时建立缺失父目录;
-    /// 唯一随机临时名 + 句柄相对替换 + 文件/目录双重落盘)。
-    fn write_change_atomic(&self, rel: &str, content: &[u8]) -> Result<()> {
-        validate_change_path(&self.repo_root, rel)?;
-        let (dir, name) = crate::fs_safe::open_parent_for(&self.repo_root, rel, true)?;
-        dir.write_file(&name, content)
+    fn atomically_verify_entry(
+        &self,
+        dir: &crate::fs_safe::SafeDir,
+        name: &str,
+        verify_name: &str,
+        expected: Option<&[u8]>,
+    ) -> Result<bool> {
+        let sentinel = format!("mf-cas-absence-sentinel-{verify_name}");
+        if expected.is_none() && !dir.write_file_if_absent(name, sentinel.as_bytes())? {
+            return Ok(false);
+        }
+        let moved = match dir.rename_noreplace(name, verify_name) {
+            Ok(moved) => moved,
+            Err(e) if error_is_path_absent(&e) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        anyhow::ensure!(moved, "CAS 验证临时名已存在:{verify_name}");
+        if self.current_fault() == Some(MergeFault::CrashAfterVerifyMove) {
+            anyhow::bail!("(测试注入)目录项移入 verify 后进程死亡");
+        }
+        let captured = dir
+            .read_file(verify_name)?
+            .context("CAS 验证文件原子取走后消失")?;
+        let matches = expected.map_or(captured == sentinel.as_bytes(), |bytes| captured == bytes);
+        if matches && expected.is_none() {
+            dir.remove_file(verify_name)?;
+            dir.sync()?;
+            return Ok(true);
+        }
+        match dir.rename_noreplace(verify_name, name)? {
+            true => Ok(matches),
+            false if matches => {
+                // 用户已占回目标名；captured 只是 desired/sentinel，不覆盖用户。
+                dir.remove_file(verify_name)?;
+                dir.sync()?;
+                Ok(false)
+            }
+            false => anyhow::bail!(
+                "CAS 验证捕获用户字节后目标名又被占用；保留 `{verify_name}` 待人工处理"
+            ),
+        }
     }
 
-    /// F6:变更路径的句柄相对删除(终句柄 reparse 验证)。
-    fn remove_change_file(&self, rel: &str) -> Result<()> {
+    fn recover_verify_artifact(
+        &self,
+        dir: &crate::fs_safe::SafeDir,
+        name: &str,
+        verify_name: &str,
+        desired: Option<&[u8]>,
+    ) -> Result<Option<bool>> {
+        let sentinel = format!("mf-cas-absence-sentinel-{verify_name}");
+        let mut current = dir.read_file(name)?;
+        let mut captured = dir.read_file(verify_name)?;
+        if captured.is_none() && current.as_deref() == Some(sentinel.as_bytes()) {
+            anyhow::ensure!(
+                dir.rename_noreplace(name, verify_name)?,
+                "恢复 absence verify 时临时名已被占用"
+            );
+            captured = dir.read_file(verify_name)?;
+            current = None;
+        }
+        let Some(captured) = captured else {
+            return Ok(None);
+        };
+        match desired {
+            Some(bytes) if captured == bytes => {
+                anyhow::ensure!(
+                    current.is_none(),
+                    "verify 崩溃恢复时目标名已被外部占用；保留 verify 待人工处理"
+                );
+                anyhow::ensure!(
+                    dir.rename_noreplace(verify_name, name)?,
+                    "恢复 verify 目标名失败"
+                );
+                Ok(Some(true))
+            }
+            None if captured == sentinel.as_bytes() => {
+                dir.remove_file(verify_name)?;
+                dir.sync()?;
+                Ok(Some(current.is_none()))
+            }
+            _ if current.is_none() => {
+                anyhow::ensure!(
+                    dir.rename_noreplace(verify_name, name)?,
+                    "恢复 verify 捕获的用户字节失败"
+                );
+                Ok(Some(false))
+            }
+            _ => anyhow::bail!(
+                "verify 捕获用户字节后目标名又被占用；保留 `{verify_name}` 待人工处理"
+            ),
+        }
+    }
+
+    /// 目录项级内容 CAS。现有文件先被原子移到事务独占备份名，再校验
+    /// 备份字节；结果只以“不覆盖”方式安装。用户在任一窗口创建第三态
+    /// 时返回 false 且保留用户路径内容。
+    fn compare_exchange_change(
+        &self,
+        rel: &str,
+        expected: Option<&[u8]>,
+        desired: Option<&[u8]>,
+        transaction_id: &str,
+    ) -> Result<bool> {
+        use sha2::{Digest as _, Sha256};
         validate_change_path(&self.repo_root, rel)?;
-        let (dir, name) = crate::fs_safe::open_parent_for(&self.repo_root, rel, false)?;
-        dir.remove_file(&name)
+        let create_parent = expected.is_none() && desired.is_some();
+        let (dir, name) = match crate::fs_safe::open_parent_for(&self.repo_root, rel, create_parent)
+        {
+            Ok(pair) => pair,
+            Err(e) if expected.is_none() && error_is_path_absent(&e) => {
+                return Ok(desired.is_none())
+            }
+            Err(e) => return Err(e),
+        };
+        let mut h = Sha256::new();
+        h.update(transaction_id.as_bytes());
+        h.update([0]);
+        h.update(name.as_bytes());
+        let digest = h.finalize();
+        let backup = format!(
+            ".mfcas-{}",
+            digest[..16]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        let verify_name = format!(
+            ".mfverify-{}",
+            digest[16..]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+
+        let mut backup_present = dir.read_file(&backup)?;
+        if let Some(recovered) = self.recover_verify_artifact(&dir, &name, &verify_name, desired)? {
+            if recovered && backup_present.is_some() {
+                dir.remove_file(&backup)?;
+                dir.sync()?;
+            }
+            return Ok(recovered);
+        }
+        let current = dir.read_file(&name)?;
+        while self.current_fault() == Some(MergeFault::WaitAfterCasRead) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if backup_present.is_none() && current.as_deref() == desired {
+            return self.atomically_verify_entry(&dir, &name, &verify_name, desired);
+        }
+        if let Some(saved) = backup_present.as_deref() {
+            if expected != Some(saved) {
+                if dir.rename_noreplace(&backup, &name)? {
+                    return Ok(false);
+                }
+                anyhow::bail!(
+                    "CAS 捕获到窗口内编辑且目标名又被占用({rel});保留备份 `{backup}` 待人工处理"
+                );
+            }
+            if current.as_deref() == desired {
+                // 崩溃发生在结果安装后、备份清理前：先原子复验结果，
+                // 验证通过才补清理原始备份。
+                if self.atomically_verify_entry(&dir, &name, &verify_name, desired)? {
+                    dir.remove_file(&backup)?;
+                    dir.sync()?;
+                    return Ok(true);
+                }
+                return Ok(false);
+            }
+        } else if expected.is_some() {
+            if current.as_deref() != expected {
+                return Ok(false);
+            }
+            anyhow::ensure!(
+                dir.rename_noreplace(&name, &backup)?,
+                "CAS 备份名意外已存在({backup})"
+            );
+            backup_present = dir.read_file(&backup)?;
+            if backup_present.as_deref() != expected {
+                if dir.rename_noreplace(&backup, &name)? {
+                    return Ok(false);
+                }
+                anyhow::bail!(
+                    "CAS 捕获到窗口内编辑且目标名又被占用({rel});保留备份 `{backup}` 待人工处理"
+                );
+            }
+        } else if current.is_some() {
+            return Ok(false);
+        }
+
+        let installed = match desired {
+            Some(bytes) => dir.write_file_if_absent(&name, bytes)?,
+            None => dir.read_file(&name)?.is_none(),
+        };
+        if !installed {
+            // 用户赢得目标名；不覆盖。expected 的旧字节已由 journal/Git
+            // 记录，删除事务备份，冲突交给上层 NeedsUser。
+            if backup_present.is_some() {
+                dir.remove_file(&backup)?;
+                dir.sync()?;
+            }
+            return Ok(false);
+        }
+        if backup_present.is_some() {
+            dir.remove_file(&backup)?;
+        }
+        dir.sync()?;
+        Ok(true)
     }
 }
 
@@ -787,7 +992,7 @@ impl GitWorktreeProvider {
         let mut applied: Vec<&JournaledChange> = Vec::new();
         let outcome = (|| -> Step {
             for change in &journal.changes {
-                match self.apply_one(change) {
+                match self.apply_one(&journal.transaction_id, change) {
                     Ok(()) => {}
                     Err(ApplyOneError::Conflict(c)) => return Step::Conflict(vec![c]),
                     Err(ApplyOneError::Error(e)) => return Step::Fail(e),
@@ -808,7 +1013,7 @@ impl GitWorktreeProvider {
         if rollback_of(&outcome) {
             let mut failures: Vec<String> = Vec::new();
             for change in applied.iter().rev() {
-                if let Err(e) = self.rollback_one(change) {
+                if let Err(e) = self.rollback_one(&journal.transaction_id, change) {
                     failures.push(format!("{}: {e:#}", change.path));
                 }
             }
@@ -857,159 +1062,73 @@ impl GitWorktreeProvider {
     /// - 写入经同目录唯一临时文件 + flush/fsync + 原子 rename,
     ///   失败时目标保持原状(无部分写);
     /// - 删除只在现状等于原状态时执行(已被用户改动 → Conflict)。
-    fn apply_one(&self, change: &JournaledChange) -> std::result::Result<(), ApplyOneError> {
+    fn apply_one(
+        &self,
+        transaction_id: &str,
+        change: &JournaledChange,
+    ) -> std::result::Result<(), ApplyOneError> {
         let original: Option<Vec<u8>> = change
             .original_hex
             .as_deref()
             .map(hex_decode)
             .transpose()
             .map_err(ApplyOneError::Error)?;
-        if change.deleted {
-            match self
-                .read_change_current(&change.path)
-                .map_err(ApplyOneError::Error)?
-            {
-                Some(bytes) => {
-                    if change.original_present && Some(bytes) == original {
-                        self.remove_change_file(&change.path)
-                            .with_context(|| format!("合并删除失败: {}", change.path))
-                            .map_err(ApplyOneError::Error)?;
-                    } else if !change.original_present {
-                        return Err(ApplyOneError::Conflict(format!(
-                            "{}(应用前不存在,现已被外部创建,拒绝删除)",
-                            change.path
-                        )));
-                    } else {
-                        return Err(ApplyOneError::Conflict(format!(
-                            "{}(应用后被用户修改,拒绝删除)",
-                            change.path
-                        )));
-                    }
-                }
-                None if !change.original_present => {} // 本就不存在,删除 no-op
-                None => {
-                    return Err(ApplyOneError::Conflict(format!(
-                        "{}(应用前存在、现已被删除,拒绝盲目处理)",
-                        change.path
-                    )))
-                }
-            }
-            return Ok(());
-        }
-        let content = change
-            .content_hex
-            .as_deref()
-            .map(hex_decode)
-            .transpose()
-            .map_err(ApplyOneError::Error)?
-            .expect("非删除变更的内容已在收集阶段读出");
+        let content = if change.deleted {
+            None
+        } else {
+            Some(
+                change
+                    .content_hex
+                    .as_deref()
+                    .map(hex_decode)
+                    .transpose()
+                    .map_err(ApplyOneError::Error)?
+                    .expect("非删除变更的内容已在收集阶段读出"),
+            )
+        };
         match self
-            .read_change_current(&change.path)
+            .compare_exchange_change(
+                &change.path,
+                original.as_deref(),
+                content.as_deref(),
+                transaction_id,
+            )
             .map_err(ApplyOneError::Error)?
         {
-            // 已是目标内容:幂等重试,跳过
-            Some(bytes) if bytes == *content => return Ok(()),
-            // 现状 == 快照原状态:CAS 通过,执行原子替换
-            Some(bytes) if change.original_present && Some(&bytes) == original.as_ref() => {}
-            Some(_) => {
-                return Err(ApplyOneError::Conflict(format!(
-                    "{}(项目目录现状与合并快照不符,疑似窗口内被用户修改,拒绝覆盖)",
-                    change.path
-                )))
-            }
-            // 应用前不存在:新建
-            None if !change.original_present => {}
-            None => {
-                return Err(ApplyOneError::Conflict(format!(
-                    "{}(应用前存在、现已被删除,拒绝盲目重建)",
-                    change.path
-                )))
-            }
+            true => Ok(()),
+            false => Err(ApplyOneError::Conflict(format!(
+                "{}(目录项 CAS 未命中:窗口内被用户修改,拒绝覆盖)",
+                change.path
+            ))),
         }
-        self.write_change_atomic(&change.path, &content)
-            .map_err(ApplyOneError::Error)
     }
 
     /// 回滚单条已应用变更(F9:target→original CAS)—— 只有当前内容
     /// 确实等于**本事务 target**(即应用结果未被触碰)或已等于
     /// original(幂等重试)时才恢复/删除;窗口内被用户改成第三种
     /// 内容 → 该文件回滚失败(调用方聚合上报,绝不覆盖用户字节)。
-    fn rollback_one(&self, change: &JournaledChange) -> Result<()> {
+    fn rollback_one(&self, transaction_id: &str, change: &JournaledChange) -> Result<()> {
         if self.current_fault() == Some(MergeFault::FailUndo) {
             anyhow::bail!("(测试注入)回滚动作失败: {}", change.path);
         }
-        if change.deleted {
-            if !change.original_present {
-                return Ok(()); // 应用前本就不存在(删除为 no-op)
-            }
-            let original = hex_decode(
-                change
-                    .original_hex
-                    .as_deref()
-                    .expect("original_present 时必有原字节"),
-            )?;
-            match self.read_change_current(&change.path)? {
-                // 当前 == target(已删除)→ 恢复 original
-                None => self
-                    .write_change_atomic(&change.path, &original)
-                    .with_context(|| format!("恢复被删文件失败: {}", change.path)),
-                Some(bytes) if bytes == original => Ok(()), // 已回滚:幂等
-                Some(_) => anyhow::bail!(
-                    "{} 回滚拒绝:本事务删除后用户重建了不同内容(不得覆盖用户字节)",
-                    change.path
-                ),
-            }
-        } else if !change.original_present {
-            // 应用前不存在:本次新建的文件(target = 存在该内容)
-            match self.read_change_current(&change.path)? {
-                None => return Ok(()), // 已不在:幂等
-                Some(bytes) => {
-                    let target = hex_decode(
-                        change
-                            .content_hex
-                            .as_deref()
-                            .expect("非删除变更必有目标内容"),
-                    )?;
-                    if bytes != target {
-                        anyhow::bail!(
-                            "{} 回滚拒绝:本事务新建后用户改写了内容(不得删除用户字节)",
-                            change.path
-                        );
-                    }
-                    self.remove_change_file(&change.path)
-                        .with_context(|| format!("回滚删除新建文件失败: {}", change.path))
-                }
-            }
+        let original = change.original_hex.as_deref().map(hex_decode).transpose()?;
+        let target = change.content_hex.as_deref().map(hex_decode).transpose()?;
+        let applied_state = if change.deleted {
+            None
         } else {
-            let original = hex_decode(
-                change
-                    .original_hex
-                    .as_deref()
-                    .expect("original_present 时必有原字节"),
-            )?;
-            match self.read_change_current(&change.path)? {
-                Some(bytes) if bytes == original => Ok(()), // 已回滚:幂等
-                Some(bytes) => {
-                    let target = hex_decode(
-                        change
-                            .content_hex
-                            .as_deref()
-                            .expect("非删除变更必有目标内容"),
-                    )?;
-                    anyhow::ensure!(
-                        bytes == target,
-                        "{} 回滚拒绝:应用结果已被用户修改(当前既非本事务 target 也非 original,不得覆盖用户字节)",
-                        change.path
-                    );
-                    self.write_change_atomic(&change.path, &original)
-                        .with_context(|| format!("恢复被覆盖文件失败: {}", change.path))
-                }
-                None => anyhow::bail!(
-                    "{} 回滚拒绝:应用结果已被用户删除(不敢盲目重建,请人工处理)",
-                    change.path
-                ),
-            }
-        }
+            target.as_deref()
+        };
+        anyhow::ensure!(
+            self.compare_exchange_change(
+                &change.path,
+                applied_state,
+                original.as_deref(),
+                transaction_id,
+            )?,
+            "{} 回滚 CAS 未命中:应用结果已被用户修改,拒绝覆盖",
+            change.path
+        );
+        Ok(())
     }
 
     /// 启动/合并前恢复:重放或清理未完成的事务日志,一致收敛。
@@ -1024,20 +1143,23 @@ impl GitWorktreeProvider {
         }
         let repo = git2::Repository::open(&self.repo_root)?;
         let dir = journal_dir_of(&repo);
-        if !dir.is_dir() {
+        if !dir.exists() {
             return Ok(());
         }
+        // 先绑定稳定目录句柄；之后即使路径被替换，读取/删除仍只作用于
+        // 已验证的原目录对象。
+        let safe_dir = open_journal_dir(&repo, false)?;
         let mut errors: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(&dir)
-            .with_context(|| format!("读取事务日志目录失败: {}", dir.display()))?
-        {
-            let entry = entry?;
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        for name in safe_dir.list_file_names()? {
+            if std::path::Path::new(&name)
+                .extension()
+                .and_then(|e| e.to_str())
+                != Some("json")
+            {
                 continue;
             }
-            if let Err(e) = self.recover_journal_file(&repo, &path) {
-                errors.push(format!("{}: {e:#}", path.display()));
+            if let Err(e) = self.recover_journal_file(&repo, &safe_dir, &name) {
+                errors.push(format!("{name}: {e:#}"));
             }
         }
         if errors.is_empty() {
@@ -1050,58 +1172,68 @@ impl GitWorktreeProvider {
         }
     }
 
-    fn recover_journal_file(&self, repo: &git2::Repository, path: &std::path::Path) -> Result<()> {
-        let journal: MergeJournal = serde_json::from_str(&std::fs::read_to_string(path)?)
-            .with_context(|| format!("解析事务日志失败: {}", path.display()))?;
+    fn recover_journal_file(
+        &self,
+        repo: &git2::Repository,
+        journal_dir: &crate::fs_safe::SafeDir,
+        file_name: &str,
+    ) -> Result<()> {
+        let bytes = journal_dir
+            .read_file(file_name)?
+            .ok_or_else(|| anyhow::anyhow!("枚举后事务日志已消失: {file_name}"))?;
+        let journal: MergeJournal = serde_json::from_slice(&bytes)
+            .with_context(|| format!("解析事务日志失败: {file_name}"))?;
         // F12:journal version 严格校验 —— 未来版本的日志结构未知,
         // 按当前版本语义盲执行可能破坏一致性;拒绝并保留日志
         anyhow::ensure!(
             journal.version == MERGE_JOURNAL_VERSION,
             "事务日志版本不受支持(日志 v{},程序支持 v{MERGE_JOURNAL_VERSION};未来版本拒绝执行): {}",
             journal.version,
-            path.display()
+            file_name
         );
         // C6:磁盘上的日志可能被篡改/植入 —— 读取即校验(先于任何
         // ref 读取/判定/文件操作):refname 形态 + 每条变更路径
         // (纯 relative/normal、拒绝 symlink/junction/穿越),非法即拒
         // (日志保留,绝不执行)
         validate_refname(&journal.refname).with_context(|| {
-            format!(
-                "事务日志 refname 非法({}): {}",
-                path.display(),
-                journal.refname
-            )
+            format!("事务日志 refname 非法({}): {}", file_name, journal.refname)
         })?;
         for change in &journal.changes {
-            validate_change_path(&self.repo_root, &change.path).with_context(|| {
-                format!("事务日志变更路径非法({}): {}", path.display(), change.path)
-            })?;
+            validate_change_path(&self.repo_root, &change.path)
+                .with_context(|| format!("事务日志变更路径非法({file_name}): {}", change.path))?;
         }
         let git = Git::open(&self.repo_root)?;
         let current = git.read_ref(&journal.refname)?;
-        let target_tree = git2::Oid::from_str(&journal.target_tree).ok();
+        let target_tree = git2::Oid::from_str(&journal.target_tree)
+            .with_context(|| format!("事务日志 target_tree OID 非法: {file_name}"))?;
+        repo.find_tree(target_tree)
+            .with_context(|| format!("事务日志 target_tree 对象不存在: {file_name}"))?;
         let current_tree = current
             .and_then(|o| git2::Oid::from_str(&o.to_string()).ok())
             .and_then(|oid| repo.find_commit(oid).ok())
             .map(|c| c.tree_id());
-        if current_tree.is_some() && current_tree == target_tree {
+        if current_tree == Some(target_tree) {
             // ref 已推进:重放应用直到项目目录一致
             self.replay_journal(&journal)
-                .with_context(|| format!("重放事务日志失败: {}", path.display()))?;
-            std::fs::remove_file(path)
-                .with_context(|| format!("删除已收敛的事务日志失败: {}", path.display()))?;
-            sync_dir_of(path)?;
+                .with_context(|| format!("重放事务日志失败: {file_name}"))?;
+            journal_dir.remove_file(file_name)?;
+            journal_dir.sync()?;
             return Ok(());
         }
-        let ref_before = journal
-            .ref_before
-            .as_deref()
-            .and_then(|s| git2::Oid::from_str(s).ok());
+        let ref_before = match journal.ref_before.as_deref() {
+            Some(value) => {
+                let oid = git2::Oid::from_str(value)
+                    .with_context(|| format!("事务日志 ref_before OID 非法: {file_name}"))?;
+                repo.find_commit(oid)
+                    .with_context(|| format!("事务日志 ref_before 提交不存在: {file_name}"))?;
+                Some(oid)
+            }
+            None => None,
+        };
         if current == ref_before {
             // 推进前死亡:无任何文件应用发生 → 安全清日志
-            std::fs::remove_file(path)
-                .with_context(|| format!("删除未推进的事务日志失败: {}", path.display()))?;
-            sync_dir_of(path)?;
+            journal_dir.remove_file(file_name)?;
+            journal_dir.sync()?;
             return Ok(());
         }
         anyhow::bail!(
@@ -1115,56 +1247,22 @@ impl GitWorktreeProvider {
     /// 路径在重放前再次校验(C6:应用前复验,消除检查后替换窗口)。
     fn replay_journal(&self, journal: &MergeJournal) -> Result<()> {
         for change in &journal.changes {
-            if change.deleted {
-                match self.read_change_current(&change.path)? {
-                    None => continue, // 已删除
-                    Some(bytes) => {
-                        let original =
-                            change.original_hex.as_deref().map(hex_decode).transpose()?;
-                        if change.original_present && Some(bytes) == original {
-                            self.remove_change_file(&change.path)
-                                .with_context(|| format!("重放删除失败: {}", change.path))?;
-                        } else if change.original_present {
-                            anyhow::bail!(
-                                "{} 在崩溃后被外部修改,拒绝重放删除(请人工处理)",
-                                change.path
-                            );
-                        }
-                        // 应用前本就不存在且现在存在:外部新建,不动
-                    }
-                }
-                continue;
-            }
-            let target = hex_decode(
-                change
-                    .content_hex
-                    .as_deref()
-                    .expect("非删除变更必有目标内容"),
-            )?;
-            match self.read_change_current(&change.path)? {
-                Some(bytes) if bytes == target => continue, // 已应用
-                Some(bytes) => {
-                    let original = change.original_hex.as_deref().map(hex_decode).transpose()?;
-                    if change.original_present && Some(bytes) == original {
-                        // F9:重放同样走原子替换(不留半写状态)
-                        self.write_change_atomic(&change.path, &target)
-                            .with_context(|| format!("重放写入失败: {}", change.path))?;
+            let original = change.original_hex.as_deref().map(hex_decode).transpose()?;
+            let target = change.content_hex.as_deref().map(hex_decode).transpose()?;
+            anyhow::ensure!(
+                self.compare_exchange_change(
+                    &change.path,
+                    original.as_deref(),
+                    if change.deleted {
+                        None
                     } else {
-                        anyhow::bail!(
-                            "{} 在崩溃后被外部修改(疑似用户编辑),拒绝覆盖(请人工处理)",
-                            change.path
-                        );
-                    }
-                }
-                None if !change.original_present => {
-                    self.write_change_atomic(&change.path, &target)
-                        .with_context(|| format!("重放新建失败: {}", change.path))?;
-                }
-                None => anyhow::bail!(
-                    "{} 应用前存在、崩溃后被删除,拒绝盲目重建(请人工处理)",
-                    change.path
-                ),
-            }
+                        target.as_deref()
+                    },
+                    &journal.transaction_id,
+                )?,
+                "{} 在崩溃后被外部修改，目录项 CAS 未命中，拒绝覆盖",
+                change.path
+            );
         }
         Ok(())
     }
@@ -1650,6 +1748,153 @@ mod merge_journal_tests {
         provider.release(&lease).unwrap();
     }
 
+    /// 真正的内容 CAS 必须覆盖“已读取 expected、尚未 rename”这一窗口。
+    /// 用户在该窗口写入第三态时，merge 必须 NeedsUser 且保留用户字节。
+    #[test]
+    fn apply_cas_rejects_edit_after_expected_was_read() {
+        let (_dir, root) = fixture();
+        let provider = Arc::new(GitWorktreeProvider::new(root.clone()).unwrap());
+        let lease = provider.acquire(&ctx(&root, 18, "a")).unwrap();
+        std::fs::write(wt_path(&root, 18, "a").join("a.txt"), "agent-cas\n").unwrap();
+
+        provider.set_merge_fault(MergeFault::WaitAfterCasRead);
+        let p2 = provider.clone();
+        let lease2 = lease.clone();
+        let merger = std::thread::spawn(move || p2.merge(&[lease2]));
+        let refname = Git::integration_ref(18, 1);
+        assert!(
+            (0..500).any(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                ref_tree(&root, &refname).is_some()
+            }),
+            "前置:ref 已推进且 apply 进入 CAS"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::fs::write(root.join("a.txt"), "user-after-read\n").unwrap();
+        provider.clear_merge_fault();
+
+        match merger.join().unwrap().unwrap() {
+            MergeOutcome::NeedsUser { conflicts } => assert!(
+                conflicts.iter().any(|c| c.contains("a.txt")),
+                "CAS 冲突必须带路径:{conflicts:?}"
+            ),
+            other => panic!("读后竞态必须拒绝覆盖，得到 {other:?}"),
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "user-after-read\n"
+        );
+        provider.release(&lease).unwrap();
+    }
+
+    #[test]
+    fn recovery_idempotent_desired_state_is_atomically_reverified() {
+        let (_dir, root) = fixture();
+        let provider = Arc::new(GitWorktreeProvider::new(root.clone()).unwrap());
+        let lease = provider.acquire(&ctx(&root, 22, "a")).unwrap();
+        std::fs::write(wt_path(&root, 22, "a").join("a.txt"), "desired\n").unwrap();
+        provider.set_merge_fault(MergeFault::CrashAfterRefAdvance);
+        assert!(provider.merge(&[lease.clone()]).is_err());
+        std::fs::write(root.join("a.txt"), "desired\n").unwrap();
+
+        provider.set_merge_fault(MergeFault::WaitAfterCasRead);
+        let p2 = provider.clone();
+        let recovery = std::thread::spawn(move || p2.recover_interrupted());
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        std::fs::write(root.join("a.txt"), "user-third-state\n").unwrap();
+        provider.clear_merge_fault();
+        assert!(
+            recovery.join().unwrap().is_err(),
+            "read 后 desired 被改写时不得宣称 journal 已收敛"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "user-third-state\n"
+        );
+        let journal_dir = git2::Repository::open(&root)
+            .unwrap()
+            .path()
+            .join(JOURNAL_DIR);
+        assert!(std::fs::read_dir(journal_dir).unwrap().count() > 0);
+        provider.release(&lease).unwrap();
+    }
+
+    #[test]
+    fn idempotent_verify_crash_is_recovered_on_next_cas() {
+        let (_dir, root) = fixture();
+        let provider = GitWorktreeProvider::new(root.clone()).unwrap();
+        provider.set_merge_fault(MergeFault::CrashAfterVerifyMove);
+        assert!(provider
+            .compare_exchange_change("a.txt", Some(b"aaa\n"), Some(b"aaa\n"), "verify-crash-txn",)
+            .is_err());
+        assert!(!root.join("a.txt").exists(), "故障点应位于移名后");
+        provider.clear_merge_fault();
+        assert!(provider
+            .compare_exchange_change("a.txt", Some(b"aaa\n"), Some(b"aaa\n"), "verify-crash-txn",)
+            .unwrap());
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), b"aaa\n");
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(".mfverify-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// journal 目录本身若被替换为 symlink/junction，恢复必须在打开稳定
+    /// 目录句柄时拒绝，不能通过 entry.path() 读取/删除仓库外文件。
+    #[test]
+    fn recovery_rejects_replaced_journal_directory() {
+        let (_dir, root) = fixture();
+        let repo = git2::Repository::open(&root).unwrap();
+        let journal_dir = repo.path().join(JOURNAL_DIR);
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("outside.json");
+        std::fs::write(
+            &outside_file,
+            serde_json::json!({
+                "version": 999,
+                "transaction_id": "outside",
+                "refname": Git::integration_ref(19, 1),
+                "ref_before": null,
+                "target_tree": "0101010101010101010101010101010101010101",
+                "changes": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        #[cfg(windows)]
+        {
+            let out = std::process::Command::new("cmd")
+                .args([
+                    "/c",
+                    "mklink",
+                    "/J",
+                    &journal_dir.to_string_lossy(),
+                    &outside.path().to_string_lossy(),
+                ])
+                .output()
+                .unwrap();
+            if !out.status.success() {
+                eprintln!("跳过:当前环境无法创建 junction");
+                return;
+            }
+        }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &journal_dir).unwrap();
+
+        let provider = GitWorktreeProvider::new(root.clone()).unwrap();
+        let err = provider.recover_interrupted().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("符号链接") || msg.contains("接合点") || msg.contains("reparse"),
+            "必须因 journal 目录身份非法而拒绝，而不是读取外部日志:{msg}"
+        );
+        assert!(outside_file.exists(), "仓库外日志绝不能被删除");
+    }
+
     /// F12:事务日志 version 严格校验 —— 未来版本(>1)的日志结构
     /// 未知,恢复必须拒绝执行(保留日志),不得按 v1 语义盲放行。
     #[test]
@@ -1677,6 +1922,35 @@ mod merge_journal_tests {
             "未来版本必须被拒绝并指明日志: {msg}"
         );
         assert!(path.exists(), "被拒绝的日志必须保留(人工处理)");
+    }
+
+    #[test]
+    fn recovery_preserves_journal_with_malformed_oids() {
+        let (_dir, root) = fixture();
+        let provider = GitWorktreeProvider::new(root.clone()).unwrap();
+        let repo = git2::Repository::open(&root).unwrap();
+        let journal_dir = repo.path().join(JOURNAL_DIR);
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        let path = journal_dir.join("bad-oid.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": MERGE_JOURNAL_VERSION,
+                "transaction_id": "bad-oid",
+                "refname": Git::integration_ref(21, 1),
+                "ref_before": null,
+                "target_tree": "not-an-oid",
+                "changes": []
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let err = provider.recover_interrupted().unwrap_err();
+        assert!(format!("{err:#}").contains("OID"), "{err:#}");
+        assert!(
+            path.exists(),
+            "OID 损坏的日志必须保留，不能误判为推进前死亡"
+        );
     }
 
     /// C6:磁盘上的事务日志被篡改/植入恶意路径(../、绝对盘符、
@@ -1861,18 +2135,18 @@ mod merge_journal_tests {
         };
         // 已应用(target 在盘上)→ 回滚恢复 original
         std::fs::write(root.join("a.txt"), "target\n").unwrap();
-        provider.rollback_one(&change).unwrap();
+        provider.rollback_one("test-rollback", &change).unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "aaa\n",
             "当前 == target 时必须恢复 original"
         );
         // 幂等:当前已 == original → no-op 成功
-        provider.rollback_one(&change).unwrap();
+        provider.rollback_one("test-rollback", &change).unwrap();
 
         // 用户在窗口内编辑(第三种内容)→ 拒绝回滚,字节保持
         std::fs::write(root.join("a.txt"), "user-edit\n").unwrap();
-        let err = provider.rollback_one(&change).unwrap_err();
+        let err = provider.rollback_one("test-rollback", &change).unwrap_err();
         assert!(
             format!("{err:#}").contains("用户"),
             "错误必须指明用户修改: {err:#}"
@@ -1899,14 +2173,14 @@ mod merge_journal_tests {
         };
         // 已应用(文件已删)→ 恢复 original
         std::fs::remove_file(root.join("b.txt")).unwrap();
-        provider.rollback_one(&change).unwrap();
+        provider.rollback_one("test-rollback", &change).unwrap();
         assert_eq!(
             std::fs::read_to_string(root.join("b.txt")).unwrap(),
             "bbb\n"
         );
         // 用户重建为不同内容 → 拒绝恢复(会覆盖用户字节)
         std::fs::write(root.join("b.txt"), "user-recreated\n").unwrap();
-        let err = provider.rollback_one(&change).unwrap_err();
+        let err = provider.rollback_one("test-rollback", &change).unwrap_err();
         assert!(format!("{err:#}").contains("用户"), "{err:#}");
         assert_eq!(
             std::fs::read_to_string(root.join("b.txt")).unwrap(),

@@ -789,16 +789,33 @@ impl PluginHost {
         version: &str,
         content_hash: &str,
     ) -> Result<DirectoryProviderResolution> {
-        let (plugin_full_id, contribution_id) = full_contribution_id
-            .rsplit_once('.')
-            .ok_or_else(|| anyhow::anyhow!("完整贡献 ID 非法(缺贡献段): {full_contribution_id}"))?;
+        // 插件 full_id 来自已安装注册表，按最长精确前缀定位；贡献 id
+        // 自身允许包含 `.`，禁止用 rsplit 猜边界。
+        let (plugin_full_id, contribution_id) = {
+            let plugins = self.plugins.read();
+            let plugin = plugins
+                .iter()
+                .filter(|entry| full_contribution_id.starts_with(&format!("{}.", entry.full_id)))
+                .max_by_key(|entry| entry.full_id.len())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("完整贡献 ID 不属于任何已安装插件: {full_contribution_id}")
+                })?;
+            let contribution_id = full_contribution_id
+                .strip_prefix(&format!("{}.", plugin.full_id))
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("完整贡献 ID 非法(缺贡献段): {full_contribution_id}")
+                })?
+                .to_string();
+            (plugin.full_id.clone(), contribution_id)
+        };
         if content_hash.is_empty() {
             // 内置合成插件:精确身份 → 进程内 worktree 工厂
             anyhow::ensure!(
                 plugin_full_id == BUILTIN_DIRECTORIES_PLUGIN_ID,
                 "内置空哈希身份只属于 {BUILTIN_DIRECTORIES_PLUGIN_ID}(请求 {plugin_full_id})"
             );
-            self.ensure_builtin_plugin(plugin_full_id, version)?;
+            self.ensure_builtin_plugin(&plugin_full_id, version)?;
             let contribution = {
                 let plugins = self.plugins.read();
                 let plugin = plugins
@@ -827,9 +844,10 @@ impl PluginHost {
                 supports_parallel: contribution.supports_parallel,
                 factory: DirectoryProviderFactory::BuiltinWorktree,
                 pin: mf_agent::workflow::PluginSourcePin {
-                    full_id: plugin_full_id.to_string(),
+                    full_id: plugin_full_id.clone(),
                     version: version.to_string(),
                     content_hash: content_hash.to_string(),
+                    contribution_id: full_contribution_id.to_string(),
                 },
             });
         }
@@ -838,7 +856,7 @@ impl PluginHost {
             plugin_full_id != BUILTIN_DIRECTORIES_PLUGIN_ID,
             "第三方内容不得冒充内置目录插件身份({plugin_full_id})"
         );
-        let resolved = self.resolve(plugin_full_id, version, content_hash)?;
+        let resolved = self.resolve(&plugin_full_id, version, content_hash)?;
         let contribution = resolved
             .manifest
             .execution_directory_providers
@@ -899,9 +917,10 @@ impl PluginHost {
                 plugin_root: resolved.root.clone(),
             },
             pin: mf_agent::workflow::PluginSourcePin {
-                full_id: plugin_full_id.to_string(),
+                full_id: plugin_full_id,
                 version: version.to_string(),
                 content_hash: content_hash.to_string(),
+                contribution_id: full_contribution_id.to_string(),
             },
         })
     }

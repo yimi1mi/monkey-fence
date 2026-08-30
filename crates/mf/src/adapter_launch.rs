@@ -196,6 +196,7 @@ pub fn workflow_plugin_index(plugins: &Arc<PluginRegistry>) -> HashMap<String, P
             full_id: source.plugin_full_id.clone(),
             version: source.plugin_version.clone(),
             content_hash: source.content_hash.clone(),
+            contribution_id: String::new(),
         };
         if let Some(short) = full_contribution_id.rsplit_once('.') {
             index

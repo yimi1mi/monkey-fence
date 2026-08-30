@@ -327,6 +327,7 @@ fn submit_assigns_selected_template_to_new_task() {
                         full_id: "monkeyfence.generic-command".into(),
                         version: "0.1.0".into(),
                         content_hash: String::new(),
+                        contribution_id: String::new(),
                     },
                 );
                 orch.assign_workflow(task_id, &current, &plugins, false)?;

@@ -355,9 +355,9 @@ fn snapshot_collects_sessions_handoffs_leases_and_conflicts() {
     let lease = mf_agent::execution_directory::ExecutionLease {
         id: "lease-1".into(),
         path: dir.path().join("wt"),
-        isolated: true,
-        provider: "worktree".into(),
-        metadata: serde_json::json!({}),
+        isolated: false,
+        provider: "project-dir".into(),
+        metadata: serde_json::json!({ "step_key": "build", "task_id": task.id }),
     };
     orch.store
         .insert_execution_lease(&lease, Some(run.id), step.id, task.id)
@@ -384,6 +384,25 @@ fn snapshot_collects_sessions_handoffs_leases_and_conflicts() {
             &["src/main.rs(修改者: a 与 b)".to_string()],
         )
         .unwrap();
+    match orch.store.claim_single_merge_batch(
+        task.id,
+        &lease.id,
+        "build",
+        step.revision_id,
+        "txn-monitor",
+        "owner-monitor",
+    ) {
+        Ok(mf_agent::store::JoinMergeClaim::Claimed { .. }) => {}
+        _ => panic!("Run Monitor 夹具必须建立完整 merge batch"),
+    }
+    orch.store
+        .complete_merge_batch(
+            "txn-monitor",
+            "owner-monitor",
+            true,
+            &["src/main.rs(修改者: a 与 b)".to_string()],
+        )
+        .unwrap();
 
     let snapshot = RunMonitorSnapshot::collect(&orch, task.id);
     // 待决冲突可见
@@ -402,7 +421,11 @@ fn snapshot_collects_sessions_handoffs_leases_and_conflicts() {
     assert!(extras.session_status.is_some(), "Session 状态必须可见");
     assert_eq!(extras.handoff_summary.as_deref(), Some("构建完成"));
     assert_eq!(extras.handoff_files, vec!["src/main.rs".to_string()]);
-    assert!(extras.lease.as_deref().unwrap_or("").contains("worktree"));
+    assert!(extras
+        .lease
+        .as_deref()
+        .unwrap_or("")
+        .contains("project-dir"));
     assert!(
         extras
             .log_ref

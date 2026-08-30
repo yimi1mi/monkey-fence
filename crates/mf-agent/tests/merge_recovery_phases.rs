@@ -309,3 +309,342 @@ fn startup_flushes_settled_single_lease_without_join() {
         "单租约批必须持久化结论:{batches:?}"
     );
 }
+
+/// 新实例启动不能把另一个仍存活实例正在处理的 `merging` 批抢回
+/// `ready`。否则两个实例会分别执行同一批的 provider merge / release。
+#[test]
+fn startup_does_not_reclaim_a_fresh_merging_batch() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture(tmp.path());
+    fx.pins.resolve_ok(true);
+    let version = fx.template(
+        "fresh-merging-owner",
+        vec![node("solo", &[], "独立步骤", &fx.instance_id)],
+    );
+    let task = fx.orch.create_task("活跃 merging 不得被抢", "g").unwrap();
+    fx.assign_and_run(task.id, &version);
+    assert!(wait_until(Duration::from_secs(5), || !fx
+        .host
+        .workflow
+        .lock()
+        .is_empty()));
+    fx.orch
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "solo"),
+            Settlement::complete("done"),
+        )
+        .unwrap();
+    assert!(wait_until(Duration::from_secs(5), || fx
+        .orch
+        .store
+        .list_merge_batches(task.id)
+        .map(|rows| {
+            rows.iter()
+                .any(|b| matches!(b.status.as_str(), "merged" | "released"))
+        })
+        .unwrap_or(false)));
+    let batch = fx.orch.store.list_merge_batches(task.id).unwrap().remove(0);
+    fx.orch
+        .store
+        .force_merge_batch_active(task.id, &batch.join_step_key, batch.revision_id)
+        .unwrap();
+
+    let fx2 = restart(tmp.path());
+    std::thread::sleep(Duration::from_millis(300));
+    let batches = fx2.orch.store.list_merge_batches(task.id).unwrap();
+    assert_eq!(
+        batches[0].status, "merging",
+        "新实例不得重置仍在有效 owner 租期内的批:{batches:?}"
+    );
+    fx.orch.stop();
+    fx2.orch.stop();
+}
+
+/// provider 已应用后，如果 `merging -> merged` 的持久化提交失败，
+/// 后处理必须停止：租约仍 held，不能先释放真实目录再留下 merging 行。
+#[test]
+fn merge_conclusion_persist_failure_does_not_release_lease() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture(tmp.path());
+    fx.pins.resolve_ok(true);
+    let version = fx.template(
+        "persist-before-release",
+        vec![node("solo", &[], "独立步骤", &fx.instance_id)],
+    );
+    let task = fx.orch.create_task("结论持久化失败", "g").unwrap();
+    fx.assign_and_run(task.id, &version);
+    assert!(wait_until(Duration::from_secs(5), || !fx
+        .host
+        .workflow
+        .lock()
+        .is_empty()));
+    fx.orch
+        .store
+        .with_conn(|c| {
+            c.execute_batch(
+                "CREATE TRIGGER reject_merge_conclusion
+                 BEFORE UPDATE ON merge_batches
+                 WHEN NEW.status IN ('merged', 'needs_user')
+                 BEGIN SELECT RAISE(ABORT, 'injected conclusion failure'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    fx.orch
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "solo"),
+            Settlement::complete("done"),
+        )
+        .unwrap();
+
+    let leases = fx.orch.store.list_execution_leases(task.id).unwrap();
+    assert!(
+        leases.iter().all(|row| row.status == "held"),
+        "结论未提交时不得释放租约:{leases:?}"
+    );
+    assert!(
+        fx.directory.released.lock().is_empty(),
+        "结论未提交时不得调用 provider.release"
+    );
+    assert!(
+        fx.orch
+            .store
+            .list_pending_merges(Some(task.id))
+            .unwrap()
+            .is_empty(),
+        "needs_user 结论未提交时也不得提前写投影"
+    );
+    fx.orch.stop();
+}
+
+/// 即使调度 tick 已停止，领取批的外部 provider 调用也必须由独立 guard
+/// 续租；第二实例不得在慢 merge 期间回收并重复执行。
+#[test]
+fn blocked_merge_renews_owner_without_scheduler_tick() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture(tmp.path());
+    fx.pins.resolve_ok(true);
+    let version = fx.template(
+        "owner-heartbeat-guard",
+        vec![node("solo", &[], "独立步骤", &fx.instance_id)],
+    );
+    let task = fx.orch.create_task("慢 merge owner", "g").unwrap();
+    fx.assign_and_run(task.id, &version);
+    assert!(wait_until(Duration::from_secs(5), || !fx
+        .host
+        .workflow
+        .lock()
+        .is_empty()));
+    let token = token_of_node(&fx.orch, task.id, "solo");
+    fx.directory.block_merge.store(true, Ordering::SeqCst);
+    fx.orch.stop(); // 关闭 tick，外部调用不能依赖调度线程续租
+    let orch1 = fx.orch.clone();
+    let settle = std::thread::spawn(move || {
+        orch1
+            .settle_by_token(&token, Settlement::complete("done"))
+            .unwrap();
+    });
+    assert!(wait_until(Duration::from_secs(5), || fx
+        .directory
+        .merge_entered
+        .load(Ordering::SeqCst)));
+    fx.orch
+        .store
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE merge_batches SET owner_expires_at = '1970-01-01T00:00:00+00:00'
+                 WHERE task_id = ?1 AND status = 'merging'",
+                rusqlite::params![task.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(700));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let db = tmp.path().join("workflow-v1.db");
+    let root = tmp.path().to_path_buf();
+    let catalog = fx.catalog.clone();
+    let pins = fx.pins.clone();
+    let directory = fx.directory.clone();
+    let host = fx.host.clone();
+    let starter = std::thread::spawn(move || {
+        let orch = Orchestrator::start_with_routing(
+            Store::open(&db).unwrap(),
+            root,
+            mf_agent::config::Config::default(),
+            host,
+            empty_profiles(),
+            GlobalLimiter::new(4),
+            "pipe-2".into(),
+            directory,
+            WorkflowKernel {
+                catalog,
+                pins: Some(pins),
+            },
+            scripted_routing(),
+        )
+        .unwrap();
+        let _ = tx.send(orch);
+    });
+    let started_quickly = rx.recv_timeout(Duration::from_millis(800)).ok();
+    let was_quick = started_quickly.is_some();
+    fx.directory.block_merge.store(false, Ordering::SeqCst);
+    settle.join().unwrap();
+    let orch2 = match started_quickly {
+        Some(orch) => orch,
+        None => rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+    };
+    starter.join().unwrap();
+    assert!(
+        was_quick,
+        "第二实例启动被重复 merge 阻塞，说明活跃 owner 已被错误回收"
+    );
+    assert_eq!(
+        fx.directory.merges.load(Ordering::SeqCst),
+        1,
+        "慢 merge 必须只执行一次"
+    );
+    orch2.stop();
+}
+
+/// 同一任务可因并行在途步骤形成多个独立批。`merged` 只补 release，
+/// `needs_user` 必须逐批重新 merge，绝不能把 task 全部 pending 合成一批。
+#[test]
+fn resolve_groups_mixed_batch_states_without_remerging_merged_leases() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture(tmp.path());
+    fx.pins.resolve_ok(true);
+    let version = fx.template(
+        "mixed-resolution-batches",
+        vec![
+            node("a", &[], "A", &fx.instance_id),
+            node("b", &[], "B", &fx.instance_id),
+        ],
+    );
+    let task = fx.orch.create_task("混合批状态", "g").unwrap();
+    fx.assign_and_run(task.id, &version);
+    assert!(wait_until(Duration::from_secs(5), || fx
+        .host
+        .workflow
+        .lock()
+        .len()
+        == 2));
+    fx.directory.release_fails.store(true, Ordering::SeqCst);
+    fx.orch
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "a"),
+            Settlement::complete("a"),
+        )
+        .unwrap();
+    assert!(fx
+        .orch
+        .store
+        .list_merge_batches(task.id)
+        .unwrap()
+        .iter()
+        .any(|batch| batch.join_step_key == "__single__:a" && batch.status == "merged"));
+    fx.directory.release_fails.store(false, Ordering::SeqCst);
+    fx.directory.merge_ok.store(false, Ordering::SeqCst);
+    fx.orch
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "b"),
+            Settlement::complete("b"),
+        )
+        .unwrap();
+    assert_eq!(
+        fx.orch
+            .store
+            .list_pending_merges(Some(task.id))
+            .unwrap()
+            .len(),
+        2
+    );
+    fx.directory.merge_ok.store(true, Ordering::SeqCst);
+    let remaining = fx.orch.resolve_pending_merges(task.id).unwrap();
+    assert!(remaining.is_empty(), "{remaining:?}");
+    let sizes = fx.directory.merge_batches.lock().clone();
+    assert_eq!(
+        sizes,
+        vec![1, 1, 1],
+        "前两次是各自冲突；resolve 只能重合并 needs_user 的 b，不能把已 merged 的 a 合入:{sizes:?}"
+    );
+    assert!(fx
+        .orch
+        .store
+        .list_pending_merges(Some(task.id))
+        .unwrap()
+        .is_empty());
+    fx.orch.stop();
+}
+
+#[test]
+fn join_authority_uses_step_id_and_never_silently_drops_corrupt_metadata() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture(tmp.path());
+    fx.pins.resolve_ok(true);
+    let version = fx.template(
+        "corrupt-parent-metadata",
+        vec![
+            node("a", &[], "A", &fx.instance_id),
+            node("b", &[], "B", &fx.instance_id),
+            node("j", &["a", "b"], "J", &fx.instance_id),
+        ],
+    );
+    let task = fx
+        .orch
+        .create_task("损坏 metadata 的完整父集", "g")
+        .unwrap();
+    fx.assign_and_run(task.id, &version);
+    assert!(wait_until(Duration::from_secs(5), || fx
+        .host
+        .workflow
+        .lock()
+        .len()
+        == 2));
+    let a_step = fx
+        .orch
+        .store
+        .task_steps(task.id)
+        .unwrap()
+        .into_iter()
+        .find(|step| step.step_key == "a")
+        .unwrap();
+    fx.orch
+        .store
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE execution_leases SET metadata_json = '{broken'
+                 WHERE task_id = ?1 AND step_id = ?2",
+                rusqlite::params![task.id, a_step.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    fx.orch
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "a"),
+            Settlement::complete("a"),
+        )
+        .unwrap();
+    fx.orch
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "b"),
+            Settlement::complete("b"),
+        )
+        .unwrap();
+    let batches = fx.orch.store.list_merge_batches(task.id).unwrap();
+    assert!(
+        batches
+            .iter()
+            .any(|batch| batch.join_step_key == "j" && batch.lease_keys.len() == 2),
+        "损坏 metadata 不能让权威父租约集静默缩水:{batches:?}"
+    );
+    assert_eq!(
+        fx.directory.merges.load(Ordering::SeqCst),
+        0,
+        "pin metadata 损坏时应整批 NeedsYou，不能执行半批 merge"
+    );
+    fx.orch.stop();
+}

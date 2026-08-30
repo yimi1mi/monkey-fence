@@ -9,7 +9,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-pub const PROJECT_SCHEMA_VERSION: i64 = 4;
+pub const PROJECT_SCHEMA_VERSION: i64 = 5;
 pub const CATALOG_SCHEMA_VERSION: i64 = 1;
 
 /// 项目库路径:`<project>/.mf-agent/workflow-v1.db`。
@@ -61,6 +61,9 @@ pub fn upgrade_project(conn: &mut Connection, target: i64) -> Result<()> {
     }
     if current < 4 {
         backfill_merge_batch_columns(&tx)?;
+    }
+    if current < 5 {
+        backfill_merge_owner_columns(&tx)?;
     }
     tx.pragma_update(None, "user_version", target)?;
     tx.commit()?;
@@ -326,6 +329,8 @@ CREATE TABLE IF NOT EXISTS merge_batches (
     lease_keys_json TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'ready',
     transaction_id TEXT NOT NULL DEFAULT '',
+    owner_id TEXT NOT NULL DEFAULT '',
+    owner_expires_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(task_id, join_step_key, revision_id)
@@ -396,6 +401,36 @@ fn backfill_merge_batch_columns(conn: &Connection) -> Result<()> {
     if !has_column("merge_batches", "conflicts_json")? {
         conn.execute(
             "ALTER TABLE merge_batches ADD COLUMN conflicts_json TEXT NOT NULL DEFAULT '[]'",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// v5 增量:合并批领取者租期。新实例只能回收已过期 owner 的
+/// `merging/resolving`，不能在另一个活跃 Orchestrator 工作时无条件抢占。
+fn backfill_merge_owner_columns(conn: &Connection) -> Result<()> {
+    let has_column = |column: &str| -> Result<bool> {
+        let mut stmt = conn.prepare("PRAGMA table_info(merge_batches)")?;
+        let mut exists = false;
+        let mut found = false;
+        for c in stmt.query_map([], |r| r.get::<_, String>(1))? {
+            exists = true;
+            if c? == column {
+                found = true;
+            }
+        }
+        Ok(!exists || found)
+    };
+    if !has_column("owner_id")? {
+        conn.execute(
+            "ALTER TABLE merge_batches ADD COLUMN owner_id TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !has_column("owner_expires_at")? {
+        conn.execute(
+            "ALTER TABLE merge_batches ADD COLUMN owner_expires_at TEXT NOT NULL DEFAULT ''",
             [],
         )?;
     }

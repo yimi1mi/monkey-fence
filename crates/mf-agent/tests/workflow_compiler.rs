@@ -89,6 +89,7 @@ fn agent_types() -> &'static HashMap<String, PluginSourcePin> {
                     full_id: "builtin.core".into(),
                     version: "1.0.0".into(),
                     content_hash: format!("hash-{agent_type}"),
+                    contribution_id: String::new(),
                 },
             );
         }

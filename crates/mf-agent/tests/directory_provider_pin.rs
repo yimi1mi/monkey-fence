@@ -15,6 +15,7 @@ fn pin(v: &str) -> PluginSourcePin {
         full_id: format!("vendor.dirs"),
         version: v.into(),
         content_hash: format!("hash-{v}"),
+        contribution_id: "scripted".into(),
     }
 }
 

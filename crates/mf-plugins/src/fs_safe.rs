@@ -159,15 +159,156 @@ mod imp {
                 Ok(())
             })();
             drop(f); // 关闭(成功或失败路径都不泄漏 fd)
-            result?;
+            if let Err(e) = result {
+                let cleanup = unsafe { libc::unlinkat(self.fd, tmp_c.as_ptr(), 0) };
+                if cleanup != 0 {
+                    return Err(e).context(format!(
+                        "临时文件 {tmp:?} 清理失败: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                return Err(e);
+            }
             let name_c = cstr(name)?;
             let r = unsafe { libc::renameat(self.fd, tmp_c.as_ptr(), self.fd, name_c.as_ptr()) };
+            if r != 0 {
+                let rename_error = std::io::Error::last_os_error();
+                let cleanup = unsafe { libc::unlinkat(self.fd, tmp_c.as_ptr(), 0) };
+                anyhow::ensure!(
+                    cleanup == 0,
+                    "句柄相对改名失败({tmp:?} → {name:?}): {rename_error}; 且临时文件清理失败: {}",
+                    std::io::Error::last_os_error()
+                );
+                return Err(rename_error).context(format!(
+                    "句柄相对改名失败({tmp:?} → {name:?})，临时文件已清理"
+                ));
+            }
+            self.sync()
+        }
+
+        /// 仅当目标名不存在时原子安装内容。返回 false 表示并发方已创建
+        /// 目标；绝不覆盖。
+        pub fn write_file_if_absent(&self, name: &str, content: &[u8]) -> Result<bool> {
+            use std::io::Write as _;
+            validate_component(name)?;
+            let tmp = format!(".{name}.mfs-{}", crate::fs_atomic::random_txn_id());
+            let tmp_c = cstr(&tmp)?;
+            let fd = unsafe {
+                libc::openat(
+                    self.fd,
+                    tmp_c.as_ptr(),
+                    libc::O_WRONLY
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_CLOEXEC
+                        | libc::O_NOFOLLOW,
+                    0o644,
+                )
+            };
             anyhow::ensure!(
-                r == 0,
-                "句柄相对改名失败({tmp:?} → {name:?}): {}",
+                fd >= 0,
+                "创建 CAS 临时文件失败: {}",
                 std::io::Error::last_os_error()
             );
-            self.sync()
+            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+            let write_result = (|| -> Result<()> {
+                file.write_all(content)?;
+                file.flush()?;
+                file.sync_all()?;
+                Ok(())
+            })();
+            drop(file);
+            if let Err(e) = write_result {
+                let cleanup = unsafe { libc::unlinkat(self.fd, tmp_c.as_ptr(), 0) };
+                if cleanup != 0 {
+                    return Err(e).context(format!(
+                        "CAS 临时文件 {tmp:?} 清理失败: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                return Err(e);
+            }
+            let name_c = cstr(name)?;
+            let linked =
+                unsafe { libc::linkat(self.fd, tmp_c.as_ptr(), self.fd, name_c.as_ptr(), 0) };
+            if linked != 0 {
+                let err = std::io::Error::last_os_error();
+                let cleanup = unsafe { libc::unlinkat(self.fd, tmp_c.as_ptr(), 0) };
+                if cleanup != 0 {
+                    return Err(err).context(format!(
+                        "CAS 安装失败且临时文件 {tmp:?} 清理失败: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+                if err.raw_os_error() == Some(libc::EEXIST) {
+                    return Ok(false);
+                }
+                return Err(err).context("CAS 安装临时文件失败");
+            }
+            let unlinked = unsafe { libc::unlinkat(self.fd, tmp_c.as_ptr(), 0) };
+            anyhow::ensure!(
+                unlinked == 0,
+                "清理 CAS 临时文件失败: {}",
+                std::io::Error::last_os_error()
+            );
+            self.sync()?;
+            Ok(true)
+        }
+
+        /// 同目录原子改名，目标已存在时返回 false（不替换）。
+        pub fn rename_noreplace(&self, from: &str, to: &str) -> Result<bool> {
+            validate_component(from)?;
+            validate_component(to)?;
+            let from_c = cstr(from)?;
+            let to_c = cstr(to)?;
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let renamed = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    self.fd,
+                    from_c.as_ptr(),
+                    self.fd,
+                    to_c.as_ptr(),
+                    1u32, // RENAME_NOREPLACE
+                ) as i32
+            };
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            let renamed = unsafe {
+                unsafe extern "C" {
+                    fn renameatx_np(
+                        fromfd: libc::c_int,
+                        from: *const libc::c_char,
+                        tofd: libc::c_int,
+                        to: *const libc::c_char,
+                        flags: libc::c_uint,
+                    ) -> libc::c_int;
+                }
+                renameatx_np(
+                    self.fd,
+                    from_c.as_ptr(),
+                    self.fd,
+                    to_c.as_ptr(),
+                    0x0000_0004, // RENAME_EXCL
+                )
+            };
+            #[cfg(not(any(
+                target_os = "linux",
+                target_os = "android",
+                target_os = "macos",
+                target_os = "ios"
+            )))]
+            let renamed = {
+                anyhow::bail!("当前 Unix 平台没有可靠的原子 no-replace rename，保守拒绝 CAS");
+            };
+            if renamed != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EEXIST) {
+                    return Ok(false);
+                }
+                return Err(err).context("原子 no-replace rename 失败");
+            }
+            self.sync()?;
+            Ok(true)
         }
 
         pub fn read_file(&self, name: &str) -> Result<Option<Vec<u8>>> {
@@ -216,6 +357,50 @@ mod imp {
             );
             Ok(())
         }
+
+        pub fn list_file_names(&self) -> Result<Vec<String>> {
+            use std::ffi::CStr;
+            let dot = cstr(".")?;
+            let independent = unsafe {
+                libc::openat(
+                    self.fd,
+                    dot.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            anyhow::ensure!(
+                independent >= 0,
+                "重新打开独立目录描述失败: {}",
+                std::io::Error::last_os_error()
+            );
+            let stream = unsafe { libc::fdopendir(independent) };
+            if stream.is_null() {
+                unsafe { libc::close(independent) };
+                anyhow::bail!("fdopendir 失败: {}", std::io::Error::last_os_error());
+            }
+            let result = (|| -> Result<Vec<String>> {
+                let mut names = Vec::new();
+                loop {
+                    errno::set_errno(errno::Errno(0));
+                    let entry = unsafe { libc::readdir(stream) };
+                    if entry.is_null() {
+                        let errno = errno::errno().0;
+                        anyhow::ensure!(errno == 0, "readdir 失败: os error {errno}");
+                        break;
+                    }
+                    let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }
+                        .to_str()
+                        .context("目录项文件名不是 UTF-8")?;
+                    if name != "." && name != ".." {
+                        validate_component(name)?;
+                        names.push(name.to_string());
+                    }
+                }
+                Ok(names)
+            })();
+            unsafe { libc::closedir(stream) }; // 同时关闭 independent fd
+            result
+        }
     }
 
     impl SafeDir {
@@ -252,6 +437,25 @@ mod imp {
         FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQueryDirectoryFile(
+            file_handle: HANDLE,
+            event: HANDLE,
+            apc_routine: *mut core::ffi::c_void,
+            apc_context: *mut core::ffi::c_void,
+            io_status_block: *mut IO_STATUS_BLOCK,
+            file_information: *mut core::ffi::c_void,
+            length: u32,
+            file_information_class: i32,
+            return_single_entry: u8,
+            file_name: *mut UNICODE_STRING,
+            restart_scan: u8,
+        ) -> i32;
+    }
+    const FILE_NAMES_INFORMATION_CLASS: i32 = 12;
+    const STATUS_NO_MORE_FILES: i32 = 0x8000_0006u32 as i32;
 
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -484,8 +688,9 @@ mod imp {
                 root.display(),
                 last_os_error_string()
             );
-            verify_real_dir(handle, &format!("根目录 {}", root.display()))?;
-            Ok(SafeDir { handle })
+            let dir = SafeDir { handle };
+            verify_real_dir(dir.handle, &format!("根目录 {}", root.display()))?;
+            Ok(dir)
         }
 
         pub fn child(&self, name: &str, create: bool) -> Result<SafeDir> {
@@ -498,8 +703,9 @@ mod imp {
                 true,
                 "子目录",
             )?;
-            verify_real_dir(handle, &format!("子目录 {name:?}"))?;
-            Ok(SafeDir { handle })
+            let dir = SafeDir { handle };
+            verify_real_dir(dir.handle, &format!("子目录 {name:?}"))?;
+            Ok(dir)
         }
 
         /// 原子写入:唯一随机临时名(FILE_CREATE,已存在即失败 —— 预置
@@ -534,8 +740,106 @@ mod imp {
                 nt_rename(tmp_handle, self.handle, name, true)
             })();
             unsafe { windows_sys::Win32::Foundation::CloseHandle(tmp_handle) };
-            result?;
+            if let Err(e) = result {
+                if let Err(cleanup) = self.remove_file(&tmp) {
+                    return Err(e).context(format!("临时文件 {tmp:?} 清理也失败: {cleanup:#}"));
+                }
+                return Err(e);
+            }
             self.sync()
+        }
+
+        pub fn write_file_if_absent(&self, name: &str, content: &[u8]) -> Result<bool> {
+            validate_component(name)?;
+            let tmp = format!(".{name}.mfs-{}", crate::fs_atomic::random_txn_id());
+            let tmp_handle = nt_open_relative(
+                self.handle,
+                &tmp,
+                GENERIC_WRITE | DELETE_ACCESS | SYNCHRONIZE,
+                FILE_CREATE,
+                false,
+                "CAS 临时文件",
+            )?;
+            let result = (|| -> Result<bool> {
+                let mut written = 0u32;
+                let ok = unsafe {
+                    WriteFile(
+                        tmp_handle,
+                        content.as_ptr().cast(),
+                        content.len().min(u32::MAX as usize) as u32,
+                        &mut written,
+                        core::ptr::null_mut(),
+                    )
+                };
+                anyhow::ensure!(
+                    ok != 0 && written as usize == content.len(),
+                    "CAS 临时文件写入失败"
+                );
+                anyhow::ensure!(
+                    unsafe { FlushFileBuffers(tmp_handle) } != 0,
+                    "CAS 临时文件落盘失败: {}",
+                    last_os_error_string()
+                );
+                match nt_rename(tmp_handle, self.handle, name, false) {
+                    Ok(()) => Ok(true),
+                    Err(e) => {
+                        if self.read_file(name)?.is_some() {
+                            Ok(false)
+                        } else {
+                            Err(e)
+                        }
+                    }
+                }
+            })();
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(tmp_handle) };
+            if !matches!(result, Ok(true)) {
+                if let Err(cleanup) = self.remove_file(&tmp) {
+                    return match result {
+                        Err(e) => {
+                            Err(e).context(format!("CAS 临时文件 {tmp:?} 清理也失败: {cleanup:#}"))
+                        }
+                        Ok(false) => {
+                            Err(cleanup).context(format!("CAS 冲突后临时文件 {tmp:?} 清理失败"))
+                        }
+                        Ok(true) => unreachable!(),
+                    };
+                }
+            }
+            if matches!(result, Ok(true)) {
+                self.sync()?;
+            }
+            result
+        }
+
+        pub fn rename_noreplace(&self, from: &str, to: &str) -> Result<bool> {
+            validate_component(from)?;
+            validate_component(to)?;
+            let handle = nt_open_relative(
+                self.handle,
+                from,
+                DELETE_ACCESS | GENERIC_READ | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+                FILE_OPEN,
+                false,
+                "CAS 源文件",
+            )?;
+            let result = (|| -> Result<bool> {
+                verify_not_reparse(handle, &format!("CAS 源文件 {from:?}"))?;
+                match nt_rename(handle, self.handle, to, false) {
+                    Ok(()) => Ok(true),
+                    Err(e) => {
+                        if self.read_file(to)?.is_some() {
+                            Ok(false)
+                        } else {
+                            Err(e)
+                        }
+                    }
+                }
+            })();
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(handle) };
+            if matches!(result, Ok(true)) {
+                self.sync()?;
+            }
+            result
         }
 
         pub fn read_file(&self, name: &str) -> Result<Option<Vec<u8>>> {
@@ -628,6 +932,65 @@ mod imp {
             );
             Ok(())
         }
+
+        pub fn list_file_names(&self) -> Result<Vec<String>> {
+            let mut names = Vec::new();
+            let mut restart = 1u8;
+            loop {
+                let mut buffer = vec![0u8; 64 * 1024];
+                let mut iosb: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+                let status = unsafe {
+                    NtQueryDirectoryFile(
+                        self.handle,
+                        core::ptr::null_mut(),
+                        core::ptr::null_mut(),
+                        core::ptr::null_mut(),
+                        &mut iosb,
+                        buffer.as_mut_ptr().cast(),
+                        buffer.len() as u32,
+                        FILE_NAMES_INFORMATION_CLASS,
+                        0,
+                        core::ptr::null_mut(),
+                        restart,
+                    )
+                };
+                restart = 0;
+                if status == STATUS_NO_MORE_FILES {
+                    break;
+                }
+                anyhow::ensure!(
+                    nt_success(status),
+                    "句柄相对枚举目录失败: NTSTATUS {status:#010x}"
+                );
+                let used = iosb.Information.min(buffer.len());
+                let mut offset = 0usize;
+                while offset + 12 <= used {
+                    let next =
+                        u32::from_ne_bytes(buffer[offset..offset + 4].try_into().unwrap()) as usize;
+                    let byte_len =
+                        u32::from_ne_bytes(buffer[offset + 8..offset + 12].try_into().unwrap())
+                            as usize;
+                    anyhow::ensure!(
+                        byte_len % 2 == 0 && offset + 12 + byte_len <= used,
+                        "目录枚举返回损坏记录"
+                    );
+                    let wide: Vec<u16> = buffer[offset + 12..offset + 12 + byte_len]
+                        .chunks_exact(2)
+                        .map(|b| u16::from_ne_bytes([b[0], b[1]]))
+                        .collect();
+                    let name = String::from_utf16(&wide).context("目录项文件名不是合法 UTF-16")?;
+                    if name != "." && name != ".." {
+                        validate_component(&name)?;
+                        names.push(name);
+                    }
+                    if next == 0 {
+                        break;
+                    }
+                    offset = offset.checked_add(next).context("目录枚举偏移溢出")?;
+                }
+            }
+            Ok(names)
+        }
     }
 }
 
@@ -644,6 +1007,12 @@ impl SafeDir {
     pub fn write_file(&self, name: &str, content: &[u8]) -> Result<()> {
         self.0.write_file(name, content)
     }
+    pub fn write_file_if_absent(&self, name: &str, content: &[u8]) -> Result<bool> {
+        self.0.write_file_if_absent(name, content)
+    }
+    pub fn rename_noreplace(&self, from: &str, to: &str) -> Result<bool> {
+        self.0.rename_noreplace(from, to)
+    }
     pub fn read_file(&self, name: &str) -> Result<Option<Vec<u8>>> {
         self.0.read_file(name)
     }
@@ -652,6 +1021,9 @@ impl SafeDir {
     }
     pub fn sync(&self) -> Result<()> {
         self.0.sync()
+    }
+    pub fn list_file_names(&self) -> Result<Vec<String>> {
+        self.0.list_file_names()
     }
     #[cfg(test)]
     pub(crate) fn handle_raw(&self) -> windows_sys::Win32::Foundation::HANDLE {
@@ -701,6 +1073,35 @@ mod tests {
         {
             std::os::unix::fs::symlink(target, link).is_ok()
         }
+    }
+
+    #[test]
+    fn directory_enumeration_stays_bound_to_open_handle_after_path_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("journal")).unwrap();
+        std::fs::write(root.path().join("journal").join("old.json"), b"old").unwrap();
+        let root_handle = SafeDir::open_root(root.path()).unwrap();
+        let journal = root_handle.child("journal", false).unwrap();
+        std::fs::rename(root.path().join("journal"), root.path().join("held")).unwrap();
+        std::fs::create_dir(root.path().join("journal")).unwrap();
+        std::fs::write(root.path().join("journal").join("new.json"), b"new").unwrap();
+
+        let names = journal.list_file_names().unwrap();
+        assert!(names.contains(&"old.json".to_string()), "{names:?}");
+        assert!(!names.contains(&"new.json".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn atomic_write_cleans_temp_when_final_rename_fails() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        let dir = SafeDir::open_root(root.path()).unwrap();
+        assert!(dir.write_file("target", b"data").is_err());
+        let names = dir.list_file_names().unwrap();
+        assert!(
+            names.iter().all(|name| !name.contains(".target.mfs-")),
+            "失败路径不得遗留随机临时文件:{names:?}"
+        );
     }
 
     /// F6:目录链中的 junction/symlink 分量必须被拒绝 —— 即使词法上

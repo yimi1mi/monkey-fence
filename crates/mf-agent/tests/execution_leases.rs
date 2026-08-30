@@ -149,6 +149,7 @@ impl Fixture {
                     full_id: "test.recording".into(),
                     version: "1.0.0".into(),
                     content_hash: "hash-recording".into(),
+                    contribution_id: "test.recording".into(),
                 }),
                 resolver: None,
             },
@@ -348,7 +349,9 @@ fn auto_retry_preserves_lease_for_next_attempt() {
     fixture.fail_one_run();
     // 自动重试:新会话重跑,租约不释放(保留文件修改)
     let ok = wait_until(5_000, || {
-        fixture.steps()[0].attempts >= 2 && matches!(fixture.steps()[0].status, StepStatus::Running)
+        fixture.steps()[0].attempts >= 2
+            && matches!(fixture.steps()[0].status, StepStatus::Running)
+            && fixture.host.launches.lock().len() >= 2
     });
     assert!(ok, "自动重试应再次派发");
     assert!(
@@ -380,6 +383,68 @@ fn auto_retry_preserves_lease_for_next_attempt() {
         fixture.provider.acquired_ids()
     );
     let _ = task_id;
+    fixture.orch.stop();
+}
+
+#[test]
+fn duplicate_lease_id_cannot_change_immutable_identity() {
+    let fixture = Fixture::single_step();
+    let task1 = fixture.run_task();
+    let original = fixture
+        .orch
+        .store
+        .list_execution_leases(task1)
+        .unwrap()
+        .remove(0);
+    let task2 = fixture.orch.create_task("t2", "g").unwrap();
+    fixture
+        .orch
+        .save_pipeline(
+            task2.id,
+            &PipelineDraft {
+                steps: vec![step("other")],
+            },
+        )
+        .unwrap();
+    let step2 = fixture.orch.store.task_steps(task2.id).unwrap().remove(0);
+    let forged = ExecutionLease {
+        id: original.lease_key.clone(),
+        path: PathBuf::from(&original.path),
+        isolated: original.isolated,
+        provider: original.provider.clone(),
+        metadata: serde_json::from_str(original.metadata_json.as_deref().unwrap()).unwrap(),
+    };
+    assert!(
+        fixture
+            .orch
+            .store
+            .insert_execution_lease(&forged, None, step2.id, task2.id)
+            .is_err(),
+        "同一 lease.id 不得换绑另一个 task/step"
+    );
+    let stored = fixture
+        .orch
+        .store
+        .list_execution_leases(task1)
+        .unwrap()
+        .remove(0);
+    assert_eq!(stored.task_id, task1);
+    assert_ne!(stored.step_id, step2.id);
+    let mut metadata_drift = forged.clone();
+    metadata_drift.metadata["baseline"] = serde_json::json!("evil-rebind");
+    assert!(
+        fixture
+            .orch
+            .store
+            .insert_execution_lease(
+                &metadata_drift,
+                original.run_id,
+                original.step_id,
+                original.task_id,
+            )
+            .is_err(),
+        "同 task/step 也不得改写 baseline 等行为 metadata"
+    );
     fixture.orch.stop();
 }
 

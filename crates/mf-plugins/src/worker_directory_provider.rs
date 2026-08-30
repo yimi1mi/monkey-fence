@@ -64,8 +64,7 @@ pub struct WorkerDirectoryProvider {
 
 impl WorkerDirectoryProvider {
     /// **生产构造**(F10):完整插件 pin + 宿主授权根。
-    /// pin 与 root 是路由/边界校验的依据,缺一不可 —— 生产路径禁止
-    /// pin=None 的构造(测试用 `new`/`new_with_pin`,cfg(test))。
+    /// pin 与 root 是路由/边界校验的依据,缺一不可；不存在空 pin 构造。
     pub fn new_production(
         full_contribution_id: &str,
         kind: &str,
@@ -75,9 +74,24 @@ impl WorkerDirectoryProvider {
         granted_root: std::path::PathBuf,
     ) -> Result<WorkerDirectoryProvider> {
         anyhow::ensure!(
-            !pin.full_id.is_empty() && !pin.version.is_empty(),
+            !pin.full_id.is_empty()
+                && !pin.version.is_empty()
+                && !pin.content_hash.is_empty()
+                && !pin.contribution_id.is_empty()
+                && pin.contribution_id == full_contribution_id
+                && pin
+                    .contribution_id
+                    .strip_prefix(&format!("{}.", pin.full_id))
+                    .is_some_and(|id| !id.is_empty()),
             "生产构造必须携带完整插件 pin(贡献 ID 版本): {full_contribution_id}"
         );
+        anyhow::ensure!(!kind.trim().is_empty(), "目录 provider kind 不得为空");
+        anyhow::ensure!(
+            granted_root.is_absolute() && !granted_root.as_os_str().is_empty(),
+            "生产构造必须携带绝对宿主授权根: {}",
+            granted_root.display()
+        );
+        directory_identity(&granted_root).context("宿主授权根身份验证失败")?;
         Ok(WorkerDirectoryProvider {
             full_contribution_id: full_contribution_id.to_string(),
             kind: kind.to_string(),
@@ -86,48 +100,6 @@ impl WorkerDirectoryProvider {
             pin,
             granted_root,
         })
-    }
-
-    /// 测试构造(无 pin/无授权根语义;生产代码只经 `from_resolution`/
-    /// `new_production`,此处 doc(hidden) 仅供测试桩使用)。
-    #[doc(hidden)]
-    pub fn new(
-        full_contribution_id: &str,
-        kind: &str,
-        isolates: bool,
-        transport: Box<dyn DirectoryWorkerTransport>,
-    ) -> WorkerDirectoryProvider {
-        WorkerDirectoryProvider {
-            full_contribution_id: full_contribution_id.to_string(),
-            kind: kind.to_string(),
-            isolates,
-            transport,
-            pin: PluginSourcePin {
-                full_id: String::new(),
-                version: String::new(),
-                content_hash: String::new(),
-            },
-            granted_root: std::path::PathBuf::new(),
-        }
-    }
-
-    /// 测试构造(带 pin;无授权根语义;生产禁止)。
-    #[doc(hidden)]
-    pub fn new_with_pin(
-        full_contribution_id: &str,
-        kind: &str,
-        isolates: bool,
-        transport: Box<dyn DirectoryWorkerTransport>,
-        pin: PluginSourcePin,
-    ) -> WorkerDirectoryProvider {
-        WorkerDirectoryProvider {
-            full_contribution_id: full_contribution_id.to_string(),
-            kind: kind.to_string(),
-            isolates,
-            transport,
-            pin,
-            granted_root: std::path::PathBuf::new(),
-        }
     }
 
     /// 本提供器的 pin(宿主路由注册用)。
@@ -177,24 +149,19 @@ impl WorkerDirectoryProvider {
         } else {
             &self.granted_root
         };
-        ensure_lease_under_root(granted_root, &lease.path)
-            .context("worker 返回的租约路径越出宿主授权的项目根")?;
         anyhow::ensure!(
             lease.metadata.is_object(),
             "worker 返回的租约 metadata 必须是 JSON object(得到 {:?}),无法盖章归属,拒绝",
             lease.metadata
         );
+        ensure_lease_under_root(granted_root, &lease.path)
+            .context("worker 返回的租约路径越出宿主授权的项目根")?;
+        let identity = directory_identity(&lease.path)
+            .context("worker 返回的租约目录身份无效或含 reparse/symlink")?;
         match lease.metadata.get("provider_pin") {
             None => {
                 if let Some(obj) = lease.metadata.as_object_mut() {
-                    obj.insert(
-                        "provider_pin".into(),
-                        serde_json::json!({
-                            "full_id": self.pin.full_id,
-                            "version": self.pin.version,
-                            "content_hash": self.pin.content_hash,
-                        }),
-                    );
+                    obj.insert("provider_pin".into(), serde_json::to_value(&self.pin)?);
                 }
             }
             Some(claimed) => {
@@ -207,6 +174,7 @@ impl WorkerDirectoryProvider {
                 );
             }
         }
+        lease.metadata["host_directory_identity"] = serde_json::json!(identity);
         Ok(())
     }
 
@@ -221,6 +189,12 @@ impl WorkerDirectoryProvider {
             self.full_contribution_id
         );
         anyhow::ensure!(
+            lease.isolated == self.isolates,
+            "租约 isolated={} 与提供器声明 {} 不一致",
+            lease.isolated,
+            self.isolates
+        );
+        anyhow::ensure!(
             !lease.id.is_empty() && lease.id.len() <= 128,
             "租约 ID 非法(空或超长): {:?}",
             lease.id
@@ -233,20 +207,30 @@ impl WorkerDirectoryProvider {
             "租约 ID 含路径语义,拒绝: {:?}",
             lease.id
         );
-        if !self.granted_root.as_os_str().is_empty() {
-            ensure_lease_under_root(&self.granted_root, &lease.path)
-                .context("租约路径越出宿主授权的项目根(拒绝发给 worker)")?;
-        }
-        if let Some(claimed) = lease.metadata.get("provider_pin") {
-            let claimed: PluginSourcePin = serde_json::from_value(claimed.clone())
-                .context("租约 metadata 的 provider_pin 格式非法")?;
-            // pin 已知(生产构造)才做强等值校验;测试构造空 pin 跳过
-            anyhow::ensure!(
-                self.pin.full_id.is_empty() || claimed == self.pin,
-                "租约 provider_pin({claimed:?})与本提供器({:?})不一致,拒绝",
-                self.pin
-            );
-        }
+        anyhow::ensure!(lease.metadata.is_object(), "租约 metadata 必须是 object");
+        ensure_lease_under_root(&self.granted_root, &lease.path)
+            .context("租约路径越出宿主授权的项目根(拒绝发给 worker)")?;
+        let claimed_value = lease
+            .metadata
+            .get("provider_pin")
+            .context("隔离租约缺少 provider_pin，拒绝")?;
+        let claimed: PluginSourcePin = serde_json::from_value(claimed_value.clone())
+            .context("租约 metadata 的 provider_pin 格式非法")?;
+        anyhow::ensure!(
+            claimed == self.pin,
+            "租约 provider_pin({claimed:?})与本提供器({:?})不一致,拒绝",
+            self.pin
+        );
+        let expected_identity = lease
+            .metadata
+            .get("host_directory_identity")
+            .and_then(|v| v.as_str())
+            .context("租约缺少宿主目录身份，拒绝 path-based 复用")?;
+        let current_identity = directory_identity(&lease.path)?;
+        anyhow::ensure!(
+            current_identity == expected_identity,
+            "租约目录对象身份已变化(可能被 symlink/junction 替换)，拒绝"
+        );
         Ok(())
     }
 
@@ -279,6 +263,85 @@ impl WorkerDirectoryProvider {
     }
 }
 
+/// 以最终目录句柄绑定对象身份；拒绝 symlink/junction/reparse。
+#[cfg(windows)]
+fn directory_identity(path: &std::path::Path) -> Result<String> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        OPEN_EXISTING,
+    };
+    const FILE_READ_ATTRIBUTES: u32 = 0x80;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            core::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            core::ptr::null_mut(),
+        )
+    };
+    anyhow::ensure!(
+        handle != INVALID_HANDLE_VALUE,
+        "打开目录句柄失败: {}",
+        std::io::Error::last_os_error()
+    );
+    let result = (|| -> Result<String> {
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        anyhow::ensure!(
+            unsafe { GetFileInformationByHandle(handle, &mut info) } != 0,
+            "读取目录身份失败"
+        );
+        anyhow::ensure!(
+            info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+            "租约路径不是目录"
+        );
+        anyhow::ensure!(
+            info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT == 0,
+            "租约目录是 reparse/junction/symlink"
+        );
+        Ok(format!(
+            "win:{:08x}:{:08x}{:08x}",
+            info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow
+        ))
+    })();
+    unsafe { CloseHandle(handle) };
+    result
+}
+
+#[cfg(not(windows))]
+fn directory_identity(path: &std::path::Path) -> Result<String> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    let c = CString::new(path.as_os_str().as_bytes()).context("目录路径含 NUL")?;
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    anyhow::ensure!(
+        fd >= 0,
+        "打开目录句柄失败: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    let status = unsafe { libc::fstat(fd, &mut stat) };
+    unsafe { libc::close(fd) };
+    anyhow::ensure!(
+        status == 0,
+        "读取目录身份失败: {}",
+        std::io::Error::last_os_error()
+    );
+    Ok(format!("unix:{}:{}", stat.st_dev, stat.st_ino))
+}
+
 fn ctx_params(ctx: &LeaseContext) -> Value {
     serde_json::json!({
         "task_id": ctx.task_id,
@@ -309,6 +372,10 @@ impl ExecutionDirectoryProvider for WorkerDirectoryProvider {
             serde_json::from_value(result).context("worker 返回的租约格式非法")?;
         self.validate_lease(&mut lease, ctx)?;
         Ok(lease)
+    }
+
+    fn validate_for_use(&self, lease: &ExecutionLease) -> Result<()> {
+        self.validate_existing_lease(lease)
     }
 
     fn merge(&self, leases: &[ExecutionLease]) -> Result<MergeOutcome> {

@@ -25,6 +25,7 @@ fn pin(v: &str) -> PluginSourcePin {
         full_id: "third.party.dirs".into(),
         version: v.into(),
         content_hash: format!("hash-{v}"),
+        contribution_id: "pinned".into(),
     }
 }
 
@@ -67,6 +68,7 @@ impl ExecutionDirectoryProvider for PinnedDirectory {
                     "full_id": self.pin.full_id,
                     "version": self.pin.version,
                     "content_hash": self.pin.content_hash,
+                    "contribution_id": self.pin.contribution_id,
                 },
             }),
         })
