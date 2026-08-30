@@ -938,7 +938,10 @@ impl GitWorktreeProvider {
         atomic_write_file(&dst, &content).map_err(ApplyOneError::Error)
     }
 
-    /// 回滚单条已应用变更(按应用前原状态恢复;路径校验 + 原子写)。
+    /// 回滚单条已应用变更(F9:target→original CAS)—— 只有当前内容
+    /// 确实等于**本事务 target**(即应用结果未被触碰)或已等于
+    /// original(幂等重试)时才恢复/删除;窗口内被用户改成第三种
+    /// 内容 → 该文件回滚失败(调用方聚合上报,绝不覆盖用户字节)。
     fn rollback_one(&self, change: &JournaledChange) -> Result<()> {
         if self.current_fault() == Some(MergeFault::FailUndo) {
             anyhow::bail!("(测试注入)回滚动作失败: {}", change.path);
@@ -954,25 +957,69 @@ impl GitWorktreeProvider {
                     .as_deref()
                     .expect("original_present 时必有原字节"),
             )?;
-            return atomic_write_file(&dst, &original)
-                .with_context(|| format!("恢复被删文件失败: {}", dst.display()));
-        }
-        if !change.original_present {
-            // 应用前不存在:本次新建的文件 → 删除(新建的空目录保留)
-            if dst.is_file() {
-                return std::fs::remove_file(&dst)
-                    .with_context(|| format!("回滚删除新建文件失败: {}", dst.display()));
+            match std::fs::read(&dst) {
+                Err(_) => {
+                    // 当前 == target(已删除)→ 恢复 original
+                    atomic_write_file(&dst, &original)
+                        .with_context(|| format!("恢复被删文件失败: {}", dst.display()))
+                }
+                Ok(bytes) if bytes == original => Ok(()), // 已回滚:幂等
+                Ok(_) => anyhow::bail!(
+                    "{} 回滚拒绝:本事务删除后用户重建了不同内容(不得覆盖用户字节)",
+                    change.path
+                ),
             }
-            return Ok(());
+        } else if !change.original_present {
+            // 应用前不存在:本次新建的文件(target = 存在该内容)
+            match std::fs::read(&dst) {
+                Err(_) => return Ok(()), // 已不在:幂等
+                Ok(bytes) => {
+                    let target = hex_decode(
+                        change
+                            .content_hex
+                            .as_deref()
+                            .expect("非删除变更必有目标内容"),
+                    )?;
+                    if bytes != target {
+                        anyhow::bail!(
+                            "{} 回滚拒绝:本事务新建后用户改写了内容(不得删除用户字节)",
+                            change.path
+                        );
+                    }
+                    std::fs::remove_file(&dst)
+                        .with_context(|| format!("回滚删除新建文件失败: {}", dst.display()))
+                }
+            }
+        } else {
+            let original = hex_decode(
+                change
+                    .original_hex
+                    .as_deref()
+                    .expect("original_present 时必有原字节"),
+            )?;
+            match std::fs::read(&dst) {
+                Ok(bytes) if bytes == original => Ok(()), // 已回滚:幂等
+                Ok(bytes) => {
+                    let target = hex_decode(
+                        change
+                            .content_hex
+                            .as_deref()
+                            .expect("非删除变更必有目标内容"),
+                    )?;
+                    anyhow::ensure!(
+                        bytes == target,
+                        "{} 回滚拒绝:应用结果已被用户修改(当前既非本事务 target 也非 original,不得覆盖用户字节)",
+                        change.path
+                    );
+                    atomic_write_file(&dst, &original)
+                        .with_context(|| format!("恢复被覆盖文件失败: {}", dst.display()))
+                }
+                Err(_) => anyhow::bail!(
+                    "{} 回滚拒绝:应用结果已被用户删除(不敢盲目重建,请人工处理)",
+                    change.path
+                ),
+            }
         }
-        let original = hex_decode(
-            change
-                .original_hex
-                .as_deref()
-                .expect("original_present 时必有原字节"),
-        )?;
-        atomic_write_file(&dst, &original)
-            .with_context(|| format!("恢复被覆盖文件失败: {}", dst.display()))
     }
 
     /// 启动/合并前恢复:重放或清理未完成的事务日志,一致收敛。
@@ -1110,7 +1157,8 @@ impl GitWorktreeProvider {
                 Ok(bytes) => {
                     let original = change.original_hex.as_deref().map(hex_decode).transpose()?;
                     if change.original_present && Some(bytes) == original {
-                        std::fs::write(&dst, &target)
+                        // F9:重放同样走原子替换 + 目录同步(不留半写状态)
+                        atomic_write_file(&dst, &target)
                             .with_context(|| format!("重放写入失败: {}", dst.display()))?;
                     } else {
                         anyhow::bail!(
@@ -1120,13 +1168,7 @@ impl GitWorktreeProvider {
                     }
                 }
                 Err(_) if !change.original_present => {
-                    if let Some(parent) = dst.parent() {
-                        if !parent.as_os_str().is_empty() {
-                            std::fs::create_dir_all(parent)
-                                .with_context(|| format!("重放建目录失败: {}", parent.display()))?;
-                        }
-                    }
-                    std::fs::write(&dst, &target)
+                    atomic_write_file(&dst, &target)
                         .with_context(|| format!("重放新建失败: {}", dst.display()))?;
                 }
                 Err(_) => anyhow::bail!(
@@ -1810,6 +1852,74 @@ mod merge_journal_tests {
             "收敛后不得残留事务日志: {leftovers:?}"
         );
         a.release(&lease).unwrap();
+    }
+
+    /// F9:rollback 的 target→original CAS —— 当前内容必须等于本事务
+    /// **target**(或已等于 original 的幂等重试)才恢复/删除;
+    /// 窗口内被用户改成第三种内容 → 拒绝回滚该文件(如实聚合),
+    /// 绝不覆盖用户字节。
+    #[test]
+    fn rollback_refuses_when_current_content_is_neither_target_nor_original() {
+        let (_dir, root) = fixture();
+        let provider = GitWorktreeProvider::new(root.clone()).unwrap();
+        // 本事务:把 a.txt 从 original 改成 target
+        let change = JournaledChange {
+            path: "a.txt".into(),
+            deleted: false,
+            content_hex: Some(hex_encode(b"target\n")),
+            original_present: true,
+            original_hex: Some(hex_encode(b"aaa\n")),
+        };
+        // 已应用(target 在盘上)→ 回滚恢复 original
+        std::fs::write(root.join("a.txt"), "target\n").unwrap();
+        provider.rollback_one(&change).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "aaa\n",
+            "当前 == target 时必须恢复 original"
+        );
+        // 幂等:当前已 == original → no-op 成功
+        provider.rollback_one(&change).unwrap();
+
+        // 用户在窗口内编辑(第三种内容)→ 拒绝回滚,字节保持
+        std::fs::write(root.join("a.txt"), "user-edit\n").unwrap();
+        let err = provider.rollback_one(&change).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("用户"),
+            "错误必须指明用户修改: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "user-edit\n",
+            "用户字节必须保持,不得被回滚覆盖"
+        );
+    }
+
+    /// F9:删除项的回滚同样 CAS —— 本事务删除了该文件(target = 不存在),
+    /// 当前不存在 → 恢复 original;用户重建了不同内容 → 拒绝。
+    #[test]
+    fn rollback_of_deletion_refuses_when_user_recreated_file() {
+        let (_dir, root) = fixture();
+        let provider = GitWorktreeProvider::new(root.clone()).unwrap();
+        let change = JournaledChange {
+            path: "b.txt".into(),
+            deleted: true,
+            content_hex: None,
+            original_present: true,
+            original_hex: Some(hex_encode(b"bbb\n")),
+        };
+        // 已应用(文件已删)→ 恢复 original
+        std::fs::remove_file(root.join("b.txt")).unwrap();
+        provider.rollback_one(&change).unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "bbb\n");
+        // 用户重建为不同内容 → 拒绝恢复(会覆盖用户字节)
+        std::fs::write(root.join("b.txt"), "user-recreated\n").unwrap();
+        let err = provider.rollback_one(&change).unwrap_err();
+        assert!(format!("{err:#}").contains("用户"), "{err:#}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "user-recreated\n"
+        );
     }
 
     /// F3:赢家崩溃后,另一独立实例的 recover 必须能收敛(跨实例恢复)。
