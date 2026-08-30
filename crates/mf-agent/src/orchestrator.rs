@@ -5,7 +5,8 @@
 
 use crate::config::Config;
 use crate::execution_directory::{
-    ExecutionDirectoryProvider, ExecutionLease, LeaseContext, MergeOutcome,
+    DirectoryProviderResolver, ExecutionDirectoryProvider, ExecutionLease, LeaseContext,
+    MergeOutcome,
 };
 use crate::model::*;
 use crate::pipeline::{PipelineDraft, ProfileIndex, SessionPolicy};
@@ -102,6 +103,16 @@ impl GlobalLimiter {
     }
 }
 
+/// 目录提供器路由(C7):启动期注入,先于任何调度/恢复线程。
+#[derive(Default)]
+pub struct DirectoryRouting {
+    /// 当前进程内提供器的 pinned 身份(None = 内核默认共享目录)。
+    pub current_pin: Option<PluginSourcePin>,
+    /// 按 pinned 身份解析历史提供器的注册表(宿主注入;None =
+    /// 无历史版本可解析,旧 pin 只在恰好等于 current_pin 时放行)。
+    pub resolver: Option<Arc<dyn DirectoryProviderResolver>>,
+}
+
 /// 可刷新的 Agent Profile 目录(插件注册表投影)。
 #[derive(Default)]
 pub struct ProfileCatalog {
@@ -145,6 +156,10 @@ pub struct Orchestrator {
     /// 同一任务的 join 批时,批收集→merge→release 全程串行化;
     /// 配合 Store 的 merge_batches CAS 构成双重防护)。
     settlement_locks: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
+    /// 按 pinned 身份解析目录提供器(C7):held lease 的 merge/release
+    /// 路由到租约冻结的提供器版本;None 时仅当租约 pin 与当前提供器
+    /// pin 相同才放行(绝不静默顶替)。
+    directory_resolver: Mutex<Option<Arc<dyn DirectoryProviderResolver>>>,
 }
 
 impl Orchestrator {
@@ -184,6 +199,36 @@ impl Orchestrator {
         pipe_name: String,
         directory: Arc<dyn ExecutionDirectoryProvider>,
         workflow: WorkflowKernel,
+    ) -> Result<Arc<Orchestrator>> {
+        Self::start_with_routing(
+            store,
+            root,
+            config,
+            host,
+            profiles,
+            global,
+            pipe_name,
+            directory,
+            workflow,
+            DirectoryRouting::default(),
+        )
+    }
+
+    /// 完整启动 + 目录提供器路由(C7):`current_pin` 与 `resolver`
+    /// 在**任何启动线程/恢复冲刷之前**注入(恢复的 held lease 汇合
+    /// 已能按租约 pin 路由,不存在启动期 None-pin 竞态)。
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_with_routing(
+        store: Arc<Store>,
+        root: PathBuf,
+        config: Config,
+        host: Arc<dyn RuntimeHost>,
+        profiles: Arc<RwLock<ProfileCatalog>>,
+        global: Arc<GlobalLimiter>,
+        pipe_name: String,
+        directory: Arc<dyn ExecutionDirectoryProvider>,
+        workflow: WorkflowKernel,
+        routing: DirectoryRouting,
     ) -> Result<Arc<Orchestrator>> {
         // 异常退出恢复(设计 §13):宿主确认存活的会话重连;
         // 未知状态 → interrupted + awaiting-outcome(不判失败)
@@ -229,8 +274,9 @@ impl Orchestrator {
             step_leases: Mutex::new(HashMap::new()),
             workflow,
             pending_merges: Mutex::new(HashMap::new()),
-            directory_pin: Mutex::new(None),
             settlement_locks: Mutex::new(HashMap::new()),
+            directory_resolver: Mutex::new(routing.resolver),
+            directory_pin: Mutex::new(routing.current_pin),
         });
         for run in &recovered {
             if let Some(t) = orch.store.task_view(run.task_id)? {
@@ -1061,6 +1107,44 @@ impl Orchestrator {
         }
     }
 
+    /// 租约 metadata 里的提供器 pin(dispatch 时冻结;旧租约可能无)。
+    fn lease_provider_pin(lease: &ExecutionLease) -> Option<PluginSourcePin> {
+        lease
+            .metadata
+            .get("provider_pin")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+    }
+
+    /// C7 提供器路由:按租约冻结的完整 pin 解析提供器 ——
+    /// - 无 pin(内核默认共享目录/极旧租约)→ 当前提供器;
+    /// - 有 pin 且解析器存在 → 解析器结果(旧版本仍安装在位时得到
+    ///   旧实现);解析失败 → None(调用方持久 NeedsYou,绝不用
+    ///   当前提供器顶替);
+    /// - 无解析器(测试/无插件宿主)→ 仅当 pin 恰为当前提供器 pin
+    ///   才放行当前提供器。
+    fn lease_provider(
+        &self,
+        lease: &ExecutionLease,
+    ) -> Option<Arc<dyn ExecutionDirectoryProvider>> {
+        match Self::lease_provider_pin(lease) {
+            None => Some(self.directory.clone()),
+            Some(lease_pin) => {
+                let resolver = self.directory_resolver.lock().clone();
+                match resolver {
+                    Some(r) => r.resolve(&lease_pin),
+                    None => {
+                        if self.directory_provider_pin().as_ref() == Some(&lease_pin) {
+                            Some(self.directory.clone())
+                        } else {
+                            None
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// 任务当前活动修订 id(无活动修订时 0;批状态持久化用)。
     fn active_revision_id(&self, task_id: i64) -> i64 {
         self.store
@@ -1071,13 +1155,34 @@ impl Orchestrator {
             .unwrap_or(0)
     }
 
-    /// 汇合一批隔离租约;返回冲突列表(空 = 全部合并成功)。
+    /// 汇合一批隔离租约(C7:按批首租约冻结的 pin 路由到对应提供器,
+    /// 绝不用当前 self.directory 顶替);返回冲突列表(空 = 全部合并成功)。
+    /// pin 无法解析/批内 pin 不一致 → Err(调用方持久化为待决汇合)。
     fn merge_leases(&self, leases: &[ExecutionLease]) -> Result<Vec<String>> {
         let isolated: Vec<ExecutionLease> = leases.iter().filter(|l| l.isolated).cloned().collect();
         if isolated.is_empty() {
             return Ok(Vec::new());
         }
-        Ok(match self.directory.merge(&isolated)? {
+        let provider = self.lease_provider(&isolated[0]).ok_or_else(|| {
+            anyhow::anyhow!(
+                "租约批的目录提供器 pin({:?})无法解析(插件已升级/卸载?):
+租约 {}..{}
+请先恢复对应插件版本或人工处理隔离目录",
+                Self::lease_provider_pin(&isolated[0]),
+                isolated[0].id,
+                isolated[isolated.len() - 1].id
+            )
+        })?;
+        if let (Some(first), Some(second)) = (
+            Self::lease_provider_pin(&isolated[0]),
+            Self::lease_provider_pin(&isolated[isolated.len() - 1]),
+        ) {
+            anyhow::ensure!(
+                first == second,
+                "汇合批混入不同提供器 pin 的租约({first:?} 与 {second:?})"
+            );
+        }
+        Ok(match provider.merge(&isolated)? {
             MergeOutcome::NeedsUser { conflicts } => conflicts,
             MergeOutcome::Merged | MergeOutcome::NotRequired => Vec::new(),
         })
@@ -1103,16 +1208,41 @@ impl Orchestrator {
     }
 
     /// 释放具体租约对象(进程内映射 + 数据库行 + join 暂缓行)。
+    /// C7:按租约 pin 路由到对应提供器;pin 无法解析时保持持有并
+    /// 把任务转 needs-you(绝不用当前提供器顶替释放旧版本租约)。
     fn release_lease_of_lease(&self, lease: &ExecutionLease) {
-        if let Err(e) = self.directory.release(lease) {
-            log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
+        match self.lease_provider(lease) {
+            Some(provider) => {
+                if let Err(e) = provider.release(lease) {
+                    log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
+                }
+                let _ = self.store.release_execution_lease(&lease.id);
+                let _ = self
+                    .store
+                    .delete_join_deferrals_for_leases(&[lease.id.clone()]);
+                self.held_leases.lock().retain(|_, l| l.id != lease.id);
+                self.step_leases.lock().retain(|_, l| l.id != lease.id);
+            }
+            None => {
+                log::error!(
+                    "租约 `{}` 的提供器 pin({:?})无法解析,保持持有并转 needs-you",
+                    lease.id,
+                    Self::lease_provider_pin(lease)
+                );
+                if let Some(t) = self.store.task_view_of_lease(&lease.id).ok().flatten() {
+                    if !t.status.terminal() {
+                        if let Some(t) = self
+                            .store
+                            .set_task_status(t.id, TaskStatus::NeedsYou)
+                            .ok()
+                            .flatten()
+                        {
+                            self.emit(SchedulerEvent::TaskUpdated(t));
+                        }
+                    }
+                }
+            }
         }
-        let _ = self.store.release_execution_lease(&lease.id);
-        let _ = self
-            .store
-            .delete_join_deferrals_for_leases(&[lease.id.clone()]);
-        self.held_leases.lock().retain(|_, l| l.id != lease.id);
-        self.step_leases.lock().retain(|_, l| l.id != lease.id);
     }
 
     /// 终止单个 Agent Run(完整动作):请求宿主停止进程、**等待真实终止

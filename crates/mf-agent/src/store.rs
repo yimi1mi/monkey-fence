@@ -2075,6 +2075,23 @@ impl Store {
         })
     }
 
+    /// 按租约键取其任务视图(租约释放失败转 needs-you 用)。
+    pub fn task_view_of_lease(&self, lease_key: &str) -> Result<Option<TaskView>> {
+        self.with_conn(|c| {
+            let task_id: Option<i64> = c
+                .query_row(
+                    "SELECT task_id FROM execution_leases WHERE lease_key = ?1 ORDER BY id DESC LIMIT 1",
+                    params![lease_key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match task_id {
+                Some(id) => Self::task_view_by_id(c, id),
+                None => Ok(None),
+            }
+        })
+    }
+
     /// 任务的租约列表(升序)。
     pub fn list_execution_leases(&self, task_id: i64) -> Result<Vec<ExecutionLeaseRow>> {
         self.with_conn(|c| {

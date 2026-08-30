@@ -74,6 +74,18 @@ pub trait ExecutionDirectoryProvider: Send + Sync {
     }
 }
 
+/// 按 pinned 身份解析目录提供器(C7):held lease 的 merge/release
+/// 与重启恢复必须路由到租约(或 Revision)冻结的完整
+/// `full_id + version + content_hash` 对应的提供器实现 —— 插件升级/
+/// 更换后绝不能用当前进程内提供器顶替旧租约的操作。
+/// 解析失败(旧版本已卸载)由调用方转入持久 NeedsYou。
+pub trait DirectoryProviderResolver: Send + Sync {
+    fn resolve(
+        &self,
+        pin: &crate::workflow::PluginSourcePin,
+    ) -> Option<std::sync::Arc<dyn ExecutionDirectoryProvider>>;
+}
+
 /// 默认提供器:项目目录本身,不隔离;
 /// 并行节点需要用户显式开启"共享目录并行"风险开关(编译器校验)。
 #[derive(Default)]

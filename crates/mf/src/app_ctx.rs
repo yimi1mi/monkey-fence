@@ -155,6 +155,78 @@ fn directory_provider_for(
     )
 }
 
+/// C7:按 pinned 身份解析目录提供器(宿主实现):
+/// - 内置 worktree pin → 进程内 GitWorktreeProvider(Git 根);
+/// - 第三方 pin → 经 Plugin Host 的内容寻址解析 → WorkerDirectoryProvider
+///   (旧版本包仍安装在位时可解析);
+/// - 均失败 → None(调用方持久 NeedsYou,绝不用当前提供器顶替)。
+struct PluginDirectoryResolver {
+    root: PathBuf,
+    plugins: Arc<PluginRegistry>,
+}
+
+impl mf_agent::execution_directory::DirectoryProviderResolver for PluginDirectoryResolver {
+    fn resolve(
+        &self,
+        pin: &mf_agent::workflow::PluginSourcePin,
+    ) -> Option<Arc<dyn mf_agent::execution_directory::ExecutionDirectoryProvider>> {
+        // 内置 worktree pinned 身份(空哈希)
+        if pin.full_id == WORKTREE_PLUGIN_FULL_ID && pin.content_hash.is_empty() {
+            if mf_vcs::git::Git::is_repo(&self.root) {
+                if let Ok(provider) =
+                    mf_plugins::git_worktree_provider::GitWorktreeProvider::new(self.root.clone())
+                {
+                    return Some(Arc::new(provider));
+                }
+            }
+            return None;
+        }
+        // 第三方:内容寻址解析(版本+哈希都由 Plugin Host 校验)
+        let contributions = self.plugins.contributions().execution_directories();
+        let full_contribution_id = format!("{}.{}", pin.full_id, {
+            // 贡献 ID 不在 pin 里:按插件 full_id 找其目录贡献(取匹配哈希者)
+            let mut found = String::new();
+            for (cid, source, _) in &contributions {
+                if source.plugin_full_id == pin.full_id
+                    && source.content_hash == pin.content_hash
+                    && source.plugin_version == pin.version
+                {
+                    found = cid
+                        .rsplit('.')
+                        .next()
+                        .map(|s| s.to_string())
+                        .unwrap_or_default();
+                    break;
+                }
+            }
+            found
+        });
+        if full_contribution_id.ends_with('.') || full_contribution_id.is_empty() {
+            log::warn!("目录提供器 pin({:?})在已安装贡献中找不到匹配版本", pin);
+            return None;
+        }
+        match self.plugins.resolve_directory_provider(
+            &full_contribution_id,
+            &pin.version,
+            &pin.content_hash,
+        ) {
+            Ok(res) => {
+                match mf_plugins::worker_directory_provider::WorkerDirectoryProvider::from_resolution(&res) {
+                    Ok(provider) => Some(Arc::new(provider)),
+                    Err(e) => {
+                        log::warn!("目录提供器 pin({pin:?})worker 启动失败: {e:#}");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                log::warn!("目录提供器 pin({pin:?})解析未通过: {e:#}");
+                None
+            }
+        }
+    }
+}
+
 pub struct ProjectHandle {
     pub root: PathBuf,
     pub orchestrator: Arc<Orchestrator>,
@@ -416,9 +488,11 @@ impl AppCtx {
             },
         );
         // 目录提供器:统一经 Plugin Host 解析(内置 worktree / 第三方
-        // worker / 共享目录);pin 随 Revision 冻结、派发强校验
+        // worker / 共享目录);pin 随 Revision 冻结、派发强校验。
+        // C7:current_pin 与按 pin 解析历史版本的 resolver 在启动
+        //(含 held-lease 恢复冲刷、任何调度线程)**之前**注入。
         let (directory, directory_pin) = directory_provider_for(&root, &self.plugins);
-        let orch = Orchestrator::start_with(
+        let orch = Orchestrator::start_with_routing(
             store,
             root.clone(),
             config,
@@ -433,8 +507,14 @@ impl AppCtx {
                     host: self.plugins.clone(),
                 })),
             },
+            mf_agent::orchestrator::DirectoryRouting {
+                current_pin: directory_pin,
+                resolver: Some(Arc::new(PluginDirectoryResolver {
+                    root: root.clone(),
+                    plugins: self.plugins.clone(),
+                })),
+            },
         )?;
-        orch.set_directory_provider_pin(directory_pin);
         self.projects.lock().push(ProjectHandle {
             root: root.clone(),
             orchestrator: orch.clone(),
