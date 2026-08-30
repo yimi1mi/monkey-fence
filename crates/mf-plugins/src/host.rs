@@ -73,6 +73,9 @@ pub struct DirectoryProviderResolution {
     pub isolates: bool,
     pub supports_parallel: bool,
     pub factory: DirectoryProviderFactory,
+    /// 解析出的插件包 pin(F10:生产构造 WorkerDirectoryProvider 的
+    /// 必需输入;完整贡献 ID + 精确版本 + 内容哈希)。
+    pub pin: mf_agent::workflow::PluginSourcePin,
 }
 
 pub struct PluginHost {
@@ -823,6 +826,11 @@ impl PluginHost {
                 isolates: contribution.isolates,
                 supports_parallel: contribution.supports_parallel,
                 factory: DirectoryProviderFactory::BuiltinWorktree,
+                pin: mf_agent::workflow::PluginSourcePin {
+                    full_id: plugin_full_id.to_string(),
+                    version: version.to_string(),
+                    content_hash: content_hash.to_string(),
+                },
             });
         }
         // 第三方:内容寻址包解析(版本/哈希/防篡改),身份校验在内
@@ -889,6 +897,11 @@ impl PluginHost {
                 command: worker.command,
                 args: worker.args,
                 plugin_root: resolved.root.clone(),
+            },
+            pin: mf_agent::workflow::PluginSourcePin {
+                full_id: plugin_full_id.to_string(),
+                version: version.to_string(),
+                content_hash: content_hash.to_string(),
             },
         })
     }

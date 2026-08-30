@@ -120,7 +120,7 @@ fn directory_provider_for(
             &source.content_hash,
         ) {
             Ok(res) => {
-                match mf_plugins::worker_directory_provider::WorkerDirectoryProvider::from_resolution(&res) {
+                match mf_plugins::worker_directory_provider::WorkerDirectoryProvider::from_resolution(&res, root.to_path_buf()) {
                     Ok(provider) => {
                         log::info!(
                             "执行目录提供器:{full_contribution_id}(worker 驱动,kind {})",
@@ -211,7 +211,7 @@ impl mf_agent::execution_directory::DirectoryProviderResolver for PluginDirector
             &pin.content_hash,
         ) {
             Ok(res) => {
-                match mf_plugins::worker_directory_provider::WorkerDirectoryProvider::from_resolution(&res) {
+                match mf_plugins::worker_directory_provider::WorkerDirectoryProvider::from_resolution(&res, self.root.clone()) {
                     Ok(provider) => Some(Arc::new(provider)),
                     Err(e) => {
                         log::warn!("目录提供器 pin({pin:?})worker 启动失败: {e:#}");
