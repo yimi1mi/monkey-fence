@@ -2294,11 +2294,18 @@ impl Orchestrator {
         // join 暂缓门控(按依赖精确阻塞):依赖步骤的租约仍持有
         //(等待 join 兄弟汇合/待决冲突解决)时不得派发 —— 下游必须从
         // 含全部上游的汇合基线检出;无关分支不受影响。
-        let deferred_keys: HashSet<String> = self
+        // I13:门控键必须是 (task_id, step_key) —— 全局裸 step_key 会把
+        // 其他任务的同名步骤一并误伤(两个任务都有 "a" 时,其中一个
+        // 暂缓不得阻塞另一个)。
+        let deferred_keys: HashSet<(i64, String)> = self
             .step_leases
             .lock()
             .values()
-            .filter_map(|l| lease_step_key(l).map(str::to_string))
+            .filter_map(|l| {
+                let task_id = l.metadata.get("task_id").and_then(|v| v.as_i64())?;
+                let key = lease_step_key(l)?;
+                Some((task_id, key.to_string()))
+            })
             .collect();
         let mut candidates: Vec<(TaskView, StepView)> = Vec::new();
         for task in self.store.list_tasks(false)? {
@@ -2315,12 +2322,12 @@ impl Orchestrator {
                 if step.status != StepStatus::Ready {
                     continue;
                 }
-                if step
-                    .deps
-                    .iter()
-                    .any(|d| key_of.get(d).is_some_and(|k| deferred_keys.contains(*k)))
-                {
-                    continue; // 上游租约未汇合:等 join 批完整后再派发
+                if step.deps.iter().any(|d| {
+                    key_of
+                        .get(d)
+                        .is_some_and(|k| deferred_keys.contains(&(task.id, (*k).to_string())))
+                }) {
+                    continue; // 本任务上游租约未汇合:等 join 批完整后再派发
                 }
                 candidates.push((task.clone(), step.clone()));
             }
@@ -2524,8 +2531,16 @@ impl Orchestrator {
                 lease
             }
         };
-        // 租约固定提供器 pin(审计/恢复时可见;与 Revision 冻结一致)
         let mut lease = lease;
+        // 租约元数据补齐:task_id/step_key 是调度内核的归属事实
+        //(I13 门控键、审计),提供器未自带时由内核统一盖章
+        if let Some(obj) = lease.metadata.as_object_mut() {
+            obj.entry("task_id".to_string())
+                .or_insert_with(|| serde_json::json!(task.id));
+            obj.entry("step_key".to_string())
+                .or_insert_with(|| serde_json::json!(step.step_key));
+        }
+        // 租约固定提供器 pin(审计/恢复时可见;与 Revision 冻结一致)
         if let Some(pin) = self.directory_provider_pin() {
             if lease.metadata.get("provider_pin").is_none() {
                 if let Some(obj) = lease.metadata.as_object_mut() {
