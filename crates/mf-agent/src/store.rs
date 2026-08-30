@@ -2835,18 +2835,120 @@ impl Store {
         })
     }
 
-    /// 领取结论回写:`merging → merged / needs_user`(按 transaction_id CAS;
-    /// 行已被重置/换领时 no-op)。
-    pub fn complete_merge_batch(&self, transaction_id: &str, needs_user: bool) -> Result<()> {
-        self.with_conn(|c| {
+    /// 领取结论回写:`merging → merged / needs_user`(按 transaction_id CAS)。
+    /// F2:needs_user 时**同事务持久化冲突列表**(启动恢复重建投影的
+    /// 唯一依据);0 行命中(行被重置/换领)是错误 —— 如实上抛,
+    /// 不得静默宣称结论已落库。
+    pub fn complete_merge_batch(
+        &self,
+        transaction_id: &str,
+        needs_user: bool,
+        conflicts: &[String],
+    ) -> Result<()> {
+        let n = self.with_conn(|c| {
             c.execute(
                 "UPDATE merge_batches
                     SET status = CASE ?2 WHEN 1 THEN 'needs_user' ELSE 'merged' END,
+                        conflicts_json = ?4,
                         updated_at = ?3
                  WHERE transaction_id = ?1 AND status = 'merging'",
-                params![transaction_id, needs_user as i64, now()],
+                params![
+                    transaction_id,
+                    needs_user as i64,
+                    now(),
+                    serde_json::to_string(conflicts)?
+                ],
+            )
+            .map_err(anyhow::Error::from)
+        })?;
+        anyhow::ensure!(
+            n == 1,
+            "合并批结论回写未命中(事务 {transaction_id}:行已被重置或换领)"
+        );
+        Ok(())
+    }
+
+    /// F2:待恢复的批行(provider_applied=merged / needs_user)——
+    /// 启动恢复据此补齐租约释放或冲突投影。
+    pub fn list_merge_batches_for_recovery(&self) -> Result<Vec<MergeBatchRecovery>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT task_id, join_step_key, revision_id, lease_keys_json, status, conflicts_json
+                 FROM merge_batches WHERE status IN ('merged','needs_user') ORDER BY id",
             )?;
-            Ok(())
+            let rows = stmt
+                .query_map([], |r| {
+                    let keys_json: String = r.get(3)?;
+                    let conflicts_json: String = r.get(5)?;
+                    Ok(MergeBatchRecovery {
+                        task_id: r.get(0)?,
+                        join_step_key: r.get(1)?,
+                        revision_id: r.get(2)?,
+                        lease_keys: serde_json::from_str(&keys_json).unwrap_or_default(),
+                        status: r.get(4)?,
+                        conflicts: serde_json::from_str(&conflicts_json).unwrap_or_default(),
+                    })
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// F2:`merged → released`(租约全部释放后的终态;按键 CAS)。
+    pub fn mark_merge_batch_released(
+        &self,
+        task_id: i64,
+        join_step_key: &str,
+        revision_id: i64,
+    ) -> Result<()> {
+        let n = self.with_conn(|c| {
+            c.execute(
+                "UPDATE merge_batches SET status = 'released', updated_at = ?4
+                 WHERE task_id = ?1 AND join_step_key = ?2 AND revision_id = ?3
+                   AND status = 'merged'",
+                params![task_id, join_step_key, revision_id, now()],
+            )
+            .map_err(anyhow::Error::from)
+        })?;
+        anyhow::ensure!(n == 1, "批推进 released 未命中(状态已变化)");
+        Ok(())
+    }
+
+    /// F2:按租约键批量回读 held 行(恢复释放/投影用)。
+    pub fn held_lease_rows_by_keys(&self, keys: &[String]) -> Result<Vec<ExecutionLeaseRow>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.with_conn(|c| {
+            let placeholders = vec!["?"; keys.len()].join(",");
+            let sql = format!(
+                "SELECT lease_key, run_id, step_id, task_id, provider, path, isolated,
+                        metadata_json, status, created_at, released_at
+                 FROM execution_leases
+                 WHERE status = 'held' AND lease_key IN ({placeholders})
+                 ORDER BY id"
+            );
+            let params: Vec<&dyn rusqlite::ToSql> =
+                keys.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+            let mut stmt = c.prepare(&sql)?;
+            let rows = stmt
+                .query_map(params.as_slice(), |r| {
+                    Ok(ExecutionLeaseRow {
+                        lease_key: r.get(0)?,
+                        run_id: r.get(1)?,
+                        step_id: r.get(2)?,
+                        task_id: r.get(3)?,
+                        provider: r.get(4)?,
+                        path: r.get(5)?,
+                        isolated: r.get::<_, i64>(6)? != 0,
+                        metadata_json: r.get(7)?,
+                        status: r.get(8)?,
+                        created_at: r.get(9)?,
+                        released_at: r.get(10)?,
+                    })
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(rows)
         })
     }
 

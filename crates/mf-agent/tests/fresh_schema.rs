@@ -75,7 +75,7 @@ fn legacy_v1_database_is_migrated_with_data_intact() {
     assert!(!store
         .claim_merge_batch(1, "j", 1, &["l1".into()], "txn-y")
         .unwrap());
-    store.complete_merge_batch("txn-x", false).unwrap();
+    store.complete_merge_batch("txn-x", false, &[]).unwrap();
     assert_eq!(store.list_merge_batches(1).unwrap()[0].status, "merged");
 }
 

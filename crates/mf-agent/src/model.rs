@@ -305,6 +305,19 @@ pub struct MergeBatchRow {
     pub status: String,
 }
 
+/// F2:待恢复的合并批行(provider_applied=merged 待释放 /
+/// needs_user 待投影),含持久化冲突列表。
+pub struct MergeBatchRecovery {
+    pub task_id: i64,
+    pub join_step_key: String,
+    pub revision_id: i64,
+    pub lease_keys: Vec<String>,
+    /// `merged` = 提供器已应用待释放;`needs_user` = 冲突已判定待投影。
+    pub status: String,
+    /// needs_user 判定时的冲突列表(投影重建依据)。
+    pub conflicts: Vec<String>,
+}
+
 /// 手动重试模式(设计 §9.6):继续仍存活的交互式会话,或创建新会话。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryMode {
