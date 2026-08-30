@@ -1984,7 +1984,23 @@ impl Store {
         draft: &crate::workflow::WorkflowTemplateDraft,
         allow_unsafe_parallel: bool,
     ) -> Result<()> {
+        let graph_json = serde_json::to_string(&draft.nodes)?;
         self.with_conn(|c| {
+            // 内容身份去重(I8):graph_json + 风险开关与已存草稿一致时
+            // 不刷新 updated_at —— UI 的常规「分配→确认运行」不应因
+            // 保存时间戳被刷新而重复冻结 Revision/pin
+            let existing: Option<(String, i64)> = c
+                .query_row(
+                    "SELECT graph_json, allow_unsafe_parallel FROM task_workflows
+                     WHERE project_key = ?1 AND task_id = ?2",
+                    params![project_key, task_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if existing.is_some_and(|(g, a)| g == graph_json && (a != 0) == allow_unsafe_parallel)
+            {
+                return Ok(());
+            }
             c.execute(
                 "INSERT INTO task_workflows (project_key, task_id, graph_json, allow_unsafe_parallel, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
@@ -1992,13 +2008,7 @@ impl Store {
                     graph_json = excluded.graph_json,
                     allow_unsafe_parallel = excluded.allow_unsafe_parallel,
                     updated_at = excluded.updated_at",
-                params![
-                    project_key,
-                    task_id,
-                    serde_json::to_string(&draft.nodes)?,
-                    allow_unsafe_parallel as i64,
-                    now()
-                ],
+                params![project_key, task_id, graph_json, allow_unsafe_parallel as i64, now()],
             )?;
             Ok(())
         })

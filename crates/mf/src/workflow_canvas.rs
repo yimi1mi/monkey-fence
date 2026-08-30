@@ -137,25 +137,30 @@ impl WorkflowCanvas {
 
     /// 保存草稿:写入项目 Store 的任务本地工作流(默认私有),
     /// 连同"共享目录并行"风险开关一起持久化。
-    pub fn save_draft(&mut self, cx: &mut Context<Self>) {
+    /// **返回 Result**:保存失败必须让调用方(编译/分配/确认运行)
+    /// 中止 —— 绝不能继续读取旧 Store 草稿并运行。
+    pub fn save_draft(&mut self, cx: &mut Context<Self>) -> anyhow::Result<()> {
         if self.selected_task.is_none() {
-            self.status = "请先选择一个任务(草稿保存为该任务的工作流)".into();
+            let msg = "请先选择一个任务(草稿保存为该任务的工作流)";
+            self.status = msg.into();
             cx.notify();
-            return;
+            anyhow::bail!("{msg}");
         }
         if self.editor.nodes().is_empty() {
-            self.status = "空工作流无法保存".into();
+            let msg = "空工作流无法保存";
+            self.status = msg.into();
             cx.notify();
-            return;
+            anyhow::bail!("{msg}");
         }
         let Some((root, task_id)) = self.selected_task.clone() else {
             unreachable!("上方已检查 selected_task");
         };
         // 任务本地草稿存项目 Store(project+task 双键,不进全局目录库)
         let Some(orch) = self.app.orchestrator_of(&root) else {
-            self.status = "项目未打开,无法保存草稿".into();
+            let msg = "项目未打开,无法保存草稿";
+            self.status = msg.into();
             cx.notify();
-            return;
+            anyhow::bail!("{msg}");
         };
         let draft = self.current_draft(task_id);
         let unsafe_parallel = self.unsafe_parallel;
@@ -168,12 +173,18 @@ impl WorkflowCanvas {
             Ok(()) => {
                 self.status = format!("已保存任务 {task_id} 本地草稿(项目内;可另存为全局模板)");
             }
-            Err(e) => self.status = format!("保存失败: {e:#}"),
+            Err(e) => {
+                self.status = format!("保存失败: {e:#}");
+                cx.notify();
+                anyhow::bail!("保存失败: {e:#}");
+            }
         }
         cx.notify();
+        Ok(())
     }
 
     /// 切换"共享目录并行"风险开关(立即持久化;非 Git 根并行需要它)。
+    /// 持久化失败不再静默吞掉(错误进状态栏)。
     pub fn toggle_unsafe_parallel(&mut self, cx: &mut Context<Self>) {
         self.unsafe_parallel = !self.unsafe_parallel;
         if let Some((root, task_id)) = self.selected_task.clone() {
@@ -181,12 +192,16 @@ impl WorkflowCanvas {
                 if let Some(orch) = self.app.orchestrator_of(&root) {
                     let draft = self.current_draft(task_id);
                     let flag = self.unsafe_parallel;
-                    let _ = orch.store.save_task_workflow(
+                    if let Err(e) = orch.store.save_task_workflow(
                         &root.to_string_lossy(),
                         task_id,
                         &draft,
                         flag,
-                    );
+                    ) {
+                        self.status = format!("保存失败: {e:#}");
+                        cx.notify();
+                        return;
+                    }
                 }
             }
         }
@@ -205,8 +220,11 @@ impl WorkflowCanvas {
             cx.notify();
             return;
         };
-        // 先保存当前编辑状态:编译检查的就是即将冻结的内容
-        self.save_draft(cx);
+        // 先保存当前编辑状态:编译检查的就是即将冻结的内容;
+        // 保存失败必须中止(不得检查/读取旧 Store 草稿)
+        if self.save_draft(cx).is_err() {
+            return;
+        }
         match self.app.compile_task_local_workflow(&root, task_id) {
             Ok(snapshot) => {
                 self.status = format!("编译通过:{} 个节点已可冻结", snapshot.nodes.len());
@@ -223,7 +241,10 @@ impl WorkflowCanvas {
             cx.notify();
             return;
         };
-        self.save_draft(cx);
+        // 保存失败必须中止分配(不得基于旧 Store 草稿冻结 Revision)
+        if self.save_draft(cx).is_err() {
+            return;
+        }
         match self.app.assign_task_local_workflow(&root, task_id) {
             Ok(rev) => {
                 self.status =
@@ -243,8 +264,11 @@ impl WorkflowCanvas {
         };
         // 先保存当前编辑(脏内容进项目 Store),再走原子
         // 「分配并确认」:草稿未变时不重复冻结,assign 产生的 draft
-        // 在确认前 active_revision 仍为 none —— 不用它判断是否已分配
-        self.save_draft(cx);
+        // 在确认前 active_revision 仍为 none —— 不用它判断是否已分配。
+        // 保存失败必须中止:绝不能继续读取旧 Store 草稿并运行
+        if self.save_draft(cx).is_err() {
+            return;
+        }
         match self.app.assign_and_confirm_task_local(&root, task_id) {
             Ok(()) => {
                 self.status = format!("任务 {task_id} 已确认运行");
