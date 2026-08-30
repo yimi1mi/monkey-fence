@@ -21,6 +21,245 @@ pub fn now() -> String {
 }
 
 /// 一次性能力令牌:仅对一个 Agent Run 有效。
+use std::collections::HashSet;
+
+/// F1:join 合并批权威领取的结果。
+pub enum JoinMergeClaim {
+    /// 领取成功:权威完整租约批(按 lease_key 排序)与事务标识。
+    Claimed {
+        transaction_id: String,
+        leases: Vec<ExecutionLeaseRow>,
+    },
+    /// 组内父步骤尚未全部终态(调用方应记录暂缓)。
+    NotComplete,
+    /// 已被其他线程/实例领取或已有结论(本调用方放弃,批不归它)。
+    Taken,
+}
+
+/// 排序后租约键集合的 SHA-256 hex(F1:ready→merging CAS 绑定的
+/// 批身份 digest —— 集合变化即换批,拒绝)。
+fn lease_set_digest(keys: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update((keys.len() as u64).to_le_bytes());
+    for k in keys {
+        hasher.update((k.len() as u64).to_le_bytes());
+        hasher.update(k.as_bytes());
+    }
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 修订内 join 步骤的全部父步骤 (step_key, status) 与「是否全部终态」。
+fn join_parents_tx(
+    tx: &Transaction,
+    task_id: i64,
+    join_step_key: &str,
+    revision_id: i64,
+) -> Result<(Vec<(String, String)>, bool)> {
+    let join_id: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM steps WHERE revision_id = ?1 AND task_id = ?2 AND step_key = ?3",
+            params![revision_id, task_id, join_step_key],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(join_id) = join_id else {
+        anyhow::bail!("join 步骤 `{join_step_key}` 不在修订 {revision_id} 中");
+    };
+    let mut stmt = tx.prepare("SELECT dep_step_id FROM step_deps WHERE step_id = ?1")?;
+    let parent_ids: Vec<i64> = stmt
+        .query_map(params![join_id], |r| r.get(0))?
+        .collect::<std::result::Result<_, _>>()?;
+    drop(stmt);
+    let mut parents: Vec<(String, String)> = Vec::with_capacity(parent_ids.len());
+    for pid in &parent_ids {
+        let row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT step_key, status FROM steps WHERE id = ?1",
+                params![pid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some(pair) = row {
+            parents.push(pair);
+        }
+    }
+    anyhow::ensure!(
+        parents.len() == parent_ids.len(),
+        "join 父步骤读取不完整(修订 {revision_id})"
+    );
+    const TERMINAL: [&str; 4] = ["succeeded", "failed", "skipped", "cancelled"];
+    let complete = parents.iter().all(|(_, st)| TERMINAL.contains(&st.as_str()));
+    Ok((parents, complete))
+}
+
+/// 任务内、成功父步骤键集合对应的 **held** 租约权威集合
+/// (排除 pending_merges;同键取最新行;按 lease_key 排序)。
+fn held_leases_of_steps_tx(
+    tx: &Transaction,
+    task_id: i64,
+    succeeded_keys: &HashSet<String>,
+) -> Result<Vec<ExecutionLeaseRow>> {
+    let mut pending_ids: HashSet<String> = HashSet::new();
+    {
+        let mut stmt = tx.prepare("SELECT lease_id FROM pending_merges WHERE task_id = ?1")?;
+        let rows = stmt
+            .query_map(params![task_id], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+        pending_ids.extend(rows);
+    }
+    let mut stmt = tx.prepare(
+        "SELECT lease_key, run_id, step_id, task_id, provider, path, isolated,
+                metadata_json, status, created_at, released_at, id
+         FROM execution_leases WHERE task_id = ?1 AND status = 'held' ORDER BY id",
+    )?;
+    let rows: Vec<(ExecutionLeaseRow, i64)> = stmt
+        .query_map(params![task_id], |r| {
+            Ok((
+                ExecutionLeaseRow {
+                    lease_key: r.get(0)?,
+                    run_id: r.get(1)?,
+                    step_id: r.get(2)?,
+                    task_id: r.get(3)?,
+                    provider: r.get(4)?,
+                    path: r.get(5)?,
+                    isolated: r.get::<_, i64>(6)? != 0,
+                    metadata_json: r.get(7)?,
+                    status: r.get(8)?,
+                    created_at: r.get(9)?,
+                    released_at: r.get(10)?,
+                },
+                r.get(11)?,
+            ))
+        })?
+        .collect::<std::result::Result<_, _>>()?;
+    drop(stmt);
+    let mut by_key: HashMap<String, (ExecutionLeaseRow, i64)> = HashMap::new();
+    for (row, id) in rows {
+        if pending_ids.contains(&row.lease_key) {
+            continue;
+        }
+        let step_key = row
+            .metadata_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+            .and_then(|v| {
+                v.get("step_key")
+                    .and_then(|s| s.as_str())
+                    .map(str::to_string)
+            });
+        if !step_key.as_ref().is_some_and(|k| succeeded_keys.contains(k)) {
+            continue;
+        }
+        match by_key.get(&row.lease_key) {
+            Some((_, prev_id)) if *prev_id > id => {}
+            _ => {
+                by_key.insert(row.lease_key.clone(), (row, id));
+            }
+        }
+    }
+    let mut out: Vec<ExecutionLeaseRow> = by_key.into_values().map(|(row, _)| row).collect();
+    out.sort_by(|a, b| a.lease_key.cmp(&b.lease_key));
+    Ok(out)
+}
+
+/// merge_batches 表的 ready→merging CAS(含 digest 绑定与集合变化拒绝)。
+fn claim_merge_batch_tx(
+    tx: &Transaction,
+    task_id: i64,
+    join_step_key: &str,
+    revision_id: i64,
+    keys: &[String],
+    digest: &str,
+    transaction_id: &str,
+) -> Result<()> {
+    let existing: Option<(String, String)> = tx
+        .query_row(
+            "SELECT status, lease_digest FROM merge_batches
+             WHERE task_id = ?1 AND join_step_key = ?2 AND revision_id = ?3",
+            params![task_id, join_step_key, revision_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    if let Some((status, stored_digest)) = &existing {
+        anyhow::ensure!(
+            status == "ready",
+            "合并批已被其他领取者持有或已有结论(状态 {status}):本调用方放弃"
+        );
+        if !stored_digest.is_empty() && stored_digest != digest {
+            anyhow::bail!(
+                "合并批租约集在领取之间发生变化(任务 {task_id} `{join_step_key}`):\
+                 持久 digest {stored_digest} ≠ 权威 digest {digest},拒绝换批"
+            );
+        }
+    }
+    tx.execute(
+        "INSERT INTO merge_batches
+             (task_id, join_step_key, revision_id, lease_keys_json, status,
+              transaction_id, lease_digest, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, 'ready', '', ?5, ?6, ?6)
+         ON CONFLICT(task_id, join_step_key, revision_id) DO NOTHING",
+        params![
+            task_id,
+            join_step_key,
+            revision_id,
+            serde_json::to_string(keys)?,
+            digest,
+            now()
+        ],
+    )?;
+    let n = tx.execute(
+        "UPDATE merge_batches
+            SET status = 'merging', transaction_id = ?5, lease_keys_json = ?4,
+                lease_digest = ?6, updated_at = ?7
+         WHERE task_id = ?1 AND join_step_key = ?2 AND revision_id = ?3
+           AND status = 'ready'",
+        params![
+            task_id,
+            join_step_key,
+            revision_id,
+            serde_json::to_string(keys)?,
+            transaction_id,
+            digest,
+            now()
+        ],
+    )?;
+    anyhow::ensure!(n == 1, "合并批领取 CAS 未命中(并发领取者已推进)");
+    Ok(())
+}
+
+/// 按 (lease_key, id) 回读租约行。
+fn lease_row_by_key_tx(
+    tx: &Transaction,
+    lease_key: &str,
+    row_id: i64,
+) -> Result<Option<ExecutionLeaseRow>> {
+    tx.query_row(
+        "SELECT lease_key, run_id, step_id, task_id, provider, path, isolated,
+                metadata_json, status, created_at, released_at
+         FROM execution_leases WHERE lease_key = ?1 AND id = ?2",
+        params![lease_key, row_id],
+        |r| {
+            Ok(ExecutionLeaseRow {
+                lease_key: r.get(0)?,
+                run_id: r.get(1)?,
+                step_id: r.get(2)?,
+                task_id: r.get(3)?,
+                provider: r.get(4)?,
+                path: r.get(5)?,
+                isolated: r.get::<_, i64>(6)? != 0,
+                metadata_json: r.get(7)?,
+                status: r.get(8)?,
+                created_at: r.get(9)?,
+                released_at: r.get(10)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
 pub fn gen_capability_token() -> String {
     use std::hash::{BuildHasher, Hasher};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2466,6 +2705,133 @@ impl Store {
                 ],
             )?;
             Ok(n == 1)
+        })
+    }
+
+    // ---------- F1:join 批权威领取(跨实例/跨进程半批防线) ----------
+
+    /// join 合并批权威领取(F1):**同一事务内**从修订的 join 父步骤与
+    /// held 租约行收集**完整**父集 —— 绝不信任调用方内存中可能残缺的
+    /// 批次(另一实例只缓存一半父租约的跨进程场景)。
+    /// - 组内父步骤未全部终态 → `NotComplete`(调用方记录暂缓);
+    /// - 调用方传入的租约键必须是权威集合的子集(注入外来租约拒绝);
+    /// - ready→merging CAS 绑定**排序后租约集的 SHA-256 digest**:
+    ///   行已存在、digest 非空且与本次权威 digest 不同 → 拒绝换批;
+    /// - 非 ready(merging/merged/needs_user/released)→ `Taken`。
+    pub fn claim_join_merge_batch(
+        &self,
+        task_id: i64,
+        join_step_key: &str,
+        revision_id: i64,
+        caller_lease_keys: &[String],
+        transaction_id: &str,
+    ) -> Result<JoinMergeClaim> {
+        self.with_tx(|tx| {
+            let (parents, complete) =
+                join_parents_tx(tx, task_id, join_step_key, revision_id)?;
+            anyhow::ensure!(
+                parents.len() > 1,
+                "步骤 `{join_step_key}` 不是多父 join(父依赖 {} 个)",
+                parents.len()
+            );
+            if !complete {
+                return Ok(JoinMergeClaim::NotComplete);
+            }
+            let succeeded: HashSet<String> = parents
+                .iter()
+                .filter(|(_, st)| st == "succeeded")
+                .map(|(k, _)| k.clone())
+                .collect();
+            let authoritative =
+                held_leases_of_steps_tx(tx, task_id, &succeeded)?;
+            anyhow::ensure!(
+                !authoritative.is_empty(),
+                "join 批权威收集结果为空(任务 {task_id} join `{join_step_key}`)"
+            );
+            let keys: Vec<String> = authoritative
+                .iter()
+                .map(|r| r.lease_key.clone())
+                .collect();
+            // 调用方集合必须是权威集合的子集(拒绝外来/陈旧键)
+            let key_set: HashSet<&str> = keys.iter().map(String::as_str).collect();
+            for caller in caller_lease_keys {
+                anyhow::ensure!(
+                    key_set.contains(caller.as_str()),
+                    "调用方租约 `{caller}` 不在权威批集合内(任务 {task_id} join `{join_step_key}`):拒绝"
+                );
+            }
+            let digest = lease_set_digest(&keys);
+            claim_merge_batch_tx(
+                tx,
+                task_id,
+                join_step_key,
+                revision_id,
+                &keys,
+                &digest,
+                transaction_id,
+            )?;
+            Ok(JoinMergeClaim::Claimed {
+                transaction_id: transaction_id.to_string(),
+                leases: authoritative,
+            })
+        })
+    }
+
+    /// 非 join 单租约批的权威领取(F1):验证租约行确为 held 且归属该
+    /// step_key,再走同一张 merge_batches 表的 ready→merging CAS。
+    pub fn claim_single_merge_batch(
+        &self,
+        task_id: i64,
+        lease_key: &str,
+        step_key: &str,
+        revision_id: i64,
+        transaction_id: &str,
+    ) -> Result<JoinMergeClaim> {
+        self.with_tx(|tx| {
+            let row: Option<(String, String, i64)> = tx
+                .query_row(
+                    "SELECT status, metadata_json, id FROM execution_leases
+                     WHERE lease_key = ?1 ORDER BY id DESC LIMIT 1",
+                    params![lease_key],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            let Some((status, metadata_json, row_id)) = row else {
+                anyhow::bail!("单租约批的租约 `{lease_key}` 不存在");
+            };
+            anyhow::ensure!(
+                status == "held",
+                "单租约批的租约 `{lease_key}` 状态为 {status},非 held"
+            );
+            let held_step_key = serde_json::from_str::<serde_json::Value>(&metadata_json)
+                .ok()
+                .and_then(|v| {
+                    v.get("step_key")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string)
+                });
+            anyhow::ensure!(
+                held_step_key.as_deref() == Some(step_key),
+                "租约 `{lease_key}` 的 step_key({held_step_key:?})与批键({step_key:?})不一致"
+            );
+            let keys = vec![lease_key.to_string()];
+            let digest = lease_set_digest(&keys);
+            let join_step_key = format!("__single__:{step_key}");
+            claim_merge_batch_tx(
+                tx,
+                task_id,
+                &join_step_key,
+                revision_id,
+                &keys,
+                &digest,
+                transaction_id,
+            )?;
+            let row: ExecutionLeaseRow = lease_row_by_key_tx(tx, lease_key, row_id)?
+                .ok_or_else(|| anyhow::anyhow!("租约 `{lease_key}` 回读失败"))?;
+            Ok(JoinMergeClaim::Claimed {
+                transaction_id: transaction_id.to_string(),
+                leases: vec![row],
+            })
         })
     }
 

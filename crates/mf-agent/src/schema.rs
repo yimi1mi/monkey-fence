@@ -9,7 +9,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-pub const PROJECT_SCHEMA_VERSION: i64 = 3;
+pub const PROJECT_SCHEMA_VERSION: i64 = 4;
 pub const CATALOG_SCHEMA_VERSION: i64 = 1;
 
 /// 项目库路径:`<project>/.mf-agent/workflow-v1.db`。
@@ -58,6 +58,9 @@ pub fn upgrade_project(conn: &mut Connection, target: i64) -> Result<()> {
     }
     if current < 3 {
         backfill_digest_columns(&tx)?;
+    }
+    if current < 4 {
+        backfill_merge_batch_columns(&tx)?;
     }
     tx.pragma_update(None, "user_version", target)?;
     tx.commit()?;
@@ -359,6 +362,40 @@ fn backfill_digest_columns(conn: &Connection) -> Result<()> {
     if !has_column("pipeline_revisions", "content_digest")? {
         conn.execute(
             "ALTER TABLE pipeline_revisions ADD COLUMN content_digest TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+/// v4 增量(F1/F2):merge_batches 的权威租约集 digest(领取 CAS 绑定)
+/// 与 needs_user 冲突投影(启动恢复重建 pending 行用)。
+fn backfill_merge_batch_columns(conn: &Connection) -> Result<()> {
+    let has_column = |table: &str, column: &str| -> Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut has = false;
+        let mut table_exists = false;
+        for c in stmt.query_map([], |r| r.get::<_, String>(1))? {
+            table_exists = true;
+            if c.map(|c| c == column).unwrap_or(false) {
+                has = true;
+            }
+        }
+        drop(stmt);
+        if !table_exists {
+            return Ok(true); // 残缺库无此表:跳过(无从补列)
+        }
+        Ok(has)
+    };
+    if !has_column("merge_batches", "lease_digest")? {
+        conn.execute(
+            "ALTER TABLE merge_batches ADD COLUMN lease_digest TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    if !has_column("merge_batches", "conflicts_json")? {
+        conn.execute(
+            "ALTER TABLE merge_batches ADD COLUMN conflicts_json TEXT NOT NULL DEFAULT '[]'",
             [],
         )?;
     }

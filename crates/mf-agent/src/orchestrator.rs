@@ -1799,9 +1799,12 @@ impl Orchestrator {
 
     /// 把完整租约批汇合回项目目录:成功 → 释放全部租约;冲突/出错 →
     /// 全部保持持有、逐条持久化为待决、任务 → needs-you(重启可恢复)。
-    /// 批先经 Store 持久 CAS 领取(`ready → merging`,C1):并发 complete
-    /// 同一批的其他线程领取失败即放弃 —— 批恰好汇合一次;领取出错时
-    /// 同样放弃(租约保持持有、暂缓行保留,后续冲刷重试),绝不双合并。
+    /// F1:批经 Store **权威领取**(同一事务内从修订 join 父步骤 + held
+    /// 租约收集完整父集,ready→merging CAS 绑定排序后租约集 digest)——
+    /// 调用方内存中的半批集合(跨实例只缓存一半父租约)绝不能成为合并
+    /// 批:领取即返回权威完整批,由唯一领取者一次性合并。
+    /// NotComplete(Store 视角父步骤未全部终态,与调用方读到的存在竞态)
+    /// → 记录暂缓;Taken(他人领取)→ 清理本进程内存映射避免陈旧门控。
     fn apply_merge_batch(
         &self,
         task_id: i64,
@@ -1814,40 +1817,78 @@ impl Orchestrator {
             return;
         }
         let revision_id = revision_id.unwrap_or_else(|| self.active_revision_id(task_id));
-        let keys: Vec<String> = leases.iter().map(|l| l.id.clone()).collect();
+        let caller_keys: Vec<String> = leases.iter().map(|l| l.id.clone()).collect();
         let transaction_id = format!("mfb-{}", crate::store::gen_capability_token());
-        match self.store.claim_merge_batch(
-            task_id,
-            join_step_key,
-            revision_id,
-            &keys,
-            &transaction_id,
-        ) {
-            Ok(true) => {}
-            Ok(false) => return, // 已被并发线程领取或已有结论:批不归本线程
+        let claim = if let Some(step_key) = join_step_key.strip_prefix("__single__:") {
+            self.store.claim_single_merge_batch(
+                task_id,
+                &caller_keys[0],
+                step_key,
+                revision_id,
+                &transaction_id,
+            )
+        } else {
+            self.store.claim_join_merge_batch(
+                task_id,
+                join_step_key,
+                revision_id,
+                &caller_keys,
+                &transaction_id,
+            )
+        };
+        let authoritative = match claim {
+            Ok(crate::store::JoinMergeClaim::Claimed { leases: rows, .. }) => {
+                rows.iter().map(lease_from_row).collect::<Vec<_>>()
+            }
+            Ok(crate::store::JoinMergeClaim::NotComplete) => {
+                // Store 权威视角组未完整(与调用方读到的步骤状态有竞态):
+                // 租约保持持有并记录暂缓,等待兄弟终态
+                for lease in &leases {
+                    if let Err(e) =
+                        self.store.insert_join_deferral(task_id, join_step_key, lease)
+                    {
+                        log::error!("持久化 join 暂缓失败: {e:#}");
+                    }
+                }
+                return;
+            }
+            Ok(crate::store::JoinMergeClaim::Taken) => {
+                // 其他领取者(线程/实例)负责本批:清理本进程内存映射,
+                // 避免陈旧租约继续阻塞 join 下游派发
+                for lease in &leases {
+                    self.held_leases.lock().retain(|_, l| l.id != lease.id);
+                    self.step_leases.lock().retain(|_, l| l.id != lease.id);
+                }
+                return;
+            }
             Err(e) => {
                 log::error!("领取合并批失败(保持持有待重试): {e:#}");
                 return;
             }
-        }
+        };
+        let keys: Vec<String> = authoritative.iter().map(|l| l.id.clone()).collect();
         // 批有了结论(汇合或进入待决):该批租约的 join 暂缓行随之清除
         if let Err(e) = self.store.delete_join_deferrals_for_leases(&keys) {
             log::warn!("清除 join 暂缓行失败: {e:#}");
         }
-        let conflicts = match self.merge_leases(&leases) {
+        let conflicts = match self.merge_leases(&authoritative) {
             Ok(conflicts) => conflicts,
             Err(e) => vec![format!("汇合执行失败: {e:#}")],
         };
         if conflicts.is_empty() {
-            let _ = self.store.complete_merge_batch(&transaction_id, false);
-            for lease in &leases {
+            if let Err(e) = self.store.complete_merge_batch(&transaction_id, false) {
+                log::error!("合并批结论回写失败(批状态可能停留 merging,启动恢复会重置): {e:#}");
+            }
+            for lease in &authoritative {
                 self.release_lease_of_lease(lease);
             }
             return;
         }
-        let _ = self.store.complete_merge_batch(&transaction_id, true);
+        if let Err(e) = self.store.complete_merge_batch(&transaction_id, true) {
+            log::error!("合并批结论回写失败(批状态可能停留 merging,启动恢复会重置): {e:#}");
+        }
         // 冲突持久化(重启后仍可恢复:任务保持 needs-you,租约保持持有)
-        for lease in &leases {
+        for lease in &authoritative {
             if let Err(e) = self.store.insert_pending_merge(task_id, lease, &conflicts) {
                 log::error!("持久化待决汇合失败: {e:#}");
             }
@@ -1856,7 +1897,7 @@ impl Orchestrator {
             .lock()
             .entry(task_id)
             .or_default()
-            .extend(leases.iter().cloned());
+            .extend(authoritative.iter().cloned());
         if let Some(t) = self.store.task_view(task_id).ok().flatten() {
             if !t.status.terminal() {
                 if let Some(t) = self
