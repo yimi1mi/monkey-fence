@@ -141,6 +141,10 @@ pub struct Orchestrator {
     /// 进程内目录提供器的插件包身份(分配时冻结进 Revision 快照,
     /// 派发时强校验一致;None = 内核默认共享目录)。
     directory_pin: Mutex<Option<PluginSourcePin>>,
+    /// task → 结算后处理互斥锁(named-pipe 不同连接线程并发 complete
+    /// 同一任务的 join 批时,批收集→merge→release 全程串行化;
+    /// 配合 Store 的 merge_batches CAS 构成双重防护)。
+    settlement_locks: Mutex<HashMap<i64, Arc<Mutex<()>>>>,
 }
 
 impl Orchestrator {
@@ -226,6 +230,7 @@ impl Orchestrator {
             workflow,
             pending_merges: Mutex::new(HashMap::new()),
             directory_pin: Mutex::new(None),
+            settlement_locks: Mutex::new(HashMap::new()),
         });
         for run in &recovered {
             if let Some(t) = orch.store.task_view(run.task_id)? {
@@ -934,6 +939,7 @@ impl Orchestrator {
     /// 原子应用);全部合并成功则释放租约、删除待决行并重新收敛任务。
     /// 返回仍存在的冲突(空 = 已全部解决)。
     pub fn resolve_pending_merges(&self, task_id: i64) -> Result<Vec<String>> {
+        let _guard = self.settle_serialized(task_id);
         let rows = self.store.list_pending_merges(Some(task_id))?;
         if rows.is_empty() {
             return Ok(Vec::new());
@@ -1046,9 +1052,23 @@ impl Orchestrator {
                 log::warn!("清理失效 join 暂缓行失败: {e:#}");
             }
         }
+        // 崩溃窗口中领取者消失:遗留的 merging 批重置为 ready,可重冲
+        if let Err(e) = self.store.reset_merging_batches() {
+            log::warn!("重置遗留 merging 批失败: {e:#}");
+        }
         for task_id in tasks {
             self.flush_completed_join_batches(task_id);
         }
+    }
+
+    /// 任务当前活动修订 id(无活动修订时 0;批状态持久化用)。
+    fn active_revision_id(&self, task_id: i64) -> i64 {
+        self.store
+            .active_revision(task_id)
+            .ok()
+            .flatten()
+            .map(|r| r.id)
+            .unwrap_or(0)
     }
 
     /// 汇合一批隔离租约;返回冲突列表(空 = 全部合并成功)。
@@ -1484,7 +1504,23 @@ impl Orchestrator {
     /// - 不参与任何 join → 单租约立即汇合(串行链语义不变);
     /// - 批次成功 → 释放全部;冲突/出错 → 全部保持持有并进入待决列表,
     ///   任务 → needs-you。
+    /// task 级结算后处理互斥锁的守卫:同一 task 的批收集→merge→release
+    /// 与 join 暂缓写入全程串行(不同 task 互不阻塞)。
+    /// named-pipe 不同连接线程并发 complete 同一任务时在此汇合串行。
+    fn settle_serialized(
+        &self,
+        task_id: i64,
+    ) -> parking_lot::ArcMutexGuard<parking_lot::RawMutex, ()> {
+        // 先取出 Arc 再锁(不能持 settlement_locks 的锁去锁 task 锁)
+        let lock = {
+            let mut locks = self.settlement_locks.lock();
+            locks.entry(task_id).or_default().clone()
+        };
+        lock.lock_arc()
+    }
+
     fn merge_or_pend(&self, run: &RunView) {
+        let _guard = self.settle_serialized(run.task_id);
         let lease = self.held_leases.lock().get(&run.id).cloned();
         let Some(lease) = lease else {
             self.release_lease_of_run(run.id);
@@ -1496,19 +1532,24 @@ impl Orchestrator {
         }
         let Some((steps, me_id)) = self.active_steps_of_run(run) else {
             // 活动修订不可读:退回串行语义,单租约汇合
-            self.apply_merge_batch(run.task_id, vec![lease], run.id);
+            let batch_key = single_batch_key(&lease);
+            let rev = Some(self.active_revision_id(run.task_id));
+            self.apply_merge_batch(run.task_id, &batch_key, rev, vec![lease], run.id);
             return;
         };
+        // 批的身份按 (task, join 键, revision) 持久化;同修订步骤共享 revision_id
+        let revision_id = steps.first().map(|s| s.revision_id);
         let groups = Self::join_groups_of(&steps, me_id);
         if groups.is_empty() {
-            self.apply_merge_batch(run.task_id, vec![lease], run.id);
+            let batch_key = single_batch_key(&lease);
+            self.apply_merge_batch(run.task_id, &batch_key, revision_id, vec![lease], run.id);
             return;
         }
         for (join_key, parents) in groups {
             if parents.iter().all(|p| p.status.terminal()) {
                 let batch = self.held_leases_of_parents(run.task_id, &parents, Some(&lease));
                 if !batch.is_empty() {
-                    self.apply_merge_batch(run.task_id, batch, run.id);
+                    self.apply_merge_batch(run.task_id, &join_key, revision_id, batch, run.id);
                 }
             } else if self.step_leases.lock().values().any(|l| l.id == lease.id) {
                 // 组未完整:租约仍持有才记录暂缓(可能已随先前的完整组
@@ -1612,12 +1653,38 @@ impl Orchestrator {
 
     /// 把完整租约批汇合回项目目录:成功 → 释放全部租约;冲突/出错 →
     /// 全部保持持有、逐条持久化为待决、任务 → needs-you(重启可恢复)。
-    fn apply_merge_batch(&self, task_id: i64, leases: Vec<ExecutionLease>, trigger_run: i64) {
+    /// 批先经 Store 持久 CAS 领取(`ready → merging`,C1):并发 complete
+    /// 同一批的其他线程领取失败即放弃 —— 批恰好汇合一次;领取出错时
+    /// 同样放弃(租约保持持有、暂缓行保留,后续冲刷重试),绝不双合并。
+    fn apply_merge_batch(
+        &self,
+        task_id: i64,
+        join_step_key: &str,
+        revision_id: Option<i64>,
+        leases: Vec<ExecutionLease>,
+        trigger_run: i64,
+    ) {
         if leases.is_empty() {
             return;
         }
-        // 批有了结论(汇合或进入待决):该批租约的 join 暂缓行随之清除
+        let revision_id = revision_id.unwrap_or_else(|| self.active_revision_id(task_id));
         let keys: Vec<String> = leases.iter().map(|l| l.id.clone()).collect();
+        let transaction_id = format!("mfb-{}", crate::store::gen_capability_token());
+        match self.store.claim_merge_batch(
+            task_id,
+            join_step_key,
+            revision_id,
+            &keys,
+            &transaction_id,
+        ) {
+            Ok(true) => {}
+            Ok(false) => return, // 已被并发线程领取或已有结论:批不归本线程
+            Err(e) => {
+                log::error!("领取合并批失败(保持持有待重试): {e:#}");
+                return;
+            }
+        }
+        // 批有了结论(汇合或进入待决):该批租约的 join 暂缓行随之清除
         if let Err(e) = self.store.delete_join_deferrals_for_leases(&keys) {
             log::warn!("清除 join 暂缓行失败: {e:#}");
         }
@@ -1626,11 +1693,13 @@ impl Orchestrator {
             Err(e) => vec![format!("汇合执行失败: {e:#}")],
         };
         if conflicts.is_empty() {
+            let _ = self.store.complete_merge_batch(&transaction_id, false);
             for lease in &leases {
                 self.release_lease_of_lease(lease);
             }
             return;
         }
+        let _ = self.store.complete_merge_batch(&transaction_id, true);
         // 冲突持久化(重启后仍可恢复:任务保持 needs-you,租约保持持有)
         for lease in &leases {
             if let Err(e) = self.store.insert_pending_merge(task_id, lease, &conflicts) {
@@ -1672,6 +1741,7 @@ impl Orchestrator {
     /// 已完整的父批次。按组独立判定(绝不 union),排除已进入待决汇合
     /// 的租约。幂等:无完整组或无持有租约则不动作。
     fn flush_completed_join_batches(&self, task_id: i64) {
+        let _guard = self.settle_serialized(task_id);
         let Some(rev) = self.store.active_revision(task_id).ok().flatten() else {
             return;
         };
@@ -1691,7 +1761,7 @@ impl Orchestrator {
             }
             let batch = self.held_leases_of_parents(task_id, &parents, None);
             if !batch.is_empty() {
-                self.apply_merge_batch(task_id, batch, 0);
+                self.apply_merge_batch(task_id, &child.step_key, Some(rev.id), batch, 0);
             }
         }
     }
@@ -2903,6 +2973,12 @@ fn lease_from_row(row: &ExecutionLeaseRow) -> ExecutionLease {
 /// join 组成员与暂缓门控按它跨修订对齐)。
 fn lease_step_key(lease: &ExecutionLease) -> Option<&str> {
     lease.metadata.get("step_key").and_then(|v| v.as_str())
+}
+
+/// 非 join 的单租约汇合批键(与 join 组的 step_key 键空间隔离,
+/// 前缀保留字不可能与用户节点键冲突)。
+fn single_batch_key(lease: &ExecutionLease) -> String {
+    format!("__single__:{}", lease_step_key(lease).unwrap_or(&lease.id))
 }
 
 /// 工作流节点初始提示:Task goal + 上游 Handoff 注入 + `${nodes.*}` 变量替换

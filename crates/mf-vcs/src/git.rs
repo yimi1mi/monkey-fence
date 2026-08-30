@@ -312,6 +312,8 @@ impl Git {
 
     /// 把 tree 提交到集成基线 ref 上并前移 ref(父提交 = ref 当前目标,
     /// 无 ref 时为 HEAD)。返回新提交 oid。
+    /// 注意:非 CAS 版本,仅供内部/测试使用;生产合并走
+    /// [`Git::advance_integration_ref_cas`]。
     pub fn advance_integration_ref(
         &self,
         refname: &str,
@@ -337,21 +339,102 @@ impl Git {
         Ok(oid)
     }
 
+    /// 前移集成基线 ref(expected-old CAS,C1):提交对象基于
+    /// `expected_old`(None 时基于 HEAD/空)构建,ref 仅当当前目标仍为
+    /// `expected_old`(或 ref 不存在)时才更新 —— 并发合并不得双推进,
+    /// CAS 失败如实报错(调用方按冲突处理)。
+    pub fn advance_integration_ref_cas(
+        &self,
+        refname: &str,
+        tree_id: git2::Oid,
+        message: &str,
+        expected_old: Option<git2::Oid>,
+    ) -> Result<git2::Oid> {
+        let sig = self
+            .repo
+            .signature()
+            .or_else(|_| git2::Signature::now("MonkeyFence", "monkeyfence@local"))?;
+        let parents: Vec<git2::Commit> = match expected_old {
+            Some(oid) => vec![self
+                .repo
+                .find_commit(oid)
+                .with_context(|| format!("expected-old 提交不存在: {oid}"))?],
+            None => match self.repo.head() {
+                Ok(h) => vec![h.peel_to_commit()?],
+                Err(_) => Vec::new(),
+            },
+        };
+        let tree = self.repo.find_tree(tree_id)?;
+        let parent_refs: Vec<&git2::Commit> = parents.iter().collect();
+        // 只建提交对象,不动 ref;ref 前移单独 CAS
+        let commit_oid = self
+            .repo
+            .commit(None, &sig, &sig, message, &tree, &parent_refs)?;
+        let cas_old = expected_old.unwrap_or_else(git2::Oid::zero);
+        // force=true + old_id 才是 CAS 形式:force 只绕过"已存在即 EEXISTS"
+        // 的预检查,cmp_old_ref 仍强制当前目标 == old_id(不匹配 EMODIFIED;
+        // zero oid = ref 必须不存在)。
+        self.repo
+            .reference_matching(refname, commit_oid, true, cas_old, message)
+            .with_context(|| {
+                format!(
+                    "集成 ref {refname} CAS 失败(已被并发推进,本次合并不得应用): \
+                     期望 {:?},当前 {:?}",
+                    expected_old,
+                    self.read_ref(refname).unwrap_or(None)
+                )
+            })?;
+        Ok(commit_oid)
+    }
+
     /// 把集成基线 ref 指回给定提交(合并应用失败的整体回滚用)。
     /// `target = None` 表示合并前 ref 不存在 → 删除该 ref。
+    /// `expect_current`:回滚前 ref 必须处于的值(本次合并推进到的提交);
+    /// 不匹配(被并发改动)时拒绝回滚并报错,绝不盲目覆盖。
     /// 幂等:ref 已处于目标状态时 no-op。
-    pub fn reset_integration_ref(&self, refname: &str, target: Option<git2::Oid>) -> Result<()> {
+    pub fn reset_integration_ref(
+        &self,
+        refname: &str,
+        target: Option<git2::Oid>,
+        expect_current: Option<git2::Oid>,
+    ) -> Result<()> {
         match target {
             Some(oid) => {
                 let commit = self.repo.find_commit(oid)?;
                 if self.read_ref(refname)? == Some(oid) {
                     return Ok(());
                 }
-                self.repo
-                    .reference(refname, commit.id(), true, "mf: rollback integration ref")?;
+                match expect_current {
+                    Some(cur) => {
+                        // force=true + old_id = CAS:当前目标必须仍是 cur
+                        self.repo
+                            .reference_matching(refname, commit.id(), true, cur, "mf: rollback integration ref")
+                            .with_context(|| {
+                                format!(
+                                    "回滚集成 ref {refname} 失败:已被并发改动(期望 {cur},当前 {:?})",
+                                    self.read_ref(refname).unwrap_or(None)
+                                )
+                            })?;
+                    }
+                    None => {
+                        self.repo.reference(
+                            refname,
+                            commit.id(),
+                            true,
+                            "mf: rollback integration ref",
+                        )?;
+                    }
+                }
             }
             None => {
                 if let Some(mut reference) = self.repo.find_reference(refname).ok() {
+                    if let Some(cur) = expect_current {
+                        anyhow::ensure!(
+                            reference.target() == Some(cur),
+                            "回滚删除集成 ref {refname} 失败:已被并发改动(期望 {cur},当前 {:?})",
+                            reference.target()
+                        );
+                    }
                     reference.delete()?;
                 }
             }

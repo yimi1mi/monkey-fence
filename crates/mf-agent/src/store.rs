@@ -7,9 +7,7 @@
 
 use crate::model::*;
 use crate::pipeline::{PipelineDraft, SessionPolicy};
-use crate::schema::{
-    initialize_schema, schema_version_of, table_names_of, PROJECT_SCHEMA_V1, PROJECT_SCHEMA_VERSION,
-};
+use crate::schema::{schema_version_of, table_names_of, PROJECT_SCHEMA_VERSION};
 use anyhow::{Context as _, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
@@ -67,84 +65,13 @@ impl Store {
     }
 
     fn init(conn: Connection) -> Result<Store> {
+        let mut conn = conn;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        initialize_schema(&conn, PROJECT_SCHEMA_V1, PROJECT_SCHEMA_VERSION)
-            .context("初始化项目库 v1 schema 失败")?;
-        // 早期开发库的 steps/pipeline_revisions 缺列(CREATE IF NOT EXISTS 不补列)
-        {
-            let mut stmt = conn.prepare("PRAGMA table_info(steps)")?;
-            let has_auto = stmt
-                .query_map([], |r| r.get::<_, String>(1))?
-                .any(|c| c.map(|c| c == "auto_retry").unwrap_or(false));
-            drop(stmt);
-            if !has_auto {
-                conn.execute(
-                    "ALTER TABLE steps ADD COLUMN auto_retry INTEGER NOT NULL DEFAULT 0",
-                    [],
-                )
-                .context("补齐 steps.auto_retry 列失败")?;
-            }
-        }
-        {
-            let mut stmt = conn.prepare("PRAGMA table_info(ad_hoc_sessions)")?;
-            let has_display = stmt
-                .query_map([], |r| r.get::<_, String>(1))?
-                .any(|c| c.map(|c| c == "display_session_id").unwrap_or(false));
-            drop(stmt);
-            if !has_display {
-                conn.execute(
-                    "ALTER TABLE ad_hoc_sessions ADD COLUMN display_session_id INTEGER",
-                    [],
-                )
-                .context("补齐 ad_hoc_sessions.display_session_id 列失败")?;
-            }
-        }
-        {
-            // 任务本地工作流的"共享目录并行"风险开关(非 Git 根的显式接受)
-            let mut stmt = conn.prepare("PRAGMA table_info(task_workflows)")?;
-            let has_unsafe = stmt
-                .query_map([], |r| r.get::<_, String>(1))?
-                .any(|c| c.map(|c| c == "allow_unsafe_parallel").unwrap_or(false));
-            drop(stmt);
-            if !has_unsafe {
-                conn.execute(
-                    "ALTER TABLE task_workflows ADD COLUMN allow_unsafe_parallel INTEGER NOT NULL DEFAULT 0",
-                    [],
-                )
-                .context("补齐 task_workflows.allow_unsafe_parallel 列失败")?;
-            }
-        }
-        {
-            let mut stmt = conn.prepare("PRAGMA table_info(pipeline_revisions)")?;
-            let has_snapshot = stmt
-                .query_map([], |r| r.get::<_, String>(1))?
-                .any(|c| c.map(|c| c == "snapshot_json").unwrap_or(false));
-            drop(stmt);
-            if !has_snapshot {
-                conn.execute(
-                    "ALTER TABLE pipeline_revisions ADD COLUMN snapshot_json TEXT",
-                    [],
-                )
-                .context("补齐 pipeline_revisions.snapshot_json 列失败")?;
-            }
-        }
-        // join 暂缓持久化(旧库补表;新库由 V1 DDL 创建,幂等)
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS join_deferrals (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_id INTEGER NOT NULL REFERENCES agent_tasks(id),
-                join_step_key TEXT NOT NULL,
-                lease_key TEXT NOT NULL,
-                lease_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                UNIQUE(task_id, join_step_key, lease_key)
-            );
-            CREATE INDEX IF NOT EXISTS idx_join_deferrals_task ON join_deferrals(task_id);",
-        )
-        .context("补齐 join_deferrals 表失败")?;
+        crate::schema::upgrade_project(&mut conn, PROJECT_SCHEMA_VERSION)
+            .context("项目库 schema 迁移失败")?;
         Ok(Store {
             conn: Mutex::new(conn),
         })
@@ -2399,6 +2326,123 @@ impl Store {
                 })?
                 .collect::<std::result::Result<_, _>>()?;
             Ok(rows)
+        })
+    }
+
+    // ---------- join 批持久状态(C1:ready → merging → merged/needs_you) ----------
+
+    /// 声明并领取一个合并批(事务内 CAS:仅当行不存在或 status='ready'
+    /// 时推进到 'merging')。并发 complete 同一批只有一个线程拿到
+    /// `true`;其余看到 merging/merged/needs_you → `false`(放弃执行)。
+    /// `transaction_id` 唯一标识领取者,结论回写按它 CAS。
+    pub fn claim_merge_batch(
+        &self,
+        task_id: i64,
+        join_step_key: &str,
+        revision_id: i64,
+        lease_keys: &[String],
+        transaction_id: &str,
+    ) -> Result<bool> {
+        let ts = now();
+        self.with_tx(|c| {
+            c.execute(
+                "INSERT INTO merge_batches
+                     (task_id, join_step_key, revision_id, lease_keys_json, status,
+                      transaction_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'ready', '', ?5, ?5)
+                 ON CONFLICT(task_id, join_step_key, revision_id) DO NOTHING",
+                params![
+                    task_id,
+                    join_step_key,
+                    revision_id,
+                    serde_json::to_string(lease_keys)?,
+                    ts
+                ],
+            )?;
+            let n = c.execute(
+                "UPDATE merge_batches
+                    SET status = 'merging', transaction_id = ?5, lease_keys_json = ?4,
+                        updated_at = ?6
+                 WHERE task_id = ?1 AND join_step_key = ?2 AND revision_id = ?3
+                   AND status = 'ready'",
+                params![
+                    task_id,
+                    join_step_key,
+                    revision_id,
+                    serde_json::to_string(lease_keys)?,
+                    transaction_id,
+                    now()
+                ],
+            )?;
+            Ok(n == 1)
+        })
+    }
+
+    /// 领取结论回写:`merging → merged / needs_user`(按 transaction_id CAS;
+    /// 行已被重置/换领时 no-op)。
+    pub fn complete_merge_batch(&self, transaction_id: &str, needs_user: bool) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE merge_batches
+                    SET status = CASE ?2 WHEN 1 THEN 'needs_user' ELSE 'merged' END,
+                        updated_at = ?3
+                 WHERE transaction_id = ?1 AND status = 'merging'",
+                params![transaction_id, needs_user as i64, now()],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// 任务的合并批行(测试/审计投影)。
+    pub fn list_merge_batches(&self, task_id: i64) -> Result<Vec<MergeBatchRow>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT task_id, join_step_key, revision_id, lease_keys_json, status
+                 FROM merge_batches WHERE task_id = ?1 ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map(params![task_id], |r| {
+                    let lease_keys_json: String = r.get(3)?;
+                    Ok(MergeBatchRow {
+                        task_id: r.get(0)?,
+                        join_step_key: r.get(1)?,
+                        revision_id: r.get(2)?,
+                        lease_keys: serde_json::from_str(&lease_keys_json).unwrap_or_default(),
+                        status: r.get(4)?,
+                    })
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// 重启恢复:领取者在崩溃窗口中消失,把遗留的 merging 批重置为
+    /// ready(批可重冲;提供器侧合并事务日志保证重放幂等)。
+    pub fn reset_merging_batches(&self) -> Result<usize> {
+        self.with_conn(|c| {
+            let n = c.execute(
+                "UPDATE merge_batches SET status = 'ready', transaction_id = '', updated_at = ?1
+                 WHERE status = 'merging'",
+                params![now()],
+            )?;
+            Ok(n)
+        })
+    }
+
+    /// 测试注入:把批强制置回 merging(模拟崩溃窗口)。
+    pub fn force_merge_batch_merging(
+        &self,
+        task_id: i64,
+        join_step_key: &str,
+        revision_id: i64,
+    ) -> Result<()> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE merge_batches SET status = 'merging', transaction_id = 'forced', updated_at = ?4
+                 WHERE task_id = ?1 AND join_step_key = ?2 AND revision_id = ?3",
+                params![task_id, join_step_key, revision_id, now()],
+            )?;
+            Ok(())
         })
     }
 

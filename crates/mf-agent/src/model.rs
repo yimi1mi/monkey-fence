@@ -291,6 +291,20 @@ pub struct JoinDeferralRow {
     pub lease: crate::execution_directory::ExecutionLease,
 }
 
+/// merge_batches 行:一个 join 批(或单租约汇合)的持久状态机
+/// `ready → merging → merged / needs_you`(C1)。
+/// 领取(claim)是条件更新:只有把 ready 推进到 merging 的那个线程
+/// 才允许执行 merge/release;并发 complete 同一批的其余线程看到
+/// 非 ready 状态即放弃,批恰好汇合一次。
+#[derive(Debug, Clone)]
+pub struct MergeBatchRow {
+    pub task_id: i64,
+    pub join_step_key: String,
+    pub revision_id: i64,
+    pub lease_keys: Vec<String>,
+    pub status: String,
+}
+
 /// 手动重试模式(设计 §9.6):继续仍存活的交互式会话,或创建新会话。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryMode {

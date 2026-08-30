@@ -9,7 +9,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-pub const PROJECT_SCHEMA_VERSION: i64 = 1;
+pub const PROJECT_SCHEMA_VERSION: i64 = 2;
 pub const CATALOG_SCHEMA_VERSION: i64 = 1;
 
 /// 项目库路径:`<project>/.mf-agent/workflow-v1.db`。
@@ -33,6 +33,91 @@ pub fn catalog_db_path() -> PathBuf {
 pub fn initialize_schema(conn: &Connection, ddl: &str, version: i64) -> Result<()> {
     conn.execute_batch(ddl)?;
     conn.pragma_update(None, "user_version", version)?;
+    Ok(())
+}
+
+/// 项目库按 `user_version` 链式迁移到 `target`(每步单事务;
+/// `user_version = 0` 视为全新库,从 v1 DDL 起完整应用)。
+/// 版本高于程序支持时拒绝打开(禁止隐式降级)。
+pub fn upgrade_project(conn: &mut Connection, target: i64) -> Result<()> {
+    let current = schema_version_of(conn)?;
+    anyhow::ensure!(
+        current <= target,
+        "数据库 schema 版本 v{current} 高于程序支持的 v{target}:请升级程序后再打开"
+    );
+    if current == target {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    if current < 1 {
+        tx.execute_batch(PROJECT_SCHEMA_V1)?;
+    }
+    if current < 2 {
+        tx.execute_batch(PROJECT_SCHEMA_V2_DELTA)?;
+        backfill_early_dev_columns(&tx)?;
+    }
+    tx.pragma_update(None, "user_version", target)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// 早期开发库(v1 期间缺列/缺表的库,user_version 已是 1)的幂等补齐:
+/// 升级到 v2 时统一执行,PRAGMA 探测后补列,已补齐的库为 no-op。
+/// 表不存在的残缺库跳过对应补列(后续 DDL 不再创建该表,查询时如实报错)。
+fn backfill_early_dev_columns(conn: &Connection) -> Result<()> {
+    let has_column = |table: &str, column: &str| -> Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let has = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .any(|c| c.map(|c| c == column).unwrap_or(false));
+        drop(stmt);
+        if !has {
+            // 区分"表存在但缺列"与"表不存在":后者无法 ALTER,跳过
+            let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+            let table_exists = stmt.exists([])?;
+            drop(stmt);
+            if !table_exists {
+                return Ok(true); // 视为无需补列
+            }
+        }
+        Ok(has)
+    };
+    if !has_column("steps", "auto_retry")? {
+        conn.execute(
+            "ALTER TABLE steps ADD COLUMN auto_retry INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !has_column("ad_hoc_sessions", "display_session_id")? {
+        conn.execute(
+            "ALTER TABLE ad_hoc_sessions ADD COLUMN display_session_id INTEGER",
+            [],
+        )?;
+    }
+    if !has_column("task_workflows", "allow_unsafe_parallel")? {
+        conn.execute(
+            "ALTER TABLE task_workflows ADD COLUMN allow_unsafe_parallel INTEGER NOT NULL DEFAULT 0",
+            [],
+        )?;
+    }
+    if !has_column("pipeline_revisions", "snapshot_json")? {
+        conn.execute(
+            "ALTER TABLE pipeline_revisions ADD COLUMN snapshot_json TEXT",
+            [],
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS join_deferrals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL REFERENCES agent_tasks(id),
+            join_step_key TEXT NOT NULL,
+            lease_key TEXT NOT NULL,
+            lease_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(task_id, join_step_key, lease_key)
+        );
+        CREATE INDEX IF NOT EXISTS idx_join_deferrals_task ON join_deferrals(task_id);",
+    )?;
     Ok(())
 }
 
@@ -219,6 +304,27 @@ CREATE TABLE IF NOT EXISTS join_deferrals (
     UNIQUE(task_id, join_step_key, lease_key)
 );
 CREATE INDEX IF NOT EXISTS idx_join_deferrals_task ON join_deferrals(task_id);
+";
+
+/// v2 增量(C1):join 批(或单租约汇合)的持久状态机。
+/// `status`:ready → merging → merged / needs_you;
+/// 领取是 `UPDATE ... WHERE status = 'ready'` 条件更新(CAS),
+/// 并发 complete 同一批只有一个线程能推进到 merging。
+/// `transaction_id` 唯一标识领取者,结论回写按它 CAS。
+pub const PROJECT_SCHEMA_V2_DELTA: &str = "
+CREATE TABLE IF NOT EXISTS merge_batches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES agent_tasks(id),
+    join_step_key TEXT NOT NULL,
+    revision_id INTEGER NOT NULL,
+    lease_keys_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'ready',
+    transaction_id TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(task_id, join_step_key, revision_id)
+);
+CREATE INDEX IF NOT EXISTS idx_merge_batches_task ON merge_batches(task_id);
 ";
 
 /// 目录库 v1 DDL:仅空表地基(字段随后续里程碑补全);

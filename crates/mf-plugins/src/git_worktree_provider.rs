@@ -43,6 +43,9 @@ pub struct GitWorktreeProvider {
     repo_root: PathBuf,
     /// `.worktrees` 根;非 Git 根为 None(回退共享目录)。
     worktrees_root: Option<PathBuf>,
+    /// 仓库级合并互斥(C1):merge/恢复全程串行 —— 同一进程内并发
+    /// 合并同一批时只有一个线程在推进 ref/写事务日志/应用文件。
+    merge_lock: parking_lot::Mutex<()>,
     /// 测试注入的合并故障点(生产恒 None)。
     fault: parking_lot::Mutex<Option<MergeFault>>,
 }
@@ -54,12 +57,14 @@ impl GitWorktreeProvider {
             Ok(GitWorktreeProvider {
                 repo_root,
                 worktrees_root: Some(git.worktree_root()?),
+                merge_lock: parking_lot::Mutex::new(()),
                 fault: parking_lot::Mutex::new(None),
             })
         } else {
             Ok(GitWorktreeProvider {
                 repo_root,
                 worktrees_root: None,
+                merge_lock: parking_lot::Mutex::new(()),
                 fault: parking_lot::Mutex::new(None),
             })
         }
@@ -144,6 +149,8 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
         if self.worktrees_root.is_none() {
             return Ok(MergeOutcome::NotRequired);
         }
+        // 仓库级合并互斥(C1):ref 推进/事务日志/应用文件全程串行
+        let _merge_guard = self.merge_lock.lock();
         let mut worktree_leases: Vec<ExecutionLease> = leases
             .iter()
             .filter(|l| l.isolated && l.provider == PROVIDER_ID)
@@ -266,6 +273,8 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
         // 4. 合并事务日志(旧 ref、目标 tree、目标文件内容与应用前
         //    原状态)先于 ref 推进持久化:ref 更新与文件应用之间的
         //    任何崩溃都可在启动(或下次合并前)重放/回滚一致收敛。
+        //    每次合并有唯一 transaction-id,临时文件名包含它
+        //    (并发/残留的旧临时文件互不覆盖)。
         let git = Git::open(&self.repo_root)?;
         let step_label = worktree_leases
             .first()
@@ -273,27 +282,32 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
             .and_then(|v| v.as_str())
             .unwrap_or("step");
         let ref_before = git.read_ref(&refname)?;
+        let transaction_id = format!("mtx-{}-{}", std::process::id(), journal_txn_counter());
         let journal = MergeJournal {
             version: 1,
+            transaction_id: transaction_id.clone(),
             refname: refname.clone(),
             ref_before: ref_before.map(|o| o.to_string()),
             target_tree: tree_id.to_string(),
             changes: self.snapshot_originals(&changes)?,
         };
         let journal_path = journal_file_for(&repo, &refname);
-        write_journal_atomic(&journal_path, &journal)?;
+        write_journal_atomic(&journal_path, &journal, &transaction_id)?;
         if self.current_fault() == Some(MergeFault::CrashAfterJournal) {
             return Err(anyhow::anyhow!("(测试注入)事务日志写入后进程死亡"));
         }
 
-        // 5. 原子推进集成基线 ref(下游 acquire 从汇合结果检出)。
-        git.advance_integration_ref(
+        // 5. 原子推进集成基线 ref(expected-old CAS,C1):ref 当前目标
+        //    必须仍是 journal 记录的 ref_before —— 并发推进过即失败,
+        //    绝不把同一次合并在别人推进过的 ref 上再叠一层。
+        let advanced = git.advance_integration_ref_cas(
             &refname,
             tree_id,
             &format!(
                 "mf: integrate {step_label} (+{} batch)",
                 worktree_leases.len()
             ),
+            ref_before,
         )?;
         if self.current_fault() == Some(MergeFault::CrashAfterRefAdvance) {
             return Err(anyhow::anyhow!("(测试注入)ref 推进后进程死亡"));
@@ -304,6 +318,7 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
         match self.apply_journal_with_rollback(&journal) {
             ApplyOutcome::Applied => {
                 let _ = std::fs::remove_file(&journal_path);
+                sync_dir_of(&journal_path);
                 Ok(MergeOutcome::Merged)
             }
             ApplyOutcome::Crashed(msg) => Err(anyhow::anyhow!("(测试注入){msg}")),
@@ -311,7 +326,9 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
                 error,
                 rolled_back_cleanly: true,
             } => {
-                if let Err(ref_err) = git.reset_integration_ref(&refname, ref_before) {
+                if let Err(ref_err) =
+                    git.reset_integration_ref(&refname, ref_before, Some(advanced))
+                {
                     // ref 回滚失败:保留事务日志,如实聚合上报
                     return Err(error.context(format!(
                         "合并应用失败且回滚集成 ref 失败(已保留合并事务日志,恢复将重放): {ref_err:#}"
@@ -374,6 +391,8 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
     }
 
     fn recover_interrupted(&self) -> Result<()> {
+        // 与 merge 互斥:恢复重放不与进行中的合并交错推进 ref/应用文件
+        let _merge_guard = self.merge_lock.lock();
         self.recover_merge_journals()
     }
 }
@@ -449,6 +468,9 @@ struct JournaledChange {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MergeJournal {
     version: u32,
+    /// 本次合并的唯一事务标识(临时文件名/审计)。
+    #[serde(default)]
+    transaction_id: String,
     refname: String,
     /// 推进前的 ref 目标(None = 推进前 ref 不存在)。
     ref_before: Option<String>,
@@ -489,20 +511,75 @@ fn journal_file_for(repo: &git2::Repository, refname: &str) -> PathBuf {
     journal_dir_of(repo).join(format!("{}.json", refname.replace('/', "_")))
 }
 
-/// 事务日志原子写入:同目录临时文件 → 落盘 → 改名。
-fn write_journal_atomic(path: &std::path::Path, journal: &MergeJournal) -> Result<()> {
+/// 事务日志原子写入:同目录**唯一命名**临时文件(transaction-id +
+/// 进程内计数,并发/残留互不覆盖)→ flush + fsync → 原子 rename →
+/// 父目录 fsync(掉电后 rename 结果可见,Windows 经
+/// FILE_FLAG_BACKUP_SEMANTICS 打开目录句柄 FlushFileBuffers)。
+fn write_journal_atomic(
+    path: &std::path::Path,
+    journal: &MergeJournal,
+    transaction_id: &str,
+) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        sync_dir(parent);
     }
-    let tmp = path.with_extension("tmp");
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("journal.json");
+    let tmp = path.with_file_name(format!("{file_name}.{transaction_id}.tmp"));
     {
         use std::io::Write as _;
-        let mut f = std::fs::File::create(&tmp)?;
+        let mut f = std::fs::File::create(&tmp)
+            .with_context(|| format!("创建事务日志临时文件失败: {}", tmp.display()))?;
         f.write_all(serde_json::to_string(journal)?.as_bytes())?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path)?;
+    std::fs::rename(&tmp, path).with_context(|| {
+        format!(
+            "事务日志原子改名失败: {} → {}",
+            tmp.display(),
+            path.display()
+        )
+    })?;
+    if let Some(parent) = path.parent() {
+        sync_dir(parent);
+    }
     Ok(())
+}
+
+/// 目录 fsync(让其中刚创建/改名/删除的目录项掉电后可见)。
+/// Windows 需 FILE_FLAG_BACKUP_SEMANTICS 才能打开目录句柄;失败只记录
+/// (尽力而为的持久性增强,不阻塞合并主流程)。
+fn sync_dir_of(file: &std::path::Path) {
+    if let Some(parent) = file.parent() {
+        sync_dir(parent);
+    }
+}
+
+fn sync_dir(dir: &std::path::Path) {
+    #[cfg(windows)]
+    let result = {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::File::options()
+            .read(true)
+            .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
+            .open(dir)
+            .and_then(|h| h.sync_all())
+    };
+    #[cfg(not(windows))]
+    let result = std::fs::File::open(dir).and_then(|h| h.sync_all());
+    if let Err(e) = result {
+        log::debug!("目录 fsync 尽力而为失败({}): {e}", dir.display());
+    }
+}
+
+/// 进程内事务计数(与 pid 组合构成唯一 transaction-id)。
+fn journal_txn_counter() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 impl GitWorktreeProvider {
@@ -711,6 +788,7 @@ impl GitWorktreeProvider {
                 .with_context(|| format!("重放事务日志失败: {}", path.display()))?;
             std::fs::remove_file(path)
                 .with_context(|| format!("删除已收敛的事务日志失败: {}", path.display()))?;
+            sync_dir_of(path);
             return Ok(());
         }
         let ref_before = journal
@@ -721,6 +799,7 @@ impl GitWorktreeProvider {
             // 推进前死亡:无任何文件应用发生 → 安全清日志
             std::fs::remove_file(path)
                 .with_context(|| format!("删除未推进的事务日志失败: {}", path.display()))?;
+            sync_dir_of(path);
             return Ok(());
         }
         anyhow::bail!(
@@ -1214,6 +1293,69 @@ mod merge_journal_tests {
             std::fs::read_to_string(root.join("a.txt")).unwrap(),
             "user-edit\n",
             "用户字节保持"
+        );
+        provider.release(&lease).unwrap();
+    }
+
+    /// 同一批并发 merge(C1 提供器侧防线):仓库级合并互斥 + 集成 ref
+    /// expected-old CAS —— 恰好一次 Merged,并发另一方检测到"已汇合的
+    /// 其他节点"冲突;ref 单次推进、项目目录一致、无日志/临时文件残留。
+    #[test]
+    fn concurrent_merge_of_same_batch_advances_ref_exactly_once() {
+        let (_dir, root) = fixture();
+        let provider = std::sync::Arc::new(GitWorktreeProvider::new(root.clone()).unwrap());
+        let lease = provider.acquire(&ctx(&root, 7, "a")).unwrap();
+        std::fs::write(wt_path(&root, 7, "a").join("a.txt"), "concurrent\n").unwrap();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let p1 = provider.clone();
+        let p2 = provider.clone();
+        let l1 = lease.clone();
+        let l2 = lease.clone();
+        let b1 = barrier.clone();
+        let h1 = std::thread::spawn(move || {
+            b1.wait();
+            p1.merge(&[l1])
+        });
+        let h2 = std::thread::spawn(move || {
+            barrier.wait();
+            p2.merge(&[l2])
+        });
+        let r1 = h1.join().unwrap();
+        let r2 = h2.join().unwrap();
+        let merged_count = [&r1, &r2]
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .filter(|o| matches!(o, MergeOutcome::Merged))
+            .count();
+        assert_eq!(
+            merged_count, 1,
+            "同一批并发 merge 必须恰好一次 Merged(实际 {merged_count};r1={r1:?},r2={r2:?})"
+        );
+        assert!(r1.is_ok() && r2.is_ok(), "并发合并不得产生错误(见上)");
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "concurrent\n",
+            "项目目录与汇合结果一致"
+        );
+        // 集成 ref 只推进一次:ref 树包含 a.txt="concurrent"
+        let refname = Git::integration_ref(7, 1);
+        let repo = git2::Repository::open(&root).unwrap();
+        let mut revwalk = repo.revwalk().unwrap();
+        revwalk.push_ref(&refname).unwrap();
+        revwalk.hide_ref("HEAD").unwrap();
+        let advanced_commits = revwalk.count();
+        assert_eq!(
+            advanced_commits, 1,
+            "集成 ref 必须单次推进(不得叠第二次合并提交)"
+        );
+        let journal_dir = repo.path().join(JOURNAL_DIR);
+        let leftovers: Vec<_> = std::fs::read_dir(&journal_dir)
+            .map(|it| it.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "并发合并后不得残留事务日志/临时文件: {leftovers:?}"
         );
         provider.release(&lease).unwrap();
     }
