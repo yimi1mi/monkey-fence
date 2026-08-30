@@ -11,34 +11,37 @@ use crate::catalog_store::CatalogStore;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-/// 内容身份摘要(I12):规范化节点(按 key 排序,deps 排序,字段
-/// NUL 分隔)+ unsafe-parallel 开关的 SHA-256 十六进制。
+/// 内容身份摘要(I12/F13):规范化节点(按 key 排序,deps 排序)以
+/// **长度前缀**编码(每字段前置 u64-LE 字节长度;节点数与每节点
+/// deps 数同样前置长度)后取 SHA-256 十六进制。字段值可含任意控制
+/// 字符(含 NUL/0x01)—— 边界由长度唯一决定,不同内容不可能
+/// 通过内嵌分隔符碰撞出同一字节流。
 /// `task_workflows` 与 `pipeline_revisions` 都持久化此摘要;
 /// 「分配并确认」只按摘要等值复用 Revision —— 时间戳(时钟回拨/
 /// 同秒)不参与判定。
 pub fn workflow_content_digest(nodes: &[WorkflowNodeDraft], allow_unsafe_parallel: bool) -> String {
     use sha2::{Digest, Sha256};
+    fn field(h: &mut sha2::Sha256, bytes: &[u8]) {
+        h.update((bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    }
     let mut norm: Vec<&WorkflowNodeDraft> = nodes.iter().collect();
     norm.sort_by(|a, b| a.key.cmp(&b.key));
     let mut hasher = Sha256::new();
+    field(&mut hasher, &[u8::from(allow_unsafe_parallel)]);
+    field(&mut hasher, &norm.len().to_le_bytes());
     for n in norm {
-        hasher.update(n.key.as_bytes());
-        hasher.update([0]);
-        hasher.update(n.title.as_bytes());
-        hasher.update([0]);
-        hasher.update(n.instructions.as_bytes());
-        hasher.update([0]);
-        hasher.update(n.agent_instance_id.as_bytes());
-        hasher.update([0]);
         let mut deps = n.deps.clone();
         deps.sort();
+        field(&mut hasher, n.key.as_bytes());
+        field(&mut hasher, n.title.as_bytes());
+        field(&mut hasher, n.instructions.as_bytes());
+        field(&mut hasher, n.agent_instance_id.as_bytes());
+        field(&mut hasher, &deps.len().to_le_bytes());
         for d in deps {
-            hasher.update(d.as_bytes());
-            hasher.update([0]);
+            field(&mut hasher, d.as_bytes());
         }
-        hasher.update([1]); // 节点边界
     }
-    hasher.update([u8::from(allow_unsafe_parallel)]);
     let out = hasher.finalize();
     out.iter().map(|b| format!("{b:02x}")).collect()
 }
