@@ -92,6 +92,21 @@ impl GitWorktreeProvider {
         *self.fault.lock()
     }
 
+    /// `.git` 元数据下的**跨进程/跨实例**排他合并锁(F3):
+    /// `.git/mf-merge.lock`(OS 文件锁,进程死亡自动释放)。
+    /// 进程内互斥(merge_lock)挡同实例线程;本锁挡独立实例/进程 ——
+    /// merge/recover 全程持有,journal 与集成 ref 的推进因此全局串行。
+    /// 非 Git 根无隔离语义,无需锁。
+    fn cross_instance_lock(&self) -> Result<Option<crate::fs_atomic::FileLock>> {
+        if self.worktrees_root.is_none() {
+            return Ok(None);
+        }
+        let repo = git2::Repository::open(&self.repo_root)?;
+        Ok(Some(crate::fs_atomic::FileLock::acquire(
+            &repo.path().join("mf-merge.lock"),
+        )?))
+    }
+
     fn worktree_name(ctx: &LeaseContext) -> String {
         format!("mf-run-{}-{}-{}", ctx.task_id, ctx.step_key, ctx.attempt)
     }
@@ -161,8 +176,11 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
         if self.worktrees_root.is_none() {
             return Ok(MergeOutcome::NotRequired);
         }
-        // 仓库级合并互斥(C1):ref 推进/事务日志/应用文件全程串行
+        // 仓库级合并互斥(C1):ref 推进/事务日志/应用文件全程串行。
+        // F3:进程内互斥之外,再取 `.git` 下跨实例文件锁 —— 独立
+        // provider 实例/进程同样串行(先内后外,固定顺序防死锁)
         let _merge_guard = self.merge_lock.lock();
+        let _file_lock = self.cross_instance_lock()?;
         let mut worktree_leases: Vec<ExecutionLease> = leases
             .iter()
             .filter(|l| l.isolated && l.provider == PROVIDER_ID)
@@ -447,7 +465,9 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
 
     fn recover_interrupted(&self) -> Result<()> {
         // 与 merge 互斥:恢复重放不与进行中的合并交错推进 ref/应用文件
+        //(进程内互斥 + F3 跨实例文件锁,固定先内后外防死锁)
         let _merge_guard = self.merge_lock.lock();
+        let _file_lock = self.cross_instance_lock()?;
         self.recover_merge_journals()
     }
 }
@@ -1719,6 +1739,97 @@ mod merge_journal_tests {
         for name in ["c1.json", "c2.json", "c3.json", "c4.json"] {
             assert!(msg.contains(name), "{name} 必须被拒绝: {msg}");
         }
+    }
+
+    /// F3:两个**完全独立**的 provider 实例(跨进程语义:各自独立的
+    /// 进程内锁/状态)并发 merge 同一批 —— `.git` 下的排他文件锁必须
+    /// 让后者排队等待;A 持锁期间 B 的 merge 不得完成(否则 B 会并发
+    /// 重放/清理 A 的事务日志)。A 完成后 B 收敛,项目目录一致。
+    #[test]
+    fn cross_instance_merge_serializes_via_git_file_lock() {
+        let (_dir, root) = fixture();
+        let a = std::sync::Arc::new(GitWorktreeProvider::new(root.clone()).unwrap());
+        let lease = a.acquire(&ctx(&root, 12, "a")).unwrap();
+        std::fs::write(wt_path(&root, 12, "a").join("a.txt"), "cross\n").unwrap();
+
+        // A 暂停在 journal 已写、ref 已推进的窗口(持有全部锁)
+        a.set_merge_fault(MergeFault::WaitBeforeApply);
+        let a2 = a.clone();
+        let lease_a = lease.clone();
+        let ha = std::thread::spawn(move || a2.merge(&[lease_a]));
+        let refname = Git::integration_ref(12, 1);
+        let advanced = (0..500).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            ref_tree(&root, &refname).is_some()
+        });
+        assert!(advanced, "前置:A 已进入应用前窗口(锁已持有)");
+
+        // B:独立实例(独立进程内锁)—— 只能靠 .git 下文件锁互斥
+        let b = std::sync::Arc::new(GitWorktreeProvider::new(root.clone()).unwrap());
+        let lease_b = lease.clone();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_flag = done.clone();
+        let hb = std::thread::spawn(move || {
+            let r = b.merge(&[lease_b]);
+            done_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            r
+        });
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        assert!(
+            !done.load(std::sync::atomic::Ordering::SeqCst),
+            "A 持锁期间独立实例的 merge 不得完成(必须互斥排队)"
+        );
+        a.clear_merge_fault();
+        let a_outcome = ha.join().unwrap().expect("A 合并成功");
+        assert!(matches!(a_outcome, MergeOutcome::Merged), "A 必须合并成功");
+        // A 释放后 B 完成并收敛(与已汇合结果不重叠 → NeedsUser 或幂等)
+        let b_outcome = hb.join().unwrap().expect("B 不得因互斥出错");
+        assert!(matches!(
+            b_outcome,
+            MergeOutcome::NeedsUser { .. } | MergeOutcome::Merged | MergeOutcome::NotRequired
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "cross\n",
+            "项目目录与汇合结果一致"
+        );
+        let journal_dir = git2::Repository::open(&root)
+            .unwrap()
+            .path()
+            .join(JOURNAL_DIR);
+        let leftovers: Vec<_> = std::fs::read_dir(&journal_dir)
+            .map(|it| {
+                it.filter_map(|e| e.ok())
+                    .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+                    .map(|e| e.file_name())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "收敛后不得残留事务日志: {leftovers:?}"
+        );
+        a.release(&lease).unwrap();
+    }
+
+    /// F3:赢家崩溃后,另一独立实例的 recover 必须能收敛(跨实例恢复)。
+    #[test]
+    fn crashed_winner_is_recoverable_by_independent_instance() {
+        let (_dir, root) = fixture();
+        let a = GitWorktreeProvider::new(root.clone()).unwrap();
+        let lease = a.acquire(&ctx(&root, 13, "a")).unwrap();
+        std::fs::write(wt_path(&root, 13, "a").join("a.txt"), "winner\n").unwrap();
+        a.set_merge_fault(MergeFault::CrashAfterRefAdvance);
+        assert!(a.merge(&[lease.clone()]).is_err());
+        // 独立实例(另一"进程")恢复:journal 重放应用到一致
+        let b = GitWorktreeProvider::new(root.clone()).unwrap();
+        b.recover_interrupted().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "winner\n",
+            "独立实例必须能重放赢家的合并结果"
+        );
+        b.release(&lease).unwrap();
     }
 
     /// 同一批并发 merge(C1 提供器侧防线):仓库级合并互斥 + 集成 ref
