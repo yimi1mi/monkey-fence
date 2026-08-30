@@ -604,7 +604,13 @@ fn launch_pty(
             return;
         }
     };
-    let job = child.job();
+    let job = child
+        .job()
+        .map_err(|e| {
+            log::warn!("克隆进程树守卫失败(退化为直接 kill): {e:#}");
+            e
+        })
+        .ok();
     let pid = child.process_id();
 
     let session = Arc::new(PtySession {
@@ -914,7 +920,13 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
         )
     })?;
     let killer = child.clone_killer().context("离散会话克隆 kill 句柄失败")?;
-    let job = child.job();
+    let job = child
+        .job()
+        .map_err(|e| {
+            log::warn!("克隆进程树守卫失败(退化为直接 kill): {e:#}");
+            e
+        })
+        .ok();
     let pid = child.process_id();
 
     let session = Arc::new(PtySession {
@@ -1152,7 +1164,13 @@ fn launch_workflow_pty(
     let killer = child
         .clone_killer()
         .context("工作流节点克隆 kill 句柄失败")?;
-    let job = child.job();
+    let job = child
+        .job()
+        .map_err(|e| {
+            log::warn!("克隆进程树守卫失败(退化为直接 kill): {e:#}");
+            e
+        })
+        .ok();
     let pid = child.process_id();
 
     let session = Arc::new(PtySession {

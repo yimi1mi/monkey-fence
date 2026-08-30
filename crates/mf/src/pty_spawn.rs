@@ -1,14 +1,16 @@
-//! 原生 PTY 启动封装(Windows ConPTY;其他平台回退 portable-pty)。
+//! 原生 PTY 启动封装(Windows ConPTY / Unix openpty+fork+execve)。
 //!
-//! 取代 portable-pty 直接使用的两个关键缺口:
+//! 取代 portable-pty 直接使用的关键缺口:
 //! - **进程树所有权**(C5):Windows 用 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`
 //!   的 Job Object 拥有整个进程树(CREATE_SUSPENDED → 挂 job → 恢复,
-//!   杜绝孙进程在挂载前派生的竞态);stop 先 TerminateJobObject 再等
-//!   job 清空。`cmd /c npm → node` 风格的孙进程不再逃逸。
-//! - **可 zeroize 的 spawn 环境块**(I10):环境以 UTF-16 块一次性构造
-//!   (父环境 + 覆盖 + Secret),Secret 明文只经 zeroize 缓冲进入
-//!   `CreateProcessW`,不产生 portable-pty `CommandBuilder` 内部的
-//!   普通 OsString 长期副本。所有 launch 路径统一走本封装。
+//!   杜绝孙进程在挂载前派生的竞态);Unix 用 setsid 独立进程组,
+//!   stop 对 `-pgid` 发信号并等待整组消失。`cmd /c npm → node` 风格的
+//!   孙进程不再逃逸。
+//! - **可 zeroize 的 spawn 环境块**(I10):Windows 环境以 UTF-16 块一次性
+//!   构造,中间缓冲与最终块全部 `Zeroizing`,drop 清零后正常释放
+//!   (不 mem::forget 泄漏整份父环境);Unix 直接构造 `execve` 的
+//!   `envp`(Zeroizing CString),不经 CommandBuilder 普通 OsString 副本。
+//!   所有 launch 路径统一走本封装。
 
 use anyhow::{Context as _, Result};
 use mf_agent::secrets::SecretLease;
@@ -73,6 +75,28 @@ impl SpawnCommand {
     }
 }
 
+/// 环境键/值合法性(NUL 与键中 '=' 在两种平台的环境块格式里都非法):
+/// 静默接受会导致截断/串项,把 Secret 泄漏给错误的变量名。
+fn validate_env_entry(key: &str, value_display: &str) -> Result<()> {
+    anyhow::ensure!(
+        !key.contains('\0'),
+        "环境键 {value_display} 含 NUL,拒绝构造"
+    );
+    anyhow::ensure!(
+        !key.contains('='),
+        "环境键 {value_display} 含非法 '=',拒绝构造"
+    );
+    Ok(())
+}
+
+fn validate_no_nul(value_display: &str) -> Result<()> {
+    anyhow::ensure!(
+        !value_display.contains('\0'),
+        "{value_display} 含 NUL,拒绝构造"
+    );
+    Ok(())
+}
+
 /// 进程退出状态。
 pub struct ExitStatus {
     code: u32,
@@ -86,7 +110,8 @@ impl ExitStatus {
 
 /// 进程树守卫(平台实现 re-export):Windows 为 Job Object
 /// (terminate 杀整树、wait_empty 等树清空、句柄关闭即
-/// KILL_ON_JOB_CLOSE);非 Windows 为占位。
+/// KILL_ON_JOB_CLOSE);Unix 为独立进程组(setsid,terminate 对
+/// -pgid 发信号、wait_empty 轮询整组消失)。
 
 // ---------------------------------------------------------------------------
 // Windows:ConPTY + Job Object 原生实现
@@ -95,6 +120,7 @@ impl ExitStatus {
 #[cfg(windows)]
 mod imp {
     use super::*;
+    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{
         CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE, INVALID_HANDLE_VALUE,
     };
@@ -115,6 +141,8 @@ mod imp {
         LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
         STARTF_USESTDHANDLES, STARTUPINFOEXW,
     };
+    use zeroize::Zeroizing;
+
     // windows-sys 0.59:HPCON 为 isize 句柄
     type HPCON = isize;
     const CREATE_SUSPENDED: u32 = 0x0000_0004;
@@ -161,35 +189,46 @@ mod imp {
     // 跨线程移动(生产 reader 线程模式)。
     unsafe impl Send for OwnedHandle {}
 
-    /// UTF-16 环境块(`KEY=VALUE\0…\0\0`,drop 原地清零)。
-    /// Secret 明文在宿主侧只存在于本块与 zeroizing 租约中。
-    pub struct SpawnEnvBlock(Vec<u16>);
+    /// UTF-16 环境块(`KEY=VALUE\0…\0\0`)。**临时缓冲与最终块全部
+    /// Zeroizing**:Secret 明文在宿主侧只存在于 zeroize 缓冲与租约中,
+    /// drop 原地清零后**正常释放**(不 mem::forget 泄漏整份父环境)。
+    pub struct SpawnEnvBlock(Zeroizing<Vec<u16>>);
 
     impl SpawnEnvBlock {
         /// 由父环境 + 覆盖 + Secret 构造(键大小写不敏感去重,覆盖优先,
-        /// 稳定排序)。Secret 值直接从租约字节编码为 UTF-16,不落地副本。
+        /// 稳定排序)。Secret 值直接从租约字节编码为 UTF-16,不落地副本;
+        /// 父环境键值经 `encode_wide` 精确转码(不做 lossy 破坏)。
+        /// 键/值含 NUL、键含 '=' 时拒绝构造。
         pub fn build(
             overrides: &[(String, String)],
             secrets: &[(String, Arc<SecretLease>)],
         ) -> Result<SpawnEnvBlock> {
+            for (k, v) in overrides {
+                validate_env_entry(k, &format!("环境键 {k:?}"))?;
+                validate_no_nul(v)?;
+            }
+            for (k, _) in secrets {
+                validate_env_entry(k, &format!("Secret 环境键 {k:?}"))?;
+            }
             let overridden: Vec<String> = overrides
                 .iter()
                 .map(|(k, _)| k.to_uppercase())
                 .chain(secrets.iter().map(|(k, _)| k.to_uppercase()))
                 .collect();
-            let mut entries: Vec<(String, Vec<u16>)> = Vec::new();
-            // 父环境(去掉被覆盖键;键统一大写比较/排序)
+            // 中间条目值一律 Zeroizing(父环境值也按机密对待:
+            // 块内混有 Secret 明文,整块生命周期等同机密)
+            let mut entries: Vec<(String, Zeroizing<Vec<u16>>)> = Vec::new();
+            // 父环境(去掉被覆盖键;键统一大写比较/排序;
+            // encode_wide 保真转码,绝不 lossy)
             for (k, v) in std::env::vars_os() {
-                let k = k.to_string_lossy().into_owned();
-                if overridden.contains(&k.to_uppercase()) {
+                let key_upper = k.to_string_lossy().to_uppercase();
+                if overridden.contains(&key_upper) {
                     continue;
                 }
-                let value: Vec<u16> = v.to_string_lossy().encode_utf16().collect();
-                entries.push((k.to_uppercase(), value));
+                entries.push((key_upper, Zeroizing::new(v.encode_wide().collect())));
             }
             for (k, v) in overrides {
-                let value: Vec<u16> = v.encode_utf16().collect();
-                entries.push((k.to_uppercase(), value));
+                entries.push((k.to_uppercase(), Zeroizing::new(v.encode_utf16().collect())));
             }
             for (k, lease) in secrets {
                 let value = std::str::from_utf8(lease.as_slice()).with_context(|| {
@@ -198,36 +237,35 @@ mod imp {
                         lease.id()
                     )
                 })?;
-                let value: Vec<u16> = value.encode_utf16().collect();
-                entries.push((k.to_uppercase(), value));
+                validate_no_nul(value)?;
+                entries.push((
+                    k.to_uppercase(),
+                    Zeroizing::new(value.encode_utf16().collect()),
+                ));
             }
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             let mut block: Vec<u16> = Vec::new();
             for (k, v) in &entries {
                 block.extend(k.encode_utf16());
                 block.push('=' as u16);
-                block.extend(v);
+                block.extend(v.iter());
                 block.push(0);
             }
             block.push(0); // 块结尾
-            Ok(SpawnEnvBlock(block))
+            Ok(SpawnEnvBlock(Zeroizing::new(block)))
         }
 
         #[cfg(test)]
         pub(crate) fn raw_parts(&self) -> (*const u16, usize) {
             (self.0.as_ptr(), self.0.len())
         }
-    }
 
-    impl Drop for SpawnEnvBlock {
-        fn drop(&mut self) {
-            // 原地清零;已清零的缓冲不再交还分配器(泄漏全零页):
-            // 分配器复用会把(哪怕已清零的)环境块重新暴露给无关分配,
-            // 这里彻底杜绝任何残留路径。每次 launch 一次性开销。
-            for c in self.0.iter_mut() {
-                *c = 0;
-            }
-            std::mem::forget(std::mem::take(&mut self.0));
+        /// 与 Drop 走的同一 zeroize 例程(测试在持有分配时验证清零;
+        /// 释放后内存可能被分配器合法复用,"释放后仍为零"不是可测不变量)。
+        #[cfg(test)]
+        pub(crate) fn zeroize_in_place(&mut self) {
+            use zeroize::Zeroize;
+            self.0.zeroize();
         }
     }
 
@@ -239,15 +277,14 @@ mod imp {
     unsafe impl Send for JobGuard {}
     unsafe impl Sync for JobGuard {}
 
-    impl Clone for JobGuard {
-        fn clone(&self) -> Self {
-            JobGuard {
-                hjob: self.hjob.duplicate().expect("克隆 job 句柄失败"),
-            }
-        }
-    }
-
     impl JobGuard {
+        /// 显式 try_clone(DuplicateHandle 可失败,绝不 panic)。
+        pub fn try_clone(&self) -> Result<JobGuard> {
+            Ok(JobGuard {
+                hjob: self.hjob.duplicate()?,
+            })
+        }
+
         fn create() -> Result<JobGuard> {
             let hjob = unsafe { CreateJobObjectW(core::ptr::null(), core::ptr::null()) };
             if hjob.is_null() {
@@ -312,7 +349,6 @@ mod imp {
         fn drop(&mut self) {
             // KILL_ON_JOB_CLOSE:最后一个句柄关闭时残余进程(守护进程式
             // 孙进程)一并终止,不留孤儿
-            // KILL_ON_JOB_CLOSE:最后一个句柄关闭时残余进程一并终止
             let _ = &self.hjob; // OwnedHandle Drop 负责关闭
         }
     }
@@ -440,9 +476,13 @@ mod imp {
             })
         }
 
-        /// 进程树守卫(Windows 恒 Some;克隆共享同一 job)。
-        pub fn job(&self) -> Option<JobGuard> {
-            self.job.clone()
+        /// 进程树守卫(Windows 恒 Some;克隆共享同一 job;
+        /// DuplicateHandle 显式可失败,绝不 panic)。
+        pub fn job(&self) -> Result<JobGuard> {
+            self.job
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("本平台无进程树守卫"))
+                .and_then(|j| j.try_clone())
         }
 
         pub fn kill(&self) -> Result<()> {
@@ -488,27 +528,23 @@ mod imp {
         pub master: PtyMaster,
     }
 
+    /// CreatePipe 单组失败时,另一组句柄立即由 OwnedHandle RAII 关闭
+    /// (不再泄漏)。
+    unsafe fn create_pipe_pair() -> Result<(OwnedHandle, OwnedHandle)> {
+        let mut read: HANDLE = core::ptr::null_mut();
+        let mut write: HANDLE = core::ptr::null_mut();
+        if CreatePipe(&mut read, &mut write, core::ptr::null_mut(), 0) == 0 {
+            return Err(anyhow::anyhow!("CreatePipe 失败"));
+        }
+        Ok((OwnedHandle(read), OwnedHandle(write)))
+    }
+
     /// 打开 ConPTY(输入写端/输出读端留在宿主侧)。
     pub fn openpty(size: PtySize) -> Result<PtyPair> {
         unsafe {
-            let mut input_read: HANDLE = core::ptr::null_mut();
-            let mut input_write: HANDLE = core::ptr::null_mut();
-            let mut output_read: HANDLE = core::ptr::null_mut();
-            let mut output_write: HANDLE = core::ptr::null_mut();
-            if CreatePipe(&mut input_read, &mut input_write, core::ptr::null_mut(), 0) == 0
-                || CreatePipe(
-                    &mut output_read,
-                    &mut output_write,
-                    core::ptr::null_mut(),
-                    0,
-                ) == 0
-            {
-                return Err(anyhow::anyhow!("CreatePipe 失败"));
-            }
-            let input_read = OwnedHandle(input_read);
-            let input_write = OwnedHandle(input_write);
-            let output_read = OwnedHandle(output_read);
-            let output_write = OwnedHandle(output_write);
+            // 第二组失败时,第一组的 OwnedHandle 在 return 展开时立即关闭
+            let (input_read, input_write) = create_pipe_pair()?;
+            let (output_read, output_write) = create_pipe_pair()?;
             let coord = COORD {
                 X: size.cols as i16,
                 Y: size.rows as i16,
@@ -695,137 +731,584 @@ pub use imp::{
 };
 
 // ---------------------------------------------------------------------------
-// 非 Windows:portable-pty 回退(Secret env 仍经 CommandBuilder 普通
-// OsString —— zeroize 块是 Windows 专用实现;树终止尽力而为)
+// Unix:openpty + fork/setsid/execve 原生实现
 // ---------------------------------------------------------------------------
+// - **进程树所有权**(C4):子进程 setsid 成为会话首兼进程组长,
+//   重开 slave 获得控制终端;stop 对 `-pgid` 发 SIGKILL 并轮询整组
+//   消失 —— `sh -c npm → node` 风格孙进程不逃逸(未自行 setsid 的
+//   派生进程都在组内)。
+// - **可 zeroize 的环境块**(C3):execve 的 envp 直接以
+//   `Zeroizing<CString>` 构造,绝不经 CommandBuilder 普通 OsString
+//   明文副本;argv 同样零信任处理。
+// - 自然退出:子进程退出 → slave 全部关闭 → master read 返回
+//   EOF/EIO,reader 收口(waiter 负责 reap,见 runtime_host)。
 
 #[cfg(not(windows))]
 mod imp {
     use super::*;
-    use std::sync::Mutex;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use zeroize::Zeroize;
 
-    pub struct PtyMaster {
-        master: Box<dyn portable_pty::MasterPty + Send>,
-    }
+    /// zeroize 的 CString 持有者:drop 时清零底层字节缓冲后正常释放
+    /// (`CString` 本身不实现 `Zeroize`,不能直接用 `Zeroizing`)。
+    struct ZeroCString(CString);
 
-    impl PtyMaster {
-        pub fn try_clone_reader(&self) -> std::io::Result<PtyReader> {
-            self.master.try_clone_reader()
+    impl ZeroCString {
+        fn new(c: CString) -> ZeroCString {
+            ZeroCString(c)
         }
-        pub fn take_writer(&self) -> std::io::Result<PtyWriter> {
-            self.master.take_writer()
-        }
-        pub fn close(&mut self) {
-            // portable-pty master Drop 自行清理
-        }
-    }
-
-    pub type PtyReader = Box<dyn Read + Send>;
-    pub type PtyWriter = Box<dyn Write + Send>;
-
-    pub struct PtyPair {
-        pub master: PtyMaster,
-        slave: Mutex<Option<Box<dyn portable_pty::SlavePty>>>,
-    }
-
-    pub struct PtyChild {
-        child: Box<dyn portable_pty::Child + Send + Sync>,
-        pid: u32,
-    }
-
-    impl PtyChild {
-        pub fn process_id(&self) -> u32 {
-            self.pid
-        }
-        pub fn clone_killer(&self) -> Result<PtyChildKiller> {
-            Ok(PtyChildKiller {
-                killer: self.child.clone_killer(),
-            })
-        }
-        pub fn job(&self) -> Option<JobGuard> {
-            None
-        }
-        pub fn kill(&self) -> Result<()> {
-            self.child.kill().map_err(|e| anyhow::anyhow!("{e}"))
-        }
-        pub fn wait(&self) -> Result<ExitStatus> {
-            let status = self.child.wait().map_err(|e| anyhow::anyhow!("{e}"))?;
-            Ok(ExitStatus {
-                code: status.exit_code(),
-            })
+        fn as_ptr(&self) -> *const libc::c_char {
+            self.0.as_ptr()
         }
     }
 
-    pub struct PtyChildKiller {
-        killer: Box<dyn portable_pty::ChildKiller + Send>,
-    }
-
-    impl PtyChildKiller {
-        pub fn kill(&self) -> Result<()> {
-            self.killer.kill().map_err(|e| anyhow::anyhow!("{e}"))
+    impl Drop for ZeroCString {
+        fn drop(&mut self) {
+            let mut bytes = std::mem::take(&mut self.0).into_bytes();
+            bytes.zeroize();
+            // bytes 正常 drop(已清零)
         }
     }
 
-    impl JobGuard {
-        pub fn terminate(&self) -> Result<()> {
-            Ok(())
-        }
-        pub fn wait_empty(&self, _timeout: std::time::Duration) -> bool {
-            true
+    /// 拥有型 fd:Drop 关闭。
+    struct OwnedFd(libc::c_int);
+
+    impl OwnedFd {
+        fn as_raw(&self) -> libc::c_int {
+            self.0
         }
     }
 
-    pub fn openpty(size: PtySize) -> Result<PtyPair> {
-        let system = portable_pty::NativePtySystem::default();
-        let pair = system.openpty(portable_pty::PtySize {
-            rows: size.rows,
-            cols: size.cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })?;
-        Ok(PtyPair {
-            master: PtyMaster {
-                master: pair.master,
-            },
-            slave: Mutex::new(Some(pair.slave)),
-        })
-    }
-
-    impl PtyPair {
-        pub fn spawn_command(&mut self, cmd: &SpawnCommand) -> Result<PtyChild> {
-            let mut builder = portable_pty::CommandBuilder::new(&cmd.program);
-            for a in &cmd.args {
-                builder.arg(a);
+    impl Drop for OwnedFd {
+        fn drop(&mut self) {
+            if self.0 >= 0 {
+                unsafe { libc::close(self.0) };
             }
-            for (k, v) in &cmd.env {
-                builder.env(k, v);
+        }
+    }
+
+    unsafe impl Send for OwnedFd {}
+
+    /// execve 环境/参数块构造(平台无关校验复用)。
+    /// Secret 值只以 Zeroizing<CString> 存在,drop 清零。
+    pub struct SpawnEnvBlock {
+        entries: Vec<ZeroCString>,
+    }
+
+    impl SpawnEnvBlock {
+        pub fn build(
+            overrides: &[(String, String)],
+            secrets: &[(String, Arc<SecretLease>)],
+        ) -> Result<SpawnEnvBlock> {
+            for (k, _) in overrides {
+                validate_env_entry(k, &format!("环境键 {k:?}"))?;
             }
-            for (k, lease) in &cmd.secret_env {
+            for (k, _) in secrets {
+                validate_env_entry(k, &format!("Secret 环境键 {k:?}"))?;
+            }
+            let overridden: Vec<String> = overrides
+                .iter()
+                .map(|(k, _)| k.as_str().to_owned())
+                .chain(secrets.iter().map(|(k, _)| k.as_str().to_owned()))
+                .collect();
+            let mut entries: Vec<ZeroCString> = Vec::new();
+            // 父环境(精确 OsStr 字节,不做 lossy;去掉被覆盖键)
+            for (k, v) in std::env::vars_os() {
+                if overridden.iter().any(|o| o.as_str() == k.to_string_lossy()) {
+                    continue;
+                }
+                let mut bytes = Vec::with_capacity(k.len() + v.len() + 2);
+                bytes.extend_from_slice(k.as_bytes());
+                bytes.push(b'=');
+                bytes.extend_from_slice(v.as_bytes());
+                entries
+                    .push(ZeroCString::new(CString::new(bytes).map_err(|_| {
+                        anyhow::anyhow!("父环境变量含 NUL,拒绝构造环境块")
+                    })?));
+            }
+            let mut push_kv = |k: &str, value: &[u8]| -> Result<()> {
+                let mut bytes = Vec::with_capacity(k.len() + value.len() + 2);
+                bytes.extend_from_slice(k.as_bytes());
+                bytes.push(b'=');
+                bytes.extend_from_slice(value);
+                entries
+                    .push(ZeroCString::new(CString::new(bytes).map_err(|_| {
+                        anyhow::anyhow!("环境变量 {k} 的值含 NUL,拒绝构造")
+                    })?));
+                Ok(())
+            };
+            for (k, v) in overrides {
+                push_kv(k, v.as_bytes())?;
+            }
+            for (k, lease) in secrets {
                 let value = std::str::from_utf8(lease.as_slice()).with_context(|| {
                     format!(
                         "Secret `{}` 不是有效 UTF-8,无法注入环境变量 {k}",
                         lease.id()
                     )
                 })?;
-                builder.env(k, value);
+                push_kv(k, value.as_bytes())?;
             }
-            if let Some(cwd) = &cmd.cwd {
-                builder.cwd(cwd);
+            entries.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+            Ok(SpawnEnvBlock { entries })
+        }
+
+        fn as_ptr_array(&self) -> Vec<*const libc::c_char> {
+            self.entries
+                .iter()
+                .map(|e| e.as_ptr())
+                .chain([std::ptr::null()])
+                .collect()
+        }
+    }
+
+    /// 进程组守卫:terminate 对 -pgid 发 SIGKILL;wait_empty 轮询
+    /// kill(-pgid, 0) 直到 ESRCH(整组消失)。
+    pub struct JobGuard {
+        pgid: libc::pid_t,
+    }
+
+    unsafe impl Send for JobGuard {}
+    unsafe impl Sync for JobGuard {}
+
+    impl JobGuard {
+        pub fn try_clone(&self) -> Result<JobGuard> {
+            Ok(JobGuard { pgid: self.pgid })
+        }
+
+        pub fn terminate(&self) -> Result<()> {
+            // 负 pgid = 整组;组可能已空(ESRCH)视为成功
+            let r = unsafe { libc::kill(-self.pgid, libc::SIGKILL) };
+            if r != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                return Err(anyhow::anyhow!(
+                    "kill(-pgid {}, SIGKILL) 失败: {}",
+                    self.pgid,
+                    std::io::Error::last_os_error()
+                ));
             }
-            let mut slave = self
-                .slave
-                .lock()
-                .take()
-                .ok_or_else(|| anyhow::anyhow!("PTY slave 已消费"))?;
-            let mut child = slave.spawn_command(builder)?;
-            let pid = child.process_id().unwrap_or(0);
-            Ok(PtyChild { child, pid })
+            Ok(())
+        }
+
+        /// 等待进程组消失(kill(-pgid,0) 返回 ESRCH);超时 false。
+        pub fn wait_empty(&self, timeout: std::time::Duration) -> bool {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                let r = unsafe { libc::kill(-self.pgid, 0) };
+                if r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+        }
+    }
+
+    impl Drop for JobGuard {
+        fn drop(&mut self) {
+            // 不自动杀组:与 Windows KILL_ON_JOB_CLOSE 语义差异明确 ——
+            // 显式 terminate 由 stop 路径调用;这里只放弃跟踪
+        }
+    }
+
+    pub struct PtyMaster {
+        fd: Option<OwnedFd>,
+    }
+
+    unsafe impl Send for PtyMaster {}
+
+    impl PtyMaster {
+        pub fn try_clone_reader(&self) -> std::io::Result<PtyReader> {
+            let fd = self
+                .fd
+                .as_ref()
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "master 已关闭")
+                })?
+                .as_raw();
+            let dup = unsafe { libc::dup(fd) };
+            if dup < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(PtyReader { fd: OwnedFd(dup) })
+        }
+
+        pub fn take_writer(&self) -> std::io::Result<PtyWriter> {
+            let fd = self
+                .fd
+                .as_ref()
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::BrokenPipe, "master 已关闭")
+                })?
+                .as_raw();
+            let dup = unsafe { libc::dup(fd) };
+            if dup < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(PtyWriter { fd: OwnedFd(dup) })
+        }
+
+        /// Unix:master fd 关闭即可;阻塞中的 dup reader 由子进程退出
+        /// (slave 关闭 → EOF/EIO)解除,或 dup fd 自身被关闭解除。
+        pub fn close(&mut self) {
+            self.fd.take();
+        }
+    }
+
+    pub struct PtyReader {
+        fd: OwnedFd,
+    }
+
+    unsafe impl Send for PtyReader {}
+
+    impl Read for PtyReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            loop {
+                let n = unsafe {
+                    libc::read(
+                        self.fd.as_raw(),
+                        buf.as_mut_ptr() as *mut libc::c_void,
+                        buf.len(),
+                    )
+                };
+                if n > 0 {
+                    return Ok(n as usize);
+                }
+                if n == 0 {
+                    return Ok(0); // EOF:slave 侧全部关闭
+                }
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EIO) => return Ok(0), // Linux pty master 在 slave 关闭后的 EOF 形态
+                    Some(libc::EINTR) => continue,
+                    _ => return Err(err),
+                }
+            }
+        }
+    }
+
+    pub struct PtyWriter {
+        fd: OwnedFd,
+    }
+
+    unsafe impl Send for PtyWriter {}
+
+    impl Write for PtyWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            loop {
+                let n = unsafe {
+                    libc::write(
+                        self.fd.as_raw(),
+                        buf.as_ptr() as *const libc::c_void,
+                        buf.len(),
+                    )
+                };
+                if n >= 0 {
+                    return Ok(n as usize);
+                }
+                let err = std::io::Error::last_os_error();
+                match err.raw_os_error() {
+                    Some(libc::EINTR) => continue,
+                    _ => return Err(err),
+                }
+            }
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    pub struct PtyChild {
+        pid: libc::pid_t,
+    }
+
+    unsafe impl Send for PtyChild {}
+    unsafe impl Sync for PtyChild {}
+
+    impl PtyChild {
+        pub fn process_id(&self) -> u32 {
+            self.pid as u32
+        }
+
+        pub fn clone_killer(&self) -> Result<PtyChildKiller> {
+            Ok(PtyChildKiller { pid: self.pid })
+        }
+
+        /// 进程组守卫(setsid 后子进程即组长;pgid == pid)。
+        pub fn job(&self) -> Result<JobGuard> {
+            Ok(JobGuard { pgid: self.pid })
+        }
+
+        pub fn kill(&self) -> Result<()> {
+            let r = unsafe { libc::kill(self.pid, libc::SIGKILL) };
+            if r != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                return Err(anyhow::anyhow!(
+                    "kill({}) 失败: {}",
+                    self.pid,
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        }
+
+        /// 阻塞等待退出并返回退出码(waitpid 幂等: reap 后返回缓存语义
+        /// 由内核的 ECHILD 行为兜底 —— 多次 wait 同一已 reap 子进程时
+        /// 返回最后已知码 0)。
+        pub fn wait(&self) -> Result<ExitStatus> {
+            loop {
+                let mut status: libc::c_int = 0;
+                let r = unsafe { libc::waitpid(self.pid, &mut status, 0) };
+                if r == self.pid {
+                    let code = if libc::WIFEXITED(status) {
+                        libc::WEXITSTATUS(status) as u32
+                    } else if libc::WIFSIGNALED(status) {
+                        (128 + libc::WTERMSIG(status)) as u32
+                    } else {
+                        0
+                    };
+                    // 子进程已 reap:再无对象可等。记录到自身供重复 wait
+                    // (简化:重复 wait 返回 0 码;生产 caller 只 wait 一次,
+                    // 由 waiter 线程独占)
+                    return Ok(ExitStatus { code });
+                }
+                if r < 0 {
+                    let err = std::io::Error::last_os_error();
+                    match err.raw_os_error() {
+                        Some(libc::EINTR) => continue,
+                        // 已被其他线程 reap(生产 waiter 线程独占 wait):
+                        // 视为已终止,码不可知
+                        Some(libc::ECHILD) => return Ok(ExitStatus { code: 0 }),
+                        _ => return Err(anyhow::anyhow!("waitpid 失败: {err}")),
+                    }
+                }
+            }
+        }
+    }
+
+    pub struct PtyChildKiller {
+        pid: libc::pid_t,
+    }
+
+    unsafe impl Send for PtyChildKiller {}
+
+    impl PtyChildKiller {
+        pub fn kill(&self) -> Result<()> {
+            let r = unsafe { libc::kill(self.pid, libc::SIGKILL) };
+            if r != 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH) {
+                return Err(anyhow::anyhow!(
+                    "kill({})(killer) 失败: {}",
+                    self.pid,
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    pub struct PtyPair {
+        pub master: PtyMaster,
+        /// slave 的 pts 路径(子进程 setsid 后自行重开以获得控制终端)。
+        slave_path: CString,
+    }
+
+    /// 打开 PTY(openpty;master 留宿主,slave 由子进程在 setsid 后重开)。
+    pub fn openpty(size: PtySize) -> Result<PtyPair> {
+        unsafe {
+            let mut master: libc::c_int = -1;
+            let mut slave: libc::c_int = -1;
+            let mut win_size: libc::winsize = std::mem::zeroed();
+            win_size.ws_row = size.rows;
+            win_size.ws_col = size.cols;
+            let r = libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut win_size,
+            );
+            if r != 0 {
+                return Err(anyhow::anyhow!(
+                    "openpty 失败: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let master = OwnedFd(master);
+            let slave = OwnedFd(slave); // 宿主副本:取 pts 路径后立即关闭
+                                        // slave 的设备路径(ptsname_r 线程安全版)
+            let mut name_buf = [0u8; libc::PATH_MAX as usize];
+            let r = libc::ptsname_r(
+                slave.as_raw(),
+                name_buf.as_mut_ptr() as *mut libc::c_char,
+                name_buf.len(),
+            );
+            if r != 0 {
+                return Err(anyhow::anyhow!(
+                    "ptsname_r 失败: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let end = name_buf
+                .iter()
+                .position(|b| *b == 0)
+                .unwrap_or(name_buf.len());
+            let slave_path =
+                CString::new(&name_buf[..end]).map_err(|_| anyhow::anyhow!("pts 路径含 NUL"))?;
+            drop(slave);
+            Ok(PtyPair {
+                master: PtyMaster { fd: Some(master) },
+                slave_path,
+            })
+        }
+    }
+
+    impl PtyPair {
+        /// 在 PTY 中启动进程:fork → 子进程 setsid → 重开 slave(获得
+        /// 控制终端)→ dup2 到 0/1/2 → execve;父进程经 CLOEXEC 管道
+        /// 感知 exec 失败。每个 PtyPair 只 spawn 一次。
+        pub fn spawn_command(&mut self, cmd: &SpawnCommand) -> Result<PtyChild> {
+            let master_fd = self
+                .master
+                .fd
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("PTY master 已关闭"))?
+                .as_raw();
+            // argv/环境:Secret 只经 Zeroizing 缓冲进入 execve
+            let mut argv_owned: Vec<ZeroCString> = Vec::with_capacity(cmd.args.len() + 1);
+            let program = CString::new(cmd.program.as_os_str().as_bytes())
+                .map_err(|_| anyhow::anyhow!("程序路径含 NUL: {}", cmd.program.display()))?;
+            argv_owned.push(ZeroCString::new(program));
+            for arg in &cmd.args {
+                let c =
+                    CString::new(arg.as_bytes()).with_context(|| format!("参数含 NUL: {arg:?}"))?;
+                argv_owned.push(ZeroCString::new(c));
+            }
+            let env = SpawnEnvBlock::build(&cmd.env, &cmd.secret_env)?;
+            let cwd = match &cmd.cwd {
+                Some(p) => Some(
+                    CString::new(p.as_os_str().as_bytes())
+                        .map_err(|_| anyhow::anyhow!("cwd 含 NUL: {}", p.display()))?,
+                ),
+                None => None,
+            };
+            let argv: Vec<*const libc::c_char> = argv_owned
+                .iter()
+                .map(|a| a.as_ptr())
+                .chain([std::ptr::null()])
+                .collect();
+            let envp = env.as_ptr_array();
+
+            // exec 失败报告管道(O_CLOEXEC:exec 成功则父进程读到 EOF)
+            let mut exec_err_pipe: [libc::c_int; 2] = [-1, -1];
+            unsafe {
+                if libc::pipe2(exec_err_pipe.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+                    return Err(anyhow::anyhow!(
+                        "创建 exec 报告管道失败: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                }
+            }
+            let slave_path = self.slave_path.clone();
+
+            let pid = unsafe { libc::fork() };
+            if pid < 0 {
+                unsafe {
+                    libc::close(exec_err_pipe[0]);
+                    libc::close(exec_err_pipe[1]);
+                }
+                return Err(anyhow::anyhow!(
+                    "fork 失败: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if pid == 0 {
+                // ---- 子进程(只调用 async-signal-safe 函数) ----
+                unsafe {
+                    libc::close(exec_err_pipe[0]); // 读端
+                    libc::close(master_fd);
+                    let fail = |errno: libc::c_int| -> ! {
+                        let byte = errno as u8;
+                        libc::write(
+                            exec_err_pipe[1],
+                            &byte as *const u8 as *const libc::c_void,
+                            1,
+                        );
+                        libc::close(exec_err_pipe[1]);
+                        libc::_exit(127);
+                    };
+                    // 新会话 + 成为进程组长(整树可寻址终止的前提)
+                    if libc::setsid() < 0 {
+                        fail(9); // EBADF 类不可恢复:直接报告
+                    }
+                    // 会话首重开 slave 获得控制终端(O_RDWR 且不带 O_NOCTTY:
+                    // 会话首打开终端设备即成为其控制终端)
+                    let slave_fd = libc::open(slave_path.as_ptr(), libc::O_RDWR);
+                    if slave_fd < 0 {
+                        fail(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+                    }
+                    libc::dup2(slave_fd, 0);
+                    libc::dup2(slave_fd, 1);
+                    libc::dup2(slave_fd, 2);
+                    if slave_fd > 2 {
+                        libc::close(slave_fd);
+                    }
+                    if let Some(cwd) = &cwd {
+                        if libc::chdir(cwd.as_ptr()) < 0 {
+                            fail(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+                        }
+                    }
+                    // execve(失败经 CLOEXEC 管道上报;成功则管道自动关闭)
+                    let errno_ptr = libc::__errno_location();
+                    libc::execve(
+                        argv_owned
+                            .first()
+                            .map(|a| a.as_ptr())
+                            .unwrap_or(std::ptr::null()),
+                        argv.as_ptr(),
+                        envp.as_ptr(),
+                    );
+                    let errno = *errno_ptr;
+                    fail(errno);
+                }
+            }
+            // ---- 父进程 ----
+            unsafe {
+                libc::close(exec_err_pipe[1]); // 写端
+            }
+            let mut errno_byte: u8 = 0;
+            let reported = unsafe {
+                libc::read(
+                    exec_err_pipe[0],
+                    &mut errno_byte as *mut u8 as *mut libc::c_void,
+                    1,
+                )
+            };
+            unsafe {
+                libc::close(exec_err_pipe[0]);
+            }
+            if reported > 0 {
+                // exec/chdir/setsid 失败:回收子进程并如实报错
+                let mut status: libc::c_int = 0;
+                unsafe {
+                    libc::waitpid(pid, &mut status, 0);
+                }
+                return Err(anyhow::anyhow!(
+                    "启动 `{}` 失败(errno {errno_byte},CLI 未安装或配置无效)",
+                    cmd.program.display()
+                ));
+            }
+            Ok(PtyChild { pid })
         }
     }
 }
 
 #[cfg(not(windows))]
-pub use imp::{openpty, JobGuard, PtyChild, PtyChildKiller, PtyMaster, PtyPair};
+pub use imp::{
+    openpty, JobGuard, PtyChild, PtyChildKiller, PtyMaster, PtyPair, PtyReader, PtyWriter,
+    SpawnEnvBlock,
+};
 
 #[cfg(test)]
 mod tests {
@@ -863,27 +1346,63 @@ mod tests {
         assert!(text.contains("PATH=Z:\\override"), "{text}");
     }
 
-    /// 环境块 drop 后宿主缓冲原地清零(明文不残留可达副本)。
+    /// 环境键/值含 NUL 或键含 '=' 时必须拒绝构造(Win32 环境块格式
+    /// 非法:静默截断/串项会把 Secret 泄漏给错误的变量名)。
     #[cfg(windows)]
     #[test]
-    fn env_block_zeroizes_on_drop() {
+    fn env_block_rejects_nul_and_equals_in_key() {
+        let _guard = test_lock().lock();
+        // 值含 NUL
+        let err = SpawnEnvBlock::build(&[("A".into(), "x\0y".into())], &[])
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("NUL"), "{err:#}");
+        // 键含 NUL / '='
+        let err = SpawnEnvBlock::build(&[("K\0".into(), "v".into())], &[])
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("NUL"), "{err:#}");
+        let err = SpawnEnvBlock::build(&[("K=V".into(), "v".into())], &[])
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("'='"), "{err:#}");
+        // Secret 值含 NUL 同样拒绝
+        let secret = Arc::new(SecretLease::new("sec-nul", b"s\0e".to_vec()));
+        let err = SpawnEnvBlock::build(&[], &[("S".into(), secret)])
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("NUL"), "{err:#}");
+    }
+
+    /// 环境块清零例程:持有分配时原地清零(Drop 走同一例程);
+    /// 缓冲随后正常释放(不 mem::forget 泄漏整份父环境 ——
+    /// "释放后内存仍为零"不是可测不变量:分配器复用是合法的,
+    /// 明文在释放那一刻之前已被清零)。
+    #[cfg(windows)]
+    #[test]
+    fn env_block_zeroizes_in_place_and_releases_normally() {
         let _guard = test_lock().lock();
         let secret = Arc::new(SecretLease::new(
             "sec-zero",
             b"zeroize-canary-123456".to_vec(),
         ));
-        let block = SpawnEnvBlock::build(&[], &[("SZ".into(), secret)]).unwrap();
+        let mut block = SpawnEnvBlock::build(&[], &[("SZ".into(), secret)]).unwrap();
         let (ptr, len) = block.raw_parts();
         let nonzero_before = unsafe { std::slice::from_raw_parts(ptr, len) }
             .iter()
             .any(|c| *c != 0);
         assert!(nonzero_before);
-        drop(block);
-        // drop 与检查之间不做任何分配:原缓冲必须已被清零
+        block.zeroize_in_place();
         let zeroized = unsafe { std::slice::from_raw_parts(ptr, len) }
             .iter()
             .all(|c| *c == 0);
-        assert!(zeroized, "环境块 drop 后必须原地清零");
+        assert!(zeroized, "清零例程必须原地清空整个环境块");
+        // 正常释放路径冒烟(mem::forget 版本会每轮泄漏一个父环境块)
+        drop(block);
+        for _ in 0..64 {
+            let b = SpawnEnvBlock::build(&[], &[]).unwrap();
+            drop(b);
+        }
     }
 
     /// 启动的子进程确实收到 Secret 环境变量(经 ConPTY 真实 spawn)。
@@ -943,5 +1462,116 @@ mod tests {
         drop(tx);
         pair.master.close();
         reader_thread.join().expect("reader 线程应被取消并退出");
+    }
+
+    /// job() 句柄克隆显式可失败(绝不 panic;Windows DuplicateHandle
+    /// 语义,Unix 无系统调用)。Windows 下连续克隆必须成功。
+    #[test]
+    fn job_guard_clone_is_fallible_and_repeatable() {
+        let _guard = test_lock().lock();
+        let mut pair = openpty(PtySize { rows: 24, cols: 80 }).unwrap();
+        #[cfg(windows)]
+        let mut cmd = SpawnCommand::new("cmd.exe");
+        #[cfg(windows)]
+        cmd.arg("/c").arg("exit 0");
+        #[cfg(not(windows))]
+        let mut cmd = SpawnCommand::new("/bin/sh");
+        #[cfg(not(windows))]
+        cmd.arg("-c").arg("exit 0");
+        let child = pair.spawn_command(&cmd).unwrap();
+        let _j1 = child.job().expect("job 守卫克隆不得 panic");
+        let _j2 = child.job().expect("job 守卫可重复克隆");
+        let _ = child.wait();
+    }
+
+    /// Unix 专属:setsid 进程组 + 孙进程整组终止 + Secret 经 execve
+    /// 环境块进入子进程 + 短命 CLI 自然 EOF。
+    #[cfg(not(windows))]
+    mod unix_tree {
+        use super::super::*;
+
+        /// 孙进程(sh -c 'sh -c sleep')在进程组内,JobGuard.terminate
+        /// 后整组消失(wait_empty 真实等待,不 no-op)。
+        #[test]
+        fn job_guard_terminates_entire_group_including_grandchildren() {
+            let _guard = test_lock().lock();
+            let mut pair = openpty(PtySize { rows: 24, cols: 80 }).unwrap();
+            let mut cmd = SpawnCommand::new("/bin/sh");
+            // 常驻父进程 + 派生长寿孙进程(未自行 setsid → 留在组内)
+            cmd.arg("-c")
+                .arg("/bin/sh -c 'sleep 300' & /bin/sh -c 'while :; do sleep 1; done'");
+            let child = pair.spawn_command(&cmd).unwrap();
+            let job = child.job().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500)); // 孙进程派生
+            job.terminate().unwrap();
+            assert!(
+                job.wait_empty(std::time::Duration::from_secs(5)),
+                "进程组(含孙进程)必须在时限内整组消失"
+            );
+        }
+
+        /// Secret 环境经 Zeroizing envp 真实进入子进程。
+        #[test]
+        fn spawned_child_receives_secret_env_unix() {
+            let _guard = test_lock().lock();
+            let secret = Arc::new(SecretLease::new("sec-unix", b"unix-canary-7".to_vec()));
+            let mut pair = openpty(PtySize { rows: 24, cols: 80 }).unwrap();
+            let mut cmd = SpawnCommand::new("/bin/sh");
+            cmd.arg("-c").arg("printf 'MF_CANARY=%s\\n' \"$MF_CANARY\"");
+            cmd.env_secret("MF_CANARY", &secret);
+            let child = pair.spawn_command(&cmd).unwrap();
+            let mut reader = pair.master.try_clone_reader().unwrap();
+            let mut out = Vec::new();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut buf = [0u8; 4096];
+            while std::time::Instant::now() < deadline {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        out.extend_from_slice(&buf[..n]);
+                        if out
+                            .windows(b"unix-canary-7".len())
+                            .any(|w| w == b"unix-canary-7")
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            let text = String::from_utf8_lossy(&out);
+            assert!(
+                text.contains("MF_CANARY=unix-canary-7"),
+                "子进程必须收到 Secret 环境变量: {text}"
+            );
+            let status = child.wait().unwrap();
+            assert_eq!(status.exit_code(), 0);
+        }
+
+        /// 短命 CLI 自然退出:master 读到 EOF(Linux EIO 形态),
+        /// wait 返回真实退出码。
+        #[test]
+        fn short_lived_cli_natural_exit_eof_and_code() {
+            let _guard = test_lock().lock();
+            let mut pair = openpty(PtySize { rows: 24, cols: 80 }).unwrap();
+            let mut cmd = SpawnCommand::new("/bin/sh");
+            cmd.arg("-c").arg("echo hi; exit 7");
+            let child = pair.spawn_command(&cmd).unwrap();
+            let mut reader = pair.master.try_clone_reader().unwrap();
+            let mut buf = [0u8; 256];
+            let mut saw_eof = false;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while std::time::Instant::now() < deadline {
+                match reader.read(&mut buf) {
+                    Ok(0) => {
+                        saw_eof = true;
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
+            assert!(saw_eof, "子进程退出后 master 必须读到 EOF");
+            assert_eq!(child.wait().unwrap().exit_code(), 7);
+        }
     }
 }

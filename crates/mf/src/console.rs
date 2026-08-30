@@ -298,7 +298,7 @@ impl Drop for ConsolePane {
     fn drop(&mut self) {
         // 终端窗格关闭:终止整棵进程树(job),再收口 PTY
         if let Some(child) = self.child.take() {
-            if let Some(job) = child.job() {
+            if let Ok(job) = child.job() {
                 let _ = job.terminate();
                 job.wait_empty(std::time::Duration::from_secs(3));
             }
