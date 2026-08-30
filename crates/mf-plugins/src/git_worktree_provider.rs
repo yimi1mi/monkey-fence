@@ -25,6 +25,9 @@ pub const PROVIDER_ID: &str = "worktree";
 /// 合并事务日志目录(位于仓库 `.git` 元数据内,不污染工作目录)。
 const JOURNAL_DIR: &str = "mf-merge-journals";
 
+/// 事务日志格式版本(F12:严格校验 —— 未来版本拒绝执行,保留日志)。
+const MERGE_JOURNAL_VERSION: u32 = 1;
+
 /// 测试注入的合并故障点(生产恒为 None):
 /// 模拟“进程死亡”(不回滚、事务日志保留)与回滚自身失败。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -297,17 +300,18 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
             .and_then(|v| v.as_str())
             .unwrap_or("step");
         let ref_before = git.read_ref(&refname)?;
-        let transaction_id = format!("mtx-{}-{}", std::process::id(), journal_txn_counter());
+        // F12:随机 128-bit 事务标识 —— journal/临时文件命名互不覆盖
+        let transaction_id = format!("mtx-{}", crate::fs_atomic::random_txn_id());
         let journal = MergeJournal {
-            version: 1,
+            version: MERGE_JOURNAL_VERSION,
             transaction_id: transaction_id.clone(),
             refname: refname.clone(),
             ref_before: ref_before.map(|o| o.to_string()),
             target_tree: tree_id.to_string(),
             changes: self.snapshot_originals(&changes)?,
         };
-        let journal_path = journal_file_for(&repo, &refname);
-        write_journal_atomic(&journal_path, &journal, &transaction_id)?;
+        let journal_path = journal_file_for(&repo, &refname, &transaction_id);
+        write_journal_atomic(&journal_path, &journal)?;
         if self.current_fault() == Some(MergeFault::CrashAfterJournal) {
             return Err(anyhow::anyhow!("(测试注入)事务日志写入后进程死亡"));
         }
@@ -338,8 +342,10 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
         //    逐文件 CAS 检测到用户窗口内编辑 → 整体回滚 + NeedsUser。
         match self.apply_journal_with_rollback(&journal) {
             ApplyOutcome::Applied => {
+                // 应用已成功:日志清理由幂等恢复兜底(重放安全),
+                // 清理失败不谎报合并失败
                 let _ = std::fs::remove_file(&journal_path);
-                sync_dir_of(&journal_path);
+                let _ = sync_dir_of(&journal_path);
                 Ok(MergeOutcome::Merged)
             }
             ApplyOutcome::Crashed(msg) => Err(anyhow::anyhow!("(测试注入){msg}")),
@@ -358,7 +364,7 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
                     ));
                 }
                 let _ = std::fs::remove_file(&journal_path);
-                sync_dir_of(&journal_path);
+                let _ = sync_dir_of(&journal_path);
                 Ok(MergeOutcome::NeedsUser { conflicts })
             }
             ApplyOutcome::UserConflict {
@@ -561,79 +567,59 @@ fn journal_dir_of(repo: &git2::Repository) -> PathBuf {
     repo.path().join(JOURNAL_DIR)
 }
 
-fn journal_file_for(repo: &git2::Repository, refname: &str) -> PathBuf {
-    journal_dir_of(repo).join(format!("{}.json", refname.replace('/', "_")))
+/// 事务日志文件名:refname slug + **随机 128-bit 事务 id** ——
+/// 每次合并事务独占一个文件,并发/崩溃残留互不覆盖(F3);
+/// 恢复按目录扫描逐个收敛。
+fn journal_file_for(repo: &git2::Repository, refname: &str, transaction_id: &str) -> PathBuf {
+    journal_dir_of(repo).join(format!(
+        "{}.{transaction_id}.json",
+        refname.replace('/', "_")
+    ))
 }
 
-/// 事务日志原子写入:同目录**唯一命名**临时文件(transaction-id +
-/// 进程内计数,并发/残留互不覆盖)→ flush + fsync → 原子 rename →
-/// 父目录 fsync(掉电后 rename 结果可见,Windows 经
-/// FILE_FLAG_BACKUP_SEMANTICS 打开目录句柄 FlushFileBuffers)。
-fn write_journal_atomic(
-    path: &std::path::Path,
-    journal: &MergeJournal,
-    transaction_id: &str,
-) -> Result<()> {
+/// 事务日志原子写入(F5/F12):目录就绪并 fsync(错误传播)→
+/// 同目录 `create_new` 唯一临时文件(transaction-id 命名,存在即失败,
+/// 绝不截断他人文件)→ write + flush + fsync → 显式原子替换
+/// (Windows `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)` /
+/// Unix rename;目标文件名含随机事务 id,不会覆盖既有日志)→
+/// 父目录 fsync(错误传播)。
+fn write_journal_atomic(path: &std::path::Path, journal: &MergeJournal) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-        sync_dir(parent);
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("创建事务日志目录失败: {}", parent.display()))?;
+        crate::fs_atomic::sync_dir(parent)?;
     }
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("journal.json");
-    let tmp = path.with_file_name(format!("{file_name}.{transaction_id}.tmp"));
+    let tmp = path.with_file_name(format!("{file_name}.tmp"));
     {
         use std::io::Write as _;
-        let mut f = std::fs::File::create(&tmp)
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
             .with_context(|| format!("创建事务日志临时文件失败: {}", tmp.display()))?;
         f.write_all(serde_json::to_string(journal)?.as_bytes())?;
+        f.flush()?;
         f.sync_all()?;
     }
-    std::fs::rename(&tmp, path).with_context(|| {
-        format!(
-            "事务日志原子改名失败: {} → {}",
-            tmp.display(),
-            path.display()
-        )
-    })?;
+    crate::fs_atomic::replace_file(&tmp, path)
+        .with_context(|| format!("事务日志原子替换失败: {} → {}", tmp.display(), path.display()))?;
     if let Some(parent) = path.parent() {
-        sync_dir(parent);
+        crate::fs_atomic::sync_dir(parent)?;
     }
     Ok(())
 }
 
 /// 目录 fsync(让其中刚创建/改名/删除的目录项掉电后可见)。
-/// Windows 需 FILE_FLAG_BACKUP_SEMANTICS 才能打开目录句柄;失败只记录
-/// (尽力而为的持久性增强,不阻塞合并主流程)。
-fn sync_dir_of(file: &std::path::Path) {
-    if let Some(parent) = file.parent() {
-        sync_dir(parent);
+/// F12:错误如实传播 —— 持久化边界的同步失败不得静默吞掉。
+fn sync_dir_of(file: &std::path::Path) -> Result<()> {
+    match file.parent() {
+        Some(parent) => crate::fs_atomic::sync_dir(parent).map(|_| ()),
+        None => Ok(()),
     }
-}
-
-fn sync_dir(dir: &std::path::Path) {
-    #[cfg(windows)]
-    let result = {
-        use std::os::windows::fs::OpenOptionsExt;
-        std::fs::File::options()
-            .read(true)
-            .custom_flags(0x0200_0000) // FILE_FLAG_BACKUP_SEMANTICS
-            .open(dir)
-            .and_then(|h| h.sync_all())
-    };
-    #[cfg(not(windows))]
-    let result = std::fs::File::open(dir).and_then(|h| h.sync_all());
-    if let Err(e) = result {
-        log::debug!("目录 fsync 尽力而为失败({}): {e}", dir.display());
-    }
-}
-
-/// 进程内事务计数(与 pid 组合构成唯一 transaction-id)。
-fn journal_txn_counter() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 /// C6:校验事务日志/合并的变更路径 —— 纯 relative、全 Normal 分量
@@ -697,20 +683,16 @@ fn validate_refname(refname: &str) -> Result<()> {
     Ok(())
 }
 
-/// 唯一临时文件后缀(进程 id + 计数;并发/残留互不覆盖)。
+/// 唯一临时文件后缀(随机 128-bit hex;并发/残留互不覆盖,F6)。
 fn tmp_suffix() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    format!(
-        "{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::Relaxed)
-    )
+    crate::fs_atomic::random_txn_id()
 }
 
-/// C5:目标文件的原子替换 —— 同目录唯一隐藏临时文件 → write + flush +
-/// fsync → rename(std 在 Windows 走 MoveFileEx(REPLACE_EXISTING),原子
-/// 替换已存在的目标)→ 父目录 fsync。失败时清理临时文件,目标保持原状。
+/// C5/F5:目标文件的原子替换 —— 同目录唯一隐藏临时文件
+/// (`create_new`,存在即失败,绝不截断他人文件)→ write + flush +
+/// fsync → **显式原子替换**(Windows `MoveFileExW(REPLACE_EXISTING |
+/// WRITE_THROUGH)` / Unix rename)→ 父目录 fsync(错误传播)。
+/// 失败时清理临时文件,目标保持原状。
 fn atomic_write_file(dst: &std::path::Path, content: &[u8]) -> Result<()> {
     use std::io::Write as _;
     if let Some(parent) = dst.parent() {
@@ -722,20 +704,23 @@ fn atomic_write_file(dst: &std::path::Path, content: &[u8]) -> Result<()> {
     let file_name = dst.file_name().and_then(|n| n.to_str()).unwrap_or("target");
     let tmp = dst.with_file_name(format!(".{file_name}.mftmp-{}", tmp_suffix()));
     let write_result = (|| -> Result<()> {
-        let mut f = std::fs::File::create(&tmp)
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
             .with_context(|| format!("创建合并临时文件失败: {}", tmp.display()))?;
         f.write_all(content)?;
         f.flush()?;
         f.sync_all()?;
         drop(f);
-        std::fs::rename(&tmp, dst)
+        crate::fs_atomic::replace_file(&tmp, dst)
             .with_context(|| format!("原子替换失败: {} → {}", tmp.display(), dst.display()))?;
         Ok(())
     })();
     if write_result.is_err() {
         let _ = std::fs::remove_file(&tmp); // 失败清理:目标文件保持原状
     } else if let Some(parent) = dst.parent() {
-        sync_dir(parent);
+        crate::fs_atomic::sync_dir(parent)?;
     }
     write_result
 }
@@ -1011,6 +996,14 @@ impl GitWorktreeProvider {
     fn recover_journal_file(&self, repo: &git2::Repository, path: &std::path::Path) -> Result<()> {
         let journal: MergeJournal = serde_json::from_str(&std::fs::read_to_string(path)?)
             .with_context(|| format!("解析事务日志失败: {}", path.display()))?;
+        // F12:journal version 严格校验 —— 未来版本的日志结构未知,
+        // 按当前版本语义盲执行可能破坏一致性;拒绝并保留日志
+        anyhow::ensure!(
+            journal.version == MERGE_JOURNAL_VERSION,
+            "事务日志版本不受支持(日志 v{},程序支持 v{MERGE_JOURNAL_VERSION};未来版本拒绝执行): {}",
+            journal.version,
+            path.display()
+        );
         // C6:磁盘上的日志可能被篡改/植入 —— 读取即校验(先于任何
         // ref 读取/判定/文件操作):refname 形态 + 每条变更路径
         // (纯 relative/normal、拒绝 symlink/junction/穿越),非法即拒
@@ -1040,7 +1033,7 @@ impl GitWorktreeProvider {
                 .with_context(|| format!("重放事务日志失败: {}", path.display()))?;
             std::fs::remove_file(path)
                 .with_context(|| format!("删除已收敛的事务日志失败: {}", path.display()))?;
-            sync_dir_of(path);
+            sync_dir_of(path)?;
             return Ok(());
         }
         let ref_before = journal
@@ -1051,7 +1044,7 @@ impl GitWorktreeProvider {
             // 推进前死亡:无任何文件应用发生 → 安全清日志
             std::fs::remove_file(path)
                 .with_context(|| format!("删除未推进的事务日志失败: {}", path.display()))?;
-            sync_dir_of(path);
+            sync_dir_of(path)?;
             return Ok(());
         }
         anyhow::bail!(
@@ -1604,6 +1597,35 @@ mod merge_journal_tests {
             .unwrap_or_default();
         assert!(leftovers.is_empty(), "拒绝后不得残留日志: {leftovers:?}");
         provider.release(&lease).unwrap();
+    }
+
+    /// F12:事务日志 version 严格校验 —— 未来版本(>1)的日志结构
+    /// 未知,恢复必须拒绝执行(保留日志),不得按 v1 语义盲放行。
+    #[test]
+    fn recovery_rejects_future_journal_version() {
+        let (_dir, root) = fixture();
+        let provider = GitWorktreeProvider::new(root.clone()).unwrap();
+        let repo = git2::Repository::open(&root).unwrap();
+        let journal_dir = repo.path().join(JOURNAL_DIR);
+        std::fs::create_dir_all(&journal_dir).unwrap();
+        // 未来版本日志:version = 2,内容形态未知
+        let journal = serde_json::json!({
+            "version": 2,
+            "transaction_id": "future",
+            "refname": Git::integration_ref(11, 1),
+            "ref_before": null,
+            "target_tree": "0101010101010101010101010101010101010101",
+            "changes": [],
+        });
+        let path = journal_dir.join("future-version.json");
+        std::fs::write(&path, journal.to_string()).unwrap();
+        let err = provider.recover_interrupted().unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("future-version") && msg.contains("版本"),
+            "未来版本必须被拒绝并指明日志: {msg}"
+        );
+        assert!(path.exists(), "被拒绝的日志必须保留(人工处理)");
     }
 
     /// C6:磁盘上的事务日志被篡改/植入恶意路径(../、绝对盘符、

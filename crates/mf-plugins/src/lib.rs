@@ -13,6 +13,7 @@ pub mod builtin_secret_store;
 pub mod claude_adapter;
 pub mod codex_adapter;
 pub mod contribution_registry;
+pub mod fs_atomic;
 pub mod generic_command_adapter;
 pub mod git_worktree_provider;
 pub mod hooks;
