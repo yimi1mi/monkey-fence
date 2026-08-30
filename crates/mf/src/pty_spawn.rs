@@ -244,7 +244,9 @@ mod imp {
                 ));
             }
             entries.sort_by(|a, b| a.0.cmp(&b.0));
-            let mut block: Vec<u16> = Vec::new();
+            // F7:最终块从第一次分配就是 Zeroizing —— 累积期间对
+            // Secret 明文的每次扩容/重分配,旧缓冲都随 Zeroizing drop 清零
+            let mut block: Zeroizing<Vec<u16>> = Zeroizing::new(Vec::new());
             for (k, v) in &entries {
                 block.extend(k.encode_utf16());
                 block.push('=' as u16);
@@ -252,7 +254,7 @@ mod imp {
                 block.push(0);
             }
             block.push(0); // 块结尾
-            Ok(SpawnEnvBlock(Zeroizing::new(block)))
+            Ok(SpawnEnvBlock(block))
         }
 
         #[cfg(test)]
@@ -813,29 +815,40 @@ mod imp {
                 .chain(secrets.iter().map(|(k, _)| k.as_str().to_owned()))
                 .collect();
             let mut entries: Vec<ZeroCString> = Vec::new();
+            /// F7:构造一条 `K=V` 的 zeroizing 缓冲并转成 CString。
+            /// **先在 Zeroizing 缓冲里预检 NUL**:错误路径不产生拥有
+            /// 明文字节的 NulError/普通 Vec —— 拒绝构造时字节已随
+            /// Zeroizing drop 清零。成功路径字节原样移交 CString
+            /// (ZeroCString drop 时再清零一次),全程零明文裸缓冲。
+            fn kv_to_cstring(key: &str, key_bytes: &[u8], value: &[u8], what: &str) -> Result<ZeroCString> {
+                use zeroize::Zeroizing;
+                let mut bytes = Zeroizing::new(Vec::with_capacity(key_bytes.len() + value.len() + 2));
+                bytes.extend_from_slice(key_bytes);
+                bytes.push(b'=');
+                bytes.extend_from_slice(value);
+                if let Some(pos) = bytes.iter().position(|b| *b == 0) {
+                    anyhow::bail!("{what} {key:?} 的字节在位置 {pos} 含 NUL,拒绝构造(缓冲已清零)");
+                }
+                let taken = std::mem::take(&mut *bytes);
+                // NUL 已预检:CString::new 此处不可能失败
+                let c = CString::new(taken)
+                    .map_err(|_| anyhow::anyhow!("{what} {key:?} 含 NUL(预检后仍失败,拒绝构造)"))?;
+                Ok(ZeroCString::new(c))
+            }
             // 父环境(精确 OsStr 字节,不做 lossy;去掉被覆盖键)
             for (k, v) in std::env::vars_os() {
                 if overridden.iter().any(|o| o.as_str() == k.to_string_lossy()) {
                     continue;
                 }
-                let mut bytes = Vec::with_capacity(k.len() + v.len() + 2);
-                bytes.extend_from_slice(k.as_bytes());
-                bytes.push(b'=');
-                bytes.extend_from_slice(v.as_bytes());
-                entries
-                    .push(ZeroCString::new(CString::new(bytes).map_err(|_| {
-                        anyhow::anyhow!("父环境变量含 NUL,拒绝构造环境块")
-                    })?));
+                entries.push(kv_to_cstring(
+                    "(父环境变量)",
+                    k.as_bytes(),
+                    v.as_bytes(),
+                    "父环境变量",
+                )?);
             }
             let mut push_kv = |k: &str, value: &[u8]| -> Result<()> {
-                let mut bytes = Vec::with_capacity(k.len() + value.len() + 2);
-                bytes.extend_from_slice(k.as_bytes());
-                bytes.push(b'=');
-                bytes.extend_from_slice(value);
-                entries
-                    .push(ZeroCString::new(CString::new(bytes).map_err(|_| {
-                        anyhow::anyhow!("环境变量 {k} 的值含 NUL,拒绝构造")
-                    })?));
+                entries.push(kv_to_cstring(k, k.as_bytes(), value, "环境变量")?);
                 Ok(())
             };
             for (k, v) in overrides {
@@ -1175,22 +1188,34 @@ mod imp {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("PTY master 已关闭"))?
                 .as_raw();
-            // argv/环境:Secret 只经 Zeroizing 缓冲进入 execve
+            // argv/环境:Secret 只经 Zeroizing 缓冲进入 execve;
+            // NUL 预检后错误路径不持有明文字节(F7)
+            fn bytes_to_cstring(bytes: &[u8], what: &str) -> Result<ZeroCString> {
+                use zeroize::Zeroizing;
+                let mut buf = Zeroizing::new(Vec::with_capacity(bytes.len() + 1));
+                buf.extend_from_slice(bytes);
+                if let Some(pos) = buf.iter().position(|b| *b == 0) {
+                    anyhow::bail!("{what} 在位置 {pos} 含 NUL,拒绝启动(缓冲已清零)");
+                }
+                let taken = std::mem::take(&mut *buf);
+                let c = CString::new(taken)
+                    .map_err(|_| anyhow::anyhow!("{what} 含 NUL(预检后仍失败,拒绝启动)"))?;
+                Ok(ZeroCString::new(c))
+            }
             let mut argv_owned: Vec<ZeroCString> = Vec::with_capacity(cmd.args.len() + 1);
-            let program = CString::new(cmd.program.as_os_str().as_bytes())
-                .map_err(|_| anyhow::anyhow!("程序路径含 NUL: {}", cmd.program.display()))?;
-            argv_owned.push(ZeroCString::new(program));
+            argv_owned.push(bytes_to_cstring(
+                cmd.program.as_os_str().as_bytes(),
+                &format!("程序路径 {}", cmd.program.display()),
+            )?);
             for arg in &cmd.args {
-                let c =
-                    CString::new(arg.as_bytes()).with_context(|| format!("参数含 NUL: {arg:?}"))?;
-                argv_owned.push(ZeroCString::new(c));
+                argv_owned.push(bytes_to_cstring(arg.as_bytes(), "参数")?);
             }
             let env = SpawnEnvBlock::build(&cmd.env, &cmd.secret_env)?;
             let cwd = match &cmd.cwd {
-                Some(p) => Some(
-                    CString::new(p.as_os_str().as_bytes())
-                        .map_err(|_| anyhow::anyhow!("cwd 含 NUL: {}", p.display()))?,
-                ),
+                Some(p) => Some(bytes_to_cstring(
+                    p.as_os_str().as_bytes(),
+                    &format!("cwd {}", p.display()),
+                )?),
                 None => None,
             };
             let argv: Vec<*const libc::c_char> = argv_owned

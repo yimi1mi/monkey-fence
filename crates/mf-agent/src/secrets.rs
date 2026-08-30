@@ -122,7 +122,9 @@ pub struct StreamingRedactor {
     /// 这里绝不复制副本(最后一个引用 drop 即擦除)。
     secrets: Vec<std::sync::Arc<SecretLease>>,
     max_len: usize,
-    carry: Vec<u8>,
+    /// 跨块未决前缀(可能是明文/Secret 前缀):Zeroizing ——
+    /// 每次被新前缀替换、redactor drop 时都原地清零。
+    carry: Zeroizing<Vec<u8>>,
 }
 
 impl StreamingRedactor {
@@ -148,7 +150,7 @@ impl StreamingRedactor {
         StreamingRedactor {
             secrets,
             max_len,
-            carry: Vec::new(),
+            carry: Zeroizing::new(Vec::new()),
         }
     }
 
@@ -165,6 +167,8 @@ impl StreamingRedactor {
 
     /// 脱敏一个输出块。最后 `max_len - 1` 个原始字节可能是不完整前缀,
     /// 留在 carry 中等待下一块;函数返回可安全进入 screen/日志的前缀。
+    /// carry+chunk 的合并缓冲(`combined`)也是明文形态:Zeroizing,
+    /// 函数返回时未保留部分原地清零后释放。
     pub fn redact_chunk(&mut self, chunk: &[u8]) -> Vec<u8> {
         if self.secrets.is_empty() {
             return chunk.to_vec();
@@ -186,7 +190,8 @@ impl StreamingRedactor {
                 break;
             }
         }
-        self.carry = combined.split_off(i);
+        // 尾部换成新的 carry;前缀部分随 combined(Zeroizing)drop 清零
+        self.carry = Zeroizing::new(combined.split_off(i));
         out
     }
 
@@ -195,7 +200,7 @@ impl StreamingRedactor {
     pub fn finish(&mut self) -> Vec<u8> {
         let carry = std::mem::take(&mut self.carry);
         if self.secrets.is_empty() {
-            return carry;
+            return carry.to_vec();
         }
         let mut out = Vec::with_capacity(carry.len());
         let mut i = 0;
@@ -211,10 +216,17 @@ impl StreamingRedactor {
         self.secrets.clear(); // 归还共享引用(最后一个引用 drop 即擦除明文)
         out
     }
-}
 
-impl Drop for StreamingRedactor {
-    fn drop(&mut self) {
+    /// carry 缓冲视图(测试:验证擦除例程作用于真实驻留缓冲)。
+    #[cfg(test)]
+    pub(crate) fn carry_parts(&self) -> (*const u8, usize) {
+        (self.carry.as_ptr(), self.carry.len())
+    }
+
+    /// 与 Drop 走的同一清零例程(测试在持有分配时验证清零;
+    /// 释放后内存可能被分配器合法复用,"释放后仍为零"不是可测不变量)。
+    #[cfg(test)]
+    pub(crate) fn zeroize_scrub_routine(&mut self) {
         use zeroize::Zeroize;
         self.carry.zeroize();
     }
@@ -368,6 +380,48 @@ mod carry_bound_tests {
         );
         assert!(text.contains("***"), "完整 Secret 应被替换: {text}");
         assert!(text.ends_with(" tail"), "普通明文应放行: {text}");
+    }
+}
+
+#[cfg(test)]
+mod carry_scrub_tests {
+    use super::*;
+
+    /// F7:carry 驻留缓冲的清零例程(Drop 走同一例程):
+    /// 跨块未决前缀(可能是 Secret 前缀/明文)在持有分配时必须能被
+    /// 原地清零;释放后内存可能被分配器合法复用,"释放后仍为零"
+    /// 不是可测不变量。
+    #[test]
+    fn carry_plaintext_is_scrubbed_by_zeroize_routine() {
+        let mut redactor = StreamingRedactor::new(vec![b"tok-scrub".to_vec()]);
+        // 尾部留下未决前缀(Secret 前缀 + 普通明文混杂)
+        redactor.redact_chunk(b"plain tok-scr");
+        let (ptr, len) = redactor.carry_parts();
+        assert!(len > 0, "前置:carry 持有未决前缀");
+        let has_plaintext = unsafe { std::slice::from_raw_parts(ptr, len) }
+            .windows(4)
+            .any(|w| w == b"crub" || w == b"tok-" || w == b"n to");
+        assert!(has_plaintext, "前置:carry 里确实有明文残留");
+        redactor.zeroize_scrub_routine();
+        let zeroized = unsafe { std::slice::from_raw_parts(ptr, len) }
+            .iter()
+            .all(|b| *b == 0);
+        assert!(zeroized, "清零例程必须原地清空 carry 缓冲");
+        // 正常 drop 路径冒烟(不应 panic/泄漏)
+        drop(redactor);
+    }
+
+    /// 跨块回显仍然正确(carry 换 Zeroizing 后的行为回归)。
+    #[test]
+    fn redaction_unchanged_after_carry_hardening() {
+        let mut redactor = StreamingRedactor::new(vec![b"tok-multi".to_vec()]);
+        let a = redactor.redact_chunk(b"x tok-mul");
+        let b = redactor.redact_chunk(b"ti y tok-multi z");
+        let c = redactor.finish();
+        let text = String::from_utf8_lossy(&[a, b, c].concat()).into_owned();
+        assert!(!text.contains("tok-multi"), "{text}");
+        assert_eq!(text.matches("***").count(), 2, "{text}");
+        assert!(text.contains('x') && text.contains(" y ") && text.contains(" z"), "{text}");
     }
 }
 
