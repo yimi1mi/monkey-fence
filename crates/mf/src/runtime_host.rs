@@ -89,11 +89,6 @@ struct PtySession {
     alive: AtomicBool,
     /// OS 进程 PID(终止验证/诊断;无进程时 None)。
     pid: Option<u32>,
-    /// child 的 reap 归属:true = reader 线程持有 child(launch_pty),
-    /// stop/kill 方需关闭 master 解除 reader 阻塞,由 reader wait 后
-    /// 确认终止;false = 独立 waiter 线程持有 child(工作流/离散会话),
-    /// waiter wait 后自行关闭 master 并确认终止。
-    reader_owns_reap: bool,
     /// 终止确认:reap 线程在 child.wait()(reap)完成、生命周期收口后
     /// 置位并唤醒。kill 请求本身不置位 —— stop_run 据此等待真实终止。
     term: TermSignal,
@@ -384,11 +379,6 @@ impl SessionRegistry {
                     p.master.lock().take();
                     p.mark_terminated();
                 }
-                if p.reader_owns_reap {
-                    // ConPTY 在 master 存续期间不给 reader EOF:关闭 master
-                    // 解除 reader 阻塞,由 reader 完成 child.wait 并确认终止
-                    p.master.lock().take();
-                }
                 if p.wait_terminated(std::time::Duration::from_secs(10)) {
                     Ok(())
                 } else {
@@ -433,11 +423,6 @@ impl SessionRegistry {
                         let _ = child.wait();
                         p.master.lock().take();
                         p.mark_terminated();
-                    }
-                    if p.reader_owns_reap {
-                        // reader 持有 child:关闭 master 解除其阻塞,
-                        // 由 reader wait 后收口;waiter 模式则交给 waiter
-                        p.master.lock().take();
                     }
                 }
                 SessionInner::Http(h) => {
@@ -626,7 +611,7 @@ fn launch_pty(
         session_id: spec.session_id,
         master: Mutex::new(Some(pair.master)),
         writer: Mutex::new(Some(writer)),
-        // child 由 reader 线程持有并 wait;kill 经 killer 克隆执行
+        // child 由独立 waiter 线程持有并 wait;kill 经 killer 克隆执行
         child: Mutex::new(None),
         killer: Mutex::new(Some(killer)),
         job: Mutex::new(job),
@@ -635,7 +620,6 @@ fn launch_pty(
         output_tail: Mutex::new(Vec::new()),
         alive: AtomicBool::new(true),
         pid: Some(pid),
-        reader_owns_reap: true,
         term: TermSignal::new(),
     });
     registry.register(
@@ -645,20 +629,51 @@ fn launch_pty(
     );
     registry.bind_run(&project, spec.run_id, spec.session_id);
 
-    // reader 线程:喂终端模拟器 + 输出缓冲 + Output 事件(节流);
-    // 拥有 child 并负责 wait。线程启动失败 → 收回 child kill + wait,
-    // 注册表条目摘除,上报 SpawnError(调度方按失败结算),不留孤儿。
+    // ConPTY 在 master 存续期间不给 reader EOF(自然退出的短命 CLI 会把
+    // reader 永远挂在 ReadFile 上):waiter 持有 child,wait 返回后记录
+    // 退出码并关闭 master,解除 reader 阻塞 —— 会话不依赖 stop 自然收口。
+    // 生命周期收口顺序:waiter wait(reap 真实 OS 进程)→ 写退出码 →
+    // 关 master;reader EOF 后清资源、上报 Exited/Dead、摘除注册表;
+    // stop_run 返回即代表进程已被 reap 且事件已发。
     let child_slot = Arc::new(Mutex::new(Some(child)));
-    let slot_for_thread = child_slot.clone();
+    let exit_code_slot = Arc::new(Mutex::new(None::<i32>));
+    // reader 完成握手:reader 在 Exited/Dead 事件**发出之后**置位;
+    // waiter 关闭 master 后等它(宽限 5s,reader 缺失/卡死时兜底),
+    // 再确认终止 —— stop_run 返回即代表进程已被 reap 且事件已发。
+    let reader_done = Arc::new(TermSignal::new());
+    let waiter_session = session.clone();
+    let waiter_slot = exit_code_slot.clone();
+    let waiter_child_slot = child_slot.clone();
+    let waiter_reader_done = reader_done.clone();
+    let waiter = std::thread::Builder::new()
+        .name(format!("pty-waiter-{}", session.session_id))
+        .spawn(move || {
+            let mut child = waiter_child_slot.lock().take();
+            let code = child
+                .as_mut()
+                .and_then(|c| c.wait().ok())
+                .map(|s| s.exit_code() as i32);
+            *waiter_slot.lock() = code;
+            // 先写 slot 再关 master:reader 被解除阻塞时退出码已就绪
+            waiter_session.master.lock().take();
+            // 等 reader 收口(事件已发)后再确认终止(幂等,二者都会 mark)
+            waiter_reader_done.wait_for(std::time::Duration::from_secs(5));
+            waiter_session.mark_terminated();
+        });
+
+    // reader 线程:喂终端模拟器 + 输出缓冲 + Output 事件(节流)。
+    // 任一线程启动失败 → kill 子进程(waiter 负责 reap)、注册表条目
+    // 摘除,上报 SpawnError(调度方按失败结算),不留孤儿。
     let run_id = spec.run_id;
     let events_out = events.clone();
     let reader_registry = registry.clone();
     let reader_project = project.clone();
     let reader_session = session.clone();
+    let exit_code_slot_reader = exit_code_slot.clone();
+    let reader_done_flag = reader_done.clone();
     let spawned = std::thread::Builder::new()
         .name(format!("pty-reader-{}", session.session_id))
         .spawn(move || {
-            let mut child = slot_for_thread.lock().take();
             let mut buf = [0u8; 8192];
             let mut last_output_event =
                 std::time::Instant::now() - std::time::Duration::from_secs(10);
@@ -688,23 +703,29 @@ fn launch_pty(
                     }
                 }
             }
-            // 生命周期收口顺序:先 wait(reap 真实 OS 进程)→ 清理
-            // PTY 资源 → 上报退出事件 → 最后确认终止(唤醒 stop_run)。
-            // stop_run 返回即代表进程已被 reap 且事件已发。
-            let code = child
-                .as_mut()
-                .and_then(|c| c.wait().ok())
-                .map(|s| s.exit_code() as i32);
+            let code = *exit_code_slot_reader.lock();
+            reader_session.alive.store(false, Ordering::SeqCst);
             reader_session.writer.lock().take();
             reader_session.master.lock().take();
             let _ = events_out.send((run_id, RuntimeEvent::Exited { code }));
             let _ = events_out.send((run_id, RuntimeEvent::AgentState(mf_agent::AgentState::Dead)));
             // 进程已结束并 wait:摘除注册表条目(不 kill)
             reader_registry.kill_session(&reader_project, reader_session.session_id);
-            reader_session.mark_terminated();
+            // 事件已发出:唤醒 waiter 的终止确认握手(见上)
+            reader_done_flag.mark();
         });
-    if let Err(error) = spawned {
-        // reader 线程未启动:无人读取/等待 PTY → 收回 child kill + wait
+    if let Err(error) = waiter {
+        // waiter 未启动:无人 reap child → reader 也不能启动,直接终止并
+        // 同步收口(child kill + wait、资源清理、SpawnError)
+        if let Err(reader_err) = spawned {
+            // reader 也未启动:双失败一并上报
+            let _ = events.send((
+                spec.run_id,
+                RuntimeEvent::SpawnError(format!(
+                    "启动 PTY waiter/reader 线程失败: {error} / {reader_err}"
+                )),
+            ));
+        }
         if let Some(mut child) = child_slot.lock().take() {
             let _ = child.kill();
             let _ = child.wait();
@@ -718,11 +739,24 @@ fn launch_pty(
         registry.kill_session(&project, spec.session_id);
         let _ = events.send((
             spec.run_id,
+            RuntimeEvent::SpawnError(format!("启动 PTY waiter 线程失败: {error}")),
+        ));
+        return;
+    }
+    if let Err(error) = spawned {
+        // reader 未启动但 waiter 存活:kill 后由 waiter reap 并收口
+        if let Some(mut killer) = session.killer.lock().take() {
+            let _ = killer.kill();
+        }
+        session.master.lock().take(); // reader 不存在,直接解除阻塞语义
+        registry.kill_session(&project, spec.session_id);
+        let _ = events.send((
+            spec.run_id,
             RuntimeEvent::SpawnError(format!("启动 PTY reader 线程失败: {error}")),
         ));
         return;
     }
-    // reader 线程已完全接管生命周期 → 才上报 Launched
+    // waiter/reader 线程已完全接管生命周期 → 才上报 Launched
     let _ = events.send((spec.run_id, RuntimeEvent::Launched));
     let _ = events.send((
         spec.run_id,
@@ -896,7 +930,6 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
         output_tail: Mutex::new(Vec::new()),
         alive: AtomicBool::new(true),
         pid: Some(pid),
-        reader_owns_reap: false,
         term: TermSignal::new(),
     });
     registry.register(&project, display_id, SessionInner::Pty(session.clone()));
@@ -1135,7 +1168,6 @@ fn launch_workflow_pty(
         output_tail: Mutex::new(Vec::new()),
         alive: AtomicBool::new(true),
         pid: Some(pid),
-        reader_owns_reap: true,
         term: TermSignal::new(),
     });
     registry.register(
@@ -1160,16 +1192,21 @@ fn launch_workflow_pty(
             .context("向工作流节点 stdin 写入提示失败")?;
     }
 
-    // ConPTY:waiter 拥有 child,wait 返回后关闭 master 解除 reader 阻塞
+    // ConPTY:waiter 拥有 child,wait 返回后关闭 master 解除 reader 阻塞;
+    // 等 reader 把 Exited/Dead 事件发出(宽限 5s)后再确认终止 ——
+    // stop_run 返回即代表进程已被 reap 且事件已发。
     let exit_code_slot = Arc::new(Mutex::new(None::<i32>));
+    let reader_done = Arc::new(TermSignal::new());
     let waiter_session = session.clone();
     let waiter_slot = exit_code_slot.clone();
+    let waiter_reader_done = reader_done.clone();
     std::thread::Builder::new()
         .name(format!("wf-pty-waiter-{}", spec.session_id))
         .spawn(move || {
             let code = child.wait().ok().map(|status| status.exit_code() as i32);
             *waiter_slot.lock() = code;
             waiter_session.master.lock().take();
+            waiter_reader_done.wait_for(std::time::Duration::from_secs(5));
             // child 已 reap:确认终止(唤醒等待中的 stop_run/kill)
             waiter_session.mark_terminated();
         })
@@ -1181,6 +1218,7 @@ fn launch_workflow_pty(
     let reader_project = project.clone();
     let reader_session_id = spec.session_id;
     let exit_code_slot_reader = exit_code_slot.clone();
+    let reader_done_flag = reader_done.clone();
     let events_out = events.clone();
     let build = std::thread::Builder::new()
         .name(format!("wf-pty-reader-{}", spec.session_id))
@@ -1229,7 +1267,8 @@ fn launch_workflow_pty(
             let _ = events_out.send((run_id, RuntimeEvent::AgentState(mf_agent::AgentState::Dead)));
             // 进程已结束并 wait:摘除注册表条目(不 kill)
             reader_registry.kill_session(&reader_project, reader_session_id);
-            // 终止确认由 waiter 负责(child.wait 完成即置位)
+            // 事件已发出:唤醒 waiter 的终止确认握手(见上)
+            reader_done_flag.mark();
         });
     if let Err(error) = build {
         // guard 仍 armed → drop 时 kill(killer)+摘除注册表;waiter 负责 reap
@@ -2327,6 +2366,77 @@ mod tests {
         assert!(registry.snapshot(&project, 7).is_none());
         // 二次停止幂等
         host.stop_run(&project, 42).unwrap();
+    }
+
+    /// C2:普通 launch_pty 会话的短命 CLI 自然退出 —— 不调用 stop_run,
+    /// reader/wait 循环必须自然收口:Exited 携带真实退出码、
+    /// 注册表条目移除、session_alive=false。
+    #[test]
+    fn pty_natural_exit_short_lived_cli_ends_session_without_stop() {
+        let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        let host = RuntimeHostImpl::new(registry.clone());
+        let (events, rx) = crossbeam_channel::bounded(64);
+        let workdir = std::env::temp_dir();
+        let spec = LaunchSpec {
+            project_root: workdir.clone(),
+            run_id: 88,
+            step_id: 1,
+            task_id: 1,
+            session_id: 21,
+            session_key: None,
+            attach_existing_session: false,
+            profile: AgentProfileSpec {
+                id: "cmd".into(),
+                display_name: "cmd".into(),
+                runtime: RuntimeKind::Pty,
+                command: cmd,
+                args: vec!["/C".into(), "echo hi&&exit 7".into()], // 输出后退出
+                env: vec![],
+                permission_args: vec![],
+                provider: None,
+                icon: None,
+                homepage: None,
+                hook: None,
+            },
+            step_title: "t".into(),
+            prompt: String::new(),
+            capability_token: "tok".into(),
+            pipe_name: "pipe".into(),
+            mfctl_hint: None,
+            workdir: workdir.clone(),
+        };
+        let project = workdir.to_string_lossy().to_string();
+        host.launch(spec, events);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut exit_code = None;
+        while std::time::Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok((_, RuntimeEvent::Exited { code })) => {
+                    exit_code = code;
+                    break;
+                }
+                Ok(_) => {}
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => break,
+            }
+        }
+        assert_eq!(
+            exit_code,
+            Some(7),
+            "短命 CLI 自然退出必须上报 Exited(码 7),不依赖 stop_run"
+        );
+        // 注册表条目移除(session_alive 由条目存在性判定)
+        let removed = (0..150).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            !registry.session_alive(&project, 21)
+        });
+        assert!(
+            removed,
+            "自然退出后注册表条目必须移除、alive=false(否则资源泄漏)"
+        );
     }
 
     #[test]
