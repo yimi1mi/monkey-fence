@@ -98,3 +98,87 @@ fn future_schema_version_is_rejected() {
         "错误必须明示版本不兼容: {err:#}"
     );
 }
+
+/// F-附带:**真实完整 v1 DDL** fixture(`PROJECT_SCHEMA_V1` 原文)+
+/// steps/step_deps/sessions/runs/leases/deferrals/handoffs/task_workflows
+/// 全表业务数据 → 链式迁移后数据完整可读。
+#[test]
+fn full_v1_ddl_fixture_migrates_all_tables_with_data() {
+    use mf_agent::schema::PROJECT_SCHEMA_V1;
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("workflow-v1.db");
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(PROJECT_SCHEMA_V1).unwrap();
+        conn.execute_batch(
+            "INSERT INTO agent_tasks (title, goal, status, active_revision, created_at, updated_at)
+                 VALUES ('全量任务', 'g', 'running', 1, '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z');
+             INSERT INTO pipeline_revisions (task_id, revision, status, created_at)
+                 VALUES (1, 1, 'active', '2024-01-01T00:00:00Z');
+             INSERT INTO steps (revision_id, task_id, step_key, title, agent_profile, status, created_at, updated_at)
+                 VALUES (1, 1, 'a', 'A', 'p', 'succeeded', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z'),
+                        (1, 1, 'j', 'J', 'p', 'pending', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z');
+             INSERT INTO step_deps (step_id, dep_step_id) VALUES (2, 1);
+             INSERT INTO agent_sessions (runtime, agent_profile, title, status, created_at, updated_at)
+                 VALUES ('pty', 'p', 's', 'dead', '2024-01-01T00:00:00Z', '2024-01-01T00:00:00Z');
+             INSERT INTO agent_runs (task_id, step_id, revision_id, session_id, status, capability_token, started_at)
+                 VALUES (1, 1, 1, 1, 'succeeded', 'tok-v1', '2024-01-01T00:00:00Z');
+             INSERT INTO execution_leases (lease_key, run_id, step_id, task_id, provider, path, isolated, metadata_json, status, created_at)
+                 VALUES ('lease-v1', 1, 1, 1, 'worktree', 'C:/wt', 1, '{\"step_key\":\"a\"}', 'held', '2024-01-01T00:00:00Z');
+             INSERT INTO join_deferrals (task_id, join_step_key, lease_key, lease_json, created_at)
+                 VALUES (1, 'j', 'lease-v1',
+                     '{\"id\":\"lease-v1\",\"path\":\"C:/wt\",\"isolated\":true,\"provider\":\"worktree\",\"metadata\":{}}',
+                     '2024-01-01T00:00:00Z');
+             INSERT INTO handoffs (task_id, step_id, run_id, handoff_json, created_at)
+                 VALUES (1, 1, 1, '{\"status\":\"ok\",\"summary\":\"s\",\"changed_files\":[],\"artifacts\":[],\"blockers\":[],\"recommendations\":[],\"output\":{}}', '2024-01-01T00:00:00Z');
+             INSERT INTO task_workflows (project_key, task_id, graph_json, updated_at)
+                 VALUES ('proj', 1, '[]', '2024-01-01T00:00:00Z');
+             PRAGMA user_version = 1;",
+        )
+        .unwrap();
+    }
+    let store = Store::open(&db).unwrap();
+    assert_eq!(
+        store.schema_version().unwrap(),
+        PROJECT_SCHEMA_VERSION,
+        "完整 v1 库必须链式迁移到当前版本"
+    );
+    // steps:状态与依赖投影完整
+    let steps = store.task_steps(1).unwrap();
+    assert_eq!(steps.len(), 2, "steps 迁移不丢行");
+    assert!(steps.iter().any(|s| s.step_key == "a" && s.status.as_str() == "succeeded"));
+    let j = steps.iter().find(|s| s.step_key == "j").unwrap();
+    assert_eq!(j.deps.len(), 1, "step_deps 迁移保留依赖");
+    // runs:能力令牌与状态
+    let runs = store.list_runs_of_task(1).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].capability_token, "tok-v1");
+    // leases:held 行可被重启恢复路径读取
+    let held = store.list_held_execution_leases().unwrap();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].lease_key, "lease-v1");
+    // deferrals
+    let deferrals = store.list_join_deferrals(Some(1)).unwrap();
+    assert_eq!(deferrals.len(), 1);
+    // handoffs
+    let handoffs = store.list_handoffs(1).unwrap();
+    assert_eq!(handoffs.len(), 1);
+    // task_workflows(草稿)迁移后仍可加载
+    let draft = store.load_task_workflow("proj", 1).unwrap();
+    assert!(draft.is_some(), "任务本地工作流草稿迁移保留");
+    // merge_batches 表经 v2+v4 迁移可用(新列 lease_digest 就位):
+    // held 租约可被权威领取并离开 ready
+    match store.claim_single_merge_batch(1, "lease-v1", "a", 1, "txn-f1") {
+        Ok(mf_agent::store::JoinMergeClaim::Claimed { leases, .. }) => {
+            assert_eq!(leases.len(), 1);
+            assert_eq!(leases[0].lease_key, "lease-v1");
+        }
+        Err(e) => panic!("迁移后的 merge_batches 必须可领取: {e:#}"),
+        _ => panic!("迁移后的 merge_batches 必须可领取"),
+    }
+    let batches = store.list_merge_batches(1).unwrap();
+    assert!(
+        batches.iter().any(|b| b.status == "merging" && b.lease_keys == vec!["lease-v1".to_string()]),
+        "领取后批状态 merging 且租约集完整: {batches:?}"
+    );
+}

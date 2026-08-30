@@ -221,7 +221,11 @@ mod imp {
             // 父环境(去掉被覆盖键;键统一大写比较/排序;
             // encode_wide 保真转码,绝不 lossy)
             for (k, v) in std::env::vars_os() {
-                let key_upper = k.to_string_lossy().to_uppercase();
+                // F-附带:键经 encode_wide 保真转码后大写化(不做 lossy;
+                // vars_os 的 UTF-16 恒有效,from_utf16 不会失败)
+                let key_upper: String = String::from_utf16(&k.encode_wide().collect::<Vec<_>>())
+                    .unwrap_or_default()
+                    .to_uppercase();
                 if overridden.contains(&key_upper) {
                     continue;
                 }
@@ -583,20 +587,17 @@ mod imp {
                 .master
                 .hpc
                 .ok_or_else(|| anyhow::anyhow!("PTY master 已关闭"))?;
-            let mut cmdline = quote_windows(&cmd.program.to_string_lossy());
+            // F-附带:program/args 经 encode_wide 保真转码(不做 lossy;
+            // 非 UTF-8 路径不得被替换为 U+FFFD)
+            let mut cmdline_w: Vec<u16> = quote_windows_wide(&cmd.program);
             for arg in &cmd.args {
-                cmdline.push(' ');
-                cmdline.push_str(&quote_windows(arg));
+                cmdline_w.push(32 as u16);
+                cmdline_w.extend_from_slice(&quote_windows_wide(std::path::Path::new(arg)));
             }
-            let mut cmdline_w: Vec<u16> = cmdline.encode_utf16().chain([0]).collect();
+            cmdline_w.push(0);
             let env = SpawnEnvBlock::build(&cmd.env, &cmd.secret_env)?;
             let cwd_w: Vec<u16> = match &cmd.cwd {
-                Some(p) => p
-                    .as_os_str()
-                    .to_string_lossy()
-                    .encode_utf16()
-                    .chain([0])
-                    .collect(),
+                Some(p) => p.as_os_str().encode_wide().chain([0]).collect(),
                 None => Vec::new(),
             };
 
@@ -690,6 +691,47 @@ mod imp {
                 })
             }
         }
+    }
+
+    /// Windows 命令行引号规则(OsStr → UTF-16 保真;与 std 一致):
+    /// 空串/含空白或引号 → 引号包裹,反斜杠在引号边界转义。
+    /// 逐 code unit 处理,非 UTF-8 字节经 encode_wide 保留原样。
+    fn quote_windows_wide(path: &std::path::Path) -> Vec<u16> {
+        let units: Vec<u16> = path.as_os_str().encode_wide().collect();
+        let needs = units.is_empty()
+            || units.iter().any(|&w| {
+                let c = char::from_u32(w as u32).unwrap_or(' ');
+                c.is_whitespace() || w == '"' as u16
+            });
+        if !needs {
+            return units;
+        }
+        let mut out = vec!['"' as u16];
+        let mut backslashes = 0usize;
+        for &w in &units {
+            if w == 92 as u16 {
+                backslashes += 1;
+                continue;
+            }
+            if w == '"' as u16 {
+                for _ in 0..(backslashes * 2 + 1) {
+                    out.push(92 as u16);
+                }
+                out.push('"' as u16);
+                backslashes = 0;
+            } else {
+                for _ in 0..backslashes {
+                    out.push(92 as u16);
+                }
+                backslashes = 0;
+                out.push(w);
+            }
+        }
+        for _ in 0..(backslashes * 2) {
+            out.push(92 as u16);
+        }
+        out.push('"' as u16);
+        out
     }
 
     /// Windows 命令行引号规则(与 std/portable-pty 一致):
