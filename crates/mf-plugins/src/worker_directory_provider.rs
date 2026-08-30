@@ -8,8 +8,9 @@
 use crate::worker::WorkerClient;
 use anyhow::{Context as _, Result};
 use mf_agent::execution_directory::{
-    ExecutionDirectoryProvider, ExecutionLease, LeaseContext, MergeOutcome,
+    ensure_lease_under_root, ExecutionDirectoryProvider, ExecutionLease, LeaseContext, MergeOutcome,
 };
+use mf_agent::workflow::PluginSourcePin;
 use serde_json::Value;
 
 /// 目录提供器 worker 传输层(生产:NDJSON stdio;测试:内存桩)。
@@ -49,6 +50,9 @@ pub struct WorkerDirectoryProvider {
     kind: String,
     isolates: bool,
     transport: Box<dyn DirectoryWorkerTransport>,
+    /// 提供器自身的插件包 pin(acquire 时盖进租约 metadata,
+    /// C7 held-lease 路由依据;None = 未指定(测试)不盖章)。
+    pin: Option<PluginSourcePin>,
 }
 
 impl WorkerDirectoryProvider {
@@ -63,7 +67,87 @@ impl WorkerDirectoryProvider {
             kind: kind.to_string(),
             isolates,
             transport,
+            pin: None,
         }
+    }
+
+    /// 同 `new`,但携带插件包 pin(acquire 校验/盖章 provider_pin)。
+    pub fn new_with_pin(
+        full_contribution_id: &str,
+        kind: &str,
+        isolates: bool,
+        transport: Box<dyn DirectoryWorkerTransport>,
+        pin: PluginSourcePin,
+    ) -> WorkerDirectoryProvider {
+        WorkerDirectoryProvider {
+            full_contribution_id: full_contribution_id.to_string(),
+            kind: kind.to_string(),
+            isolates,
+            transport,
+            pin: Some(pin),
+        }
+    }
+
+    /// I8:校验 worker 返回的租约协议边界。
+    /// - provider 身份必须与解析层一致(伪造拒绝);
+    /// - 路径必须在宿主授予的项目根内(拒绝绝对越界/盘符/前缀相似/
+    ///   相对路径/.. 穿越/symlink);
+    /// - isolated 必须与清单声明一致(worker 不得自封/自降能力);
+    /// - 租约 ID 稳定可用(非空、无路径分隔/穿越、长度有界);
+    /// - metadata 里的 provider_pin:无则由宿主盖本提供器 pin(C7 路由
+    ///   依据),有则必须与本提供器 pin 一致(伪造拒绝)。
+    fn validate_lease(&self, lease: &mut ExecutionLease, ctx: &LeaseContext) -> Result<()> {
+        anyhow::ensure!(
+            lease.provider == self.full_contribution_id,
+            "worker 返回的租约 provider 身份({})与解析层({})不一致,拒绝",
+            lease.provider,
+            self.full_contribution_id
+        );
+        anyhow::ensure!(
+            lease.isolated == self.isolates,
+            "worker 返回的租约 isolated={} 与清单声明({})不一致,拒绝",
+            lease.isolated,
+            self.isolates
+        );
+        anyhow::ensure!(
+            !lease.id.is_empty() && lease.id.len() <= 128,
+            "worker 返回的租约 ID 非法(空或超长): {:?}",
+            lease.id
+        );
+        anyhow::ensure!(
+            !lease.id.contains('/')
+                && !lease.id.contains('\\')
+                && !lease.id.contains(':')
+                && lease.id != "..",
+            "worker 返回的租约 ID 含路径语义,拒绝: {:?}",
+            lease.id
+        );
+        ensure_lease_under_root(&ctx.project_root, &lease.path)
+            .context("worker 返回的租约路径越出宿主授予的项目根")?;
+        match (&self.pin, lease.metadata.get("provider_pin")) {
+            (None, _) => {}
+            (Some(pin), None) => {
+                if let Some(obj) = lease.metadata.as_object_mut() {
+                    obj.insert(
+                        "provider_pin".into(),
+                        serde_json::json!({
+                            "full_id": pin.full_id,
+                            "version": pin.version,
+                            "content_hash": pin.content_hash,
+                        }),
+                    );
+                }
+            }
+            (Some(pin), Some(claimed)) => {
+                let claimed: PluginSourcePin = serde_json::from_value(claimed.clone())
+                    .context("租约 metadata 的 provider_pin 格式非法")?;
+                anyhow::ensure!(
+                    claimed == *pin,
+                    "worker 返回的租约 provider_pin({claimed:?})与本提供器({pin:?})不一致,拒绝"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// 从 Plugin Host 解析结果构造(Worker 工厂 → 启动 worker 进程)。
@@ -117,7 +201,10 @@ impl ExecutionDirectoryProvider for WorkerDirectoryProvider {
             .transport
             .request("dir.acquire", ctx_params(ctx))
             .context("目录提供器 worker acquire 失败")?;
-        serde_json::from_value(result).context("worker 返回的租约格式非法")
+        let mut lease: ExecutionLease =
+            serde_json::from_value(result).context("worker 返回的租约格式非法")?;
+        self.validate_lease(&mut lease, ctx)?;
+        Ok(lease)
     }
 
     fn merge(&self, leases: &[ExecutionLease]) -> Result<MergeOutcome> {
@@ -150,6 +237,12 @@ impl ExecutionDirectoryProvider for WorkerDirectoryProvider {
     }
 
     fn release(&self, lease: &ExecutionLease) -> Result<()> {
+        anyhow::ensure!(
+            lease.provider == self.full_contribution_id,
+            "拒绝释放他人提供器({})的租约(本提供器: {})",
+            lease.provider,
+            self.full_contribution_id
+        );
         let params = serde_json::json!({ "lease": lease });
         self.transport
             .request("dir.release", params)

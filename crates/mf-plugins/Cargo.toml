@@ -12,6 +12,7 @@ serde_json.workspace = true
 toml.workspace = true
 chrono.workspace = true
 parking_lot.workspace = true
+libc = "0.2"
 dirs.workspace = true
 sha2 = "0.10"
 aes-gcm.workspace = true
