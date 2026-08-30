@@ -820,13 +820,19 @@ impl Orchestrator {
         // 预编译通过才写库(pin key 含 revision id,必须先建 Revision);
         // pin 失败 → 精确回滚:释放本次 run_key 已 pin 引用 + 删除刚建的 draft Revision
         let rev = self.store.create_workflow_revision(task_id, &snapshot)?;
-        // 目录提供器 pin 同随 Revision 固定:pin 期间插件包不可清理/卸载
+        // 目录提供器 pin 同随 Revision 固定:pin 期间插件包不可清理/卸载。
+        // I11:落库失败 = assign 整体失败 —— 绝不保留无 pin 保护的
+        // Revision(插件包可能随后被 GC/卸载),回滚 draft Revision 后报错
         if let Some(dir_pin) = &snapshot.directory_provider {
             if let Some(pins) = &self.workflow.pins {
                 if let Err(e) =
                     pins.pin_for_run(&workflow_pin_key(&self.root, task_id, rev.id), dir_pin)
                 {
-                    log::warn!("固定目录提供器 pin 失败: {e:#}");
+                    if let Err(del) = self.store.delete_draft_revision(rev.id) {
+                        log::warn!("回滚 draft Revision 失败: {del:#}");
+                    }
+                    return Err(anyhow::anyhow!(e)
+                        .context("固定目录提供器 pin 失败(插件包不可用):已回滚本次分配"));
                 }
             }
         }

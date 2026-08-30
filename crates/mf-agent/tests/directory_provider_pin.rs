@@ -159,3 +159,40 @@ fn directory_provider_pin_drift_between_none_and_some_rejected() {
 
 #[allow(dead_code)]
 fn _keep(_: Arc<()>) {}
+
+/// I11:目录提供器 pin 落库失败 → assign 必须失败并回滚
+///(不留无 pin 保护的 draft Revision;节点 pin 不残留)。
+#[test]
+fn directory_pin_persist_failure_fails_assign_and_rolls_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture(tmp.path());
+    fx.pins.resolve_ok(true);
+    fx.orch.set_directory_provider_pin(Some(pin("9.9")));
+    let version = fx.template("pin-fail", vec![node("a", &[], "做 A", &fx.instance_id)]);
+    // 注入:目录提供器 pin 持久化失败
+    fx.pins.fail_on("vendor.dirs");
+    let task = fx.orch.create_task("pin 落库失败", "g").unwrap();
+    let err = fx
+        .orch
+        .assign_workflow(task.id, &version, &plugin_index(), false)
+        .err()
+        .expect("目录提供器 pin 落库失败必须让 assign 失败");
+    assert!(
+        format!("{err:#}").contains("目录提供器"),
+        "错误必须明示目录提供器 pin 失败: {err:#}"
+    );
+    assert!(
+        fx.orch.store.active_revision(task.id).unwrap().is_none(),
+        "失败后不得有激活 Revision"
+    );
+    let revisions = fx.orch.store.list_revision_ids(task.id).unwrap();
+    assert!(
+        revisions.is_empty(),
+        "失败必须回滚 draft Revision(实际 {revisions:?})"
+    );
+    assert!(
+        fx.pins.pinned.lock().is_empty(),
+        "失败后不得残留节点 pin: {:?}",
+        fx.pins.pinned.lock()
+    );
+}
