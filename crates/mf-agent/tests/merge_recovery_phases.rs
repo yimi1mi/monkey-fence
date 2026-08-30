@@ -37,7 +37,7 @@ fn restart(dir: &std::path::Path) -> Fixture {
     let directory = Arc::new(ScriptedDirectory::new(dir));
     let host = Arc::new(RecordingHost::default());
     let store = Store::open(&dir.join("workflow-v1.db")).unwrap();
-    let orch = Orchestrator::start_with(
+    let orch = Orchestrator::start_with_routing(
         store,
         dir.to_path_buf(),
         mf_agent::config::Config::default(),
@@ -49,6 +49,10 @@ fn restart(dir: &std::path::Path) -> Fixture {
         WorkflowKernel {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
+        },
+        mf_agent::orchestrator::DirectoryRouting {
+            current_pin: Some(plugin_pin("scripted", "hash-scripted")),
+            resolver: None,
         },
     )
     .unwrap();

@@ -5,6 +5,10 @@
 //! `${nodes.*}` 变量替换、Task goal 与上游 Handoff 注入、
 //! 目录租约失败不留 Running、隔离租约汇合冲突 → needs-you。
 
+mod common;
+
+use common::*;
+
 use crossbeam_channel::Sender;
 use mf_agent::agent_instance::AgentInstanceDraft;
 use mf_agent::catalog_store::CatalogStore;
@@ -96,7 +100,7 @@ impl Fixture {
         let directory = Arc::new(ScriptedDirectory::new(dir));
         let host = Arc::new(RecordingHost::default());
         let store = Store::open(&dir.join("workflow-v1.db")).unwrap();
-        let orch = Orchestrator::start_with(
+        let orch = Orchestrator::start_with_routing(
             store,
             dir.to_path_buf(),
             Config::default(),
@@ -109,7 +113,8 @@ impl Fixture {
                 catalog: catalog.clone(),
                 pins: Some(pins.clone()),
             },
-        )
+        scripted_routing(),
+    )
         .unwrap();
         Fixture {
             catalog,
@@ -422,16 +427,19 @@ fn assign_workflow_compiles_pins_and_creates_active_revision() {
         .orch
         .assign_workflow(task.id, &version, &plugin_index(), false)
         .unwrap();
-    // 插件 pin 已按任务 run_key 固定
+    // 插件 pin 已按任务 run_key 固定(目录提供器 pin 随快照一并固定)
     let pinned = fx.pins.pinned.lock().clone();
-    assert_eq!(pinned.len(), 1, "去重后每个插件只 pin 一次");
+    let run_key = mf_agent::orchestrator::workflow_pin_key(tmp.path(), task.id, rev.id);
+    let agent_pins: Vec<_> = pinned
+        .iter()
+        .filter(|(k, p)| *k == run_key && p.full_id == "builtin.core")
+        .collect();
+    assert_eq!(agent_pins.len(), 1, "去重后每个插件只 pin 一次:{pinned:?}");
     assert_eq!(
-        pinned[0].0,
-        mf_agent::orchestrator::workflow_pin_key(tmp.path(), task.id, rev.id),
+        agent_pins[0].0, run_key,
         "pin key 必须含规范化 project+task+revision"
     );
-    assert_eq!(pinned[0].1.full_id, "builtin.core");
-    assert_eq!(pinned[0].1.content_hash, "hash-generic");
+    assert_eq!(agent_pins[0].1.content_hash, "hash-generic");
     // Step 已投影,快照含插件 pin
     let steps = fx.orch.store.revision_steps(rev.id).unwrap();
     assert_eq!(steps.len(), 1);
@@ -783,7 +791,7 @@ fn merge_conflicts_persist_across_restart_and_resolve() {
     // 重启:同一 Store/目录提供器重建 Orchestrator,待决汇合恢复
     fx.orch.stop();
     let store = mf_agent::store::Store::open(&tmp.path().join("workflow-v1.db")).unwrap();
-    let orch2 = Orchestrator::start_with(
+    let orch2 = Orchestrator::start_with_routing(
         store,
         tmp.path().to_path_buf(),
         Config::default(),
@@ -796,6 +804,7 @@ fn merge_conflicts_persist_across_restart_and_resolve() {
             catalog: fx.catalog.clone(),
             pins: Some(fx.pins.clone()),
         },
+        scripted_routing(),
     )
     .unwrap();
     assert_eq!(
@@ -826,7 +835,7 @@ fn merge_conflicts_persist_across_restart_and_resolve() {
 
     // 再次重启:无待决行,任务保持 Succeeded(不复活)
     let store3 = mf_agent::store::Store::open(&tmp.path().join("workflow-v1.db")).unwrap();
-    let orch3 = Orchestrator::start_with(
+    let orch3 = Orchestrator::start_with_routing(
         store3,
         tmp.path().to_path_buf(),
         Config::default(),
@@ -839,6 +848,7 @@ fn merge_conflicts_persist_across_restart_and_resolve() {
             catalog: fx.catalog.clone(),
             pins: Some(fx.pins.clone()),
         },
+        scripted_routing(),
     )
     .unwrap();
     assert!(orch3.pending_merge_conflicts(task.id).is_empty());
@@ -1272,7 +1282,7 @@ fn parallel_siblings_same_file_conflict_needs_user_with_real_worktrees() {
     let db_dir = repo_root.join(".mf-agent");
     std::fs::create_dir_all(&db_dir).unwrap();
     let store = Store::open(&db_dir.join("workflow-v1.db")).unwrap();
-    let orch = Orchestrator::start_with(
+    let orch = Orchestrator::start_with_routing(
         store,
         repo_root.clone(),
         Config::default(),
@@ -1285,6 +1295,7 @@ fn parallel_siblings_same_file_conflict_needs_user_with_real_worktrees() {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
         },
+        scripted_routing(),
     )
     .unwrap();
 

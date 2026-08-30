@@ -326,7 +326,8 @@ impl Store {
 
     pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
         let conn = self.conn.lock();
-        f(&conn)
+        let out = f(&conn);
+        out
     }
 
     /// 在写事务中执行(供 Orchestrator 组合多步状态变更)。

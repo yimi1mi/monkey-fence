@@ -130,7 +130,9 @@ impl Fixture {
     fn with(provider: Arc<RecordingProvider>) -> Fixture {
         let store = Store::memory().unwrap();
         let host = Arc::new(MockHost::default());
-        let orch = Orchestrator::start(
+        // F4:隔离提供器必须携带 pin(dispatch 盖章 provider_pin;
+        // 无 pin 的隔离租约按 Absent 三态拒绝路由)
+        let orch = Orchestrator::start_with_routing(
             store,
             PathBuf::from("."),
             mf_agent::Config::default(),
@@ -139,6 +141,17 @@ impl Fixture {
             GlobalLimiter::new(4),
             "test-pipe".into(),
             provider.clone(),
+            mf_agent::orchestrator::WorkflowKernel::new(
+                mf_agent::catalog_store::CatalogStore::memory().unwrap(),
+            ),
+            mf_agent::orchestrator::DirectoryRouting {
+                current_pin: Some(mf_agent::workflow::PluginSourcePin {
+                    full_id: "test.recording".into(),
+                    version: "1.0.0".into(),
+                    content_hash: "hash-recording".into(),
+                }),
+                resolver: None,
+            },
         )
         .unwrap();
         Fixture {

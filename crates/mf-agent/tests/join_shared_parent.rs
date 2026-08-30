@@ -248,7 +248,7 @@ fn join_deferral_survives_restart_and_merges_full_batch() {
     let db_path = repo_root.join(".mf-agent").join("workflow-v1.db");
     std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
 
-    let orch1 = Orchestrator::start_with(
+    let orch1 = Orchestrator::start_with_routing(
         Store::open(&db_path).unwrap(),
         repo_root.clone(),
         mf_agent::config::Config::default(),
@@ -261,6 +261,7 @@ fn join_deferral_survives_restart_and_merges_full_batch() {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
         },
+        pinned_routing("builtin.core", "hash-worktree"),
     )
     .unwrap();
     let version = catalog
@@ -352,7 +353,7 @@ fn join_deferral_survives_restart_and_merges_full_batch() {
     // 重启(同 DB 同 provider):held 租约与 join deferral 从 Store 重建;
     // B 的 run 经恢复为 interrupted(宿主无法确认存活)
     let host2 = Arc::new(RecordingHost::default());
-    let orch2 = Orchestrator::start_with(
+    let orch2 = Orchestrator::start_with_routing(
         Store::open(&db_path).unwrap(),
         repo_root.clone(),
         mf_agent::config::Config::default(),
@@ -365,6 +366,7 @@ fn join_deferral_survives_restart_and_merges_full_batch() {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
         },
+        pinned_routing("builtin.core", "hash-worktree"),
     )
     .unwrap();
     let step_a = orch2

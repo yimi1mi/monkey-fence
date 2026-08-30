@@ -244,10 +244,43 @@ impl Orchestrator {
                 orphan_steps.len()
             );
         }
-        // 提供器持久化痕迹的崩溃一致性恢复(如合并事务日志重放);
+        // 提供器持久化痕迹的崩溃一致性恢复(如合并事务日志重放)。
+        // F4:**所有 held pin 提供器**都要恢复,不只当前提供器 ——
+        // 跨版本持有的租约(旧插件版本)同样可能留有未收敛的合并痕迹;
         // 失败如实上报并保持可恢复状态,不阻塞启动(后续合并前会再试)
-        if let Err(e) = directory.recover_interrupted() {
-            log::error!("执行目录提供器崩溃恢复失败(保留可恢复状态): {e:#}");
+        let mut recovered_pins: Vec<Option<PluginSourcePin>> = vec![routing.current_pin.clone()];
+        if let Ok(held) = store.list_held_execution_leases() {
+            for row in &held {
+                let pin = row
+                    .metadata_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                    .and_then(|v| {
+                        serde_json::from_value::<PluginSourcePin>(v.get("provider_pin")?.clone()).ok()
+                    });
+                if !recovered_pins.contains(&pin) {
+                    recovered_pins.push(pin);
+                }
+            }
+        }
+        for pin in recovered_pins {
+            let provider = match &pin {
+                None => Some(directory.clone()),
+                Some(p) => match &routing.resolver {
+                    Some(r) => r.resolve(p),
+                    None if routing.current_pin.as_ref() == Some(p) => Some(directory.clone()),
+                    None => None,
+                },
+            };
+            let Some(provider) = provider else {
+                log::error!(
+                    "held 租约的提供器 pin({pin:?})无法解析,跳过其崩溃恢复(保持可恢复状态)"
+                );
+                continue;
+            };
+            if let Err(e) = provider.recover_interrupted() {
+                log::error!("执行目录提供器(pin {pin:?})崩溃恢复失败(保留可恢复状态): {e:#}");
+            }
         }
         let (events_tx, events_rx) = crossbeam_channel::bounded(8192);
         let (runtime_tx, runtime_rx) = crossbeam_channel::bounded(8192);
@@ -433,12 +466,42 @@ impl Orchestrator {
         }
         self.release_workflow_pins(task_id);
         let _ = self.store.clear_pending_merges(task_id)?;
-        if let Err(e) = self.directory.discard_task_baselines(task_id) {
-            log::warn!("清理任务 {task_id} 集成基线失败: {e:#}");
-        }
+        self.discard_task_baselines_routed(task_id);
         self.store.set_task_status(task_id, TaskStatus::Archived)?;
         self.emit(SchedulerEvent::TaskRemoved(task_id));
         Ok(())
+    }
+
+    /// 丢弃任务的集成基线(F4:全部相关提供器 —— 当前提供器 + 任务
+    /// 租约行上出现过的每个 pin 解析出的提供器;解析失败的 pin 记录
+    // 警告,不阻塞 —— 基线清理是尽力而为的收尾,不改变正确性)。
+    fn discard_task_baselines_routed(&self, task_id: i64) {
+        let mut providers: Vec<Arc<dyn ExecutionDirectoryProvider>> = vec![self.directory.clone()];
+        let mut seen_pins: Vec<Option<PluginSourcePin>> = vec![self.directory_provider_pin()];
+        let lease_rows = self
+            .store
+            .list_execution_leases(task_id)
+            .unwrap_or_default();
+        for row in &lease_rows {
+            let lease = lease_from_row(row);
+            let pin = Self::lease_provider_pin(&lease);
+            if pin.is_none() || seen_pins.contains(&pin) {
+                continue;
+            }
+            seen_pins.push(pin.clone());
+            match self.lease_provider(&lease) {
+                Some(provider) => providers.push(provider),
+                None => log::warn!(
+                    "任务 {task_id} 租约 `{}` 的提供器 pin({pin:?})无法解析,跳过其基线清理",
+                    lease.id
+                ),
+            }
+        }
+        for provider in providers {
+            if let Err(e) = provider.discard_task_baselines(task_id) {
+                log::warn!("清理任务 {task_id} 集成基线失败: {e:#}");
+            }
+        }
     }
 
     /// 释放任务的全部执行租约痕迹:待决汇合批(pending_merges 映射 +
@@ -459,14 +522,33 @@ impl Orchestrator {
             if !done.insert(lease.id.clone()) {
                 continue;
             }
-            match self.directory.release(&lease) {
-                Ok(()) => {
-                    let _ = self.store.release_execution_lease(&lease.id);
-                    self.held_leases.lock().retain(|_, l| l.id != lease.id);
-                    self.step_leases.lock().retain(|_, l| l.id != lease.id);
-                }
+            // F4:按租约冻结的 pin 路由(C7);解析/释放失败 → 保持
+            // 持有并计入错误(阻止归档,可重试)
+            let routed = self.lease_provider(&lease).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "租约 `{}` 的提供器 pin({:?})无法解析",
+                    lease.id,
+                    Self::lease_provider_pin(&lease)
+                )
+            });
+            match routed {
+                Ok(provider) => match provider.release(&lease) {
+                    Ok(()) => {
+                        if let Err(db_e) = self.store.release_execution_lease(&lease.id) {
+                            log::error!("释放租约 `{}` 落库失败: {db_e:#}", lease.id);
+                            errors.push(format!("{}: {db_e:#}", lease.id));
+                            continue;
+                        }
+                        self.held_leases.lock().retain(|_, l| l.id != lease.id);
+                        self.step_leases.lock().retain(|_, l| l.id != lease.id);
+                    }
+                    Err(e) => {
+                        log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
+                        errors.push(format!("{}: {e:#}", lease.id));
+                    }
+                },
                 Err(e) => {
-                    log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
+                    log::error!("路由租约 `{}` 提供器失败: {e:#}", lease.id);
                     errors.push(format!("{}: {e:#}", lease.id));
                 }
             }
@@ -482,12 +564,32 @@ impl Orchestrator {
             if !done.insert(lease.id.clone()) {
                 continue;
             }
-            if let Err(e) = self.directory.release(&lease) {
-                log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
-                errors.push(format!("{}: {e:#}", lease.id));
-                continue; // 保持持有
+            let routed = self.lease_provider(&lease).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "租约 `{}` 的提供器 pin({:?})无法解析",
+                    lease.id,
+                    Self::lease_provider_pin(&lease)
+                )
+            });
+            match routed {
+                Ok(provider) => {
+                    if let Err(e) = provider.release(&lease) {
+                        log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
+                        errors.push(format!("{}: {e:#}", lease.id));
+                        continue; // 保持持有
+                    }
+                }
+                Err(e) => {
+                    log::error!("路由租约 `{}` 提供器失败: {e:#}", lease.id);
+                    errors.push(format!("{}: {e:#}", lease.id));
+                    continue; // 保持持有
+                }
             }
-            let _ = self.store.release_execution_lease(&lease.id);
+            if let Err(db_e) = self.store.release_execution_lease(&lease.id) {
+                log::error!("释放租约 `{}` 落库失败: {db_e:#}", lease.id);
+                errors.push(format!("{}: {db_e:#}", lease.id));
+                continue;
+            }
             self.held_leases.lock().remove(&run.id);
             self.step_leases.lock().retain(|_, l| l.id != lease.id);
         }
@@ -499,12 +601,32 @@ impl Orchestrator {
                     if done.contains(&lease.id) {
                         continue;
                     }
-                    if let Err(e) = self.directory.release(&lease) {
-                        log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
-                        errors.push(format!("{}: {e:#}", lease.id));
+                    let routed = self.lease_provider(&lease).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "租约 `{}` 的提供器 pin({:?})无法解析",
+                            lease.id,
+                            Self::lease_provider_pin(&lease)
+                        )
+                    });
+                    match routed {
+                        Ok(provider) => {
+                            if let Err(e) = provider.release(&lease) {
+                                log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
+                                errors.push(format!("{}: {e:#}", lease.id));
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("路由租约 `{}` 提供器失败: {e:#}", lease.id);
+                            errors.push(format!("{}: {e:#}", lease.id));
+                            continue;
+                        }
+                    }
+                    if let Err(db_e) = self.store.release_execution_lease(&lease.id) {
+                        log::error!("释放租约 `{}` 落库失败: {db_e:#}", lease.id);
+                        errors.push(format!("{}: {db_e:#}", lease.id));
                         continue;
                     }
-                    let _ = self.store.release_execution_lease(&lease.id);
                 }
             }
         }
@@ -522,26 +644,17 @@ impl Orchestrator {
     /// 释放 run 持有的执行租约(终态结算/取消;未知状态不调用)。
     /// 重启恢复后的 run 不在进程内映射中,按数据库兜底查找。
     fn release_lease_of_run(&self, run_id: i64) {
-        if let Some(lease) = self.held_leases.lock().remove(&run_id) {
-            if let Err(e) = self.directory.release(&lease) {
-                log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
-            }
-            let _ = self.store.release_execution_lease(&lease.id);
-            let _ = self
-                .store
-                .delete_join_deferrals_for_leases(&[lease.id.clone()]);
-            self.step_leases.lock().retain(|_, l| l.id != lease.id);
+        // F4:统一经 release_lease_of_lease(按租约 pin 路由 +
+        // release 成功才落库/清内存)。先取出并释放锁 —— if let 条件
+        // 里的临时 guard 会活到块末,持锁再锁 held_leases 会死锁
+        let lease = self.held_leases.lock().remove(&run_id);
+        if let Some(lease) = lease {
+            self.release_lease_of_lease(&lease);
             return;
         }
         if let Ok(Some(row)) = self.store.held_lease_of_run(run_id) {
             let lease = lease_from_row(&row);
-            if let Err(e) = self.directory.release(&lease) {
-                log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
-            }
-            let _ = self.store.release_execution_lease(&row.lease_key);
-            let _ = self
-                .store
-                .delete_join_deferrals_for_leases(&[row.lease_key.clone()]);
+            self.release_lease_of_lease(&lease);
         }
     }
 
@@ -654,9 +767,7 @@ impl Orchestrator {
         }
         let _ = self.store.clear_pending_merges(task_id)?;
         self.release_workflow_pins(task_id);
-        if let Err(e) = self.directory.discard_task_baselines(task_id) {
-            log::warn!("清理任务 {task_id} 集成基线失败: {e:#}");
-        }
+        self.discard_task_baselines_routed(task_id);
         let t = self
             .store
             .set_task_status(task_id, TaskStatus::Cancelled)?
@@ -1327,7 +1438,11 @@ impl Orchestrator {
         lease: &ExecutionLease,
     ) -> Option<Arc<dyn ExecutionDirectoryProvider>> {
         match Self::lease_provider_pin(lease) {
-            None => Some(self.directory.clone()),
+            // F4 三态之 Absent:只放行**非隔离**的内核默认共享目录
+            //(project-dir 语义);隔离提供器(worktree/worker)下无法
+            // 归属租约版本 → None(NeedsYou),绝不静默顶替
+            None if !self.directory.isolates() => Some(self.directory.clone()),
+            None => None,
             Some(lease_pin) => {
                 let resolver = self.directory_resolver.lock().clone();
                 match resolver {
@@ -1372,13 +1487,14 @@ impl Orchestrator {
                 isolated[isolated.len() - 1].id
             )
         })?;
-        if let (Some(first), Some(second)) = (
-            Self::lease_provider_pin(&isolated[0]),
-            Self::lease_provider_pin(&isolated[isolated.len() - 1]),
-        ) {
+        // F4:全批逐项比较(不只首尾)—— 批内任一租约的 pin 与首个
+        // 不同即拒绝;无 pin 租约混入有 pin 批同样拒绝(无法归属)
+        let reference = Self::lease_provider_pin(&isolated[0]);
+        for lease in isolated.iter().skip(1) {
+            let pin = Self::lease_provider_pin(lease);
             anyhow::ensure!(
-                first == second,
-                "汇合批混入不同提供器 pin 的租约({first:?} 与 {second:?})"
+                pin == reference,
+                "汇合批混入不同提供器 pin 的租约({reference:?} 与 {pin:?}):整批拒绝"
             );
         }
         Ok(match provider.merge(&isolated)? {
@@ -1410,12 +1526,23 @@ impl Orchestrator {
     /// C7:按租约 pin 路由到对应提供器;pin 无法解析时保持持有并
     /// 把任务转 needs-you(绝不用当前提供器顶替释放旧版本租约)。
     fn release_lease_of_lease(&self, lease: &ExecutionLease) {
-        match self.lease_provider(lease) {
+        let routed = self.lease_provider(lease);
+        match routed {
             Some(provider) => {
+                // F4:release 成功后才标 released/清内存 —— 提供器释放
+                // 失败时租约保持 held(可重试;启动恢复按 merged 批补释放),
+                // 绝不谎报已释放
                 if let Err(e) = provider.release(lease) {
-                    log::warn!("释放执行租约 `{}` 失败: {e:#}", lease.id);
+                    log::warn!(
+                        "释放执行租约 `{}` 失败(保持持有,恢复/重试补释放): {e:#}",
+                        lease.id
+                    );
+                    return;
                 }
-                let _ = self.store.release_execution_lease(&lease.id);
+                if let Err(e) = self.store.release_execution_lease(&lease.id) {
+                    log::error!("释放租约 `{}` 落库失败: {e:#}", lease.id);
+                    return;
+                }
                 let _ = self
                     .store
                     .delete_join_deferrals_for_leases(&[lease.id.clone()]);
@@ -2189,9 +2316,7 @@ impl Orchestrator {
                     self.emit(SchedulerEvent::TaskUpdated(t));
                 }
                 self.release_workflow_pins(task_id);
-                if let Err(e) = self.directory.discard_task_baselines(task_id) {
-                    log::warn!("清理任务 {task_id} 集成基线失败: {e:#}");
-                }
+                self.discard_task_baselines_routed(task_id);
             }
             Some(false) => {
                 if let Some(t) = self.store.set_task_status(task_id, TaskStatus::Failed)? {

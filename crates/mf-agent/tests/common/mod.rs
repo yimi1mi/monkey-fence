@@ -123,7 +123,9 @@ pub fn fixture(dir: &Path) -> Fixture {
     let directory = Arc::new(ScriptedDirectory::new(dir));
     let host = Arc::new(RecordingHost::default());
     let store = Store::open(&dir.join("workflow-v1.db")).unwrap();
-    let orch = Orchestrator::start_with(
+    // F4:测试提供器也携带 pin(dispatch 盖章 provider_pin;
+    // 无 pin 的隔离租约会按 Absent 三态拒绝路由)
+    let orch = Orchestrator::start_with_routing(
         store,
         dir.to_path_buf(),
         mf_agent::config::Config::default(),
@@ -136,6 +138,10 @@ pub fn fixture(dir: &Path) -> Fixture {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
         },
+        mf_agent::orchestrator::DirectoryRouting {
+            current_pin: Some(plugin_pin("scripted", "hash-scripted")),
+            resolver: None,
+        },
     )
     .unwrap();
     Fixture {
@@ -145,6 +151,22 @@ pub fn fixture(dir: &Path) -> Fixture {
         host,
         orch,
         instance_id,
+    }
+}
+
+/// F4:ScriptedDirectory 测试的标准路由(current pin 一致,无 resolver)。
+pub fn scripted_routing() -> mf_agent::orchestrator::DirectoryRouting {
+    mf_agent::orchestrator::DirectoryRouting {
+        current_pin: Some(plugin_pin("scripted", "hash-scripted")),
+        resolver: None,
+    }
+}
+
+/// F4:任意测试提供器的 pinned 路由。
+pub fn pinned_routing(full_id: &str, hash: &str) -> mf_agent::orchestrator::DirectoryRouting {
+    mf_agent::orchestrator::DirectoryRouting {
+        current_pin: Some(plugin_pin(full_id, hash)),
+        resolver: None,
     }
 }
 
@@ -213,6 +235,8 @@ pub struct ScriptedDirectory {
     /// 每次调用的批大小(leases.len()),按调用顺序。
     pub merge_batches: Mutex<Vec<usize>>,
     pub released: Mutex<Vec<String>>,
+    /// F4:release 可注入失败(验证"release 成功后才标 released")。
+    pub release_fails: AtomicBool,
 }
 
 impl ScriptedDirectory {
@@ -225,6 +249,7 @@ impl ScriptedDirectory {
             merges: AtomicUsize::new(0),
             merge_batches: Mutex::new(Vec::new()),
             released: Mutex::new(Vec::new()),
+            release_fails: AtomicBool::new(false),
         }
     }
 
@@ -264,6 +289,9 @@ impl ExecutionDirectoryProvider for ScriptedDirectory {
         }
     }
     fn release(&self, lease: &ExecutionLease) -> anyhow::Result<()> {
+        if self.release_fails.load(Ordering::SeqCst) {
+            anyhow::bail!("释放执行租约失败(脚本注入)");
+        }
         self.released.lock().push(lease.id.clone());
         Ok(())
     }

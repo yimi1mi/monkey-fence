@@ -136,7 +136,7 @@ fn merge_batch_state_is_persisted_and_recovered_on_restart() {
         .unwrap();
     let store = Store::open(&tmp.path().join("workflow-v1.db")).unwrap();
     // 重启路径(restore)触发重置
-    let orch2 = Orchestrator::start_with(
+    let orch2 = Orchestrator::start_with_routing(
         store,
         tmp.path().to_path_buf(),
         mf_agent::config::Config::default(),
@@ -149,6 +149,7 @@ fn merge_batch_state_is_persisted_and_recovered_on_restart() {
             catalog: fx.catalog.clone(),
             pins: Some(fx.pins.clone()),
         },
+        scripted_routing(),
     )
     .unwrap();
     let batches = orch2.store.list_merge_batches(task.id).unwrap();

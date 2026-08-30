@@ -21,7 +21,7 @@ fn fixture_with_concurrency(dir: &std::path::Path) -> Fixture {
     let mut config = mf_agent::config::Config::default();
     config.engine.per_project_concurrency = 8;
     config.engine.global_concurrency = 8;
-    let orch = Orchestrator::start_with(
+    let orch = Orchestrator::start_with_routing(
         store,
         dir.to_path_buf(),
         config,
@@ -34,6 +34,7 @@ fn fixture_with_concurrency(dir: &std::path::Path) -> Fixture {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
         },
+        scripted_routing(),
     )
     .unwrap();
     Fixture {

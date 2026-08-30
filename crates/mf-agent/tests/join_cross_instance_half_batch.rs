@@ -82,7 +82,7 @@ fn start_instance(
     // 每实例并发 1:A 只能派发 a;a 转 running 后 B 启动只能派发 b
     // —— 两个实例的内存租约缓存天然各持一半(半批场景前提)
     config.engine.per_project_concurrency = 1;
-    Orchestrator::start_with(
+    Orchestrator::start_with_routing(
         store,
         dir.to_path_buf(),
         config,
@@ -94,6 +94,10 @@ fn start_instance(
         WorkflowKernel {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
+        },
+        mf_agent::orchestrator::DirectoryRouting {
+            current_pin: Some(plugin_pin("scripted", "hash-scripted")),
+            resolver: None,
         },
     )
     .unwrap()
@@ -168,7 +172,7 @@ fn cross_instance_complete_merges_full_batch_exactly_once() {
             let store = Store::open(&db).unwrap();
             let mut config = mf_agent::config::Config::default();
             config.engine.per_project_concurrency = 1;
-            Orchestrator::start_with(
+            Orchestrator::start_with_routing(
                 store,
                 tmp.path().to_path_buf(),
                 config,
@@ -180,6 +184,10 @@ fn cross_instance_complete_merges_full_batch_exactly_once() {
                 WorkflowKernel {
                     catalog: fx.catalog.clone(),
                     pins: Some(fx.pins.clone()),
+                },
+                mf_agent::orchestrator::DirectoryRouting {
+                    current_pin: Some(plugin_pin("scripted", "hash-scripted")),
+                    resolver: None,
                 },
             )
             .unwrap()
