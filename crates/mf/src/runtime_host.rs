@@ -322,13 +322,20 @@ impl SessionRegistry {
     /// (进程可能仍在运行,调用方不得标记 Cancelled/释放租约)。
     pub fn stop_run(&self, project: &str, run_id: i64) -> Result<()> {
         let run_key = session_key(project, run_id);
-        let bound = self.run_sessions.lock().remove(&run_key);
+        // I10:只查找、不预先移除 —— 未确认终止前 binding/session 保留
+        // (超时后可重试停止);确认 terminated 并回收线程后才移除。
+        let bound = self.run_sessions.lock().get(&run_key).cloned();
         let Some(session_key_of_run) = bound else {
             return Ok(()); // 无绑定:无进程可停,视为已停止
         };
-        let inner = self.sessions.lock().remove(&session_key_of_run);
+        let inner = self.sessions.lock().get(&session_key_of_run).cloned();
         let Some(inner) = inner else {
+            self.run_sessions.lock().remove(&run_key);
             return Ok(()); // 绑定指向的会话已摘除(自然退出/已清理)
+        };
+        let confirm_removed = |me: &SessionRegistry| {
+            me.sessions.lock().remove(&session_key_of_run);
+            me.run_sessions.lock().remove(&run_key);
         };
         match &inner {
             SessionInner::Http(h) => {
@@ -341,10 +348,12 @@ impl SessionRegistry {
                     if let Some(handle) = h.join.lock().take() {
                         let _ = handle.join();
                     }
+                    confirm_removed(self); // 确认结束:此刻才移除
                     Ok(())
                 } else {
+                    // 超时:保留 binding/session(stopping 可重试状态)
                     Err(anyhow!(
-                        "run {run_id} HTTP 工具循环未在时限内真正结束(可能仍在处理请求)"
+                        "run {run_id} HTTP 工具循环未在时限内真正结束(可能仍在处理请求;会话保留,可重试停止)"
                     ))
                 }
             }
@@ -380,10 +389,13 @@ impl SessionRegistry {
                     p.mark_terminated();
                 }
                 if p.wait_terminated(std::time::Duration::from_secs(10)) {
+                    confirm_removed(self); // 确认终止:此刻才移除
                     Ok(())
                 } else {
+                    // 超时:保留 binding/session(可重试;killer/job 已消费,
+                    // 重试路径由 reader/waiter 线程的收口确认终止)
                     Err(anyhow!(
-                        "run {run_id} 会话进程停止未在 10s 内确认(可能被外部阻塞)"
+                        "run {run_id} 会话进程停止未在 10s 内确认(可能被外部阻塞;会话保留,可重试停止)"
                     ))
                 }
             }
@@ -1510,8 +1522,22 @@ fn run_http_turn_async(
             // stop_run 据此等待,确认前不得释放执行租约
             session.mark_terminated();
         });
-    if let Ok(handle) = handle {
-        *join_session.join.lock() = Some(handle);
+    match handle {
+        Ok(handle) => {
+            *join_session.join.lock() = Some(handle);
+        }
+        Err(error) => {
+            // 后台线程启动失败:run 不能永远停在 Working —— 摘除会话/
+            // 绑定、确认终止(无线程存活)、上报 SpawnError(调度方按
+            // 失败结算),绝不留下"已注册但无人推进"的僵尸会话。
+            log::error!("run {run_id} HTTP 工具循环线程启动失败: {error}");
+            join_session.mark_terminated();
+            registry.kill_session(&spec.project_root.to_string_lossy(), spec.session_id);
+            let _ = events.send((
+                run_id,
+                RuntimeEvent::SpawnError(format!("启动 HTTP 工具循环线程失败: {error}")),
+            ));
+        }
     }
 }
 
@@ -2510,6 +2536,45 @@ mod tests {
         let err = registry.stop_run("proj", 502).expect_err("未确认必须 Err");
         assert!(format!("{err:#}").contains("HTTP 工具循环"), "{err:#}");
         assert!(session.cancel.load(Ordering::SeqCst), "终止信号必须已发出");
+    }
+
+    /// I10:HTTP stop 超时不得先删 binding/session —— 第一次超时后
+    /// 会话仍可重试停止;确认 terminated 后第二次成功并移除。
+    #[test]
+    fn http_stop_timeout_keeps_session_and_binding_for_retry() {
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        registry.set_stop_confirm_timeout(std::time::Duration::from_millis(200));
+        let session = Arc::new(HttpSession {
+            session_id: 15,
+            transcript: Mutex::new(Vec::new()),
+            alive: AtomicBool::new(true),
+            answer_tx: Mutex::new(None),
+            cancel: AtomicBool::new(false),
+            term: TermSignal::new(),
+            join: Mutex::new(None),
+        });
+        registry.register("proj", 15, SessionInner::Http(session.clone()));
+        registry.bind_run("proj", 504, 15);
+
+        // 第一次:工具循环未结束 → Err
+        let err = registry.stop_run("proj", 504).expect_err("未确认必须 Err");
+        assert!(format!("{err:#}").contains("HTTP 工具循环"), "{err:#}");
+        assert!(
+            registry.session_alive("proj", 15),
+            "超时后 session/binding 必须保留(否则永远无法重试停止)"
+        );
+
+        // 循环真正结束(join 句柄已终结)
+        let finished = std::thread::spawn(|| {});
+        *session.join.lock() = Some(finished);
+        session.mark_terminated();
+
+        // 第二次:确认终止 → Ok 且移除
+        registry.stop_run("proj", 504).expect("重试停止必须成功");
+        assert!(
+            !registry.session_alive("proj", 15),
+            "确认终止后 session 必须移除"
+        );
     }
 
     #[test]
