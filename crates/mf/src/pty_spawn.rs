@@ -287,7 +287,7 @@ mod imp {
             })
         }
 
-        fn create() -> Result<JobGuard> {
+        pub fn create() -> Result<JobGuard> {
             let hjob = unsafe { CreateJobObjectW(core::ptr::null(), core::ptr::null()) };
             if hjob.is_null() {
                 return Err(anyhow::anyhow!("CreateJobObjectW 失败"));

@@ -358,17 +358,27 @@ impl SessionRegistry {
                 }
             }
             SessionInner::Pty(p) => {
-                // 拥有并等待**整个进程树**(Windows Job Object):
+                // 拥有并等待**整个进程树**(Windows Job Object / Unix PGID):
                 // cmd/npm 风格父进程派生的孙进程一并终止,job 清空
-                // (全部派生进程消失)才算停止确认。
-                if let Some(job) = p.job.lock().take() {
+                //(全部派生进程消失)才算停止确认。
+                // C8:终止/等待全部经 try_clone 的**克隆**执行 —— 原守卫
+                // 留在会话里,超时未确认不消费守卫(第二次重试仍能整组杀);
+                // 整组确认消失且真实终止确认后才 take/drop。
+                if let Some(job) = p
+                    .job
+                    .lock()
+                    .as_ref()
+                    .map(pty::JobGuard::try_clone)
+                    .transpose()?
+                {
                     if let Err(e) = job.terminate() {
                         log::warn!("run {run_id} 进程树 terminate 请求失败: {e}");
                     }
                     let empty = job.wait_empty(std::time::Duration::from_secs(10));
                     drop(job);
                     if !empty {
-                        // 树未清空:进程可能仍在写执行目录 → 不确认、不释放
+                        // 树未清空:进程可能仍在写执行目录 → 不确认、不释放、
+                        // 不消费守卫(会话保留,重试仍能整组终止)
                         return Err(anyhow!("run {run_id} 进程树未在 10s 内清空(孙进程仍存活)"));
                     }
                 }
@@ -389,11 +399,13 @@ impl SessionRegistry {
                     p.mark_terminated();
                 }
                 if p.wait_terminated(std::time::Duration::from_secs(10)) {
-                    confirm_removed(self); // 确认终止:此刻才移除
+                    // 整组已消失 + 真实终止确认:此刻才消费守卫并移除
+                    drop(p.job.lock().take());
+                    confirm_removed(self);
                     Ok(())
                 } else {
-                    // 超时:保留 binding/session(可重试;killer/job 已消费,
-                    // 重试路径由 reader/waiter 线程的收口确认终止)
+                    // 超时:保留 binding/session 与进程树守卫
+                    //(可重试;重试路径由 reader/waiter 线程的收口确认终止)
                     Err(anyhow!(
                         "run {run_id} 会话进程停止未在 10s 内确认(可能被外部阻塞;会话保留,可重试停止)"
                     ))
@@ -2410,6 +2422,62 @@ mod tests {
         assert!(registry.snapshot(&project, 7).is_none());
         // 二次停止幂等
         host.stop_run(&project, 42).unwrap();
+    }
+
+    /// C8:stop 超时返回 Err 后**进程树守卫必须仍留在会话里** ——
+    /// 终止/等待用 try_clone 的克隆执行,原 guard 只有在停止整体确认后
+    /// 才消费;第二次 stop 重试必须仍能整组终止并成功。
+    ///(确定性场景:空 Job Object 守卫 + 永不置位的终止确认 →
+    /// stop_run 必然走超时 Err 分支。)
+    #[test]
+    fn stop_run_timeout_keeps_job_guard_for_retry() {
+        if !cfg!(windows) {
+            return; // Unix 守卫为 pgid 值类型,空构造无意义;语义同源
+        }
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        let host = RuntimeHostImpl::new(registry.clone());
+        let project = "proj-f8".to_string();
+        let session = Arc::new(PtySession {
+            session_id: 55,
+            master: Mutex::new(None),
+            writer: Mutex::new(None),
+            child: Mutex::new(None),
+            killer: Mutex::new(None),
+            job: Mutex::new(Some(pty::JobGuard::create().unwrap())),
+            screen: Mutex::new(Screen::new(TERM_ROWS, TERM_COLS)),
+            title: Mutex::new("f8".into()),
+            output_tail: Mutex::new(Vec::new()),
+            alive: AtomicBool::new(true),
+            pid: None,
+            term: TermSignal::new(),
+        });
+        registry.register(&project, 55, SessionInner::Pty(session.clone()));
+        registry.bind_run(&project, 4242, 55);
+
+        // 极短确认超时:终止确认永不置位 → stop_run 必然 Err
+        registry.set_stop_confirm_timeout(std::time::Duration::from_millis(1));
+        let first = host.stop_run(&project, 4242);
+        assert!(first.is_err(), "前置:确认超时必须返回 Err({first:?})");
+        // 守卫必须在会话里保留(重试仍能整组杀);会话/绑定保留
+        assert!(
+            session.job.lock().is_some(),
+            "stop 超时后进程树守卫必须留在会话(第二次重试仍能整组杀)"
+        );
+        assert!(registry.session_alive(&project, 55), "超时后会话保留");
+
+        // 第二次重试:守卫仍在 → 仍可整组终止;确认到达后成功收口
+        session.mark_terminated();
+        registry.set_stop_confirm_timeout(std::time::Duration::from_secs(10));
+        host.stop_run(&project, 4242)
+            .expect("第二次 stop 必须用保留的守卫完成整组终止并确认");
+        assert!(
+            !registry.session_alive(&project, 55),
+            "重试后会话必须真正收口"
+        );
+        assert!(
+            session.job.lock().is_none(),
+            "确认停止后守卫才被消费"
+        );
     }
 
     /// C2:普通 launch_pty 会话的短命 CLI 自然退出 —— 不调用 stop_run,
