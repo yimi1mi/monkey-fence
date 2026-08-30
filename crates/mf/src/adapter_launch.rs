@@ -167,24 +167,21 @@ pub fn compile_instance_launch(
             None => mf_plugins::builtin_secret_store::BuiltinSecretStore::open(catalog.clone())?,
         };
         // run token 授权:本次 run 只能解封其实例声明的 Secret;
-        // 解封(或出错)后立即撤销,不留长期有效凭据
+        // RAII 守卫保证解封(或出错/panic)后立即撤销,
+        // 不留长期有效凭据(I11:配对由类型系统保证)
         let declared: Vec<&str> = instance
             .sealed_secret_ids
             .iter()
             .map(String::as_str)
             .collect();
-        mf_plugins::builtin_secret_store::authorize_run_secrets(run_token, &declared);
-        let unsealed = (|| -> Result<()> {
-            for secret_id in &instance.sealed_secret_ids {
-                let lease = secret_store.unseal_for_run(run_token, secret_id)?;
-                launch_ctx
-                    .secrets
-                    .insert(secret_id.clone(), Arc::new(lease));
-            }
-            Ok(())
-        })();
-        mf_plugins::builtin_secret_store::revoke_run_secrets(run_token);
-        unsealed?;
+        let _grant =
+            mf_plugins::builtin_secret_store::RunSecretGrant::authorize(run_token, &declared);
+        for secret_id in &instance.sealed_secret_ids {
+            let lease = secret_store.unseal_for_run(run_token, secret_id)?;
+            launch_ctx
+                .secrets
+                .insert(secret_id.clone(), Arc::new(lease));
+        }
     }
     adapter.compile_launch(instance, &launch_ctx)
 }

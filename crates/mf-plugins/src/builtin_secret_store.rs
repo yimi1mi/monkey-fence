@@ -49,6 +49,29 @@ pub fn revoke_run_secrets(run_token: &str) {
     grants().lock().remove(run_token);
 }
 
+/// run token 授权的 RAII 守卫(I11):构造即授权,Drop 即撤销 ——
+/// 正常返回、错误传播与 panic/unwind 都保证配对,杜绝手工
+/// authorize/revoke 遗漏导致的长期有效凭据。
+pub struct RunSecretGrant {
+    run_token: String,
+}
+
+impl RunSecretGrant {
+    /// 为一次运行授权解封指定的 Secret(守卫存活期间有效)。
+    pub fn authorize(run_token: &str, secret_ids: &[&str]) -> RunSecretGrant {
+        authorize_run_secrets(run_token, secret_ids);
+        RunSecretGrant {
+            run_token: run_token.to_string(),
+        }
+    }
+}
+
+impl Drop for RunSecretGrant {
+    fn drop(&mut self) {
+        revoke_run_secrets(&self.run_token);
+    }
+}
+
 /// 解封前的授权校验:令牌非空且已为该 secret 授权。
 fn ensure_authorized(run_token: &str, secret_id: &str) -> Result<()> {
     anyhow::ensure!(

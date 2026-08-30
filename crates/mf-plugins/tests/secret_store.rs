@@ -8,6 +8,7 @@ use mf_agent::catalog_store::CatalogStore;
 use mf_agent::secrets::{Redacted, SecretLease, SecretStore};
 use mf_plugins::builtin_secret_store::{
     authorize_run_secrets, revoke_run_secrets, BuiltinSecretStore, InMemorySecretStore,
+    RunSecretGrant,
 };
 
 /// 测试内解封一律先为令牌授权(Runtime 编译 LaunchPlan 的等价动作)。
@@ -168,4 +169,57 @@ fn unseal_requires_token_authorization() {
     // 撤销后拒绝(spawn 完成)
     revoke_run_secrets("run-token-a");
     assert!(store.unseal_for_run("run-token-a", &id).is_err());
+}
+
+// ---------- RunSecretGrant RAII(I11) ----------
+
+#[test]
+fn run_secret_grant_authorizes_during_scope_and_revokes_on_drop() {
+    let store = InMemorySecretStore::new([7u8; 32]);
+    let id = store.seal("api-key", SECRET).unwrap();
+    {
+        let _grant = RunSecretGrant::authorize("raii-tok", &[&id]);
+        // 守卫存活期间:授权有效
+        assert!(store.unseal_for_run("raii-tok", &id).is_ok());
+    }
+    // Drop 后:授权撤销(无凭据解封拒绝)
+    assert!(
+        store.unseal_for_run("raii-tok", &id).is_err(),
+        "守卫 Drop 后授权必须撤销"
+    );
+}
+
+#[test]
+fn run_secret_grant_revokes_on_panic_unwind() {
+    let store = InMemorySecretStore::new([7u8; 32]);
+    let id = store.seal("api-key", SECRET).unwrap();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _grant = RunSecretGrant::authorize("panic-tok", &[&id]);
+        assert!(store.unseal_for_run("panic-tok", &id).is_ok());
+        panic!("模拟解封过程中的 panic");
+    }));
+    assert!(result.is_err(), "前置:闭包确实 panic");
+    // panic/unwind 后:授权仍被回收(不留长期有效凭据)
+    assert!(
+        store.unseal_for_run("panic-tok", &id).is_err(),
+        "panic unwind 后授权必须被 Drop 回收"
+    );
+}
+
+#[test]
+fn run_secret_grant_revokes_on_early_error_return() {
+    let store = InMemorySecretStore::new([7u8; 32]);
+    let id = store.seal("api-key", SECRET).unwrap();
+    fn work(store: &InMemorySecretStore, id: &str) -> Result<(), String> {
+        let _grant = RunSecretGrant::authorize("err-tok", &[id]);
+        store
+            .unseal_for_run("err-tok", id)
+            .map_err(|e| format!("{e:#}"))?;
+        Err("解封后的后续步骤失败".into()) // 错误提前返回
+    }
+    assert!(work(&store, &id).is_err());
+    assert!(
+        store.unseal_for_run("err-tok", &id).is_err(),
+        "错误提前返回后授权必须撤销(不得依赖手工配对)"
+    );
 }

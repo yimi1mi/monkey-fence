@@ -534,3 +534,55 @@ fn dangerous_actions_require_explicit_confirmation() {
     assert!(confirmation_prompt(&RunAction::Skip).contains("跳过"));
     assert!(confirmation_prompt(&RunAction::Cancel).contains("终止"));
 }
+
+// ---------- 结构化 output 显示任意合法 JSON(I12) ----------
+
+#[test]
+fn handoff_output_renders_any_legal_json_except_null() {
+    // 除 null 外的任意合法 JSON(object/array/string/number/bool,
+    // 含空对象)都必须显示;只过滤 null。
+    let render = |output: serde_json::Value| -> Vec<String> {
+        let extras = crate::run_node_details::NodeExtras {
+            handoff_output: crate::run_monitor::handoff_output_text(&output),
+            ..Default::default()
+        };
+        let details = crate::run_node_details::RunNodeDetails {
+            extras,
+            ..crate::run_node_details::RunNodeDetails::from((
+                &run(mf_agent::model::RunStatus::Succeeded, None),
+                &step(mf_agent::model::StepStatus::Succeeded),
+            ))
+        };
+        details.extra_lines()
+    };
+    // 字符串
+    let lines = render(serde_json::json!("完成报告文本"));
+    assert!(
+        lines.iter().any(|l| l.contains("完成报告文本")),
+        "字符串 output 必须显示: {lines:?}"
+    );
+    // 数组
+    let lines = render(serde_json::json!([1, 2, 3]));
+    assert!(lines.iter().any(|l| l.contains("[1,2,3]")), "{lines:?}");
+    // 数字
+    let lines = render(serde_json::json!(3.14));
+    assert!(lines.iter().any(|l| l.contains("3.14")), "{lines:?}");
+    // 布尔
+    let lines = render(serde_json::json!(true));
+    assert!(lines.iter().any(|l| l.contains("true")), "{lines:?}");
+    // 空对象(合法 JSON,不再被 "{}" 过滤)
+    let lines = render(serde_json::json!({}));
+    assert!(
+        lines.iter().any(|l| l.contains("{}")),
+        "空对象是合法 JSON,必须显示: {lines:?}"
+    );
+    // 非空对象(原行为保持)
+    let lines = render(serde_json::json!({ "report_path": "out.md" }));
+    assert!(lines.iter().any(|l| l.contains("report_path")), "{lines:?}");
+    // null:唯一被过滤的值
+    let lines = render(serde_json::Value::Null);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("输出:")),
+        "null 不显示: {lines:?}"
+    );
+}

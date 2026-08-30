@@ -148,7 +148,9 @@ impl RunNodeDetails {
             ));
         }
         if let Some(output) = &self.extras.handoff_output {
-            if !output.trim().is_empty() && output != "{}" {
+            // null 在收集端已过滤;空串与字面 "null" 兜底不显示,
+            // 其余(含空对象 "{}")都是合法结构化输出,如实展示
+            if !output.trim().is_empty() && output != "null" {
                 lines.push(format!("输出: {output}"));
             }
         }

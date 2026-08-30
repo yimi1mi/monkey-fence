@@ -28,6 +28,15 @@ pub struct RunMonitorSnapshot {
     pub settle_input: String,
 }
 
+/// 结构化 output 的显示文本(I12):除 null 外的任意合法 JSON
+/// (object/array/string/number/bool,含空对象)都显示。
+pub fn handoff_output_text(output: &serde_json::Value) -> Option<String> {
+    if output.is_null() {
+        return None;
+    }
+    Some(serde_json::to_string(output).unwrap_or_default())
+}
+
 impl RunMonitorSnapshot {
     pub fn from_parts(steps: Vec<StepView>, runs: Vec<RunView>) -> RunMonitorSnapshot {
         RunMonitorSnapshot {
@@ -113,12 +122,7 @@ impl RunMonitorSnapshot {
                         extras.handoff_artifacts = row.handoff.artifacts.clone();
                         extras.handoff_blockers = row.handoff.blockers.clone();
                         extras.handoff_recommendations = row.handoff.recommendations.clone();
-                        extras.handoff_output = row
-                            .handoff
-                            .output
-                            .as_object()
-                            .filter(|map| !map.is_empty())
-                            .map(|map| serde_json::to_string(map).unwrap_or_default());
+                        extras.handoff_output = handoff_output_text(&row.handoff.output);
                         extras.log_ref = row.handoff.raw_log_ref.clone();
                     }
                     if let Some(lease) = self
