@@ -11,6 +11,38 @@ use crate::catalog_store::CatalogStore;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+/// 内容身份摘要(I12):规范化节点(按 key 排序,deps 排序,字段
+/// NUL 分隔)+ unsafe-parallel 开关的 SHA-256 十六进制。
+/// `task_workflows` 与 `pipeline_revisions` 都持久化此摘要;
+/// 「分配并确认」只按摘要等值复用 Revision —— 时间戳(时钟回拨/
+/// 同秒)不参与判定。
+pub fn workflow_content_digest(nodes: &[WorkflowNodeDraft], allow_unsafe_parallel: bool) -> String {
+    use sha2::{Digest, Sha256};
+    let mut norm: Vec<&WorkflowNodeDraft> = nodes.iter().collect();
+    norm.sort_by(|a, b| a.key.cmp(&b.key));
+    let mut hasher = Sha256::new();
+    for n in norm {
+        hasher.update(n.key.as_bytes());
+        hasher.update([0]);
+        hasher.update(n.title.as_bytes());
+        hasher.update([0]);
+        hasher.update(n.instructions.as_bytes());
+        hasher.update([0]);
+        hasher.update(n.agent_instance_id.as_bytes());
+        hasher.update([0]);
+        let mut deps = n.deps.clone();
+        deps.sort();
+        for d in deps {
+            hasher.update(d.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update([1]); // 节点边界
+    }
+    hasher.update([u8::from(allow_unsafe_parallel)]);
+    let out = hasher.finalize();
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// 工作流节点草案:稳定键 + 依赖 + Agent Instance 引用。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowNodeDraft {

@@ -818,8 +818,13 @@ impl Orchestrator {
                 )
             })?;
         // 预编译通过才写库(pin key 含 revision id,必须先建 Revision);
-        // pin 失败 → 精确回滚:释放本次 run_key 已 pin 引用 + 删除刚建的 draft Revision
-        let rev = self.store.create_workflow_revision(task_id, &snapshot)?;
+        // pin 失败 → 精确回滚:释放本次 run_key 已 pin 引用 + 删除刚建的 draft Revision。
+        // Revision 持久化内容身份摘要(I12:与草稿同公式,复用判定只认摘要)
+        let content_digest =
+            crate::workflow::workflow_content_digest(&version.nodes, allow_unsafe_shared_directory);
+        let rev = self
+            .store
+            .create_workflow_revision(task_id, &snapshot, Some(&content_digest))?;
         // 目录提供器 pin 同随 Revision 固定:pin 期间插件包不可清理/卸载。
         // I11:落库失败 = assign 整体失败 —— 绝不保留无 pin 保护的
         // Revision(插件包可能随后被 GC/卸载),回滚 draft Revision 后报错
@@ -954,20 +959,25 @@ impl Orchestrator {
     }
 
     /// 任务本地草稿是否已被冻结成 Revision(draft 待确认或 active 均算):
-    /// 以草稿最近保存时间与 Revision 冻结时间比较 —— 草稿在冻结后又
-    /// 保存过即视为已变化,需要重新冻结;未变化则复用既有 Revision。
+    /// I12 只按**内容身份摘要**等值判定(规范化节点 + unsafe 开关的
+    /// SHA-256,持久化于 task_workflows 与 pipeline_revisions)——
+    /// 时间戳不参与(时钟回拨/同秒不同内容都不可靠);旧库行摘要
+    /// NULL 视为未冻结,重新冻结一次后即有摘要。
     fn task_local_draft_is_frozen(&self, task_id: i64) -> bool {
-        let Ok(Some(saved_at)) = self.store.task_workflow_saved_at(&self.root_str, task_id) else {
+        let Ok(Some(draft_digest)) = self
+            .store
+            .task_workflow_content_digest(&self.root_str, task_id)
+        else {
             return false;
         };
-        if let Ok(Some((_, created))) = self.store.latest_draft_revision(task_id) {
-            if created >= saved_at {
-                return true; // 冻结于最近保存之后:draft 一致,待确认
+        if let Ok(Some((_, rev_digest))) = self.store.latest_draft_revision_digest(task_id) {
+            if rev_digest.as_deref() == Some(draft_digest.as_str()) {
+                return true; // 最新 draft Revision 即当前草稿内容
             }
         }
-        if let Ok(Some(rev)) = self.store.active_revision(task_id) {
-            if rev.created_at >= saved_at {
-                return true; // 当前活动 Revision 即最新草稿
+        if let Ok(Some((_, rev_digest))) = self.store.active_revision_digest(task_id) {
+            if rev_digest.as_deref() == Some(draft_digest.as_str()) {
+                return true; // 活动 Revision 即当前草稿内容
             }
         }
         false

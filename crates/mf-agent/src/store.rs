@@ -1617,6 +1617,7 @@ impl Store {
         &self,
         task_id: i64,
         snapshot: &crate::workflow::WorkflowSnapshot,
+        content_digest: Option<&str>,
     ) -> Result<RevisionView> {
         self.with_tx(|c| {
             let ts = now();
@@ -1626,9 +1627,16 @@ impl Store {
                 |r| r.get(0),
             )?;
             c.execute(
-                "INSERT INTO pipeline_revisions (task_id, revision, status, snapshot_json, created_at)
-                 VALUES (?1, ?2, 'draft', ?3, ?4)",
-                params![task_id, next, serde_json::to_string(snapshot)?, ts],
+                "INSERT INTO pipeline_revisions
+                     (task_id, revision, status, snapshot_json, created_at, content_digest)
+                 VALUES (?1, ?2, 'draft', ?3, ?4, ?5)",
+                params![
+                    task_id,
+                    next,
+                    serde_json::to_string(snapshot)?,
+                    ts,
+                    content_digest
+                ],
             )?;
             let rev_id = c.last_insert_rowid();
             Self::project_workflow_steps_tx(c, task_id, rev_id, snapshot)?;
@@ -1929,15 +1937,81 @@ impl Store {
                 return Ok(());
             }
             c.execute(
-                "INSERT INTO task_workflows (project_key, task_id, graph_json, allow_unsafe_parallel, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO task_workflows
+                     (project_key, task_id, graph_json, allow_unsafe_parallel, updated_at, content_digest)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(project_key, task_id) DO UPDATE SET
                     graph_json = excluded.graph_json,
                     allow_unsafe_parallel = excluded.allow_unsafe_parallel,
-                    updated_at = excluded.updated_at",
-                params![project_key, task_id, graph_json, allow_unsafe_parallel as i64, now()],
+                    updated_at = excluded.updated_at,
+                    content_digest = excluded.content_digest",
+                params![
+                    project_key,
+                    task_id,
+                    graph_json,
+                    allow_unsafe_parallel as i64,
+                    now(),
+                    crate::workflow::workflow_content_digest(&draft.nodes, allow_unsafe_parallel)
+                ],
             )?;
             Ok(())
+        })
+    }
+
+    /// 任务本地草稿的内容身份(I12):graph_json + 风险开关重算的摘要
+    ///(存储列为审计投影;判定以重算值为准,防行篡改/旧库 NULL)。
+    pub fn task_workflow_content_digest(
+        &self,
+        project_key: &str,
+        task_id: i64,
+    ) -> Result<Option<String>> {
+        self.with_conn(|c| {
+            let row: Option<(String, i64)> = c
+                .query_row(
+                    "SELECT graph_json, allow_unsafe_parallel FROM task_workflows
+                     WHERE project_key = ?1 AND task_id = ?2",
+                    params![project_key, task_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            Ok(row.map(|(json, flag)| {
+                let nodes: Vec<crate::workflow::WorkflowNodeDraft> =
+                    serde_json::from_str(&json).unwrap_or_default();
+                crate::workflow::workflow_content_digest(&nodes, flag != 0)
+            }))
+        })
+    }
+
+    /// 最新 draft Revision 的 (id, 内容摘要;NULL = 旧库未回填)。
+    pub fn latest_draft_revision_digest(
+        &self,
+        task_id: i64,
+    ) -> Result<Option<(i64, Option<String>)>> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT id, content_digest FROM pipeline_revisions
+                 WHERE task_id = ?1 AND status = 'draft'
+                 ORDER BY revision DESC LIMIT 1",
+                params![task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    /// 活动 Revision 的 (id, 内容摘要;NULL = 旧库未回填)。
+    pub fn active_revision_digest(&self, task_id: i64) -> Result<Option<(i64, Option<String>)>> {
+        self.with_conn(|c| {
+            c.query_row(
+                "SELECT r.id, r.content_digest FROM pipeline_revisions r
+                 JOIN agent_tasks t ON t.active_revision = r.id
+                 WHERE t.id = ?1",
+                params![task_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
         })
     }
 

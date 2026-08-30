@@ -233,7 +233,9 @@ fn revision_stores_serialized_snapshot() {
     let snapshot = fixture.compile(version.version_id);
 
     let task = store.create_task("标题", "目标").unwrap();
-    let revision = store.create_workflow_revision(task.id, &snapshot).unwrap();
+    let revision = store
+        .create_workflow_revision(task.id, &snapshot, None)
+        .unwrap();
     let loaded = store.revision_snapshot(revision.id).unwrap().unwrap();
     assert_eq!(loaded, snapshot);
     // 快照不可变:再次读取一致

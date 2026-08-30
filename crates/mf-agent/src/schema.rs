@@ -9,7 +9,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-pub const PROJECT_SCHEMA_VERSION: i64 = 2;
+pub const PROJECT_SCHEMA_VERSION: i64 = 3;
 pub const CATALOG_SCHEMA_VERSION: i64 = 1;
 
 /// 项目库路径:`<project>/.mf-agent/workflow-v1.db`。
@@ -55,6 +55,9 @@ pub fn upgrade_project(conn: &mut Connection, target: i64) -> Result<()> {
     if current < 2 {
         tx.execute_batch(PROJECT_SCHEMA_V2_DELTA)?;
         backfill_early_dev_columns(&tx)?;
+    }
+    if current < 3 {
+        backfill_digest_columns(&tx)?;
     }
     tx.pragma_update(None, "user_version", target)?;
     tx.commit()?;
@@ -326,6 +329,41 @@ CREATE TABLE IF NOT EXISTS merge_batches (
 );
 CREATE INDEX IF NOT EXISTS idx_merge_batches_task ON merge_batches(task_id);
 ";
+
+/// v3 增量(I12):内容身份摘要列(规范化节点 + unsafe 开关的
+/// SHA-256)。`assign/confirm` 只按 digest 等值复用 Revision,
+/// 禁止 saved_at/created_at 时间戳比较(时钟回拨/同秒不同内容)。
+fn backfill_digest_columns(conn: &Connection) -> Result<()> {
+    let has_column = |table: &str, column: &str| -> Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut has = false;
+        let mut table_exists = false;
+        for c in stmt.query_map([], |r| r.get::<_, String>(1))? {
+            table_exists = true;
+            if c.map(|c| c == column).unwrap_or(false) {
+                has = true;
+            }
+        }
+        drop(stmt);
+        if !table_exists {
+            return Ok(true); // 残缺库无此表:跳过(无从补列)
+        }
+        Ok(has)
+    };
+    if !has_column("task_workflows", "content_digest")? {
+        conn.execute(
+            "ALTER TABLE task_workflows ADD COLUMN content_digest TEXT",
+            [],
+        )?;
+    }
+    if !has_column("pipeline_revisions", "content_digest")? {
+        conn.execute(
+            "ALTER TABLE pipeline_revisions ADD COLUMN content_digest TEXT",
+            [],
+        )?;
+    }
+    Ok(())
+}
 
 /// 目录库 v1 DDL:仅空表地基(字段随后续里程碑补全);
 /// Secret 密文与普通配置分表存放。

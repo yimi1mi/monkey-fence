@@ -18,6 +18,7 @@ parking_lot.workspace = true
 dirs.workspace = true
 thiserror = "2"
 zeroize.workspace = true
+sha2.workspace = true
 mf-skills = { path = "../mf-skills" }
 
 [dev-dependencies]

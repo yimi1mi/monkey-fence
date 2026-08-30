@@ -388,7 +388,7 @@ fn workflow_revision_projects_steps_with_deps() {
     let rev = fx
         .orch
         .store
-        .create_workflow_revision(task.id, &snapshot)
+        .create_workflow_revision(task.id, &snapshot, None)
         .unwrap();
 
     // 投影的 Step 与快照节点一致(键/标题/说明/依赖),

@@ -106,3 +106,111 @@ fn confirm_after_noop_save_reuses_frozen_revision() {
     );
     fx.orch.stop();
 }
+
+/// I12:内容身份判定不得依赖时间戳 —— 系统时钟回拨(saved_at 落在
+/// 冻结之后/未来)时,同内容仍必须复用已冻结 Revision。
+#[test]
+fn clock_rollback_same_content_still_reuses_frozen_revision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture(tmp.path());
+    fx.pins.resolve_ok(true);
+    let task = fx.orch.create_task("时钟回拨", "g").unwrap();
+    let root = tmp.path().to_string_lossy().to_string();
+    let saved = WorkflowTemplateDraft {
+        key: format!("task-{}", task.id),
+        name: "本地".into(),
+        task_local: true,
+        nodes: vec![node("a", &[], "做 A", &fx.instance_id)],
+    };
+    fx.orch
+        .store
+        .save_task_workflow(&root, task.id, &saved, false)
+        .unwrap();
+    fx.orch
+        .assign_and_confirm_task_local(task.id, &plugin_index())
+        .unwrap();
+    assert_eq!(fx.orch.store.list_revision_ids(task.id).unwrap().len(), 1);
+
+    // 模拟时钟回拨:草稿 updated_at 被写到未来(比 Revision created_at 晚)
+    fx.orch
+        .store
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE task_workflows SET updated_at = '2999-01-01T00:00:00+00:00'
+                 WHERE project_key = ?1 AND task_id = ?2",
+                rusqlite::params![root, task.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    fx.orch
+        .assign_and_confirm_task_local(task.id, &plugin_index())
+        .unwrap();
+    let revisions = fx.orch.store.list_revision_ids(task.id).unwrap();
+    assert_eq!(
+        revisions.len(),
+        1,
+        "同内容 + 时钟回拨必须按内容身份复用 Revision(实际 {revisions:?})"
+    );
+    fx.orch.stop();
+}
+
+/// I12:时间戳相同(甚至草稿 updated_at 早于冻结)但内容不同 →
+/// 必须重新冻结,不得误复用旧 Revision。
+#[test]
+fn earlier_timestamp_different_content_must_refreeze() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fx = fixture(tmp.path());
+    fx.pins.resolve_ok(true);
+    let task = fx.orch.create_task("同时间不同内容", "g").unwrap();
+    let root = tmp.path().to_string_lossy().to_string();
+    let v1 = WorkflowTemplateDraft {
+        key: format!("task-{}", task.id),
+        name: "本地".into(),
+        task_local: true,
+        nodes: vec![node("a", &[], "做 A", &fx.instance_id)],
+    };
+    fx.orch
+        .store
+        .save_task_workflow(&root, task.id, &v1, false)
+        .unwrap();
+    fx.orch
+        .assign_and_confirm_task_local(task.id, &plugin_index())
+        .unwrap();
+    assert_eq!(fx.orch.store.list_revision_ids(task.id).unwrap().len(), 1);
+
+    // 内容改为双节点;updated_at 被压回冻结之前(时间戳会误判"未变化")
+    let v2 = WorkflowTemplateDraft {
+        nodes: vec![
+            node("a", &[], "做 A", &fx.instance_id),
+            node("b", &[], "做 B", &fx.instance_id),
+        ],
+        ..v1
+    };
+    fx.orch
+        .store
+        .save_task_workflow(&root, task.id, &v2, false)
+        .unwrap();
+    fx.orch
+        .store
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE task_workflows SET updated_at = '2000-01-01T00:00:00+00:00'
+                 WHERE project_key = ?1 AND task_id = ?2",
+                rusqlite::params![root, task.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    fx.orch.store.set_task_paused(task.id, true).unwrap(); // 运行中需先暂停
+    fx.orch
+        .assign_and_confirm_task_local(task.id, &plugin_index())
+        .unwrap();
+    let revisions = fx.orch.store.list_revision_ids(task.id).unwrap();
+    assert_eq!(
+        revisions.len(),
+        2,
+        "不同内容必须重新冻结 Revision(时间戳不得参与判定;实际 {revisions:?})"
+    );
+    fx.orch.stop();
+}
