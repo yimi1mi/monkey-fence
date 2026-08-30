@@ -329,7 +329,12 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
             changes: self.snapshot_originals(&changes)?,
         };
         let journal_path = journal_file_for(&repo, &refname, &transaction_id);
-        write_journal_atomic(&journal_path, &journal)?;
+        let journal_file_name = journal_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("journal.json")
+            .to_string();
+        write_journal_atomic(&repo, &journal, &journal_file_name)?;
         if self.current_fault() == Some(MergeFault::CrashAfterJournal) {
             return Err(anyhow::anyhow!("(测试注入)事务日志写入后进程死亡"));
         }
@@ -583,6 +588,20 @@ fn hex_decode(hex: &str) -> Result<Vec<u8>> {
         .collect()
 }
 
+/// 错误链里是否含「路径不存在」类失败(文件必然不在):
+/// Windows STATUS_OBJECT_NAME_NOT_FOUND/PATH_NOT_FOUND、ERROR_FILE_NOT_FOUND/
+/// ERROR_PATH_NOT_FOUND;Unix ENOENT。CAS 读取据此归一为 None。
+fn error_is_path_absent(e: &anyhow::Error) -> bool {
+    let text = format!("{e:#}");
+    text.contains("0xc0000034")
+        || text.contains("0xc000003a")
+        || text.contains("0xc0000103") // 父路径是普通文件:目标必然不存在
+        || text.contains("os error 2")
+        || text.contains("os error 3")
+        || text.contains("os error 267")
+        || text.contains("No such file or directory")
+}
+
 fn journal_dir_of(repo: &git2::Repository) -> PathBuf {
     repo.path().join(JOURNAL_DIR)
 }
@@ -597,40 +616,22 @@ fn journal_file_for(repo: &git2::Repository, refname: &str, transaction_id: &str
     ))
 }
 
-/// 事务日志原子写入(F5/F12):目录就绪并 fsync(错误传播)→
-/// 同目录 `create_new` 唯一临时文件(transaction-id 命名,存在即失败,
-/// 绝不截断他人文件)→ write + flush + fsync → 显式原子替换
-/// (Windows `MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH)` /
-/// Unix rename;目标文件名含随机事务 id,不会覆盖既有日志)→
-/// 父目录 fsync(错误传播)。
-fn write_journal_atomic(path: &std::path::Path, journal: &MergeJournal) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("创建事务日志目录失败: {}", parent.display()))?;
-        crate::fs_atomic::sync_dir(parent)?;
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("journal.json");
-    let tmp = path.with_file_name(format!("{file_name}.tmp"));
-    {
-        use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .with_context(|| format!("创建事务日志临时文件失败: {}", tmp.display()))?;
-        f.write_all(serde_json::to_string(journal)?.as_bytes())?;
-        f.flush()?;
-        f.sync_all()?;
-    }
-    crate::fs_atomic::replace_file(&tmp, path)
-        .with_context(|| format!("事务日志原子替换失败: {} → {}", tmp.display(), path.display()))?;
-    if let Some(parent) = path.parent() {
-        crate::fs_atomic::sync_dir(parent)?;
-    }
-    Ok(())
+/// 事务日志原子写入(F5/F12/F6):`.git` 打开为受信根 →
+/// `mf-merge-journals` 子目录逐级句柄相对打开(reparse 拒绝)→
+/// **唯一随机文件名**(每事务独占,绝不覆盖他人日志)+ 内容序列化后
+/// 单次原子写入(create_new 语义临时名 + 句柄相对替换 + 双重落盘)。
+fn write_journal_atomic(
+    repo: &git2::Repository,
+    journal: &MergeJournal,
+    file_name: &str,
+) -> Result<()> {
+    let git_root = repo.path().to_path_buf();
+    let dir = crate::fs_safe::SafeDir::open_root(&git_root)
+        .with_context(|| format!("打开 .git 失败: {}", git_root.display()))?
+        .child(JOURNAL_DIR, true)?;
+    let payload = serde_json::to_string(journal)?;
+    dir.write_file(file_name, payload.as_bytes())
+        .with_context(|| format!("写入事务日志失败: {file_name}"))
 }
 
 /// 目录 fsync(让其中刚创建/改名/删除的目录项掉电后可见)。
@@ -703,46 +704,33 @@ fn validate_refname(refname: &str) -> Result<()> {
     Ok(())
 }
 
-/// 唯一临时文件后缀(随机 128-bit hex;并发/残留互不覆盖,F6)。
-fn tmp_suffix() -> String {
-    crate::fs_atomic::random_txn_id()
-}
-
-/// C5/F5:目标文件的原子替换 —— 同目录唯一隐藏临时文件
-/// (`create_new`,存在即失败,绝不截断他人文件)→ write + flush +
-/// fsync → **显式原子替换**(Windows `MoveFileExW(REPLACE_EXISTING |
-/// WRITE_THROUGH)` / Unix rename)→ 父目录 fsync(错误传播)。
-/// 失败时清理临时文件,目标保持原状。
-fn atomic_write_file(dst: &std::path::Path, content: &[u8]) -> Result<()> {
-    use std::io::Write as _;
-    if let Some(parent) = dst.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("合并建目录失败: {}", parent.display()))?;
+impl GitWorktreeProvider {
+    /// F6:变更路径的句柄相对读取(词法校验 + 逐级 reparse 拒绝)。
+    /// 「父目录不存在/父路径不是目录」归一为文件不存在(None)——
+    /// CAS 读取语义:文件必然不在;其余 IO 错误如实上抛。
+    fn read_change_current(&self, rel: &str) -> Result<Option<Vec<u8>>> {
+        validate_change_path(&self.repo_root, rel)?;
+        match crate::fs_safe::open_parent_for(&self.repo_root, rel, false) {
+            Ok((dir, name)) => dir.read_file(&name),
+            Err(e) if error_is_path_absent(&e) => Ok(None),
+            Err(e) => Err(e),
         }
     }
-    let file_name = dst.file_name().and_then(|n| n.to_str()).unwrap_or("target");
-    let tmp = dst.with_file_name(format!(".{file_name}.mftmp-{}", tmp_suffix()));
-    let write_result = (|| -> Result<()> {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-            .with_context(|| format!("创建合并临时文件失败: {}", tmp.display()))?;
-        f.write_all(content)?;
-        f.flush()?;
-        f.sync_all()?;
-        drop(f);
-        crate::fs_atomic::replace_file(&tmp, dst)
-            .with_context(|| format!("原子替换失败: {} → {}", tmp.display(), dst.display()))?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(&tmp); // 失败清理:目标文件保持原状
-    } else if let Some(parent) = dst.parent() {
-        crate::fs_atomic::sync_dir(parent)?;
+
+    /// F6:变更路径的句柄相对原子写入(必要时建立缺失父目录;
+    /// 唯一随机临时名 + 句柄相对替换 + 文件/目录双重落盘)。
+    fn write_change_atomic(&self, rel: &str, content: &[u8]) -> Result<()> {
+        validate_change_path(&self.repo_root, rel)?;
+        let (dir, name) = crate::fs_safe::open_parent_for(&self.repo_root, rel, true)?;
+        dir.write_file(&name, content)
     }
-    write_result
+
+    /// F6:变更路径的句柄相对删除(终句柄 reparse 验证)。
+    fn remove_change_file(&self, rel: &str) -> Result<()> {
+        validate_change_path(&self.repo_root, rel)?;
+        let (dir, name) = crate::fs_safe::open_parent_for(&self.repo_root, rel, false)?;
+        dir.remove_file(&name)
+    }
 }
 
 /// apply 单条变更的失败分类:用户冲突(NeedsUser)vs 系统错误(回滚+Err)。
@@ -760,27 +748,27 @@ impl From<anyhow::Error> for ApplyOneError {
 
 impl GitWorktreeProvider {
     /// 采集应用前项目目录原状态(事务日志的回滚/重放依据)。
+    /// F6:读取经句柄相对路径(逐级 reparse 拒绝),不按完整路径解析。
     fn snapshot_originals(&self, changes: &[MergeChange]) -> Result<Vec<JournaledChange>> {
         changes
             .iter()
             .map(|c| {
-                let dst = self.repo_root.join(&c.path);
-                let original = if dst.is_file() {
-                    std::fs::read(&dst)
-                        .with_context(|| format!("读取应用前文件失败: {}", dst.display()))?
-                } else {
-                    Vec::new()
+                validate_change_path(&self.repo_root, &c.path)?;
+                // 父路径存在但不是目录(应用阶段的障碍)视同"文件不存在":
+                // 快照只记录现状,失败留给 apply 原地暴露
+                let original = match self.read_change_current(&c.path) {
+                    Ok(bytes) => bytes,
+                    Err(e) if error_is_path_absent(&e) => None,
+                    Err(e) => {
+                        return Err(e.context(format!("读取应用前文件失败: {}", c.path)))
+                    }
                 };
                 Ok(JournaledChange {
                     path: c.path.clone(),
                     deleted: c.deleted,
                     content_hex: c.content.as_deref().map(hex_encode),
-                    original_present: dst.is_file(),
-                    original_hex: if dst.is_file() {
-                        Some(hex_encode(&original))
-                    } else {
-                        None
-                    },
+                    original_present: original.is_some(),
+                    original_hex: original.as_deref().map(hex_encode),
                 })
             })
             .collect()
@@ -872,7 +860,6 @@ impl GitWorktreeProvider {
     ///   失败时目标保持原状(无部分写);
     /// - 删除只在现状等于原状态时执行(已被用户改动 → Conflict)。
     fn apply_one(&self, change: &JournaledChange) -> std::result::Result<(), ApplyOneError> {
-        let dst = validate_change_path(&self.repo_root, &change.path)?;
         let original: Option<Vec<u8>> = change
             .original_hex
             .as_deref()
@@ -880,11 +867,11 @@ impl GitWorktreeProvider {
             .transpose()
             .map_err(ApplyOneError::Error)?;
         if change.deleted {
-            match std::fs::read(&dst) {
-                Ok(bytes) => {
+            match self.read_change_current(&change.path).map_err(ApplyOneError::Error)? {
+                Some(bytes) => {
                     if change.original_present && Some(bytes) == original {
-                        std::fs::remove_file(&dst)
-                            .with_context(|| format!("合并删除失败: {}", dst.display()))
+                        self.remove_change_file(&change.path)
+                            .with_context(|| format!("合并删除失败: {}", change.path))
                             .map_err(ApplyOneError::Error)?;
                     } else if !change.original_present {
                         return Err(ApplyOneError::Conflict(format!(
@@ -898,8 +885,8 @@ impl GitWorktreeProvider {
                         )));
                     }
                 }
-                Err(_) if !change.original_present => {} // 本就不存在,删除 no-op
-                Err(_) => {
+                None if !change.original_present => {} // 本就不存在,删除 no-op
+                None => {
                     return Err(ApplyOneError::Conflict(format!(
                         "{}(应用前存在、现已被删除,拒绝盲目处理)",
                         change.path
@@ -915,27 +902,28 @@ impl GitWorktreeProvider {
             .transpose()
             .map_err(ApplyOneError::Error)?
             .expect("非删除变更的内容已在收集阶段读出");
-        match std::fs::read(&dst) {
+        match self.read_change_current(&change.path).map_err(ApplyOneError::Error)? {
             // 已是目标内容:幂等重试,跳过
-            Ok(bytes) if bytes == *content => return Ok(()),
+            Some(bytes) if bytes == *content => return Ok(()),
             // 现状 == 快照原状态:CAS 通过,执行原子替换
-            Ok(bytes) if change.original_present && Some(&bytes) == original.as_ref() => {}
-            Ok(_) => {
+            Some(bytes) if change.original_present && Some(&bytes) == original.as_ref() => {}
+            Some(_) => {
                 return Err(ApplyOneError::Conflict(format!(
                     "{}(项目目录现状与合并快照不符,疑似窗口内被用户修改,拒绝覆盖)",
                     change.path
                 )))
             }
             // 应用前不存在:新建
-            Err(_) if !change.original_present => {}
-            Err(_) => {
+            None if !change.original_present => {}
+            None => {
                 return Err(ApplyOneError::Conflict(format!(
                     "{}(应用前存在、现已被删除,拒绝盲目重建)",
                     change.path
                 )))
             }
         }
-        atomic_write_file(&dst, &content).map_err(ApplyOneError::Error)
+        self.write_change_atomic(&change.path, &content)
+            .map_err(ApplyOneError::Error)
     }
 
     /// 回滚单条已应用变更(F9:target→original CAS)—— 只有当前内容
@@ -946,7 +934,6 @@ impl GitWorktreeProvider {
         if self.current_fault() == Some(MergeFault::FailUndo) {
             anyhow::bail!("(测试注入)回滚动作失败: {}", change.path);
         }
-        let dst = validate_change_path(&self.repo_root, &change.path)?;
         if change.deleted {
             if !change.original_present {
                 return Ok(()); // 应用前本就不存在(删除为 no-op)
@@ -957,23 +944,22 @@ impl GitWorktreeProvider {
                     .as_deref()
                     .expect("original_present 时必有原字节"),
             )?;
-            match std::fs::read(&dst) {
-                Err(_) => {
-                    // 当前 == target(已删除)→ 恢复 original
-                    atomic_write_file(&dst, &original)
-                        .with_context(|| format!("恢复被删文件失败: {}", dst.display()))
-                }
-                Ok(bytes) if bytes == original => Ok(()), // 已回滚:幂等
-                Ok(_) => anyhow::bail!(
+            match self.read_change_current(&change.path)? {
+                // 当前 == target(已删除)→ 恢复 original
+                None => self
+                    .write_change_atomic(&change.path, &original)
+                    .with_context(|| format!("恢复被删文件失败: {}", change.path)),
+                Some(bytes) if bytes == original => Ok(()), // 已回滚:幂等
+                Some(_) => anyhow::bail!(
                     "{} 回滚拒绝:本事务删除后用户重建了不同内容(不得覆盖用户字节)",
                     change.path
                 ),
             }
         } else if !change.original_present {
             // 应用前不存在:本次新建的文件(target = 存在该内容)
-            match std::fs::read(&dst) {
-                Err(_) => return Ok(()), // 已不在:幂等
-                Ok(bytes) => {
+            match self.read_change_current(&change.path)? {
+                None => return Ok(()), // 已不在:幂等
+                Some(bytes) => {
                     let target = hex_decode(
                         change
                             .content_hex
@@ -986,8 +972,8 @@ impl GitWorktreeProvider {
                             change.path
                         );
                     }
-                    std::fs::remove_file(&dst)
-                        .with_context(|| format!("回滚删除新建文件失败: {}", dst.display()))
+                    self.remove_change_file(&change.path)
+                        .with_context(|| format!("回滚删除新建文件失败: {}", change.path))
                 }
             }
         } else {
@@ -997,9 +983,9 @@ impl GitWorktreeProvider {
                     .as_deref()
                     .expect("original_present 时必有原字节"),
             )?;
-            match std::fs::read(&dst) {
-                Ok(bytes) if bytes == original => Ok(()), // 已回滚:幂等
-                Ok(bytes) => {
+            match self.read_change_current(&change.path)? {
+                Some(bytes) if bytes == original => Ok(()), // 已回滚:幂等
+                Some(bytes) => {
                     let target = hex_decode(
                         change
                             .content_hex
@@ -1011,10 +997,10 @@ impl GitWorktreeProvider {
                         "{} 回滚拒绝:应用结果已被用户修改(当前既非本事务 target 也非 original,不得覆盖用户字节)",
                         change.path
                     );
-                    atomic_write_file(&dst, &original)
-                        .with_context(|| format!("恢复被覆盖文件失败: {}", dst.display()))
+                    self.write_change_atomic(&change.path, &original)
+                        .with_context(|| format!("恢复被覆盖文件失败: {}", change.path))
                 }
-                Err(_) => anyhow::bail!(
+                None => anyhow::bail!(
                     "{} 回滚拒绝:应用结果已被用户删除(不敢盲目重建,请人工处理)",
                     change.path
                 ),
@@ -1125,16 +1111,15 @@ impl GitWorktreeProvider {
     /// 路径在重放前再次校验(C6:应用前复验,消除检查后替换窗口)。
     fn replay_journal(&self, journal: &MergeJournal) -> Result<()> {
         for change in &journal.changes {
-            let dst = validate_change_path(&self.repo_root, &change.path)?;
             if change.deleted {
-                match std::fs::read(&dst) {
-                    Err(_) => continue, // 已删除
-                    Ok(bytes) => {
+                match self.read_change_current(&change.path)? {
+                    None => continue, // 已删除
+                    Some(bytes) => {
                         let original =
                             change.original_hex.as_deref().map(hex_decode).transpose()?;
                         if change.original_present && Some(bytes) == original {
-                            std::fs::remove_file(&dst)
-                                .with_context(|| format!("重放删除失败: {}", dst.display()))?;
+                            self.remove_change_file(&change.path)
+                                .with_context(|| format!("重放删除失败: {}", change.path))?;
                         } else if change.original_present {
                             anyhow::bail!(
                                 "{} 在崩溃后被外部修改,拒绝重放删除(请人工处理)",
@@ -1152,14 +1137,14 @@ impl GitWorktreeProvider {
                     .as_deref()
                     .expect("非删除变更必有目标内容"),
             )?;
-            match std::fs::read(&dst) {
-                Ok(bytes) if bytes == target => continue, // 已应用
-                Ok(bytes) => {
+            match self.read_change_current(&change.path)? {
+                Some(bytes) if bytes == target => continue, // 已应用
+                Some(bytes) => {
                     let original = change.original_hex.as_deref().map(hex_decode).transpose()?;
                     if change.original_present && Some(bytes) == original {
-                        // F9:重放同样走原子替换 + 目录同步(不留半写状态)
-                        atomic_write_file(&dst, &target)
-                            .with_context(|| format!("重放写入失败: {}", dst.display()))?;
+                        // F9:重放同样走原子替换(不留半写状态)
+                        self.write_change_atomic(&change.path, &target)
+                            .with_context(|| format!("重放写入失败: {}", change.path))?;
                     } else {
                         anyhow::bail!(
                             "{} 在崩溃后被外部修改(疑似用户编辑),拒绝覆盖(请人工处理)",
@@ -1167,11 +1152,11 @@ impl GitWorktreeProvider {
                         );
                     }
                 }
-                Err(_) if !change.original_present => {
-                    atomic_write_file(&dst, &target)
-                        .with_context(|| format!("重放新建失败: {}", dst.display()))?;
+                None if !change.original_present => {
+                    self.write_change_atomic(&change.path, &target)
+                        .with_context(|| format!("重放新建失败: {}", change.path))?;
                 }
-                Err(_) => anyhow::bail!(
+                None => anyhow::bail!(
                     "{} 应用前存在、崩溃后被删除,拒绝盲目重建(请人工处理)",
                     change.path
                 ),
