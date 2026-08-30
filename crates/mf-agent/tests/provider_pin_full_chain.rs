@@ -29,7 +29,11 @@ fn release_failure_keeps_lease_held_until_success() {
     );
     let task = fx.orch.create_task("释放失败", "g").unwrap();
     fx.assign_and_run(task.id, &version);
-    assert!(wait_until(Duration::from_secs(5), || !fx.host.workflow.lock().is_empty()));
+    assert!(wait_until(Duration::from_secs(5), || !fx
+        .host
+        .workflow
+        .lock()
+        .is_empty()));
     // 注入 release 失败:merge 会成功,但释放必须失败
     fx.directory.release_fails.store(true, Ordering::SeqCst);
     fx.orch
@@ -39,13 +43,17 @@ fn release_failure_keeps_lease_held_until_success() {
         )
         .unwrap();
     assert!(
-        wait_until(Duration::from_secs(3), || fx.directory.merges.load(Ordering::SeqCst) == 1),
+        wait_until(Duration::from_secs(3), || fx
+            .directory
+            .merges
+            .load(Ordering::SeqCst)
+            == 1),
         "前置:合并已执行"
     );
     let leases = fx.orch.store.list_execution_leases(task.id).unwrap();
     assert!(
         leases.iter().all(|r| r.status == "held"),
-            "释放失败时数据库租约必须保持 held(可重试),不得谎报 released:{leases:?}"
+        "释放失败时数据库租约必须保持 held(可重试),不得谎报 released:{leases:?}"
     );
     // 恢复 release 后:重启(或下次冲刷)应补释放
     fx.directory.release_fails.store(false, Ordering::SeqCst);
@@ -147,7 +155,11 @@ fn merge_batch_rejects_mixed_pins_anywhere_in_batch() {
     orch.assign_workflow(task.id, &version, &plugin_index(), false)
         .unwrap();
     orch.confirm_and_run(task.id).unwrap();
-    assert!(wait_until(Duration::from_secs(5), || host.workflow.lock().len() == 2));
+    assert!(wait_until(Duration::from_secs(5), || host
+        .workflow
+        .lock()
+        .len()
+        == 2));
     // 把 b 的租约 metadata 改成 v1 pin(模拟跨版本重启后派发的兄弟),
     // 批变为 [a(v2), b(v1)]:逐项比较必须拒绝
     {
@@ -307,7 +319,11 @@ fn absent_pin_lease_never_routes_to_isolating_provider() {
     orch.assign_workflow(task.id, &version, &plugin_index(), false)
         .unwrap();
     orch.confirm_and_run(task.id).unwrap();
-    assert!(wait_until(Duration::from_secs(5), || host.workflow.lock().len() == 2));
+    assert!(wait_until(Duration::from_secs(5), || host
+        .workflow
+        .lock()
+        .len()
+        == 2));
     orch.settle_by_token(
         &token_of_node(&orch, task.id, "a"),
         Settlement::complete("a"),

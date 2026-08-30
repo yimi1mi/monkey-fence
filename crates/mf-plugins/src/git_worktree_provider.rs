@@ -759,9 +759,7 @@ impl GitWorktreeProvider {
                 let original = match self.read_change_current(&c.path) {
                     Ok(bytes) => bytes,
                     Err(e) if error_is_path_absent(&e) => None,
-                    Err(e) => {
-                        return Err(e.context(format!("读取应用前文件失败: {}", c.path)))
-                    }
+                    Err(e) => return Err(e.context(format!("读取应用前文件失败: {}", c.path))),
                 };
                 Ok(JournaledChange {
                     path: c.path.clone(),
@@ -867,7 +865,10 @@ impl GitWorktreeProvider {
             .transpose()
             .map_err(ApplyOneError::Error)?;
         if change.deleted {
-            match self.read_change_current(&change.path).map_err(ApplyOneError::Error)? {
+            match self
+                .read_change_current(&change.path)
+                .map_err(ApplyOneError::Error)?
+            {
                 Some(bytes) => {
                     if change.original_present && Some(bytes) == original {
                         self.remove_change_file(&change.path)
@@ -902,7 +903,10 @@ impl GitWorktreeProvider {
             .transpose()
             .map_err(ApplyOneError::Error)?
             .expect("非删除变更的内容已在收集阶段读出");
-        match self.read_change_current(&change.path).map_err(ApplyOneError::Error)? {
+        match self
+            .read_change_current(&change.path)
+            .map_err(ApplyOneError::Error)?
+        {
             // 已是目标内容:幂等重试,跳过
             Some(bytes) if bytes == *content => return Ok(()),
             // 现状 == 快照原状态:CAS 通过,执行原子替换
@@ -1896,7 +1900,10 @@ mod merge_journal_tests {
         // 已应用(文件已删)→ 恢复 original
         std::fs::remove_file(root.join("b.txt")).unwrap();
         provider.rollback_one(&change).unwrap();
-        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "bbb\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "bbb\n"
+        );
         // 用户重建为不同内容 → 拒绝恢复(会覆盖用户字节)
         std::fs::write(root.join("b.txt"), "user-recreated\n").unwrap();
         let err = provider.rollback_one(&change).unwrap_err();

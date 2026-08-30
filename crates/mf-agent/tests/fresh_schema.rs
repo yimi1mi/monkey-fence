@@ -146,7 +146,9 @@ fn full_v1_ddl_fixture_migrates_all_tables_with_data() {
     // steps:状态与依赖投影完整
     let steps = store.task_steps(1).unwrap();
     assert_eq!(steps.len(), 2, "steps 迁移不丢行");
-    assert!(steps.iter().any(|s| s.step_key == "a" && s.status.as_str() == "succeeded"));
+    assert!(steps
+        .iter()
+        .any(|s| s.step_key == "a" && s.status.as_str() == "succeeded"));
     let j = steps.iter().find(|s| s.step_key == "j").unwrap();
     assert_eq!(j.deps.len(), 1, "step_deps 迁移保留依赖");
     // runs:能力令牌与状态
@@ -178,7 +180,9 @@ fn full_v1_ddl_fixture_migrates_all_tables_with_data() {
     }
     let batches = store.list_merge_batches(1).unwrap();
     assert!(
-        batches.iter().any(|b| b.status == "merging" && b.lease_keys == vec!["lease-v1".to_string()]),
+        batches
+            .iter()
+            .any(|b| b.status == "merging" && b.lease_keys == vec!["lease-v1".to_string()]),
         "领取后批状态 merging 且租约集完整: {batches:?}"
     );
 }

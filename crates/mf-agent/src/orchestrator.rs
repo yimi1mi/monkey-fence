@@ -256,7 +256,8 @@ impl Orchestrator {
                     .as_deref()
                     .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
                     .and_then(|v| {
-                        serde_json::from_value::<PluginSourcePin>(v.get("provider_pin")?.clone()).ok()
+                        serde_json::from_value::<PluginSourcePin>(v.get("provider_pin")?.clone())
+                            .ok()
                     });
                 if !recovered_pins.contains(&pin) {
                     recovered_pins.push(pin);
@@ -2154,8 +2155,9 @@ impl Orchestrator {
                 // Store 权威视角组未完整(与调用方读到的步骤状态有竞态):
                 // 租约保持持有并记录暂缓,等待兄弟终态
                 for lease in &leases {
-                    if let Err(e) =
-                        self.store.insert_join_deferral(task_id, join_step_key, lease)
+                    if let Err(e) = self
+                        .store
+                        .insert_join_deferral(task_id, join_step_key, lease)
                     {
                         log::error!("持久化 join 暂缓失败: {e:#}");
                     }
@@ -2194,7 +2196,10 @@ impl Orchestrator {
             }
             return;
         }
-        if let Err(e) = self.store.complete_merge_batch(&transaction_id, true, &conflicts) {
+        if let Err(e) = self
+            .store
+            .complete_merge_batch(&transaction_id, true, &conflicts)
+        {
             log::error!("合并批结论回写失败(批状态可能停留 merging,启动恢复会重置): {e:#}");
         }
         // 冲突持久化(重启后仍可恢复:任务保持 needs-you,租约保持持有)

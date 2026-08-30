@@ -46,7 +46,11 @@ fn lease_set_digest(keys: &[String]) -> String {
         hasher.update((k.len() as u64).to_le_bytes());
         hasher.update(k.as_bytes());
     }
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// 修订内 join 步骤的全部父步骤 (step_key, status) 与「是否全部终态」。
@@ -89,7 +93,9 @@ fn join_parents_tx(
         "join 父步骤读取不完整(修订 {revision_id})"
     );
     const TERMINAL: [&str; 4] = ["succeeded", "failed", "skipped", "cancelled"];
-    let complete = parents.iter().all(|(_, st)| TERMINAL.contains(&st.as_str()));
+    let complete = parents
+        .iter()
+        .all(|(_, st)| TERMINAL.contains(&st.as_str()));
     Ok((parents, complete))
 }
 
@@ -149,7 +155,10 @@ fn held_leases_of_steps_tx(
                     .and_then(|s| s.as_str())
                     .map(str::to_string)
             });
-        if !step_key.as_ref().is_some_and(|k| succeeded_keys.contains(k)) {
+        if !step_key
+            .as_ref()
+            .is_some_and(|k| succeeded_keys.contains(k))
+        {
             continue;
         }
         match by_key.get(&row.lease_key) {

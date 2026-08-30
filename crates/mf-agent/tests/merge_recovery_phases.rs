@@ -76,12 +76,23 @@ fn startup_recovers_merged_but_unreleased_batch() {
     fx.pins.resolve_ok(true);
     let task = fx.orch.create_task("merged 未 release", "g").unwrap();
     fx.assign_and_run(task.id, &nodes(&fx));
-    assert!(wait_until(Duration::from_secs(5), || fx.host.workflow.lock().len() == 2));
+    assert!(wait_until(Duration::from_secs(5), || fx
+        .host
+        .workflow
+        .lock()
+        .len()
+        == 2));
     fx.orch
-        .settle_by_token(&token_of_node(&fx.orch, task.id, "a"), Settlement::complete("a"))
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "a"),
+            Settlement::complete("a"),
+        )
         .unwrap();
     fx.orch
-        .settle_by_token(&token_of_node(&fx.orch, task.id, "b"), Settlement::complete("b"))
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "b"),
+            Settlement::complete("b"),
+        )
         .unwrap();
     assert!(
         wait_until(Duration::from_secs(5), || fx
@@ -153,12 +164,23 @@ fn startup_projects_unprojected_needs_user_batch() {
     fx.directory.merge_ok.store(false, Ordering::SeqCst);
     let task = fx.orch.create_task("needs_user 未投影", "g").unwrap();
     fx.assign_and_run(task.id, &nodes(&fx));
-    assert!(wait_until(Duration::from_secs(5), || fx.host.workflow.lock().len() == 2));
+    assert!(wait_until(Duration::from_secs(5), || fx
+        .host
+        .workflow
+        .lock()
+        .len()
+        == 2));
     fx.orch
-        .settle_by_token(&token_of_node(&fx.orch, task.id, "a"), Settlement::complete("a"))
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "a"),
+            Settlement::complete("a"),
+        )
         .unwrap();
     fx.orch
-        .settle_by_token(&token_of_node(&fx.orch, task.id, "b"), Settlement::complete("b"))
+        .settle_by_token(
+            &token_of_node(&fx.orch, task.id, "b"),
+            Settlement::complete("b"),
+        )
         .unwrap();
     assert!(
         wait_until(Duration::from_secs(5), || !fx
@@ -176,7 +198,10 @@ fn startup_projects_unprojected_needs_user_batch() {
         let store = Store::open(&tmp.path().join("workflow-v1.db")).unwrap();
         store
             .with_conn(|c| {
-                c.execute("DELETE FROM pending_merges WHERE task_id = ?1", rusqlite::params![task.id])?;
+                c.execute(
+                    "DELETE FROM pending_merges WHERE task_id = ?1",
+                    rusqlite::params![task.id],
+                )?;
                 Ok(())
             })
             .unwrap();
@@ -194,7 +219,8 @@ fn startup_projects_unprojected_needs_user_batch() {
     );
     let rows = fx2.orch.store.list_pending_merges(Some(task.id)).unwrap();
     assert!(
-        rows.iter().any(|r| r.conflicts.iter().any(|c| c.contains("conflict.rs"))),
+        rows.iter()
+            .any(|r| r.conflicts.iter().any(|c| c.contains("conflict.rs"))),
         "投影的冲突列表必须来自批行持久化的 conflicts:{rows:?}"
     );
     let t = fx2.orch.store.task_view(task.id).unwrap().unwrap();
@@ -220,7 +246,11 @@ fn startup_flushes_settled_single_lease_without_join() {
     );
     let task = fx.orch.create_task("单租约未汇合", "g").unwrap();
     fx.assign_and_run(task.id, &version);
-    assert!(wait_until(Duration::from_secs(5), || !fx.host.workflow.lock().is_empty()));
+    assert!(wait_until(Duration::from_secs(5), || !fx
+        .host
+        .workflow
+        .lock()
+        .is_empty()));
     fx.orch
         .settle_by_token(
             &token_of_node(&fx.orch, task.id, "solo"),

@@ -160,7 +160,10 @@ impl WorkerClient {
 
         // ---- 写入(独立线程 + 总 deadline 看守;可取消:超时杀树) ----
         let (write_tx, write_rx) = std::sync::mpsc::channel::<
-            std::result::Result<std::process::ChildStdin, (std::process::ChildStdin, anyhow::Error)>,
+            std::result::Result<
+                std::process::ChildStdin,
+                (std::process::ChildStdin, anyhow::Error),
+            >,
         >();
         let stdin_taken = self.stdin.lock().take();
         let Some(stdin) = stdin_taken else {
@@ -267,7 +270,10 @@ impl WorkerClient {
     pub fn kill(&self) {
         let mut child = self.child.lock();
         if let Err(e) = kill_tree_bounded(&mut child, self.tree.as_ref(), TREE_KILL_TIMEOUT) {
-            log::warn!("终止 worker 进程树(pid {})未完全成功: {e:#}", self.child_pid);
+            log::warn!(
+                "终止 worker 进程树(pid {})未完全成功: {e:#}",
+                self.child_pid
+            );
         }
         // stdin 归还写入线程/丢弃:进程已死,写端关闭即 EOF
         *self.stdin.lock() = None;
@@ -429,7 +435,9 @@ while ($line = [Console]::In.ReadLine()) {
             WorkerClient::start(&std::path::PathBuf::from("powershell.exe"), &args, None)
                 .expect("powershell 可用"),
         ));
-        client.lock().set_request_timeout(Duration::from_millis(900));
+        client
+            .lock()
+            .set_request_timeout(Duration::from_millis(900));
         // 2MB 参数:远超匿名管道缓冲(64KB),write_all 必然阻塞
         let big = "x".repeat(2 * 1024 * 1024);
         let (tx, rx) = std::sync::mpsc::channel::<Result<Value>>();

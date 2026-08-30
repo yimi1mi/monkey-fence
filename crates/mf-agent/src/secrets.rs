@@ -421,7 +421,10 @@ mod carry_scrub_tests {
         let text = String::from_utf8_lossy(&[a, b, c].concat()).into_owned();
         assert!(!text.contains("tok-multi"), "{text}");
         assert_eq!(text.matches("***").count(), 2, "{text}");
-        assert!(text.contains('x') && text.contains(" y ") && text.contains(" z"), "{text}");
+        assert!(
+            text.contains('x') && text.contains(" y ") && text.contains(" z"),
+            "{text}"
+        );
     }
 }
 

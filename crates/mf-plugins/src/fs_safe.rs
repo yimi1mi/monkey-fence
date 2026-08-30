@@ -87,7 +87,10 @@ mod imp {
             let c = CString::new(root.as_os_str().as_bytes())
                 .with_context(|| format!("根路径含 NUL: {}", root.display()))?;
             let fd = unsafe {
-                libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                libc::open(
+                    c.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
             };
             anyhow::ensure!(
                 fd >= 0,
@@ -239,16 +242,16 @@ mod imp {
 mod imp {
     use super::*;
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::HANDLE;
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, FlushFileBuffers, GetFileInformationByHandle, ReadFile, WriteFile,
-        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-    };
-    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
     use windows_sys::Wdk::Storage::FileSystem::{NtCreateFile, NtSetInformationFile};
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Foundation::UNICODE_STRING;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FlushFileBuffers, GetFileInformationByHandle, ReadFile, WriteFile,
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
@@ -341,7 +344,10 @@ mod imp {
         _what: &str,
     ) -> (i32, HANDLE) {
         if validate_component(name).is_err() {
-            return (0xC000_000Du32 as i32 /* STATUS_INVALID_PARAMETER */, core::ptr::null_mut());
+            return (
+                0xC000_000Du32 as i32, /* STATUS_INVALID_PARAMETER */
+                core::ptr::null_mut(),
+            );
         }
         let mut name_u16: Vec<u16> = name.encode_utf16().collect();
         let byte_len = (name_u16.len() * 2) as u16;
@@ -399,12 +405,7 @@ mod imp {
 
     /// 句柄相对 rename(FileRenameInformationEx,POSIX 语义 + 已存在即替换;
     /// 旧系统不支持时回退 FileRenameInformation.ReplaceIfExists)。
-    fn nt_rename(
-        file: HANDLE,
-        dir: HANDLE,
-        name: &str,
-        replace_if_exists: bool,
-    ) -> Result<()> {
+    fn nt_rename(file: HANDLE, dir: HANDLE, name: &str, replace_if_exists: bool) -> Result<()> {
         let name_u16: Vec<u16> = name.encode_utf16().collect();
         // FILE_RENAME_INFORMATION(x64):union(4+4 填充)/RootDirectory(8)/
         // FileNameLength(4)/FileName(变长 UTF-16)
@@ -538,8 +539,14 @@ mod imp {
         }
 
         pub fn read_file(&self, name: &str) -> Result<Option<Vec<u8>>> {
-            let (status, handle) =
-                nt_open_relative_raw(self.handle, name, GENERIC_READ | SYNCHRONIZE, FILE_OPEN, false, "文件");
+            let (status, handle) = nt_open_relative_raw(
+                self.handle,
+                name,
+                GENERIC_READ | SYNCHRONIZE,
+                FILE_OPEN,
+                false,
+                "文件",
+            );
             if status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND {
                 return Ok(None); // 不存在(单分量名:路径不存在即名字不存在)
             }
@@ -563,7 +570,11 @@ mod imp {
                             core::ptr::null_mut(),
                         )
                     };
-                    anyhow::ensure!(ok != 0, "读取文件 {name:?} 失败: {}", last_os_error_string());
+                    anyhow::ensure!(
+                        ok != 0,
+                        "读取文件 {name:?} 失败: {}",
+                        last_os_error_string()
+                    );
                     if read == 0 {
                         break;
                     }
@@ -610,7 +621,11 @@ mod imp {
 
         pub fn sync(&self) -> Result<()> {
             let ok = unsafe { FlushFileBuffers(self.handle) };
-            anyhow::ensure!(ok != 0, "目录 FlushFileBuffers 失败: {}", last_os_error_string());
+            anyhow::ensure!(
+                ok != 0,
+                "目录 FlushFileBuffers 失败: {}",
+                last_os_error_string()
+            );
             Ok(())
         }
     }
@@ -658,7 +673,6 @@ pub fn open_parent_for(root: &Path, rel: &str, create_dirs: bool) -> Result<(Saf
     Ok((dir, file_name))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -675,7 +689,10 @@ mod tests {
                 .output()
                 .unwrap();
             if !out.status.success() {
-                eprintln!("跳过:当前环境无法创建 junction: {}", String::from_utf8_lossy(&out.stderr));
+                eprintln!(
+                    "跳过:当前环境无法创建 junction: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
                 return false;
             }
             true
@@ -709,7 +726,10 @@ mod tests {
         // 已打开的根不受影响:正常文件照常读写
         let (dir, name) = open_parent_for(root.path(), "normal.txt", false).unwrap();
         dir.write_file(&name, b"ok").unwrap();
-        assert_eq!(dir.read_file(&name).unwrap().as_deref(), Some(b"ok".as_slice()));
+        assert_eq!(
+            dir.read_file(&name).unwrap().as_deref(),
+            Some(b"ok".as_slice())
+        );
     }
 
     /// F6:句柄打开后的磁盘布局变化不影响后续写入的落点 ——
@@ -731,7 +751,11 @@ mod tests {
             "写入不得被重定向到仓库之外"
         );
         // 内容可从原路径或句柄读回(原目录仍存在时两者一致)
-        if sub.is_dir() && std::fs::symlink_metadata(&sub).map(|m| !m.file_type().is_symlink()).unwrap_or(false) {
+        if sub.is_dir()
+            && std::fs::symlink_metadata(&sub)
+                .map(|m| !m.file_type().is_symlink())
+                .unwrap_or(false)
+        {
             assert_eq!(std::fs::read(sub.join("inner.txt")).unwrap(), b"contained");
         }
     }
@@ -780,7 +804,10 @@ mod tests {
         assert_eq!(dir.read_file(&name).unwrap(), None);
         dir.write_file(&name, b"v1").unwrap();
         dir.write_file(&name, b"v2").unwrap(); // 替换已存在
-        assert_eq!(dir.read_file(&name).unwrap().as_deref(), Some(b"v2".as_slice()));
+        assert_eq!(
+            dir.read_file(&name).unwrap().as_deref(),
+            Some(b"v2".as_slice())
+        );
         assert!(root.path().join("a/b/c/file.txt").exists());
         // 无残留临时文件
         let leftovers: Vec<_> = std::fs::read_dir(root.path().join("a/b/c"))
@@ -798,8 +825,7 @@ mod tests {
     fn invalid_components_rejected() {
         let root = tempfile::tempdir().unwrap();
         let backslash_path = format!("a{}b", std::path::MAIN_SEPARATOR);
-        let mut bad_paths: Vec<&str> =
-            vec!["../evil.txt", "/abs", "a//b", ".", "..", "a/b/.."];
+        let mut bad_paths: Vec<&str> = vec!["../evil.txt", "/abs", "a//b", ".", "..", "a/b/.."];
         for bad in &bad_paths {
             assert!(
                 open_parent_for(root.path(), bad, true).is_err(),

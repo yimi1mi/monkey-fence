@@ -113,8 +113,8 @@ impl Fixture {
                 catalog: catalog.clone(),
                 pins: Some(pins.clone()),
             },
-        scripted_routing(),
-    )
+            scripted_routing(),
+        )
         .unwrap();
         Fixture {
             catalog,

@@ -18,7 +18,11 @@ use mf_agent::workflow::{WorkflowNodeDraft, WorkflowTemplateDraft, WorkflowTempl
 struct SharedHost(RecordingHost);
 
 impl RuntimeHost for SharedHost {
-    fn launch(&self, spec: mf_agent::LaunchSpec, events: crossbeam_channel::Sender<(i64, mf_agent::RuntimeEvent)>) {
+    fn launch(
+        &self,
+        spec: mf_agent::LaunchSpec,
+        events: crossbeam_channel::Sender<(i64, mf_agent::RuntimeEvent)>,
+    ) {
         self.0.launch(spec, events)
     }
     fn launch_workflow(
@@ -163,7 +167,8 @@ fn cross_instance_complete_merges_full_batch_exactly_once() {
         fx.assign_and_run(task.id, &version);
         // A 派发 a(并发槽内只有 a ready;先于 B 存在)
         assert!(
-            wait_until(Duration::from_secs(5), || fx.host.0.workflow.lock().len() == 1),
+            wait_until(Duration::from_secs(5), || fx.host.0.workflow.lock().len()
+                == 1),
             "实例 A 先派发 a(第 {round} 轮)"
         );
         // B 现在才启动:只会看到 b ready → 派发 b —— 两个实例的
@@ -192,14 +197,21 @@ fn cross_instance_complete_merges_full_batch_exactly_once() {
             )
             .unwrap()
         };
-        if !wait_until(Duration::from_secs(5), || fx.host.0.workflow.lock().len() == 2) {
+        if !wait_until(Duration::from_secs(5), || {
+            fx.host.0.workflow.lock().len() == 2
+        }) {
             let steps = fx.orch.store.task_steps(task.id).unwrap();
             for st in &steps {
                 eprintln!("[diag] step {} status={}", st.step_key, st.status.as_str());
             }
             let runs = fx.orch.store.list_runs_of_task(task.id).unwrap();
             for r in &runs {
-                eprintln!("[diag] run {} step_id={} status={}", r.id, r.step_id, r.status.as_str());
+                eprintln!(
+                    "[diag] run {} step_id={} status={}",
+                    r.id,
+                    r.step_id,
+                    r.status.as_str()
+                );
             }
             panic!("实例 B 派发 b 失败(第 {round} 轮)");
         }
@@ -235,7 +247,9 @@ fn cross_instance_complete_merges_full_batch_exactly_once() {
         // 断言收敛(等待后台 flush 完成)
         assert!(
             wait_until(Duration::from_secs(5), || {
-                fx.orch.store.list_execution_leases(task.id)
+                fx.orch
+                    .store
+                    .list_execution_leases(task.id)
                     .map(|rows| rows.iter().all(|r| r.status == "released"))
                     .unwrap_or(false)
             }),

@@ -234,9 +234,8 @@ impl WorkerDirectoryProvider {
             lease.id
         );
         if !self.granted_root.as_os_str().is_empty() {
-            ensure_lease_under_root(&self.granted_root, &lease.path).context(
-                "租约路径越出宿主授权的项目根(拒绝发给 worker)",
-            )?;
+            ensure_lease_under_root(&self.granted_root, &lease.path)
+                .context("租约路径越出宿主授权的项目根(拒绝发给 worker)")?;
         }
         if let Some(claimed) = lease.metadata.get("provider_pin") {
             let claimed: PluginSourcePin = serde_json::from_value(claimed.clone())

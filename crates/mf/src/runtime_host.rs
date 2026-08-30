@@ -2474,10 +2474,7 @@ mod tests {
             !registry.session_alive(&project, 55),
             "重试后会话必须真正收口"
         );
-        assert!(
-            session.job.lock().is_none(),
-            "确认停止后守卫才被消费"
-        );
+        assert!(session.job.lock().is_none(), "确认停止后守卫才被消费");
     }
 
     /// C2:普通 launch_pty 会话的短命 CLI 自然退出 —— 不调用 stop_run,

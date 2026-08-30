@@ -60,10 +60,28 @@ fn nul_inside_dep_list_cannot_shift_entries() {
 /// 草稿 digest 相等;任一字段不同则不同(基础回归)。
 #[test]
 fn digest_still_identifies_equal_content() {
-    let a = vec![node("k1", "t", "i", &["x", "y"]), node("k2", "t2", "i2", &[])];
-    let a_reordered = vec![node("k2", "t2", "i2", &[]), node("k1", "t", "i", &["y", "x"])];
-    assert_eq!(workflow_content_digest(&a, true), workflow_content_digest(&a_reordered, true));
-    let c = vec![node("k1", "t", "i-changed", &["x", "y"]), node("k2", "t2", "i2", &[])];
-    assert_ne!(workflow_content_digest(&a, true), workflow_content_digest(&c, true));
-    assert_ne!(workflow_content_digest(&a, true), workflow_content_digest(&a, false));
+    let a = vec![
+        node("k1", "t", "i", &["x", "y"]),
+        node("k2", "t2", "i2", &[]),
+    ];
+    let a_reordered = vec![
+        node("k2", "t2", "i2", &[]),
+        node("k1", "t", "i", &["y", "x"]),
+    ];
+    assert_eq!(
+        workflow_content_digest(&a, true),
+        workflow_content_digest(&a_reordered, true)
+    );
+    let c = vec![
+        node("k1", "t", "i-changed", &["x", "y"]),
+        node("k2", "t2", "i2", &[]),
+    ];
+    assert_ne!(
+        workflow_content_digest(&a, true),
+        workflow_content_digest(&c, true)
+    );
+    assert_ne!(
+        workflow_content_digest(&a, true),
+        workflow_content_digest(&a, false)
+    );
 }

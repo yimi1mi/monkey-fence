@@ -862,9 +862,15 @@ mod imp {
             /// 明文字节的 NulError/普通 Vec —— 拒绝构造时字节已随
             /// Zeroizing drop 清零。成功路径字节原样移交 CString
             /// (ZeroCString drop 时再清零一次),全程零明文裸缓冲。
-            fn kv_to_cstring(key: &str, key_bytes: &[u8], value: &[u8], what: &str) -> Result<ZeroCString> {
+            fn kv_to_cstring(
+                key: &str,
+                key_bytes: &[u8],
+                value: &[u8],
+                what: &str,
+            ) -> Result<ZeroCString> {
                 use zeroize::Zeroizing;
-                let mut bytes = Zeroizing::new(Vec::with_capacity(key_bytes.len() + value.len() + 2));
+                let mut bytes =
+                    Zeroizing::new(Vec::with_capacity(key_bytes.len() + value.len() + 2));
                 bytes.extend_from_slice(key_bytes);
                 bytes.push(b'=');
                 bytes.extend_from_slice(value);

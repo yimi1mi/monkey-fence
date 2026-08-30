@@ -92,7 +92,7 @@ impl ProcTreeGuard {
         #[cfg(windows)]
         {
             use windows_sys::Win32::System::JobObjects::{
-                QueryInformationJobObject, TerminateJobObject, JobObjectBasicProcessIdList,
+                JobObjectBasicProcessIdList, QueryInformationJobObject, TerminateJobObject,
                 JOBOBJECT_BASIC_PROCESS_ID_LIST,
             };
             if let Some(handle) = &self.job {

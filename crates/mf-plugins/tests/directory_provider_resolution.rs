@@ -679,18 +679,20 @@ fn merge_validates_every_lease_provider_pin_root_id() {
         version: "2.0.0".into(),
         content_hash: "hash-f10".into(),
     };
-    let make = |id: &str, provider: &str, path: std::path::PathBuf, with_pin: bool| ExecutionLease {
-        id: id.into(),
-        path,
-        isolated: true,
-        provider: provider.into(),
-        metadata: if with_pin {
-            serde_json::json!({ "step_key": "a", "provider_pin": {
-                "full_id": pin.full_id, "version": pin.version, "content_hash": pin.content_hash,
-            }})
-        } else {
-            serde_json::json!({ "step_key": "a" })
-        },
+    let make = |id: &str, provider: &str, path: std::path::PathBuf, with_pin: bool| {
+        ExecutionLease {
+            id: id.into(),
+            path,
+            isolated: true,
+            provider: provider.into(),
+            metadata: if with_pin {
+                serde_json::json!({ "step_key": "a", "provider_pin": {
+                    "full_id": pin.full_id, "version": pin.version, "content_hash": pin.content_hash,
+                }})
+            } else {
+                serde_json::json!({ "step_key": "a" })
+            },
+        }
     };
     let dir = tempfile::tempdir().unwrap();
     let transport = std::sync::Arc::new(CannedTransport2 {
@@ -714,9 +716,17 @@ fn merge_validates_every_lease_provider_pin_root_id() {
     let err = provider.merge(&[foreign]).unwrap_err();
     assert!(format!("{err:#}").contains("提供器"), "{err:#}");
     // 越出授权根 → 拒绝
-    let escaped = make("l3", "third.party.wt", std::env::temp_dir().join("outside"), true);
+    let escaped = make(
+        "l3",
+        "third.party.wt",
+        std::env::temp_dir().join("outside"),
+        true,
+    );
     let err = provider.merge(&[escaped]).unwrap_err();
-    assert!(format!("{err:#}").contains("根") || format!("{err:#}").contains("越"), "{err:#}");
+    assert!(
+        format!("{err:#}").contains("根") || format!("{err:#}").contains("越"),
+        "{err:#}"
+    );
     // 不同 pin → 拒绝
     let mut wrong_pin = make("l4", "third.party.wt", in_root.clone(), true);
     wrong_pin.metadata["provider_pin"]["content_hash"] = serde_json::json!("hash-OTHER");
@@ -763,7 +773,10 @@ fn release_validates_lease_identity() {
     provider.release(&lease).unwrap();
     let mut foreign = lease.clone();
     foreign.provider = "other.provider".into();
-    assert!(provider.release(&foreign).is_err(), "他人提供器租约必须拒绝");
+    assert!(
+        provider.release(&foreign).is_err(),
+        "他人提供器租约必须拒绝"
+    );
     let mut escaped = lease.clone();
     escaped.path = std::env::temp_dir().join("outside-wt");
     assert!(provider.release(&escaped).is_err(), "越出授权根必须拒绝");
