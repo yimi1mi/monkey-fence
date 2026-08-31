@@ -34,6 +34,20 @@ fn history_file_page_bounds(total: usize, page: usize) -> std::ops::Range<usize>
     start..end
 }
 
+fn project_is_in_p4_client(root: &std::path::Path, client_root: &str) -> bool {
+    fn components(path: &str) -> Vec<String> {
+        path.replace('/', "\\")
+            .split('\\')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .map(str::to_lowercase)
+            .collect()
+    }
+
+    let root = components(&root.to_string_lossy());
+    let client = components(client_root);
+    !client.is_empty() && root.starts_with(&client)
+}
+
 /// 异步刷新闸门。刷新进行中再次请求时，必须在当前请求结束后重放一次。
 #[derive(Debug, Default)]
 struct RefreshGate {
@@ -304,8 +318,11 @@ impl VcsPanel {
             this.update(cx, |p, cx| {
                 match result {
                     Ok(out) => {
-                        let brief = out.lines().take(3).collect::<Vec<_>>().join(" | ");
-                        p.notice = Some(format!("{} 完成: {}", label, brief));
+                        p.notice = Some(format!(
+                            "{}完成 · {}",
+                            label,
+                            summarize_operation_output(&out)
+                        ));
                     }
                     Err(e) => p.error = Some(format!("{} 失败: {}", label, e)),
                 }
@@ -914,11 +931,7 @@ fn load_vcs(
     if let Some(p4) = environment.p4(root) {
         match p4.info() {
             Ok(info) => {
-                let in_client = !info.client_root.is_empty()
-                    && root
-                        .to_string_lossy()
-                        .to_lowercase()
-                        .starts_with(&info.client_root.to_lowercase());
+                let in_client = project_is_in_p4_client(root, &info.client_root);
                 if in_client {
                     data.p4_info = Some(info.clone());
                     data.opened = p4.opened().unwrap_or_default();
@@ -1036,6 +1049,28 @@ fn history_detail_message(text: &str, error: bool) -> Div {
             crate::theme::Theme::fg_faint()
         }))
         .child(text.to_string())
+}
+
+fn summarize_operation_output(output: &str) -> String {
+    let lines: Vec<&str> = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return "无额外输出".into();
+    }
+    let first: String = lines[0].chars().take(96).collect();
+    let ellipsis = if lines[0].chars().count() > 96 {
+        "…"
+    } else {
+        ""
+    };
+    if lines.len() == 1 {
+        format!("{first}{ellipsis}")
+    } else {
+        format!("{} 条结果 · {first}{ellipsis}", lines.len())
+    }
 }
 
 fn action_color(action: &str) -> u32 {
@@ -1391,8 +1426,10 @@ fn section_header(text: String) -> impl IntoElement {
 
 fn banner(color: u32, text: String) -> impl IntoElement {
     div()
+        .max_h(px(34.))
         .px_2()
         .py_1()
+        .overflow_hidden()
         .text_size(px(11.))
         .text_color(rgb(color))
         .bg(rgb(crate::theme::Theme::bg_elevated()))
@@ -1437,8 +1474,9 @@ fn tool_btn_disabled(label: &str) -> impl IntoElement {
 #[cfg(test)]
 mod tests {
     use super::{
-        history_file_page_bounds, history_page_bounds, p4_history_action, take_history_page,
-        RefreshGate, HISTORY_FILES_PAGE_SIZE, HISTORY_PAGE_SIZE,
+        history_file_page_bounds, history_page_bounds, p4_history_action, project_is_in_p4_client,
+        summarize_operation_output, take_history_page, RefreshGate, HISTORY_FILES_PAGE_SIZE,
+        HISTORY_PAGE_SIZE,
     };
 
     #[test]
@@ -1471,5 +1509,29 @@ mod tests {
         assert_eq!(p4_history_action("edit"), "M");
         assert_eq!(p4_history_action("delete"), "D");
         assert_eq!(p4_history_action("move/add"), "R");
+    }
+
+    #[test]
+    fn p4_client_root_accepts_mixed_windows_separators() {
+        let project =
+            std::path::Path::new(r"E:\Beyond_v2d0\hongjinmin_DM42.Beyond_Beyond_v2d0_project");
+        assert!(project_is_in_p4_client(
+            project,
+            r"E:/Beyond_v2d0\hongjinmin_DM42.Beyond_Beyond_v2d0_project"
+        ));
+        assert!(!project_is_in_p4_client(
+            std::path::Path::new(r"E:\Beyond_v2d0\project-other"),
+            r"E:\Beyond_v2d0\project"
+        ));
+    }
+
+    #[test]
+    fn operation_notice_stays_single_line_and_bounded() {
+        let long_path = format!("//Depot/{}#2 - deleted", "nested/".repeat(40));
+        let summary =
+            summarize_operation_output(&format!("{long_path}\n{long_path}\n{long_path}\n"));
+        assert!(summary.starts_with("3 条结果 · "));
+        assert!(!summary.contains('\n'));
+        assert!(summary.chars().count() < 120);
     }
 }
