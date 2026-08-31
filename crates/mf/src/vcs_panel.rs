@@ -6,6 +6,54 @@ use mf_vcs::p4::{Change, OpenedFile, P4};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
+const HISTORY_PAGE_SIZE: usize = 20;
+
+#[derive(Clone, Copy, Debug)]
+enum HistoryLoad {
+    Hidden,
+    First,
+    Next { p4_skip: usize, git_skip: usize },
+}
+
+fn take_history_page<T>(mut rows: Vec<T>) -> (Vec<T>, bool) {
+    let has_more = rows.len() > HISTORY_PAGE_SIZE;
+    rows.truncate(HISTORY_PAGE_SIZE);
+    (rows, has_more)
+}
+
+fn history_page_bounds(total: usize, page: usize) -> std::ops::Range<usize> {
+    let start = page.saturating_mul(HISTORY_PAGE_SIZE).min(total);
+    let end = (start + HISTORY_PAGE_SIZE).min(total);
+    start..end
+}
+
+/// 异步刷新闸门。刷新进行中再次请求时，必须在当前请求结束后重放一次。
+#[derive(Debug, Default)]
+struct RefreshGate {
+    loading: bool,
+    pending: bool,
+}
+
+impl RefreshGate {
+    fn request(&mut self) -> bool {
+        if self.loading {
+            self.pending = true;
+            return false;
+        }
+        self.loading = true;
+        true
+    }
+
+    fn finish(&mut self) -> bool {
+        self.loading = false;
+        std::mem::take(&mut self.pending)
+    }
+
+    fn loading(&self) -> bool {
+        self.loading
+    }
+}
+
 /// 版本控制面板:SourceTree 风格(左侧变更列表 + 文件 + 提交/搁置/还原 + 历史)
 pub struct VcsPanel {
     kind: VcsKind,
@@ -15,13 +63,14 @@ pub struct VcsPanel {
     opened: Vec<OpenedFile>,
     pending: Vec<Change>,
     history: Vec<Change>,
+    history_has_more: bool,
+    history_page: usize,
     git_status: Vec<mf_vcs::git::GitFileEntry>,
     git_log: Vec<mf_vcs::git::GitLogEntry>,
     git_branch: String,
     selected: HashSet<String>,
     submit_desc: String,
-    loading: bool,
-    pending_environment_refresh: bool,
+    refresh_gate: RefreshGate,
     error: Option<String>,
     notice: Option<String>,
     show_history: bool,
@@ -41,6 +90,7 @@ struct LoadedData {
     opened: Vec<OpenedFile>,
     pending: Vec<Change>,
     history: Vec<Change>,
+    history_has_more: bool,
     git_status: Vec<mf_vcs::git::GitFileEntry>,
     git_log: Vec<mf_vcs::git::GitLogEntry>,
     git_branch: String,
@@ -56,14 +106,15 @@ impl VcsPanel {
             opened: Vec::new(),
             pending: Vec::new(),
             history: Vec::new(),
+            history_has_more: false,
+            history_page: 0,
             git_status: Vec::new(),
             git_log: Vec::new(),
             git_branch: String::new(),
             selected: HashSet::new(),
             submit_desc: String::new(),
             desc_focus: cx.focus_handle(),
-            loading: false,
-            pending_environment_refresh: false,
+            refresh_gate: RefreshGate::default(),
             error: None,
             notice: None,
             show_history: false,
@@ -75,10 +126,6 @@ impl VcsPanel {
 
     pub fn set_environment(&mut self, environment: VcsEnvironment, cx: &mut Context<Self>) {
         self.environment = environment;
-        if self.loading {
-            self.pending_environment_refresh = true;
-            return;
-        }
         self.refresh(cx);
     }
 
@@ -111,20 +158,46 @@ impl VcsPanel {
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
-        if self.loading {
+        let history = if self.show_history {
+            HistoryLoad::First
+        } else {
+            HistoryLoad::Hidden
+        };
+        self.start_refresh(history, false, cx);
+    }
+
+    fn load_more_history(&mut self, cx: &mut Context<Self>) {
+        if self.refresh_gate.loading() || !self.history_has_more {
             return;
         }
-        self.loading = true;
+        self.start_refresh(
+            HistoryLoad::Next {
+                p4_skip: self.history.len(),
+                git_skip: self.git_log.len(),
+            },
+            true,
+            cx,
+        );
+    }
+
+    fn start_refresh(
+        &mut self,
+        history_load: HistoryLoad,
+        append_history: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.refresh_gate.request() {
+            return;
+        }
         self.error = None;
         let root = self.root.clone();
         let environment = self.environment.clone();
-        let show_history = self.show_history;
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { load_vcs(&root, &environment, show_history) })
+                .background_spawn(async move { load_vcs(&root, &environment, history_load) })
                 .await;
             this.update(cx, |p, cx| {
-                p.loading = false;
+                let refresh_again = p.refresh_gate.finish();
                 match result {
                     Ok(data) => {
                         p.kind = if data.p4_info.is_some() {
@@ -137,9 +210,21 @@ impl VcsPanel {
                         p.p4_info = data.p4_info;
                         p.opened = data.opened;
                         p.pending = data.pending;
-                        p.history = data.history;
+                        if append_history {
+                            p.history.extend(data.history);
+                            p.git_log.extend(data.git_log);
+                            let count = match p.kind {
+                                VcsKind::P4 => p.history.len(),
+                                VcsKind::Git => p.git_log.len(),
+                            };
+                            p.history_page = count.saturating_sub(1) / HISTORY_PAGE_SIZE;
+                        } else {
+                            p.history = data.history;
+                            p.git_log = data.git_log;
+                            p.history_page = 0;
+                        }
+                        p.history_has_more = data.history_has_more;
                         p.git_status = data.git_status;
-                        p.git_log = data.git_log;
                         p.git_branch = data.git_branch;
                         // 清掉已不存在的选择
                         p.selected.retain(|s| {
@@ -149,8 +234,7 @@ impl VcsPanel {
                     }
                     Err(e) => p.error = Some(e.to_string()),
                 }
-                if p.pending_environment_refresh {
-                    p.pending_environment_refresh = false;
+                if refresh_again {
                     p.refresh(cx);
                 } else {
                     cx.notify();
@@ -412,7 +496,79 @@ impl VcsPanel {
 
     fn toggle_history(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
         self.show_history = !self.show_history;
-        self.refresh(cx);
+        if self.show_history {
+            self.refresh(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn previous_history_page(&mut self, cx: &mut Context<Self>) {
+        self.history_page = self.history_page.saturating_sub(1);
+        cx.notify();
+    }
+
+    fn next_history_page(&mut self, cx: &mut Context<Self>) {
+        let count = match self.kind {
+            VcsKind::P4 => self.history.len(),
+            VcsKind::Git => self.git_log.len(),
+        };
+        let loaded_pages = (count + HISTORY_PAGE_SIZE - 1) / HISTORY_PAGE_SIZE;
+        if self.history_page + 1 < loaded_pages {
+            self.history_page += 1;
+            cx.notify();
+        } else if self.history_has_more {
+            self.load_more_history(cx);
+        }
+    }
+
+    fn render_history_footer(&self, count: usize, cx: &Context<Self>) -> AnyElement {
+        let loading = self.refresh_gate.loading();
+        let mut row = div()
+            .min_h(px(30.))
+            .px_2()
+            .py_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .text_size(px(10.))
+            .text_color(rgb(crate::theme::Theme::fg_faint()));
+        if loading {
+            row = row.child("正在获取历史…");
+        } else if count == 0 {
+            row = row.child("没有可见的提交记录");
+        } else {
+            let loaded_pages = (count + HISTORY_PAGE_SIZE - 1) / HISTORY_PAGE_SIZE;
+            let has_next = self.history_page + 1 < loaded_pages || self.history_has_more;
+            row = row
+                .child(if self.history_page > 0 {
+                    tool_btn(
+                        "上一页",
+                        cx.listener(|panel: &mut VcsPanel, _, _, cx| {
+                            panel.previous_history_page(cx)
+                        }),
+                    )
+                    .into_any_element()
+                } else {
+                    tool_btn_disabled("上一页").into_any_element()
+                })
+                .child(format!(
+                    "第 {} 页 · 每页 {} 条",
+                    self.history_page + 1,
+                    HISTORY_PAGE_SIZE
+                ))
+                .child(if has_next {
+                    tool_btn(
+                        "下一页",
+                        cx.listener(|panel: &mut VcsPanel, _, _, cx| panel.next_history_page(cx)),
+                    )
+                    .into_any_element()
+                } else {
+                    tool_btn_disabled("下一页").into_any_element()
+                });
+        }
+        row.into_any_element()
     }
 
     fn on_desc_key(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
@@ -432,36 +588,50 @@ impl VcsPanel {
 fn load_vcs(
     root: &PathBuf,
     environment: &VcsEnvironment,
-    with_history: bool,
+    history_load: HistoryLoad,
 ) -> anyhow::Result<LoadedData> {
     let mut data = LoadedData {
         p4_info: None,
         opened: Vec::new(),
         pending: Vec::new(),
         history: Vec::new(),
+        history_has_more: false,
         git_status: Vec::new(),
         git_log: Vec::new(),
         git_branch: String::new(),
     };
     // 优先探测 P4(工作区在 client root 下且 p4 可用)
+    let mut p4_connection_error = None;
     if let Some(p4) = environment.p4(root) {
-        if let Ok(info) = p4.info() {
-            let in_client = !info.client_root.is_empty()
-                && root
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .starts_with(&info.client_root.to_lowercase());
-            if in_client {
-                data.p4_info = Some(info.clone());
-                data.opened = p4.opened().unwrap_or_default();
-                data.pending = p4.pending_changes(20).unwrap_or_default();
-                if with_history {
-                    data.history = p4
-                        .submitted_history(&info.client_stream, 30)
-                        .unwrap_or_default();
+        match p4.info() {
+            Ok(info) => {
+                let in_client = !info.client_root.is_empty()
+                    && root
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .starts_with(&info.client_root.to_lowercase());
+                if in_client {
+                    data.p4_info = Some(info.clone());
+                    data.opened = p4.opened().unwrap_or_default();
+                    data.pending = p4.pending_changes(20).unwrap_or_default();
+                    if !matches!(history_load, HistoryLoad::Hidden) {
+                        let skip = match history_load {
+                            HistoryLoad::Next { p4_skip, .. } => p4_skip,
+                            _ => 0,
+                        };
+                        let page = p4.submitted_history_page(
+                            &info.client_stream,
+                            skip,
+                            (HISTORY_PAGE_SIZE + 1) as u32,
+                        )?;
+                        let (page, has_more) = take_history_page(page);
+                        data.history_has_more = has_more;
+                        data.history = page;
+                    }
+                    return Ok(data);
                 }
-                return Ok(data);
             }
+            Err(error) => p4_connection_error = Some(error),
         }
     }
     // 回退 Git
@@ -469,8 +639,21 @@ fn load_vcs(
         if let Ok(git) = Git::open(root) {
             data.git_branch = git.branch().unwrap_or_default();
             data.git_status = git.status().unwrap_or_default();
-            data.git_log = git.log(30).unwrap_or_default();
+            if !matches!(history_load, HistoryLoad::Hidden) {
+                let skip = match history_load {
+                    HistoryLoad::Next { git_skip, .. } => git_skip,
+                    _ => 0,
+                };
+                let (page, has_more) =
+                    take_history_page(git.log_page(skip, HISTORY_PAGE_SIZE + 1)?);
+                data.history_has_more = has_more;
+                data.git_log = page;
+            }
+            return Ok(data);
         }
+    }
+    if let Some(error) = p4_connection_error {
+        anyhow::bail!("Perforce 连接失败: {error:#}");
     }
     Ok(data)
 }
@@ -531,12 +714,18 @@ impl Render for VcsPanel {
         if let Some(n) = &self.notice {
             col = col.child(banner(crate::theme::Theme::fg_dim(), n.clone()));
         }
-        if self.loading {
+        if self.refresh_gate.loading() {
             col = col.child(banner(crate::theme::Theme::accent(), "加载中…".into()));
         }
 
         // 文件列表区
-        let mut list = div().flex_1().flex().flex_col().overflow_hidden();
+        let mut list = div()
+            .id("vcs-file-list")
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll();
         match self.kind {
             VcsKind::P4 => {
                 list = list.child(section_header(format!("待提交变更({})", self.opened.len())));
@@ -591,8 +780,13 @@ impl Render for VcsPanel {
                     );
                 }
                 if self.show_history {
-                    list = list.child(section_header("提交历史".into()));
-                    for h in self.history.iter().take(30) {
+                    list = list.child(section_header(format!(
+                        "提交历史 · 第 {} 页（已加载 {}）",
+                        self.history_page + 1,
+                        self.history.len(),
+                    )));
+                    let bounds = history_page_bounds(self.history.len(), self.history_page);
+                    for h in &self.history[bounds] {
                         list = list.child(
                             div()
                                 .id(("hist", h.id as u64))
@@ -627,6 +821,7 @@ impl Render for VcsPanel {
                                 ),
                         );
                     }
+                    list = list.child(self.render_history_footer(self.history.len(), cx));
                 }
             }
             VcsKind::Git => {
@@ -702,11 +897,16 @@ impl Render for VcsPanel {
                     );
                 }
                 if self.show_history {
-                    list = list.child(section_header("提交历史".into()));
-                    for (i, h) in self.git_log.iter().enumerate() {
+                    list = list.child(section_header(format!(
+                        "提交历史 · 第 {} 页（已加载 {}）",
+                        self.history_page + 1,
+                        self.git_log.len(),
+                    )));
+                    let bounds = history_page_bounds(self.git_log.len(), self.history_page);
+                    for (i, h) in self.git_log[bounds.clone()].iter().enumerate() {
                         list = list.child(
                             div()
-                                .id(("gh", i))
+                                .id(("gh", bounds.start + i))
                                 .pl_2()
                                 .pr_2()
                                 .pt_1()
@@ -733,6 +933,7 @@ impl Render for VcsPanel {
                                 ),
                         );
                     }
+                    list = list.child(self.render_history_footer(self.git_log.len(), cx));
                 }
             }
         }
@@ -886,4 +1087,46 @@ fn tool_btn(
         .cursor_pointer()
         .child(label.to_string())
         .on_click(move |e, window, cx| (listener)(e, window, cx))
+}
+
+fn tool_btn_disabled(label: &str) -> impl IntoElement {
+    div()
+        .px_2()
+        .py_1()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(crate::theme::Theme::border()))
+        .text_size(px(11.))
+        .text_color(rgb(crate::theme::Theme::fg_faint()))
+        .child(label.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{history_page_bounds, take_history_page, RefreshGate, HISTORY_PAGE_SIZE};
+
+    #[test]
+    fn refresh_requested_while_loading_is_replayed() {
+        let mut gate = RefreshGate::default();
+        assert!(gate.request(), "第一次请求应立即开始");
+        assert!(!gate.request(), "加载中不得并发启动第二次请求");
+        assert!(
+            gate.finish(),
+            "加载中发生的第二次请求必须在当前请求结束后重放"
+        );
+    }
+
+    #[test]
+    fn history_pages_expose_twenty_rows_and_more_flag() {
+        let (first, has_more) = take_history_page((0..HISTORY_PAGE_SIZE + 1).collect::<Vec<_>>());
+        assert_eq!(first.len(), 20);
+        assert!(has_more);
+
+        let (last, has_more) = take_history_page((0..7).collect::<Vec<_>>());
+        assert_eq!(last.len(), 7);
+        assert!(!has_more);
+        assert_eq!(history_page_bounds(45, 0), 0..20);
+        assert_eq!(history_page_bounds(45, 1), 20..40);
+        assert_eq!(history_page_bounds(45, 2), 40..45);
+    }
 }

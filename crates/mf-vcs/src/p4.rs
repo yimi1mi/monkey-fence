@@ -169,8 +169,14 @@ impl P4 {
         let mut command = Command::new(&self.config.executable);
         command.current_dir(&self.cwd);
         if self.config.use_p4config {
-            if !self.config.p4config.trim().is_empty() {
-                command.env("P4CONFIG", self.config.p4config.trim());
+            let configured = self.config.p4config.trim();
+            let p4config = if configured.is_empty() {
+                detect_p4config_name(&self.cwd)
+            } else {
+                Some(configured.to_string())
+            };
+            if let Some(p4config) = p4config {
+                command.env("P4CONFIG", p4config);
             }
         } else {
             for key in ["P4CONFIG", "P4PORT", "P4USER", "P4CLIENT", "P4CHARSET"] {
@@ -296,15 +302,25 @@ impl P4 {
             .collect())
     }
 
-    /// 已提交历史(限定在 stream 路径下)
-    pub fn submitted_history(&self, stream_path: &str, max: u32) -> Result<Vec<Change>> {
-        let range = if stream_path.is_empty() {
-            "//...".to_string()
-        } else {
-            format!("{}/...", stream_path.trim_end_matches('/'))
-        };
-        let recs =
-            self.run_ztag(&["changes", "-s", "submitted", "-m", &max.to_string(), &range])?;
+    /// 已提交历史分页(限定在 stream 路径下)。P4 没有高效的 offset 参数；
+    /// 按需把 `-m` 扩到 `skip + max`，再从结果窗口切出当前页。相比在大型
+    /// stream 上使用 changelist revision range，这条路径能继续利用最新变更索引。
+    pub fn submitted_history_page(
+        &self,
+        stream_path: &str,
+        skip: usize,
+        max: u32,
+    ) -> Result<Vec<Change>> {
+        let range = submitted_history_filespec(stream_path);
+        let query_max = skip.saturating_add(max as usize).min(u32::MAX as usize) as u32;
+        let recs = self.run_ztag(&[
+            "changes",
+            "-s",
+            "submitted",
+            "-m",
+            &query_max.to_string(),
+            &range,
+        ])?;
         Ok(recs
             .iter()
             .map(|r| Change {
@@ -316,6 +332,8 @@ impl P4 {
                 shelved: false,
                 time: r.get("time").unwrap_or_default().parse().unwrap_or(0),
             })
+            .skip(skip)
+            .take(max as usize)
             .collect())
     }
 
@@ -451,9 +469,66 @@ impl P4 {
     }
 }
 
+/// Rider/P4V 项目常见配置名。只把文件名交给 P4，让 CLI 自己按 cwd
+/// 向上查找；不读取内容，也不修改进程或系统的全局环境。
+fn detect_p4config_name(cwd: &Path) -> Option<String> {
+    for directory in cwd.ancestors() {
+        for name in ["p4config.txt", ".p4config"] {
+            if directory.join(name).is_file() {
+                return Some(name.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn submitted_history_filespec(stream_path: &str) -> String {
+    if stream_path.is_empty() {
+        // classic client 没有 clientStream；以 P4 命令 cwd 为根的本地
+        // `...` 文件范围查询，避免退化为扫描整个服务器的 `//...`。
+        "...".to_string()
+    } else if stream_path.ends_with("...") {
+        stream_path.to_string()
+    } else {
+        format!("{}/...", stream_path.trim_end_matches('/'))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn submitted_history_filespec_scopes_stream_or_current_directory() {
+        assert_eq!(
+            submitted_history_filespec("//Depot/main"),
+            "//Depot/main/..."
+        );
+        assert_eq!(
+            submitted_history_filespec("//Depot/main/..."),
+            "//Depot/main/..."
+        );
+        assert_eq!(submitted_history_filespec(""), "...");
+    }
+
+    #[test]
+    fn p4config_auto_detection_prefers_complete_rider_style_name() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("project").join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(root.path().join(".p4config"), "P4CLIENT=test\n").unwrap();
+        std::fs::write(
+            root.path().join("p4config.txt"),
+            "P4PORT=ssl:perforce:1666\n",
+        )
+        .unwrap();
+        assert_eq!(
+            detect_p4config_name(&nested).as_deref(),
+            Some("p4config.txt")
+        );
+        std::fs::remove_file(root.path().join("p4config.txt")).unwrap();
+        assert_eq!(detect_p4config_name(&nested).as_deref(), Some(".p4config"));
+    }
 
     const OPENED_SAMPLE: &str = "\
 ... depotFile //DEPOT/main/a.rs

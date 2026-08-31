@@ -123,8 +123,8 @@ pub fn p4_contribution() -> VcsProviderContribution {
                 "P4CONFIG 文件名",
                 "text",
                 "",
-                "留空=继承环境；例如 .p4config",
-                "仅 P4CONFIG 模式使用。文件按当前项目目录向上查找。",
+                "留空=自动检测 p4config.txt / .p4config",
+                "仅 P4CONFIG 模式使用；不会修改系统 P4 环境。",
             ),
             text_field(
                 "port",

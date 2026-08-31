@@ -186,10 +186,14 @@ impl Git {
     }
 
     pub fn log(&self, max: usize) -> Result<Vec<GitLogEntry>> {
+        self.log_page(0, max)
+    }
+
+    pub fn log_page(&self, skip: usize, max: usize) -> Result<Vec<GitLogEntry>> {
         let mut revwalk = self.repo.revwalk()?;
         revwalk.push_head()?;
         let mut out = Vec::new();
-        for oid in revwalk.take(max) {
+        for oid in revwalk.skip(skip).take(max) {
             let oid = oid?;
             let commit = self.repo.find_commit(oid)?;
             out.push(GitLogEntry {
@@ -540,6 +544,32 @@ mod tests {
         // 分支名可能是 master 或 main,不断言具体值
         let b = git.branch().unwrap();
         assert!(b == "master" || b == "main", "branch = {b}");
+    }
+
+    #[test]
+    fn log_page_skips_already_loaded_commits() {
+        let (tmp, git) = init_repo();
+        for index in 1..=3 {
+            std::fs::write(tmp.path().join("x"), index.to_string()).unwrap();
+            git.stage(&[PathBuf::from("x")]).unwrap();
+            git.commit(&format!("c{index}")).unwrap();
+        }
+        let first = git.log_page(0, 2).unwrap();
+        let second = git.log_page(2, 2).unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|row| row.summary.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c3", "c2"]
+        );
+        assert_eq!(
+            second
+                .iter()
+                .map(|row| row.summary.as_str())
+                .collect::<Vec<_>>(),
+            vec!["c1"]
+        );
     }
 
     #[test]
