@@ -3,10 +3,11 @@ use gpui::*;
 use mf_plugins::vcs_provider::VcsEnvironment;
 use mf_vcs::git::Git;
 use mf_vcs::p4::{Change, OpenedFile, P4};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 const HISTORY_PAGE_SIZE: usize = 20;
+const HISTORY_FILES_PAGE_SIZE: usize = 100;
 
 #[derive(Clone, Copy, Debug)]
 enum HistoryLoad {
@@ -27,11 +28,46 @@ fn history_page_bounds(total: usize, page: usize) -> std::ops::Range<usize> {
     start..end
 }
 
+fn history_file_page_bounds(total: usize, page: usize) -> std::ops::Range<usize> {
+    let start = page.saturating_mul(HISTORY_FILES_PAGE_SIZE).min(total);
+    let end = (start + HISTORY_FILES_PAGE_SIZE).min(total);
+    start..end
+}
+
 /// 异步刷新闸门。刷新进行中再次请求时，必须在当前请求结束后重放一次。
 #[derive(Debug, Default)]
 struct RefreshGate {
     loading: bool,
     pending: bool,
+}
+
+#[derive(Clone, Debug)]
+struct HistoryFileView {
+    action: String,
+    path: String,
+    old_path: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+enum HistoryDetailsState {
+    Loading,
+    Loaded(Vec<HistoryFileView>),
+    Error(String),
+}
+
+#[derive(Clone, Debug)]
+enum HistoryCommitTarget {
+    P4(i64),
+    Git(String),
+}
+
+impl HistoryCommitTarget {
+    fn key(&self) -> String {
+        match self {
+            Self::P4(change) => format!("p4:{change}"),
+            Self::Git(oid) => format!("git:{oid}"),
+        }
+    }
 }
 
 impl RefreshGate {
@@ -65,6 +101,9 @@ pub struct VcsPanel {
     history: Vec<Change>,
     history_has_more: bool,
     history_page: usize,
+    expanded_history: Option<String>,
+    history_details: HashMap<String, HistoryDetailsState>,
+    history_file_pages: HashMap<String, usize>,
     git_status: Vec<mf_vcs::git::GitFileEntry>,
     git_log: Vec<mf_vcs::git::GitLogEntry>,
     git_branch: String,
@@ -108,6 +147,9 @@ impl VcsPanel {
             history: Vec::new(),
             history_has_more: false,
             history_page: 0,
+            expanded_history: None,
+            history_details: HashMap::new(),
+            history_file_pages: HashMap::new(),
             git_status: Vec::new(),
             git_log: Vec::new(),
             git_branch: String::new(),
@@ -126,6 +168,9 @@ impl VcsPanel {
 
     pub fn set_environment(&mut self, environment: VcsEnvironment, cx: &mut Context<Self>) {
         self.environment = environment;
+        self.expanded_history = None;
+        self.history_details.clear();
+        self.history_file_pages.clear();
         self.refresh(cx);
     }
 
@@ -223,6 +268,7 @@ impl VcsPanel {
                             p.git_log = data.git_log;
                             p.history_page = 0;
                         }
+                        p.expanded_history = None;
                         p.history_has_more = data.history_has_more;
                         p.git_status = data.git_status;
                         p.git_branch = data.git_branch;
@@ -503,8 +549,270 @@ impl VcsPanel {
         }
     }
 
+    fn toggle_history_commit(&mut self, target: HistoryCommitTarget, cx: &mut Context<Self>) {
+        let key = target.key();
+        if self.expanded_history.as_deref() == Some(&key) {
+            self.expanded_history = None;
+            cx.notify();
+            return;
+        }
+        self.expanded_history = Some(key.clone());
+        self.history_file_pages.entry(key.clone()).or_insert(0);
+        if matches!(
+            self.history_details.get(&key),
+            Some(HistoryDetailsState::Loading | HistoryDetailsState::Loaded(_))
+        ) {
+            cx.notify();
+            return;
+        }
+        self.history_details
+            .insert(key.clone(), HistoryDetailsState::Loading);
+        let root = self.root.clone();
+        let environment = self.environment.clone();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { load_history_details(&root, &environment, target) })
+                .await;
+            this.update(cx, |panel, cx| {
+                panel.history_details.insert(
+                    key,
+                    match result {
+                        Ok(files) => HistoryDetailsState::Loaded(files),
+                        Err(error) => HistoryDetailsState::Error(format!("{error:#}")),
+                    },
+                );
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn render_history_commit(
+        &self,
+        target: HistoryCommitTarget,
+        revision: String,
+        author: String,
+        summary: String,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let key = target.key();
+        let expanded = self.expanded_history.as_deref() == Some(&key);
+        let details_label = match self.history_details.get(&key) {
+            Some(HistoryDetailsState::Loading) => "读取文件…".to_string(),
+            Some(HistoryDetailsState::Loaded(files)) => format!("{} 个文件", files.len()),
+            Some(HistoryDetailsState::Error(_)) => "读取失败".to_string(),
+            None => "查看文件".to_string(),
+        };
+        let details = expanded.then(|| self.render_history_details(&key, cx));
+        let mut commit = div()
+            .id(ElementId::Name(format!("history-commit-{key}").into()))
+            .flex()
+            .flex_col()
+            .border_b_1()
+            .border_color(rgb(crate::theme::Theme::border()))
+            .child(
+                div()
+                    .id(ElementId::Name(format!("history-toggle-{key}").into()))
+                    .min_h(px(30.))
+                    .px_2()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .hover(|row| row.bg(rgb(crate::theme::Theme::bg_hover())))
+                    .on_click(cx.listener(move |panel, _, _, cx| {
+                        panel.toggle_history_commit(target.clone(), cx)
+                    }))
+                    .child(
+                        div()
+                            .w(px(12.))
+                            .text_color(rgb(crate::theme::Theme::fg_faint()))
+                            .child(if expanded { "▾" } else { "▸" }),
+                    )
+                    .child(
+                        div()
+                            .w(px(74.))
+                            .text_size(px(10.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(crate::theme::Theme::accent()))
+                            .child(revision),
+                    )
+                    .child(
+                        div()
+                            .w(px(86.))
+                            .text_size(px(9.5))
+                            .text_color(rgb(crate::theme::Theme::fg_dim()))
+                            .overflow_hidden()
+                            .child(author),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(10.))
+                            .text_color(rgb(crate::theme::Theme::fg()))
+                            .overflow_hidden()
+                            .child(summary),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(8.5))
+                            .text_color(rgb(crate::theme::Theme::fg_faint()))
+                            .child(details_label),
+                    ),
+            );
+        if let Some(details) = details {
+            commit = commit.child(details);
+        }
+        commit.into_any_element()
+    }
+
+    fn previous_history_file_page(&mut self, key: &str, cx: &mut Context<Self>) {
+        let page = self.history_file_pages.entry(key.to_string()).or_insert(0);
+        *page = page.saturating_sub(1);
+        cx.notify();
+    }
+
+    fn next_history_file_page(&mut self, key: &str, cx: &mut Context<Self>) {
+        let total = match self.history_details.get(key) {
+            Some(HistoryDetailsState::Loaded(files)) => files.len(),
+            _ => 0,
+        };
+        let pages = (total + HISTORY_FILES_PAGE_SIZE - 1) / HISTORY_FILES_PAGE_SIZE;
+        let page = self.history_file_pages.entry(key.to_string()).or_insert(0);
+        if *page + 1 < pages {
+            *page += 1;
+        }
+        cx.notify();
+    }
+
+    fn render_history_details(&self, key: &str, cx: &Context<Self>) -> AnyElement {
+        let mut body = div()
+            .id(ElementId::Name(format!("history-details-{key}").into()))
+            .ml_4()
+            .border_l_2()
+            .border_color(rgb(crate::theme::Theme::accent_dim()))
+            .bg(rgb(crate::theme::Theme::bg_elevated()))
+            .flex()
+            .flex_col();
+        match self.history_details.get(key) {
+            Some(HistoryDetailsState::Loading) => {
+                body = body.child(history_detail_message("正在读取提交文件列表…", false));
+            }
+            Some(HistoryDetailsState::Error(error)) => {
+                body = body.child(history_detail_message(
+                    &format!("读取失败：{error}（收起后重新展开可重试）"),
+                    true,
+                ));
+            }
+            Some(HistoryDetailsState::Loaded(files)) if files.is_empty() => {
+                body = body.child(history_detail_message("该提交没有文件变化", false));
+            }
+            Some(HistoryDetailsState::Loaded(files)) => {
+                let page = self.history_file_pages.get(key).copied().unwrap_or(0);
+                let bounds = history_file_page_bounds(files.len(), page);
+                body = body.child(
+                    div()
+                        .min_h(px(24.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .text_size(px(9.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(crate::theme::Theme::fg_faint()))
+                        .child(format!(
+                            "文件变更 {}–{} / {}",
+                            bounds.start + 1,
+                            bounds.end,
+                            files.len()
+                        )),
+                );
+                for file in &files[bounds.clone()] {
+                    let path = match &file.old_path {
+                        Some(old) => format!("{old}  →  {}", file.path),
+                        None => file.path.clone(),
+                    };
+                    body = body.child(
+                        div()
+                            .min_h(px(24.))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .border_b_1()
+                            .border_color(rgb(crate::theme::Theme::border()))
+                            .child(
+                                div()
+                                    .w(px(20.))
+                                    .text_size(px(9.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(history_action_color(&file.action)))
+                                    .child(file.action.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .text_size(px(9.5))
+                                    .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                    .overflow_hidden()
+                                    .child(path),
+                            ),
+                    );
+                }
+                if files.len() > HISTORY_FILES_PAGE_SIZE {
+                    let pages =
+                        (files.len() + HISTORY_FILES_PAGE_SIZE - 1) / HISTORY_FILES_PAGE_SIZE;
+                    let previous_key = key.to_string();
+                    let next_key = key.to_string();
+                    let mut footer = div()
+                        .min_h(px(30.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .text_size(px(9.))
+                        .text_color(rgb(crate::theme::Theme::fg_faint()));
+                    footer = footer
+                        .child(if page > 0 {
+                            tool_btn(
+                                "上一页",
+                                cx.listener(move |panel, _, _, cx| {
+                                    panel.previous_history_file_page(&previous_key, cx)
+                                }),
+                            )
+                            .into_any_element()
+                        } else {
+                            tool_btn_disabled("上一页").into_any_element()
+                        })
+                        .child(format!("文件第 {} / {} 页", page + 1, pages))
+                        .child(if page + 1 < pages {
+                            tool_btn(
+                                "下一页",
+                                cx.listener(move |panel, _, _, cx| {
+                                    panel.next_history_file_page(&next_key, cx)
+                                }),
+                            )
+                            .into_any_element()
+                        } else {
+                            tool_btn_disabled("下一页").into_any_element()
+                        });
+                    body = body.child(footer);
+                }
+            }
+            None => {}
+        }
+        body.into_any_element()
+    }
+
     fn previous_history_page(&mut self, cx: &mut Context<Self>) {
         self.history_page = self.history_page.saturating_sub(1);
+        self.expanded_history = None;
         cx.notify();
     }
 
@@ -516,6 +824,7 @@ impl VcsPanel {
         let loaded_pages = (count + HISTORY_PAGE_SIZE - 1) / HISTORY_PAGE_SIZE;
         if self.history_page + 1 < loaded_pages {
             self.history_page += 1;
+            self.expanded_history = None;
             cx.notify();
         } else if self.history_has_more {
             self.load_more_history(cx);
@@ -658,6 +967,77 @@ fn load_vcs(
     Ok(data)
 }
 
+fn load_history_details(
+    root: &PathBuf,
+    environment: &VcsEnvironment,
+    target: HistoryCommitTarget,
+) -> anyhow::Result<Vec<HistoryFileView>> {
+    match target {
+        HistoryCommitTarget::P4(change) => {
+            let p4 = environment
+                .p4(root)
+                .ok_or_else(|| anyhow::anyhow!("Perforce 插件实例已关闭"))?;
+            let mut files: Vec<HistoryFileView> = p4
+                .describe(change)?
+                .into_iter()
+                .map(|file| HistoryFileView {
+                    action: p4_history_action(&file.action).into(),
+                    path: file.depot_file,
+                    old_path: None,
+                })
+                .collect();
+            files.sort_by(|a, b| a.path.cmp(&b.path));
+            Ok(files)
+        }
+        HistoryCommitTarget::Git(oid) => {
+            let git = Git::open(root)?;
+            Ok(git
+                .commit_files(&oid)?
+                .into_iter()
+                .map(|file| HistoryFileView {
+                    action: file.action.code().into(),
+                    path: file.path.to_string_lossy().into_owned(),
+                    old_path: file
+                        .old_path
+                        .map(|path| path.to_string_lossy().into_owned()),
+                })
+                .collect())
+        }
+    }
+}
+
+fn p4_history_action(action: &str) -> &'static str {
+    match action {
+        "add" | "branch" => "A",
+        "delete" => "D",
+        "move/add" | "move/delete" => "R",
+        "edit" | "integrate" => "M",
+        _ => "?",
+    }
+}
+
+fn history_action_color(action: &str) -> u32 {
+    match action {
+        "A" | "C" => crate::theme::Theme::success(),
+        "D" => crate::theme::Theme::danger(),
+        "R" => crate::theme::Theme::accent(),
+        _ => crate::theme::Theme::warning(),
+    }
+}
+
+fn history_detail_message(text: &str, error: bool) -> Div {
+    div()
+        .px_2()
+        .py_2()
+        .text_size(px(9.5))
+        .text_color(rgb(if error {
+            crate::theme::Theme::danger()
+        } else {
+            crate::theme::Theme::fg_faint()
+        }))
+        .child(text.to_string())
+}
+
 fn action_color(action: &str) -> u32 {
     match action {
         "add" | "branch" => crate::theme::Theme::success(),
@@ -787,39 +1167,13 @@ impl Render for VcsPanel {
                     )));
                     let bounds = history_page_bounds(self.history.len(), self.history_page);
                     for h in &self.history[bounds] {
-                        list = list.child(
-                            div()
-                                .id(("hist", h.id as u64))
-                                .pl_2()
-                                .pr_2()
-                                .pt_1()
-                                .pb_1()
-                                .flex()
-                                .flex_col()
-                                .border_b_1()
-                                .border_color(rgb(crate::theme::Theme::border()))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .text_color(rgb(crate::theme::Theme::fg_faint()))
-                                                .child(format!("#{}", h.id)),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_color(rgb(crate::theme::Theme::fg_dim()))
-                                                .child(h.user.clone()),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_color(rgb(crate::theme::Theme::fg()))
-                                                .overflow_hidden()
-                                                .child(h.short_desc()),
-                                        ),
-                                ),
-                        );
+                        list = list.child(self.render_history_commit(
+                            HistoryCommitTarget::P4(h.id),
+                            format!("#{}", h.id),
+                            h.user.clone(),
+                            h.short_desc(),
+                            cx,
+                        ));
                     }
                     list = list.child(self.render_history_footer(self.history.len(), cx));
                 }
@@ -903,35 +1257,14 @@ impl Render for VcsPanel {
                         self.git_log.len(),
                     )));
                     let bounds = history_page_bounds(self.git_log.len(), self.history_page);
-                    for (i, h) in self.git_log[bounds.clone()].iter().enumerate() {
-                        list = list.child(
-                            div()
-                                .id(("gh", bounds.start + i))
-                                .pl_2()
-                                .pr_2()
-                                .pt_1()
-                                .pb_1()
-                                .flex()
-                                .gap_2()
-                                .border_b_1()
-                                .border_color(rgb(crate::theme::Theme::border()))
-                                .child(
-                                    div()
-                                        .text_color(rgb(crate::theme::Theme::fg_faint()))
-                                        .child(h.id.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_color(rgb(crate::theme::Theme::fg_dim()))
-                                        .child(h.author.clone()),
-                                )
-                                .child(
-                                    div()
-                                        .text_color(rgb(crate::theme::Theme::fg()))
-                                        .overflow_hidden()
-                                        .child(h.summary.clone()),
-                                ),
-                        );
+                    for h in &self.git_log[bounds] {
+                        list = list.child(self.render_history_commit(
+                            HistoryCommitTarget::Git(h.full_id.clone()),
+                            h.id.clone(),
+                            h.author.clone(),
+                            h.summary.clone(),
+                            cx,
+                        ));
                     }
                     list = list.child(self.render_history_footer(self.git_log.len(), cx));
                 }
@@ -1103,7 +1436,10 @@ fn tool_btn_disabled(label: &str) -> impl IntoElement {
 
 #[cfg(test)]
 mod tests {
-    use super::{history_page_bounds, take_history_page, RefreshGate, HISTORY_PAGE_SIZE};
+    use super::{
+        history_file_page_bounds, history_page_bounds, p4_history_action, take_history_page,
+        RefreshGate, HISTORY_FILES_PAGE_SIZE, HISTORY_PAGE_SIZE,
+    };
 
     #[test]
     fn refresh_requested_while_loading_is_replayed() {
@@ -1128,5 +1464,12 @@ mod tests {
         assert_eq!(history_page_bounds(45, 0), 0..20);
         assert_eq!(history_page_bounds(45, 1), 20..40);
         assert_eq!(history_page_bounds(45, 2), 40..45);
+        assert_eq!(history_file_page_bounds(20_433, 0), 0..100);
+        assert_eq!(history_file_page_bounds(20_433, 204), 20_400..20_433);
+        assert_eq!(HISTORY_FILES_PAGE_SIZE, 100);
+        assert_eq!(p4_history_action("add"), "A");
+        assert_eq!(p4_history_action("edit"), "M");
+        assert_eq!(p4_history_action("delete"), "D");
+        assert_eq!(p4_history_action("move/add"), "R");
     }
 }

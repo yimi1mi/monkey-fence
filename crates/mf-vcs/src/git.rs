@@ -36,9 +36,42 @@ pub struct GitFileEntry {
 #[derive(Clone, Debug)]
 pub struct GitLogEntry {
     pub id: String,
+    pub full_id: String,
     pub summary: String,
     pub author: String,
     pub time: i64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitCommitFileAction {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Copied,
+    TypeChanged,
+    Other,
+}
+
+impl GitCommitFileAction {
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Added => "A",
+            Self::Modified => "M",
+            Self::Deleted => "D",
+            Self::Renamed => "R",
+            Self::Copied => "C",
+            Self::TypeChanged => "T",
+            Self::Other => "?",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GitCommitFile {
+    pub action: GitCommitFileAction,
+    pub path: PathBuf,
+    pub old_path: Option<PathBuf>,
 }
 
 impl Git {
@@ -198,12 +231,66 @@ impl Git {
             let commit = self.repo.find_commit(oid)?;
             out.push(GitLogEntry {
                 id: oid.to_string()[..8].to_string(),
+                full_id: oid.to_string(),
                 summary: commit.summary().unwrap_or_default().to_string(),
                 author: commit.author().name().unwrap_or("").to_string(),
                 time: commit.time().seconds(),
             });
         }
         Ok(out)
+    }
+
+    /// 某次提交相对第一父提交的文件清单；根提交相对空树。
+    pub fn commit_files(&self, oid: &str) -> Result<Vec<GitCommitFile>> {
+        let oid = git2::Oid::from_str(oid).with_context(|| format!("无效 Git commit: {oid}"))?;
+        let commit = self.repo.find_commit(oid)?;
+        let tree = commit.tree()?;
+        let parent_tree = if commit.parent_count() > 0 {
+            Some(commit.parent(0)?.tree()?)
+        } else {
+            None
+        };
+        let mut diff = self
+            .repo
+            .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)?;
+        let mut find = git2::DiffFindOptions::new();
+        find.renames(true).copies(true);
+        diff.find_similar(Some(&mut find))?;
+
+        let mut files = Vec::new();
+        for delta in diff.deltas() {
+            let action = match delta.status() {
+                git2::Delta::Added => GitCommitFileAction::Added,
+                git2::Delta::Modified => GitCommitFileAction::Modified,
+                git2::Delta::Deleted => GitCommitFileAction::Deleted,
+                git2::Delta::Renamed => GitCommitFileAction::Renamed,
+                git2::Delta::Copied => GitCommitFileAction::Copied,
+                git2::Delta::Typechange => GitCommitFileAction::TypeChanged,
+                _ => GitCommitFileAction::Other,
+            };
+            let old_path = delta.old_file().path().map(Path::to_path_buf);
+            let new_path = delta.new_file().path().map(Path::to_path_buf);
+            let path = match action {
+                GitCommitFileAction::Deleted => old_path.clone(),
+                _ => new_path.clone().or_else(|| old_path.clone()),
+            }
+            .unwrap_or_default();
+            let previous = match action {
+                GitCommitFileAction::Renamed | GitCommitFileAction::Copied
+                    if old_path.as_ref() != Some(&path) =>
+                {
+                    old_path
+                }
+                _ => None,
+            };
+            files.push(GitCommitFile {
+                action,
+                path,
+                old_path: previous,
+            });
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(files)
     }
 
     /// 工作区 vs HEAD 的单文件 diff(unified)
@@ -570,6 +657,29 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["c1"]
         );
+    }
+
+    #[test]
+    fn commit_files_reports_added_and_modified_paths() {
+        let (tmp, git) = init_repo();
+        std::fs::write(tmp.path().join("a.txt"), "one").unwrap();
+        git.stage(&[PathBuf::from("a.txt")]).unwrap();
+        git.commit("c1").unwrap();
+
+        std::fs::write(tmp.path().join("a.txt"), "two").unwrap();
+        std::fs::write(tmp.path().join("b.txt"), "new").unwrap();
+        git.stage(&[PathBuf::from("a.txt"), PathBuf::from("b.txt")])
+            .unwrap();
+        let commit = git.commit("c2").unwrap();
+
+        let files = git.commit_files(&commit).unwrap();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|file| {
+            file.path == PathBuf::from("a.txt") && file.action == GitCommitFileAction::Modified
+        }));
+        assert!(files.iter().any(|file| {
+            file.path == PathBuf::from("b.txt") && file.action == GitCommitFileAction::Added
+        }));
     }
 
     #[test]

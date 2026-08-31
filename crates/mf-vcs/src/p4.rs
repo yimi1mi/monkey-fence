@@ -59,6 +59,29 @@ impl ZRecord {
             .map(|(_, v)| v.as_str())
             .collect()
     }
+
+    /// P4 `-ztag` 的数组字段在不同命令/版本中可能是重复键，或
+    /// `depotFile0/depotFile1` 形式。统一按编号顺序读取并兼容旧格式。
+    pub fn get_array(&self, key: &str) -> Vec<&str> {
+        let mut indexed: Vec<(usize, &str)> = self
+            .pairs
+            .iter()
+            .filter_map(|(candidate, value)| {
+                candidate
+                    .strip_prefix(key)
+                    .filter(|suffix| {
+                        !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
+                    })
+                    .and_then(|suffix| suffix.parse::<usize>().ok())
+                    .map(|index| (index, value.as_str()))
+            })
+            .collect();
+        if indexed.is_empty() {
+            return self.get_all(key);
+        }
+        indexed.sort_by_key(|(index, _)| *index);
+        indexed.into_iter().map(|(_, value)| value).collect()
+    }
 }
 
 /// 解析 -ztag 输出:空行分记录;以空格缩进的行是上一值的续行
@@ -343,9 +366,9 @@ impl P4 {
         let Some(r) = recs.first() else {
             return Ok(vec![]);
         };
-        let depots = r.get_all("depotFile");
-        let actions = r.get_all("action");
-        let revs = r.get_all("rev");
+        let depots = r.get_array("depotFile");
+        let actions = r.get_array("action");
+        let revs = r.get_array("rev");
         Ok(depots
             .into_iter()
             .enumerate()
@@ -607,8 +630,19 @@ mod tests {
 ";
         let recs = parse_ztag(sample);
         assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].get_all("depotFile"), vec!["//D/f1", "//D/f2"]);
-        assert_eq!(recs[0].get_all("action"), vec!["edit", "delete"]);
+        assert_eq!(recs[0].get_array("depotFile"), vec!["//D/f1", "//D/f2"]);
+        assert_eq!(recs[0].get_array("action"), vec!["edit", "delete"]);
+
+        let numbered = parse_ztag(concat!(
+            "... depotFile1 //D/f2\n",
+            "... action1 delete\n",
+            "... rev1 3\n",
+            "... depotFile0 //D/f1\n",
+            "... action0 edit\n",
+            "... rev0 1\n",
+        ));
+        assert_eq!(numbered[0].get_array("depotFile"), vec!["//D/f1", "//D/f2"]);
+        assert_eq!(numbered[0].get_array("action"), vec!["edit", "delete"]);
     }
 
     #[test]
