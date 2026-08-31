@@ -241,7 +241,7 @@ impl TaskSidebar {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(11.5))
+                            .text_size(crate::theme::ui_px(11.5))
                             .text_color(rgb(if selected {
                                 crate::theme::Theme::fg()
                             } else {
@@ -259,14 +259,14 @@ impl TaskSidebar {
                     })
                     .child(
                         div()
-                            .text_size(px(9.5))
+                            .text_size(crate::theme::ui_px(9.5))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .child(row.task.status.label_cn()),
                     )
                     .when(agents > 0, |d| {
                         d.child(
                             div()
-                                .text_size(px(9.5))
+                                .text_size(crate::theme::ui_px(9.5))
                                 .text_color(rgb(crate::theme::Theme::success()))
                                 .child(format!("●{agents}")),
                         )
@@ -281,7 +281,7 @@ impl TaskSidebar {
                             .rounded_md()
                             .border_1()
                             .border_color(rgb(crate::theme::Theme::border()))
-                            .text_size(px(11.))
+                            .text_size(crate::theme::ui_px(11.))
                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                             .cursor_pointer()
                             .hover(|d| {
@@ -301,7 +301,7 @@ impl TaskSidebar {
                     .items_center()
                     .gap_1()
                     .mt_0p5()
-                    .text_size(px(9.))
+                    .text_size(crate::theme::ui_px(9.))
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .when(questions > 0, |d| {
                         d.child(
@@ -313,7 +313,7 @@ impl TaskSidebar {
                     .when(!needs_reasons.is_empty(), |d| {
                         d.child(
                             div()
-                                .text_size(px(9.))
+                                .text_size(crate::theme::ui_px(9.))
                                 .text_color(rgb(crate::theme::Theme::warning()))
                                 .child(format!("⚑{}", needs_reasons.len())),
                         )
@@ -371,6 +371,7 @@ impl TaskSidebar {
                     supports_isolated_config: a.supports_isolated_config,
                     default_command: a.command.clone(),
                     adapter: a.adapter.clone(),
+                    yolo_args: mf_plugins::builtin::yolo_args_of(&a.id),
                     modes: a
                         .modes
                         .iter()
@@ -450,7 +451,8 @@ impl TaskSidebar {
             MenuKind::Terminal => {
                 // 普通终端同样经 generic-command 适配器编译 LaunchPlan
                 let shell = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
-                let snapshot = ad_hoc_snapshot_for("generic-command", "任务终端", &shell);
+                let snapshot =
+                    ad_hoc_snapshot_for("generic-command", "任务终端", &shell, Vec::new());
                 launch(snapshot, mf_agent::RunMode::Interactive, false, self, cx);
             }
             MenuKind::DefaultCli => {
@@ -460,7 +462,9 @@ impl TaskSidebar {
                     return;
                 };
                 let command = default_command_of(&self.app, &agent_ref);
-                let snapshot = ad_hoc_snapshot_for(&agent_ref, &entry.label, &command);
+                // Orca 式权限物化:全局 yolo 时默认 CLI 附带 yolo 参数
+                let argv = self.app.permission_argv_for(&agent_ref);
+                let snapshot = ad_hoc_snapshot_for(&agent_ref, &entry.label, &command, argv);
                 // Default CLI 显式意图:只读外部已有配置,绝不写入
                 launch(snapshot, mf_agent::RunMode::Interactive, true, self, cx);
             }
@@ -566,13 +570,13 @@ impl TaskSidebar {
                             .flex_col()
                             .child(
                                 div()
-                                    .text_size(px(10.5))
+                                    .text_size(crate::theme::ui_px(10.5))
                                     .text_color(rgb(crate::theme::Theme::fg()))
                                     .child(entry.label.clone()),
                             )
                             .child(
                                 div()
-                                    .text_size(px(8.))
+                                    .text_size(crate::theme::ui_px(8.))
                                     .text_color(rgb(crate::theme::Theme::fg_dim()))
                                     .child(entry.note.clone()),
                             ),
@@ -606,13 +610,13 @@ impl TaskSidebar {
                     .gap_2()
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::ui_px(11.))
                             .child(format!("任务 {task_id} · 添加 CLI")),
                     )
                     .child(
                         div()
                             .id("cli-menu-close")
-                            .text_size(px(9.))
+                            .text_size(crate::theme::ui_px(9.))
                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                             .cursor_pointer()
                             .child("关闭")
@@ -687,7 +691,7 @@ impl Render for TaskSidebar {
                     }))
                     .child(
                         div()
-                            .text_size(px(10.5))
+                            .text_size(crate::theme::ui_px(10.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(if is_foreground {
                                 crate::theme::Theme::accent()
@@ -699,7 +703,7 @@ impl Render for TaskSidebar {
                     .when(project.active_sessions > 0, |d| {
                         d.child(
                             div()
-                                .text_size(px(9.5))
+                                .text_size(crate::theme::ui_px(9.5))
                                 .text_color(rgb(crate::theme::Theme::success()))
                                 .child(format!("●{}", project.active_sessions)),
                         )
@@ -711,7 +715,7 @@ impl Render for TaskSidebar {
                             .px_1()
                             .rounded_sm()
                             .cursor_pointer()
-                            .text_size(px(9.5))
+                            .text_size(crate::theme::ui_px(9.5))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                             .child("✕")
@@ -730,7 +734,7 @@ impl Render for TaskSidebar {
             list = list.child(
                 div()
                     .p_3()
-                    .text_size(px(11.))
+                    .text_size(crate::theme::ui_px(11.))
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child("尚未打开项目;Ctrl+Shift+O 打开文件夹。"),
             );
@@ -762,7 +766,7 @@ impl Render for TaskSidebar {
                             .border_1()
                             .border_color(rgb(crate::theme::Theme::border()))
                             .cursor_pointer()
-                            .text_size(px(10.5))
+                            .text_size(crate::theme::ui_px(10.5))
                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                             .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                             .child("+ 添加项目")
@@ -782,7 +786,7 @@ impl Render for TaskSidebar {
                             .border_1()
                             .border_color(rgb(crate::theme::Theme::border()))
                             .cursor_pointer()
-                            .text_size(px(10.5))
+                            .text_size(crate::theme::ui_px(10.5))
                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                             .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                             .child("+ 新建任务")
@@ -800,7 +804,7 @@ impl Render for TaskSidebar {
                         .mx_1p5()
                         .mb_1()
                         .px_2()
-                        .text_size(px(10.))
+                        .text_size(crate::theme::ui_px(10.))
                         .text_color(rgb(crate::theme::Theme::danger()))
                         .child(err),
                 )
@@ -813,10 +817,12 @@ impl Render for TaskSidebar {
 }
 
 /// 构造离散会话用的最小实例快照(默认 CLI / 终端入口)。
+/// `argv` 携带按全局权限模式物化的 yolo 参数(终端入口为空)。
 fn ad_hoc_snapshot_for(
     agent_type: &str,
     name: &str,
     executable: &str,
+    argv: Vec<String>,
 ) -> mf_agent::AgentInstanceSnapshot {
     mf_agent::AgentInstanceSnapshot {
         id: format!("adhoc-{agent_type}"),
@@ -826,7 +832,7 @@ fn ad_hoc_snapshot_for(
         enabled: true,
         run_mode: mf_agent::RunMode::Interactive,
         executable: executable.to_string(),
-        argv: vec![],
+        argv,
         env: vec![],
         config: serde_json::json!({}),
         execution_contract: serde_json::json!({ "completion": "manual" }),
@@ -863,6 +869,7 @@ fn temp_generic_type_info() -> crate::agent_instance_editor::AgentTypeInfo {
         supports_isolated_config: false,
         default_command: String::new(),
         adapter: "generic-command".into(),
+        yolo_args: None,
         modes: vec![mf_agent::RunMode::Interactive, mf_agent::RunMode::OneShot],
     }
 }
@@ -989,7 +996,7 @@ impl TempInstanceComposer {
             } else {
                 crate::theme::Theme::border()
             }))
-            .text_size(px(10.5))
+            .text_size(crate::theme::ui_px(10.5))
             .cursor_pointer()
             .on_click(
                 cx.listener(move |c: &mut TempInstanceComposer, _, window, cx| {
@@ -1033,7 +1040,7 @@ impl Render for TempInstanceComposer {
             .track_focus(&self.focus_handle)
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(crate::theme::ui_px(11.))
                     .child("临时实例(仅本次任务,不保存)"),
             )
             .child(self.field_el(TempField::Name, "temp-name", "名称(必填)", cx, window))
@@ -1055,14 +1062,14 @@ impl Render for TempInstanceComposer {
             .child(
                 div()
                     .id("temp-run-mode")
-                    .h(px(20.))
+                    .h(px(22.))
                     .px_2()
                     .flex()
                     .items_center()
                     .rounded_md()
                     .border_1()
                     .border_color(rgb(crate::theme::Theme::border()))
-                    .text_size(px(10.))
+                    .text_size(crate::theme::ui_px(10.))
                     .cursor_pointer()
                     .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                     .child(format!(
@@ -1089,13 +1096,13 @@ impl Render for TempInstanceComposer {
                         div()
                             .id("temp-cancel")
                             .px_2()
-                            .h(px(20.))
+                            .h(px(22.))
                             .flex()
                             .items_center()
                             .rounded_md()
                             .border_1()
                             .border_color(rgb(crate::theme::Theme::border()))
-                            .text_size(px(10.))
+                            .text_size(crate::theme::ui_px(10.))
                             .cursor_pointer()
                             .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                             .child("取消(Esc)")
@@ -1108,11 +1115,11 @@ impl Render for TempInstanceComposer {
                         div()
                             .id("temp-launch")
                             .px_2()
-                            .h(px(20.))
+                            .h(px(22.))
                             .flex()
                             .items_center()
                             .rounded_md()
-                            .text_size(px(10.))
+                            .text_size(crate::theme::ui_px(10.))
                             .cursor_pointer()
                             .when(valid, |d| {
                                 d.bg(rgb(crate::theme::Theme::accent()))

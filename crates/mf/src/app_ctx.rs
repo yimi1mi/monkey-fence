@@ -604,6 +604,28 @@ impl AppCtx {
             .map(|p| p.orchestrator.clone())
     }
 
+    /// Orca 式权限物化:全局 yolo 时返回该 agent type 的 yolo 参数
+    /// (manual 返回空,由用户在终端里手动批准)。
+    /// 默认 CLI 的临时快照没有实例参数,权限默认在这里落地。
+    pub fn permission_argv_for(&self, agent_type: &str) -> Vec<String> {
+        let global_yolo = {
+            let cfg = self.config.lock();
+            cfg.agents.permission_mode != "manual"
+        };
+        if !global_yolo {
+            return Vec::new();
+        }
+        self.plugins
+            .contributions()
+            .agent_types()
+            .into_iter()
+            // 完整贡献 ID 优先;短 id 仅兼容显式 legacy 内置引用
+            .find(|(full_id, _, a)| full_id == agent_type || a.id == agent_type)
+            .and_then(|(_, _, a)| mf_plugins::builtin::yolo_args_of(&a.id))
+            .map(|s| s.split_whitespace().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
     /// 在项目任务下创建离散 CLI 会话(设计 §4.7 / §10):
     /// 不属于 DAG、没有 Step / Agent Run,不改变 Task 状态。
     /// `external_config = true` 表示 Default CLI 只读外部配置意图

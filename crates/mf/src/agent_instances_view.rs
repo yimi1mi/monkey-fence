@@ -2,7 +2,7 @@
 //!
 //! Agent Type(默认 CLI 引导入口)与用户实例同页展示、视觉区分:
 //! 默认 CLI 条目只是"快速打开全部已检测 Agent"的入口(不落库);
-//! 持久化实例独立列出。缺失 CLI 置灰并解释原因(设计 §11.1)。
+//! 持久化实例独立列出。未检测到 CLI 的类型不出现在页面列表。
 
 use crate::agent_instance_editor::AgentTypeInfo;
 use mf_agent::agent_instance::AgentInstance;
@@ -119,10 +119,12 @@ impl AgentInstancesViewModel {
     }
 
     /// 文本过滤(标题 + 副标题,大小写不敏感)。
+    /// 未检测到的类型入口不进页面列表(选了也起不来);实例条目不受影响。
     pub fn filtered(&self, text: &str) -> Vec<InstanceListEntry> {
         let needle = text.trim().to_lowercase();
         self.entries()
             .into_iter()
+            .filter(|e| e.kind != "default-cli" || e.available)
             .filter(|e| {
                 needle.is_empty()
                     || e.title.to_lowercase().contains(&needle)
@@ -171,6 +173,8 @@ pub struct AgentInstancesPage {
     /// 按键间短暂存在,seal 后清零,drop 时擦除(明文不驻留内存)。
     secret_name_input: String,
     secret_value_input: zeroize::Zeroizing<String>,
+    /// select 类型 config 字段的选项弹出(打开的字段索引);None = 全关。
+    config_popover: Option<usize>,
 }
 
 impl AgentInstancesPage {
@@ -189,6 +193,7 @@ impl AgentInstancesPage {
             selected_task: None,
             secret_name_input: String::new(),
             secret_value_input: zeroize::Zeroizing::new(String::new()),
+            config_popover: None,
         };
         page.refresh();
         page
@@ -221,6 +226,7 @@ impl AgentInstancesPage {
                     supports_isolated_config: a.supports_isolated_config,
                     default_command: a.command.clone(),
                     adapter: a.adapter.clone(),
+                    yolo_args: mf_plugins::builtin::yolo_args_of(&a.id),
                     modes: a
                         .modes
                         .iter()
@@ -298,6 +304,9 @@ impl AgentInstancesPage {
             cx.notify();
             return;
         };
+        // Orca 式权限物化:全局 yolo 时把该 CLI 的 yolo 参数写进 argv
+        // (manual 不附加,由用户在终端里手动批准)
+        let argv = self.app.permission_argv_for(&info.full_contribution_id);
         let snapshot = mf_agent::AgentInstanceSnapshot {
             id: format!("default-{}", info.id),
             name: format!("{} 默认 CLI", info.name),
@@ -307,7 +316,7 @@ impl AgentInstancesPage {
             enabled: true,
             run_mode: mf_agent::RunMode::Interactive,
             executable: info.default_command.clone(),
-            argv: vec![],
+            argv,
             env: vec![],
             config: serde_json::json!({}),
             execution_contract: serde_json::json!({ "completion": "manual" }),
@@ -330,10 +339,19 @@ impl AgentInstancesPage {
     /// 以类型预填打开新建编辑器。
     pub fn open_editor_for_type(&mut self, agent_type: &str, cx: &mut Context<Self>) {
         if let Some(info) = self.type_info_of(agent_type) {
-            self.editor = Some(crate::agent_instance_editor::AgentInstanceEditorState::new(
-                info,
-            ));
+            let mut state = crate::agent_instance_editor::AgentInstanceEditorState::new(info);
+            // Orca 式权限默认:全局 yolo 时新建实例预填 yolo 参数
+            // (参数即状态;Manual 留空,由用户在终端里手动批准)
+            let global_yolo = {
+                let cfg = self.app.config.lock();
+                cfg.agents.permission_mode != "manual"
+            };
+            if global_yolo {
+                state.set_permission_mode(crate::agent_instance_editor::PermissionMode::Yolo);
+            }
+            self.editor = Some(state);
             self.field = PageField::Name;
+            self.config_popover = None;
             cx.notify();
         }
     }
@@ -368,6 +386,7 @@ impl AgentInstancesPage {
                     ),
                 );
                 self.field = PageField::None;
+                self.config_popover = None;
                 cx.notify();
             }
             Err(e) => {
@@ -644,6 +663,7 @@ fn fallback_type_info(agent_type: &str) -> crate::agent_instance_editor::AgentTy
         supports_isolated_config: false,
         default_command: String::new(),
         adapter: "generic-command".into(),
+        yolo_args: None,
         modes: vec![mf_agent::RunMode::Interactive],
     }
 }
@@ -657,8 +677,9 @@ fn action_chip(
     let mut chip = gpui::div()
         .id(id)
         .px_2()
-        .h(px(20.))
+        .h(px(22.))
         .flex()
+        .flex_shrink_0()
         .items_center()
         .rounded_md()
         .border_1()
@@ -667,7 +688,7 @@ fn action_chip(
         } else {
             crate::theme::Theme::border()
         }))
-        .text_size(px(9.5))
+        .text_size(crate::theme::ui_px(9.5))
         .text_color(rgb(if enabled {
             color
         } else {
@@ -675,7 +696,11 @@ fn action_chip(
         }))
         .child(label.to_string());
     if enabled {
-        chip = chip.cursor_pointer();
+        // 悬停着色底,让 chip 一眼可点(静止时仅有描边,易被当成静态文本)
+        chip = chip.cursor_pointer().hover(move |d| {
+            d.bg(gpui::rgba((color << 8) | 0x22))
+                .border_color(rgb(color))
+        });
     }
     chip
 }
@@ -684,7 +709,7 @@ fn instance_list_section(label: &str) -> impl IntoElement {
     gpui::div()
         .pt_1()
         .pb_0p5()
-        .text_size(px(8.5))
+        .text_size(crate::theme::ui_px(8.5))
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(rgb(crate::theme::Theme::fg_faint()))
         .child(label.to_string())
@@ -694,11 +719,26 @@ impl Render for AgentInstancesPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let filter = self.filter.clone();
         let entries = self.model.filtered(&filter);
+        let has_types = entries.iter().any(|e| e.kind == "default-cli");
         let mut list = gpui::div()
             .flex()
             .flex_col()
             .gap_1()
             .child(instance_list_section("可用 Agent 类型"));
+        if !has_types {
+            list = list.child(
+                gpui::div()
+                    .px_2()
+                    .pb_1()
+                    .text_size(crate::theme::ui_px(9.5))
+                    .text_color(rgb(crate::theme::Theme::fg_faint()))
+                    .child(if self.model.type_infos().is_empty() {
+                        "暂无 Agent 类型"
+                    } else {
+                        "未检测到任何 Agent CLI:安装后重启应用即可出现在这里"
+                    }),
+            );
+        }
         let mut instance_header_added = false;
         for (idx, entry) in entries.iter().enumerate() {
             let is_default = entry.kind == "default-cli";
@@ -750,53 +790,67 @@ impl Render for AgentInstancesPage {
                         }),
                     )
                     .child(
+                        // 两行布局:标题行(尾随启动 chip,不收缩防截断)+ 副标题整行,
+                        // 避免窄面板下单行三段互相挤压导致 chip 文字被裁
                         gpui::div()
                             .flex()
-                            .items_center()
-                            .gap_2()
+                            .flex_col()
+                            .gap_0p5()
                             .child(
                                 gpui::div()
-                                    .text_size(px(11.))
-                                    .text_color(rgb(title_color))
-                                    .child(title),
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        gpui::div()
+                                            .text_size(crate::theme::ui_px(11.))
+                                            .text_color(rgb(title_color))
+                                            .child(title),
+                                    )
+                                    .child(gpui::div().flex_1().min_w_0())
+                                    .when(is_default && available, |d| {
+                                        d.child(
+                                            action_chip(
+                                                gpui::ElementId::Name(
+                                                    format!("inst-launch-{idx}").into()
+                                                ),
+                                                "启动临时会话",
+                                                crate::theme::Theme::accent(),
+                                                true,
+                                            )
+                                            .on_click(cx.listener(
+                                                move |page: &mut AgentInstancesPage,
+                                                      _ev,
+                                                      _w,
+                                                      cx| {
+                                                    let entry = page
+                                                        .model
+                                                        .filtered(&page.filter)
+                                                        .get(idx2)
+                                                        .cloned();
+                                                    if let Some(entry) = entry {
+                                                        if let Some(info) = page
+                                                            .model
+                                                            .type_infos()
+                                                            .iter()
+                                                            .find(|t| t.name == entry.title)
+                                                        {
+                                                            let id = info.id.clone();
+                                                            page.launch_default_cli(&id, cx);
+                                                        }
+                                                    }
+                                                },
+                                            )),
+                                        )
+                                    }),
                             )
                             .child(
                                 gpui::div()
-                                    .flex_1()
-                                    .text_size(px(9.))
+                                    .min_w_0()
+                                    .text_size(crate::theme::ui_px(9.))
                                     .text_color(rgb(sub_color))
                                     .child(subtitle),
-                            )
-                            .when(is_default && available, |d| {
-                                d.child(
-                                    action_chip(
-                                        gpui::ElementId::Name(format!("inst-launch-{idx}").into()),
-                                        "启动临时会话",
-                                        crate::theme::Theme::accent(),
-                                        true,
-                                    )
-                                    .on_click(cx.listener(
-                                        move |page: &mut AgentInstancesPage, _ev, _w, cx| {
-                                            let entry = page
-                                                .model
-                                                .filtered(&page.filter)
-                                                .get(idx2)
-                                                .cloned();
-                                            if let Some(entry) = entry {
-                                                if let Some(info) = page
-                                                    .model
-                                                    .type_infos()
-                                                    .iter()
-                                                    .find(|t| t.name == entry.title)
-                                                {
-                                                    let id = info.id.clone();
-                                                    page.launch_default_cli(&id, cx);
-                                                }
-                                            }
-                                        },
-                                    )),
-                                )
-                            }),
+                            ),
                     ),
             );
             let _ = entry_id;
@@ -809,7 +863,7 @@ impl Render for AgentInstancesPage {
                 .items_center()
                 .justify_center()
                 .text_color(rgb(crate::theme::Theme::fg_dim()))
-                .text_size(px(11.))
+                .text_size(crate::theme::ui_px(11.))
                 .child("从左侧选择 Agent 类型创建实例，或选择已有实例继续编辑")
                 .into_any_element(),
             Some(state) => {
@@ -868,10 +922,10 @@ impl Render for AgentInstancesPage {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(gpui::div().text_size(px(12.)).child(header))
+                                    .child(gpui::div().text_size(crate::theme::ui_px(12.)).child(header))
                                     .child(
                                         gpui::div()
-                                            .text_size(px(9.))
+                                            .text_size(crate::theme::ui_px(9.))
                                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                                             .child(adapter_note),
                                     ),
@@ -894,7 +948,7 @@ impl Render for AgentInstancesPage {
                                     .child(
                                         gpui::div()
                                             .w(px(140.))
-                                            .text_size(px(10.))
+                                            .text_size(crate::theme::ui_px(10.))
                                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                                             .child(label.to_string()),
                                     )
@@ -914,7 +968,7 @@ impl Render for AgentInstancesPage {
                                             } else {
                                                 crate::theme::Theme::border()
                                             }))
-                                            .text_size(px(10.))
+                                            .text_size(crate::theme::ui_px(10.))
                                             .cursor_pointer()
                                             .child(display)
                                             .on_click(cx.listener(
@@ -948,13 +1002,13 @@ impl Render for AgentInstancesPage {
                                     .child(
                                         gpui::div()
                                             .w(px(140.))
-                                            .text_size(px(10.))
+                                            .text_size(crate::theme::ui_px(10.))
                                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                                             .child("作用域(点击切换)"),
                                     )
                                     .child(
                                         gpui::div()
-                                            .text_size(px(10.))
+                                            .text_size(crate::theme::ui_px(10.))
                                             .child(match state.scope {
                                                 mf_agent::InstanceScope::User => {
                                                     "User(全局可见)".to_string()
@@ -974,7 +1028,7 @@ impl Render for AgentInstancesPage {
                                         .child(
                                             gpui::div()
                                                 .w(px(140.))
-                                                .text_size(px(10.))
+                                                .text_size(crate::theme::ui_px(10.))
                                                 .text_color(rgb(crate::theme::Theme::fg_dim()))
                                                 .child("project_key"),
                                         )
@@ -993,7 +1047,7 @@ impl Render for AgentInstancesPage {
                                                         crate::theme::Theme::border()
                                                     },
                                                 ))
-                                                .text_size(px(10.))
+                                                .text_size(crate::theme::ui_px(10.))
                                                 .cursor_pointer()
                                                 .on_click(cx.listener(
                                                     |page: &mut AgentInstancesPage, _ev, _w, cx| {
@@ -1028,17 +1082,65 @@ impl Render for AgentInstancesPage {
                                     .child(
                                         gpui::div()
                                             .w(px(140.))
-                                            .text_size(px(10.))
+                                            .text_size(crate::theme::ui_px(10.))
                                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                                             .child("运行模式(点击切换)"),
                                     )
                                     .child(
-                                        gpui::div().text_size(px(10.)).child(match state.run_mode {
+                                        gpui::div().text_size(crate::theme::ui_px(10.)).child(match state.run_mode {
                                             mf_agent::RunMode::Interactive => "交互".to_string(),
                                             mf_agent::RunMode::OneShot => "一次性".to_string(),
                                         }),
                                     ),
                             )
+                            // Orca 式权限行:模式由参数推导,点击在
+                            // Yolo/Manual 间切换(自定义参数不受影响)
+                            .when(state.info.yolo_args.is_some(), |d| {
+                                let permission = state.permission_mode();
+                                let display = match permission {
+                                    crate::agent_instance_editor::PermissionMode::Yolo => {
+                                        "Yolo(自动批准)".to_string()
+                                    }
+                                    crate::agent_instance_editor::PermissionMode::Manual => {
+                                        "Manual(终端里手动批准)".to_string()
+                                    }
+                                    crate::agent_instance_editor::PermissionMode::Custom => {
+                                        format!(
+                                            "自定义(参数含 {},切换不影响)",
+                                            state.argv_text
+                                        )
+                                    }
+                                };
+                                d.child(
+                                    gpui::div()
+                                        .id("inst-permission-toggle")
+                                        .flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .cursor_pointer()
+                                        .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                                        .on_click(cx.listener(
+                                            |page: &mut AgentInstancesPage, _ev, _w, cx| {
+                                                if let Some(state) = page.editor.as_mut() {
+                                                    state.toggle_permission();
+                                                }
+                                                cx.notify();
+                                            },
+                                        ))
+                                        .child(
+                                            gpui::div()
+                                                .w(px(140.))
+                                                .text_size(crate::theme::ui_px(10.))
+                                                .text_color(rgb(crate::theme::Theme::fg_dim()))
+                                                .child("权限(点击切换)"),
+                                        )
+                                        .child(
+                                            gpui::div()
+                                                .text_size(crate::theme::ui_px(10.))
+                                                .child(display),
+                                        ),
+                                )
+                            })
                             .when(editing, |d| {
                                 d.child(
                                     gpui::div()
@@ -1059,12 +1161,12 @@ impl Render for AgentInstancesPage {
                                         .child(
                                             gpui::div()
                                                 .w(px(140.))
-                                                .text_size(px(10.))
+                                                .text_size(crate::theme::ui_px(10.))
                                                 .text_color(rgb(crate::theme::Theme::fg_dim()))
                                                 .child("启用(点击切换)"),
                                         )
                                         .child(
-                                            gpui::div().text_size(px(10.)).child(
+                                            gpui::div().text_size(crate::theme::ui_px(10.)).child(
                                                 if state.enabled {
                                                     "已启用".to_string()
                                                 } else {
@@ -1074,7 +1176,8 @@ impl Render for AgentInstancesPage {
                                         ),
                                 )
                             })
-                            // 插件 config_schema 声明式表单(真渲染)
+                            // 插件 config_schema 声明式表单(真渲染)。
+                            // select 字段点击弹出选项列表,不让用户手敲枚举值
                             .children(
                                 state
                                     .config_form()
@@ -1088,66 +1191,218 @@ impl Render for AgentInstancesPage {
                                             if field.required { "(必填)" } else { "" }
                                         );
                                         let is_secret = field.kind == "secret";
-                                        let options_note = if field.kind == "select" {
-                                            format!("(可选:{})", field.options.join(" / "))
-                                        } else {
-                                            String::new()
-                                        };
-                                        gpui::div()
+                                        let is_select =
+                                            field.kind == "select" && !field.options.is_empty();
+                                        let value = state.config_form().masked_value(&field.id);
+                                        let popover_open =
+                                            is_select && self.config_popover == Some(idx);
+                                        let mut row = gpui::div()
                                             .flex()
-                                            .gap_2()
-                                            .items_start()
+                                            .flex_col()
+                                            .gap_1()
                                             .child(
                                                 gpui::div()
-                                                    .w(px(140.))
-                                                    .text_size(px(10.))
-                                                    .text_color(rgb(crate::theme::Theme::fg_dim()))
-                                                    .child(label),
-                                            )
-                                            .child(
-                                                gpui::div()
-                                                    .id(gpui::ElementId::Name(
-                                                        format!("inst-config-{}", field.id).into(),
-                                                    ))
-                                                    .flex_1()
-                                                    .px_2()
-                                                    .py_1()
-                                                    .rounded_md()
-                                                    .border_1()
-                                                    .border_color(rgb(
-                                                        if self.field
-                                                            == PageField::ConfigField(idx)
-                                                        {
+                                                    .flex()
+                                                    .gap_2()
+                                                    .items_center()
+                                                    .child(
+                                                        gpui::div()
+                                                            .w(px(140.))
+                                                            .flex_shrink_0()
+                                                            .text_size(crate::theme::ui_px(10.))
+                                                            .text_color(rgb(
+                                                                crate::theme::Theme::fg_dim(),
+                                                            ))
+                                                            .child(label),
+                                                    )
+                                                    .child(
+                                                        gpui::div()
+                                                            .id(gpui::ElementId::Name(
+                                                                format!("inst-config-{}", field.id)
+                                                                    .into(),
+                                                            ))
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .px_2()
+                                                            .py_1()
+                                                            .rounded_md()
+                                                            .border_1()
+                                                            .border_color(rgb(
+                                                                if popover_open
+                                                                    || self.field
+                                                                        == PageField::ConfigField(
+                                                                            idx
+                                                                        )
+                                                                {
+                                                                    crate::theme::Theme::accent()
+                                                                } else {
+                                                                    crate::theme::Theme::border()
+                                                                },
+                                                            ))
+                                                            .text_size(crate::theme::ui_px(10.))
+                                                            .cursor_pointer()
+                                                            .on_click(cx.listener(
+                                                                move |page: &mut AgentInstancesPage,
+                                                                      _ev,
+                                                                      _w,
+                                                                      cx| {
+                                                                    if is_select {
+                                                                        // 弹出/收起选项;
+                                                                        // 收起时清键盘焦点
+                                                                        page.config_popover = if page
+                                                                            .config_popover
+                                                                            == Some(idx)
+                                                                        {
+                                                                            None
+                                                                        } else {
+                                                                            Some(idx)
+                                                                        };
+                                                                        if page.config_popover
+                                                                            .is_none()
+                                                                        {
+                                                                            page.field =
+                                                                                PageField::None;
+                                                                        }
+                                                                    } else {
+                                                                        page.field =
+                                                                            PageField::ConfigField(
+                                                                                idx,
+                                                                            );
+                                                                    }
+                                                                    cx.notify();
+                                                                },
+                                                            ))
+                                                            .child(if is_select {
+                                                                if value.is_empty() {
+                                                                    "(点击选择) ▾".to_string()
+                                                                } else {
+                                                                    format!("{value} ▾")
+                                                                }
+                                                            } else {
+                                                                value.clone()
+                                                            })
+                                                            .when(is_secret, |d| {
+                                                                d.child(
+                                                                    gpui::div().text_size(crate::theme::ui_px(9.)).child(
+                                                                        "(Secret 引用;由下方 Secret 管理选择)",
+                                                                    ),
+                                                                )
+                                                            }),
+                                                    ),
+                                            );
+                                        if popover_open {
+                                            let field_id = field.id.clone();
+                                            let mut opts = gpui::div()
+                                                .id(gpui::ElementId::Name(
+                                                    format!("inst-config-opts-{}", field.id)
+                                                        .into(),
+                                                ))
+                                                .ml(px(148.))
+                                                .max_h(px(120.))
+                                                .overflow_y_scroll()
+                                                .rounded_md()
+                                                .border_1()
+                                                .border_color(rgb(
+                                                    crate::theme::Theme::border(),
+                                                ))
+                                                .bg(rgb(crate::theme::Theme::bg_elevated()))
+                                                .flex()
+                                                .flex_col();
+                                            for (opt_idx, opt) in
+                                                field.options.iter().enumerate()
+                                            {
+                                                let opt = opt.clone();
+                                                let field_id = field_id.clone();
+                                                let selected = opt == value;
+                                                opts = opts.child(
+                                                    gpui::div()
+                                                        .id(gpui::ElementId::Name(
+                                                            format!(
+                                                                "inst-config-opt-{field_id}-{opt_idx}"
+                                                            )
+                                                            .into(),
+                                                        ))
+                                                        .px_2()
+                                                        .py_1()
+                                                        .text_size(crate::theme::ui_px(10.))
+                                                        .cursor_pointer()
+                                                        .hover(|h| {
+                                                            h.bg(rgb(
+                                                                crate::theme::Theme::bg_hover(),
+                                                            ))
+                                                        })
+                                                        .text_color(rgb(if selected {
                                                             crate::theme::Theme::accent()
                                                         } else {
-                                                            crate::theme::Theme::border()
-                                                        },
-                                                    ))
-                                                    .text_size(px(10.))
-                                                    .cursor_pointer()
-                                                    .on_click(cx.listener(
-                                                        move |page: &mut AgentInstancesPage,
-                                                              _ev,
-                                                              _w,
-                                                              cx| {
-                                                            page.field =
-                                                                PageField::ConfigField(idx);
-                                                            cx.notify();
-                                                        },
-                                                    ))
-                                                    .child(format!(
-                                                        "{}{}",
-                                                        state.config_form().masked_value(&field.id),
-                                                        options_note
-                                                    ))
-                                                    .when(is_secret, |d| {
-                                                        d.child(
-                                                            gpui::div().text_size(px(9.)).child(
-                                                                "(Secret 引用;由下方 Secret 管理选择)",
-                                                            ),
-                                                        )
-                                                    }),
-                                            )
+                                                            crate::theme::Theme::fg()
+                                                        }))
+                                                        .child(if selected {
+                                                            format!("✓ {opt}")
+                                                        } else {
+                                                            opt.clone()
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |page: &mut AgentInstancesPage,
+                                                                  _ev,
+                                                                  _w,
+                                                                  cx| {
+                                                                if let Some(state) =
+                                                                    page.editor.as_mut()
+                                                                {
+                                                                    state.set_config_value(
+                                                                        &field_id, &opt,
+                                                                    );
+                                                                }
+                                                                page.config_popover = None;
+                                                                cx.notify();
+                                                            },
+                                                        )),
+                                                );
+                                            }
+                                            if !value.is_empty() {
+                                                let field_id = field_id.clone();
+                                                opts = opts.child(
+                                                    gpui::div()
+                                                        .id(gpui::ElementId::Name(
+                                                            format!(
+                                                                "inst-config-clear-{field_id}"
+                                                            )
+                                                            .into(),
+                                                        ))
+                                                        .px_2()
+                                                        .py_1()
+                                                        .text_size(crate::theme::ui_px(10.))
+                                                        .cursor_pointer()
+                                                        .hover(|h| {
+                                                            h.bg(rgb(
+                                                                crate::theme::Theme::bg_hover(),
+                                                            ))
+                                                        })
+                                                        .text_color(rgb(
+                                                            crate::theme::Theme::fg_faint(),
+                                                        ))
+                                                        .child("(清空)")
+                                                        .on_click(cx.listener(
+                                                            move |page: &mut AgentInstancesPage,
+                                                                  _ev,
+                                                                  _w,
+                                                                  cx| {
+                                                                if let Some(state) =
+                                                                    page.editor.as_mut()
+                                                                {
+                                                                    state.clear_config_value(
+                                                                        &field_id,
+                                                                    );
+                                                                }
+                                                                page.config_popover = None;
+                                                                cx.notify();
+                                                            },
+                                                        )),
+                                                );
+                                            }
+                                            row = row.child(opts);
+                                        }
+                                        row
                                     })
                                     .collect::<Vec<_>>(),
                             )
@@ -1160,7 +1415,7 @@ impl Render for AgentInstancesPage {
                                     .child(
                                         gpui::div()
                                             .w(px(140.))
-                                            .text_size(px(10.))
+                                            .text_size(crate::theme::ui_px(10.))
                                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                                             .child("Secret 引用"),
                                     )
@@ -1172,7 +1427,7 @@ impl Render for AgentInstancesPage {
                                             .gap_1()
                                             .child(
                                                 gpui::div()
-                                                    .text_size(px(10.))
+                                                    .text_size(crate::theme::ui_px(10.))
                                                     .text_color(rgb(
                                                         crate::theme::Theme::fg_dim(),
                                                     ))
@@ -1203,7 +1458,7 @@ impl Render for AgentInstancesPage {
                                                                 .flex()
                                                                 .gap_2()
                                                                 .items_center()
-                                                                .text_size(px(9.))
+                                                                .text_size(crate::theme::ui_px(9.))
                                                                 .cursor_pointer()
                                                                 .hover(|d| {
                                                                     d.bg(rgb(
@@ -1250,7 +1505,7 @@ impl Render for AgentInstancesPage {
                                     .child(
                                         gpui::div()
                                             .w(px(140.))
-                                            .text_size(px(10.))
+                                            .text_size(crate::theme::ui_px(10.))
                                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                                             .child("Secret 管理"),
                                     )
@@ -1269,7 +1524,7 @@ impl Render for AgentInstancesPage {
                                                     crate::theme::Theme::border()
                                                 },
                                             ))
-                                            .text_size(px(9.))
+                                            .text_size(crate::theme::ui_px(9.))
                                             .cursor_pointer()
                                             .on_click(cx.listener(
                                                 |page: &mut AgentInstancesPage, _ev, _w, cx| {
@@ -1298,7 +1553,7 @@ impl Render for AgentInstancesPage {
                                                     crate::theme::Theme::border()
                                                 },
                                             ))
-                                            .text_size(px(9.))
+                                            .text_size(crate::theme::ui_px(9.))
                                             .cursor_pointer()
                                             .on_click(cx.listener(
                                                 |page: &mut AgentInstancesPage, _ev, _w, cx| {
@@ -1351,7 +1606,7 @@ impl Render for AgentInstancesPage {
                                     .gap_1()
                                     .child(
                                         gpui::div()
-                                            .text_size(px(10.))
+                                            .text_size(crate::theme::ui_px(10.))
                                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                                             .child("Secret 环境变量(ENV → 引用)"),
                                     )
@@ -1381,7 +1636,7 @@ impl Render for AgentInstancesPage {
                                                                 crate::theme::Theme::border()
                                                             },
                                                         ))
-                                                        .text_size(px(9.))
+                                                        .text_size(crate::theme::ui_px(9.))
                                                         .cursor_pointer()
                                                         .child(if env.is_empty() {
                                                             "ENV_NAME…".to_string()
@@ -1401,7 +1656,7 @@ impl Render for AgentInstancesPage {
                                                 )
                                                 .child(
                                                     gpui::div()
-                                                        .text_size(px(9.))
+                                                        .text_size(crate::theme::ui_px(9.))
                                                         .text_color(rgb(crate::theme::Theme::fg_dim()))
                                                         .child(format!("→ {ref_id}")),
                                                 )
@@ -1577,7 +1832,7 @@ impl Render for AgentInstancesPage {
                             .when(!errors.is_empty(), |d| {
                                 d.child(
                                     gpui::div()
-                                        .text_size(px(9.))
+                                        .text_size(crate::theme::ui_px(9.))
                                         .text_color(rgb(crate::theme::Theme::danger()))
                                         .child(error_text),
                                 )
@@ -1614,13 +1869,13 @@ impl Render for AgentInstancesPage {
                     .gap_2()
                     .child(
                         gpui::div()
-                            .text_size(px(12.))
+                            .text_size(crate::theme::ui_px(12.))
                             .text_color(rgb(crate::theme::Theme::fg()))
                             .child("智能体 · 实例配置"),
                     )
                     .child(
                         gpui::div()
-                            .text_size(px(9.))
+                            .text_size(crate::theme::ui_px(9.))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .child("CLI、参数、环境、Secret 与隔离配置的唯一编辑入口"),
                     )
@@ -1638,7 +1893,7 @@ impl Render for AgentInstancesPage {
                             } else {
                                 crate::theme::Theme::border()
                             }))
-                            .text_size(px(10.))
+                            .text_size(crate::theme::ui_px(10.))
                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                             .cursor_pointer()
                             .child(filter_display)
@@ -1669,7 +1924,7 @@ impl Render for AgentInstancesPage {
                     .when(!status.is_empty(), |d| {
                         d.child(
                             gpui::div()
-                                .text_size(px(9.))
+                                .text_size(crate::theme::ui_px(9.))
                                 .text_color(rgb(crate::theme::Theme::fg_dim()))
                                 .child(status),
                         )

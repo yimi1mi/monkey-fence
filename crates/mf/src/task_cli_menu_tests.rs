@@ -21,6 +21,7 @@ fn menu_types() -> Vec<crate::agent_instance_editor::AgentTypeInfo> {
             supports_isolated_config: true,
             default_command: "codex".into(),
             adapter: "codex".into(),
+            yolo_args: None,
             modes: vec![RunMode::Interactive, RunMode::OneShot],
         },
         crate::agent_instance_editor::AgentTypeInfo {
@@ -35,6 +36,7 @@ fn menu_types() -> Vec<crate::agent_instance_editor::AgentTypeInfo> {
             supports_isolated_config: false,
             default_command: "gemini".into(),
             adapter: "generic-command".into(),
+            yolo_args: None,
             modes: vec![RunMode::Interactive],
         },
     ]
@@ -146,6 +148,7 @@ fn default_cli_menu_entries_carry_full_contribution_id() {
         supports_isolated_config: true,
         default_command: "super-agent".into(),
         adapter: "generic-command".into(),
+        yolo_args: None,
         modes: vec![mf_agent::RunMode::Interactive],
     });
     let menu = build_task_cli_menu(&types, &menu_instances());
@@ -186,6 +189,7 @@ fn launch_menu_entry_default_cli_uses_full_contribution_id() {
         supports_isolated_config: true,
         default_command: "super-agent".into(),
         adapter: "generic-command".into(),
+        yolo_args: None,
         modes: vec![mf_agent::RunMode::Interactive],
     });
     let info = types.last().unwrap();

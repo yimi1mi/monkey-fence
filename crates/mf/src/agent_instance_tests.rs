@@ -22,7 +22,27 @@ fn detected_type() -> AgentTypeInfo {
         supports_isolated_config: false,
         default_command: "agent.exe".into(),
         adapter: "generic-command".into(),
+        yolo_args: None,
         modes: vec![RunMode::OneShot, RunMode::Interactive],
+    }
+}
+
+/// 内置 Claude 投影:yolo 参数表命中,编辑器渲染权限行。
+fn claude_type() -> AgentTypeInfo {
+    AgentTypeInfo {
+        id: "claude".into(),
+        full_contribution_id: "monkeyfence.claude".into(),
+        name: "Claude".into(),
+        plugin_name: "MonkeyFence 内置".into(),
+        plugin_version: "0.1.0".into(),
+        content_hash: String::new(),
+        config_schema_fields: Vec::new(),
+        detected: true,
+        supports_isolated_config: true,
+        default_command: "claude".into(),
+        adapter: "claude-code".into(),
+        yolo_args: mf_plugins::builtin::yolo_args_of("claude"),
+        modes: vec![RunMode::Interactive, RunMode::OneShot],
     }
 }
 
@@ -142,11 +162,16 @@ fn list_distinguishes_default_clis_from_instances() {
     assert!(entries
         .iter()
         .any(|e| e.kind == "instance" && e.title == "Codex Review"));
-    // 未检测到的类型:可见但标注不可用
+    // 未检测到的类型:entries 完整投影仍标注不可用,
+    // 但页面列表(filtered)不出现——选了也起不来
     let mut m2 = AgentInstancesViewModel::default();
     m2.push_type(unavailable_type());
     assert!(m2
         .entries()
+        .iter()
+        .any(|e| e.kind == "default-cli" && !e.available));
+    assert!(!m2
+        .filtered("")
         .iter()
         .any(|e| e.kind == "default-cli" && !e.available));
 }
@@ -238,11 +263,12 @@ fn editor_roundtrips_scope_project_run_mode_and_enabled() {
 
 #[test]
 fn config_schema_form_renders_into_draft_config() {
-    // 插件声明式 Schema(与 manifest config_schema 文件同构)
+    // 插件声明式 Schema(与 manifest config_schema 文件同构);
+    // 权限不再是 config 字段(Orca 式权限行走 argv,见下方权限测试)
     let schema = serde_json::json!({
         "fields": [
-            { "id": "permission_mode", "label": "权限模式", "kind": "select",
-              "required": true, "options": ["default", "acceptEdits"] },
+            { "id": "log_level", "label": "日志级别", "kind": "select",
+              "required": true, "options": ["debug", "info"] },
             { "id": "api_key_ref", "label": "API Key", "kind": "secret", "required": false }
         ]
     });
@@ -251,12 +277,12 @@ fn config_schema_form_renders_into_draft_config() {
     let mut state = crate::agent_instance_editor::AgentInstanceEditorState::new(detected_type());
     state.set_config_form(form);
     state.set_name("claude 实例");
-    state.set_config_value("permission_mode", "acceptEdits");
+    state.set_config_value("log_level", "info");
     state.set_config_value("api_key_ref", "sec-123");
     // Secret 字段只存引用
     assert_eq!(state.config_form().masked_value("api_key_ref"), "••••");
     let draft = state.to_draft();
-    assert_eq!(draft.config["permission_mode"], "acceptEdits");
+    assert_eq!(draft.config["log_level"], "info");
     assert_eq!(draft.config["api_key_ref"], "sec-123");
     // 必填校验在表单层生效
     let mut empty = crate::agent_instance_editor::AgentInstanceEditorState::new(detected_type());
@@ -265,7 +291,114 @@ fn config_schema_form_renders_into_draft_config() {
     assert!(empty
         .validation()
         .iter()
-        .any(|e| e.message.contains("权限模式")));
+        .any(|e| e.message.contains("日志级别")));
+}
+
+// ---------- Orca 式权限(模式由参数推导,切换物化/清空 yolo 参数) ----------
+
+#[test]
+fn permission_mode_is_derived_from_argv() {
+    use crate::agent_instance_editor::{
+        apply_permission_mode, resolve_permission_mode, PermissionMode,
+    };
+    let yolo = Some("--dangerously-skip-permissions");
+    // 空 = Manual;恰好等于 yolo 参数 = Yolo(空白归一);其余 = Custom
+    assert_eq!(resolve_permission_mode("", yolo), PermissionMode::Manual);
+    assert_eq!(
+        resolve_permission_mode("  --dangerously-skip-permissions  ", yolo),
+        PermissionMode::Yolo
+    );
+    assert_eq!(
+        resolve_permission_mode("--model sonnet", yolo),
+        PermissionMode::Custom
+    );
+    // 类型不支持权限切换(无 yolo 参数)恒为 Manual
+    assert_eq!(
+        resolve_permission_mode("--anything", None),
+        PermissionMode::Manual
+    );
+    // 应用:空/恰好 yolo 时改写;自定义参数永不触碰
+    assert_eq!(
+        apply_permission_mode(PermissionMode::Yolo, "", yolo),
+        "--dangerously-skip-permissions"
+    );
+    assert_eq!(
+        apply_permission_mode(
+            PermissionMode::Manual,
+            "--dangerously-skip-permissions",
+            yolo
+        ),
+        ""
+    );
+    assert_eq!(
+        apply_permission_mode(PermissionMode::Manual, "--model sonnet", yolo),
+        "--model sonnet",
+        "自定义参数不受权限切换影响(Orca: overridden args untouched)"
+    );
+}
+
+#[test]
+fn editor_permission_toggle_materializes_yolo_args_into_draft() {
+    let mut state = crate::agent_instance_editor::AgentInstanceEditorState::new(claude_type());
+    state.set_name("claude-yolo");
+    state.set_executable("claude");
+    // 新建默认 Manual:参数为空,不附加权限参数
+    assert_eq!(
+        state.permission_mode(),
+        crate::agent_instance_editor::PermissionMode::Manual
+    );
+    // 切到 Yolo:参数物化为 yolo 串,随草案落库(启动链路直接用 argv)
+    state.toggle_permission();
+    assert_eq!(
+        state.permission_mode(),
+        crate::agent_instance_editor::PermissionMode::Yolo
+    );
+    let yolo = mf_plugins::builtin::yolo_args_of("claude").unwrap();
+    assert_eq!(state.argv_text, yolo);
+    let draft = state.to_draft();
+    assert_eq!(draft.argv, vec![yolo]);
+    // 再切回 Manual:恰好等于 yolo 参数 → 清空
+    state.toggle_permission();
+    assert_eq!(
+        state.permission_mode(),
+        crate::agent_instance_editor::PermissionMode::Manual
+    );
+    assert_eq!(state.argv_text, "");
+}
+
+#[test]
+fn editor_permission_toggle_never_touches_custom_argv() {
+    let mut state = crate::agent_instance_editor::AgentInstanceEditorState::new(claude_type());
+    state.set_name("claude-custom");
+    state.set_executable("claude");
+    state.set_argv("--model sonnet --permission-mode plan");
+    // 自定义参数:推导为 Custom,切换不改写(显示层折叠为 Yolo)
+    assert_eq!(
+        state.permission_mode(),
+        crate::agent_instance_editor::PermissionMode::Custom
+    );
+    state.toggle_permission();
+    assert_eq!(state.argv_text, "--model sonnet --permission-mode plan");
+    assert_eq!(
+        state.permission_mode(),
+        crate::agent_instance_editor::PermissionMode::Custom
+    );
+}
+
+#[test]
+fn builtin_yolo_args_table_covers_cli_agents() {
+    // 权限参数表与内置 CLI 对齐:已知 CLI 给出 yolo 串,未知/不支持为 None
+    assert_eq!(
+        mf_plugins::builtin::yolo_args_of("claude").as_deref(),
+        Some("--dangerously-skip-permissions")
+    );
+    assert_eq!(
+        mf_plugins::builtin::yolo_args_of("codex").as_deref(),
+        Some("--dangerously-bypass-approvals-and-sandbox")
+    );
+    assert_eq!(mf_plugins::builtin::yolo_args_of("gemini").as_deref(), Some("--yolo"));
+    assert_eq!(mf_plugins::builtin::yolo_args_of("opencode"), None);
+    assert_eq!(mf_plugins::builtin::yolo_args_of("not-a-cli"), None);
 }
 
 #[test]
@@ -451,6 +584,7 @@ fn editor_resolves_type_info_by_full_contribution_id() {
         supports_isolated_config: true,
         default_command: "super-agent".into(),
         adapter: "generic-command".into(),
+        yolo_args: None,
         modes: vec![mf_agent::RunMode::Interactive],
         config_schema_fields: Vec::new(),
     };

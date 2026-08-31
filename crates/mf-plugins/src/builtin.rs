@@ -182,6 +182,16 @@ pub fn builtin_cli_agents() -> Vec<BuiltinAgent> {
     ]
 }
 
+/// Orca 式权限配置:内置 Agent 的 yolo 参数串(空表 = 该 CLI 不支持)。
+/// 权限模式由实例参数推导,不单独持久化;切换只物化/清空这段参数。
+pub fn yolo_args_of(profile_id: &str) -> Option<String> {
+    builtin_cli_agents()
+        .iter()
+        .find(|a| a.profile_id == profile_id)
+        .filter(|a| !a.permission_args.is_empty())
+        .map(|a| a.permission_args.join(" "))
+}
+
 /// 供设置页展示:内置 Agent 的安装规格(克隆返回)。
 pub fn install_spec_of(profile_id: &str) -> Option<InstallSpec> {
     builtin_cli_agents()

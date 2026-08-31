@@ -36,8 +36,62 @@ pub struct AgentTypeInfo {
     pub default_command: String,
     pub adapter: String,
     pub modes: Vec<RunMode>,
+    /// Orca 式权限参数:该 CLI 的 yolo 参数串(如
+    /// `--dangerously-skip-permissions`);None = 不支持权限切换。
+    pub yolo_args: Option<String>,
     /// manifest config_schema 声明的表单字段(编辑器真渲染 DeclarativeForm)。
     pub config_schema_fields: Vec<crate::declarative_form::FormField>,
+}
+
+/// 权限模式(参考 Orca:由实例参数推导,不单独持久化)。
+/// 空 = Manual;恰好等于 yolo 参数 = Yolo;其余 = 自定义(切换不触碰)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionMode {
+    Yolo,
+    Manual,
+    Custom,
+}
+
+/// 空白归一化(多处空格/首尾空白视为同一参数串)。
+fn normalize_args(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// 从实例参数推导权限模式(Orca resolveAgentPermissionMode)。
+pub fn resolve_permission_mode(argv_text: &str, yolo_args: Option<&str>) -> PermissionMode {
+    let Some(yolo_args) = yolo_args else {
+        return PermissionMode::Manual;
+    };
+    let argv = normalize_args(argv_text);
+    if argv.is_empty() {
+        PermissionMode::Manual
+    } else if argv == normalize_args(yolo_args) {
+        PermissionMode::Yolo
+    } else {
+        PermissionMode::Custom
+    }
+}
+
+/// 应用权限模式(Orca applyAgentPermissionMode):仅在参数为空或
+/// 恰好等于 yolo 参数时改写;用户自定义参数永不触碰。
+/// 返回新的参数串。
+pub fn apply_permission_mode(
+    mode: PermissionMode,
+    argv_text: &str,
+    yolo_args: Option<&str>,
+) -> String {
+    let Some(yolo_args) = yolo_args else {
+        return argv_text.to_string();
+    };
+    let argv = normalize_args(argv_text);
+    if argv.is_empty() || argv == normalize_args(yolo_args) {
+        match mode {
+            PermissionMode::Yolo => yolo_args.to_string(),
+            PermissionMode::Manual | PermissionMode::Custom => String::new(),
+        }
+    } else {
+        argv_text.to_string()
+    }
 }
 
 /// 结构校验错误(机器码 + 人类可读信息)。
@@ -194,6 +248,27 @@ impl AgentInstanceEditorState {
         };
     }
 
+    /// 当前权限模式(由参数推导;类型不支持时恒为 Manual)。
+    pub fn permission_mode(&self) -> PermissionMode {
+        resolve_permission_mode(&self.argv_text, self.info.yolo_args.as_deref())
+    }
+
+    /// 设置权限模式:物化/清空 yolo 参数;自定义参数保持不动。
+    pub fn set_permission_mode(&mut self, mode: PermissionMode) {
+        self.argv_text =
+            apply_permission_mode(mode, &self.argv_text, self.info.yolo_args.as_deref());
+    }
+
+    /// 点击切换(Orca 语义):非 Manual(含自定义)显示为 Yolo,
+    /// 点击切换到 Manual;Manual 点击切换到 Yolo。
+    pub fn toggle_permission(&mut self) {
+        let target = match self.permission_mode() {
+            PermissionMode::Manual => PermissionMode::Yolo,
+            PermissionMode::Yolo | PermissionMode::Custom => PermissionMode::Manual,
+        };
+        self.set_permission_mode(target);
+    }
+
     pub fn toggle_enabled(&mut self) {
         self.enabled = !self.enabled;
     }
@@ -209,6 +284,10 @@ impl AgentInstanceEditorState {
 
     pub fn set_config_value(&mut self, id: &str, raw: &str) {
         self.config_form.set_value(id, raw);
+    }
+
+    pub fn clear_config_value(&mut self, id: &str) {
+        self.config_form.clear_value(id);
     }
 
     pub fn add_secret_ref(&mut self, secret_id: &str) {

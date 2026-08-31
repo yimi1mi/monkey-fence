@@ -221,13 +221,9 @@ fn builtin_config_schema_fields(agent_type: &str) -> Vec<crate::declarative_form
         options: options.into_iter().map(str::to_string).collect(),
     };
     match agent_type {
-        "claude" | "claude-code" => vec![f(
-            "permission_mode",
-            "权限模式",
-            "select",
-            false,
-            vec!["default", "acceptEdits", "plan", "bypassPermissions"],
-        )],
+        // 权限不再作为 config 字段:编辑器以 Orca 式权限行物化 yolo 参数进 argv
+        // (见 AgentInstanceEditorState::permission_mode);claude 无其他声明字段。
+        "claude" | "claude-code" => Vec::new(),
         // secret_env 不再是自由文本字段:编辑器以结构化 ENV→SecretRef
         // 行管理(见 AgentInstanceEditorState::secret_env_map)
         "codex" => vec![f("model", "模型", "text", false, vec![])],
