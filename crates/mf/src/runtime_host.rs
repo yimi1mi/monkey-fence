@@ -1880,6 +1880,8 @@ impl RuntimeHost for RuntimeHostImpl {
         };
         // 真实生产链:冻结 Agent Instance → Agent Adapter → LaunchPlan → PTY。
         // Adapter 按 Revision 冻结的插件包 pin 解析(不随插件更新漂移)。
+        // external_config 取冻结快照(default-cli 节点只读外部配置,
+        // 全局默认设置后续变化不影响已冻结运行)。
         let run_token = workflow_secret_run_token(&spec);
         let plan = crate::adapter_launch::compile_instance_launch(
             &launcher.plugins,
@@ -1890,7 +1892,7 @@ impl RuntimeHost for RuntimeHostImpl {
             spec.workdir.clone(),
             Some(spec.prompt.clone()),
             &run_token,
-            false,
+            spec.instance.external_config,
             launcher.secret_master_key,
         )?;
         launch_workflow_pty(&self.registry, &spec, &plan, events)
@@ -2268,6 +2270,7 @@ mod tests {
                 config: serde_json::json!({}),
                 execution_contract: serde_json::json!({}),
                 sealed_secret_ids: vec![],
+                external_config: false,
             },
             plugin: None,
             prompt: String::new(),

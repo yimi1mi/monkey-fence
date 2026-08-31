@@ -138,6 +138,7 @@ pub fn fixture(dir: &Path) -> Fixture {
         WorkflowKernel {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
+            instance_resolver: None,
         },
         mf_agent::orchestrator::DirectoryRouting {
             current_pin: Some(plugin_pin("scripted", "hash-scripted")),

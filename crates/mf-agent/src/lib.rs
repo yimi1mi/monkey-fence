@@ -48,7 +48,10 @@ pub use model::{
     StepStatus, StepView, TaskStatus, TaskView,
 };
 pub use model::{RetryMode, RetryPolicy};
-pub use orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
+pub use orchestrator::{
+    GlobalLimiter, Orchestrator, ProfileCatalog, WorkflowInstanceResolver, WorkflowKernel,
+    WorkflowPluginPins,
+};
 pub use pipeline::{PipelineDraft, ProfileIndex, SessionPolicy, StepDraft};
 pub use runtime::{
     AdHocLaunchSpec, AgentProfileSpec, AgentTypeDescriptor, HookSpec, LaunchSpec, RuntimeEvent,
@@ -58,4 +61,5 @@ pub use schema::{
     catalog_db_path, project_db_path, CATALOG_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION,
 };
 pub use store::Store;
+pub use workflow::{ProjectWorkflowDraft, ProjectWorkflowRecord};
 pub use workflow_compiler::{CompileError, CompileInput, WorkflowCompiler};

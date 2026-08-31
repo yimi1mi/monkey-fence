@@ -77,6 +77,31 @@ pub struct WorkflowTemplate {
     pub current_version: i64,
 }
 
+/// 项目工作流草案(ADR 0004):项目内可编辑、可重复运行的 DAG,
+/// 与任何 Task 无从属关系;`key` 是跨重启稳定的用户可见标识。
+/// 不复用 `WorkflowTemplateDraft.task_local` —— 项目工作流不是模板。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectWorkflowDraft {
+    pub key: String,
+    pub name: String,
+    pub nodes: Vec<WorkflowNodeDraft>,
+    #[serde(default)]
+    pub allow_unsafe_parallel: bool,
+}
+
+/// 项目库 `project_workflows` 行:只保存当前版本(无版本链);
+/// 运行时投影为临时模板版本并冻结成 Pipeline Revision。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectWorkflowRecord {
+    pub key: String,
+    pub name: String,
+    pub nodes: Vec<WorkflowNodeDraft>,
+    pub allow_unsafe_parallel: bool,
+    pub content_digest: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// 不可变模板版本行(nodes 整体序列化进 graph_json)。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowTemplateVersion {

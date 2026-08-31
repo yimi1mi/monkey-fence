@@ -309,7 +309,7 @@ impl Render for ProjectSearch {
                                     .border_1()
                                     .border_color(rgb(Theme::accent_dim()))
                                     .rounded_sm()
-                                    .text_size(px(13.))
+                                    .text_size(crate::theme::ui_px(13.))
                                     .text_color(rgb(Theme::fg()))
                                     .child(if self.query.is_empty() {
                                         "搜索…(Enter 执行)".to_string()
@@ -345,7 +345,7 @@ impl Render for ProjectSearch {
                                 div()
                                     .px_1()
                                     .pb_1()
-                                    .text_size(px(10.5))
+                                    .text_size(crate::theme::ui_px(10.5))
                                     .text_color(rgb(Theme::fg_faint()))
                                     .child(self.status.clone()),
                             )
@@ -363,7 +363,7 @@ impl Render for ProjectSearch {
                                         div()
                                             .px_1()
                                             .py_0p5()
-                                            .text_size(px(11.))
+                                            .text_size(crate::theme::ui_px(11.))
                                             .text_color(rgb(Theme::fg()))
                                             .child(format!("📄 {}  ({})", fname, g.hits.len())),
                                     )
@@ -392,7 +392,7 @@ impl Render for ProjectSearch {
                                                 div()
                                                     .flex()
                                                     .gap_2()
-                                                    .text_size(px(11.))
+                                                    .text_size(crate::theme::ui_px(11.))
                                                     .font_family("Consolas")
                                                     .child(
                                                         div()
@@ -445,7 +445,7 @@ fn toggle_btn(which: u8, label: &str, on: bool, cx: &Context<ProjectSearch>) -> 
         .rounded_sm()
         .border_1()
         .cursor_pointer()
-        .text_size(px(11.))
+        .text_size(crate::theme::ui_px(11.))
         .border_color(rgb(if on { Theme::accent() } else { Theme::border() }))
         .text_color(rgb(if on {
             Theme::accent()

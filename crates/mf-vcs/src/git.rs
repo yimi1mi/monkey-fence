@@ -16,13 +16,15 @@ pub enum GitStatus {
 }
 
 impl GitStatus {
-    pub fn label(&self) -> &'static str {
+    /// 单字母状态码(A/M/D/R),同 GitCommitFileAction::code 约定;
+    /// 中文词在变更列表定宽列中放不下,会与文件名重叠。
+    pub fn code(&self) -> &'static str {
         match self {
-            GitStatus::New => "新增",
-            GitStatus::Modified => "修改",
-            GitStatus::Deleted => "删除",
-            GitStatus::Renamed => "重命名",
-            GitStatus::Staged { .. } => "已暂存",
+            GitStatus::New => "A",
+            GitStatus::Modified => "M",
+            GitStatus::Deleted => "D",
+            GitStatus::Renamed => "R",
+            GitStatus::Staged { kind } => kind.code(),
         }
     }
 }

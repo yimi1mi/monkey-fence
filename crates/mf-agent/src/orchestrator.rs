@@ -3,6 +3,7 @@
 //!
 //! 生命周期规则见 `CONTEXT.md`;与 Runtime 的边界见 `runtime.rs`。
 
+use crate::agent_instance::AgentInstanceSnapshot;
 use crate::config::Config;
 use crate::execution_directory::{
     DirectoryProviderResolver, ExecutionDirectoryProvider, ExecutionLease, LeaseContext,
@@ -32,11 +33,21 @@ pub trait WorkflowPluginPins: Send + Sync {
     fn release_run_pins(&self, run_key: &str) -> Result<()>;
 }
 
+/// 工作流节点实例引用解析器:把 `WorkflowNodeDraft.agent_instance_id`
+/// 解析为实例快照。生产实现额外识别 `default-cli:<完整贡献 ID>` 保留
+/// 引用(按插件默认 command + 全局权限参数合成临时快照,不落目录库);
+/// 未注入(None)时内核回退目录库实例表,既有行为不变。
+pub trait WorkflowInstanceResolver: Send + Sync {
+    fn resolve(&self, reference: &str) -> anyhow::Result<AgentInstanceSnapshot>;
+}
+
 /// 工作流内核依赖:实例解析(目录库)与插件 pin。
 /// `pins` 为 None 时跳过 pin 校验(旧项目库/无插件宿主场景)。
 pub struct WorkflowKernel {
     pub catalog: Arc<crate::catalog_store::CatalogStore>,
     pub pins: Option<Arc<dyn WorkflowPluginPins>>,
+    /// 插件感知实例解析器(生产注入;测试/旧装配点保持 None)。
+    pub instance_resolver: Option<Arc<dyn WorkflowInstanceResolver>>,
 }
 
 impl WorkflowKernel {
@@ -45,6 +56,16 @@ impl WorkflowKernel {
         WorkflowKernel {
             catalog,
             pins: None,
+            instance_resolver: None,
+        }
+    }
+
+    /// 解析节点实例引用:有 resolver 时经它(支持 `default-cli:` 保留
+    /// 引用),否则回退目录库 Agent Instance 表(既有行为)。
+    pub fn resolve_instance(&self, reference: &str) -> anyhow::Result<AgentInstanceSnapshot> {
+        match &self.instance_resolver {
+            Some(resolver) => resolver.resolve(reference),
+            None => self.catalog.snapshot_agent_instance(reference, None),
         }
     }
 }
@@ -335,7 +356,7 @@ impl Orchestrator {
                 let pin = match parse_lease_provider_pin(&metadata) {
                     LeaseProviderPin::Valid(pin) => pin,
                     LeaseProviderPin::Absent if !row.isolated && row.provider == "project-dir" => {
-                        continue
+                        continue;
                     }
                     LeaseProviderPin::Absent => {
                         log::error!(
@@ -552,7 +573,13 @@ impl Orchestrator {
     /// 丢弃任务(Composer 分配失败的回滚):无活动 Run 才允许,
     /// 连带清理 Revision/Step/待决汇合;成功后发 TaskRemoved。
     pub fn discard_task(&self, task_id: i64) -> Result<()> {
+        // delete_task_if_unused 会连带删除 Revision；先缓存 id，删除成功后
+        // 仍能用精确 task/revision key 释放已经固定的插件包。
+        let revision_ids = self.store.list_revision_ids(task_id)?;
         if self.store.delete_task_if_unused(task_id)? {
+            for revision_id in revision_ids {
+                self.release_revision_pins_for_task(task_id, revision_id);
+            }
             self.emit(SchedulerEvent::TaskRemoved(task_id));
             Ok(())
         } else {
@@ -993,7 +1020,7 @@ impl Orchestrator {
                 directory_provider: self.directory_provider_pin(),
                 allow_unsafe_shared_directory,
                 agent_type_plugins,
-                resolve_instance: &|id| self.workflow.catalog.snapshot_agent_instance(id, None),
+                resolve_instance: &|id| self.workflow.resolve_instance(id),
             })
             .map_err(|errors| {
                 anyhow::anyhow!(
@@ -1035,7 +1062,7 @@ impl Orchestrator {
                 directory_provider: self.directory_provider_pin(),
                 allow_unsafe_shared_directory,
                 agent_type_plugins,
-                resolve_instance: &|id| self.workflow.catalog.snapshot_agent_instance(id, None),
+                resolve_instance: &|id| self.workflow.resolve_instance(id),
             })
             .map_err(|errors| {
                 anyhow::anyhow!(
@@ -2592,6 +2619,10 @@ impl Orchestrator {
             .ok()
             .flatten()
             .unwrap_or(0);
+        self.release_revision_pins_for_task(task_id, revision_id);
+    }
+
+    fn release_revision_pins_for_task(&self, task_id: i64, revision_id: i64) {
         if let Some(pins) = &self.workflow.pins {
             let run_key = workflow_pin_key(&self.root, task_id, revision_id);
             if let Err(e) = pins.release_run_pins(&run_key) {

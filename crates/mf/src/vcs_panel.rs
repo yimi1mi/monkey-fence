@@ -653,7 +653,7 @@ impl VcsPanel {
                     .child(
                         div()
                             .w(px(74.))
-                            .text_size(px(10.))
+                            .text_size(crate::theme::ui_px(10.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(crate::theme::Theme::accent()))
                             .child(revision),
@@ -661,7 +661,7 @@ impl VcsPanel {
                     .child(
                         div()
                             .w(px(86.))
-                            .text_size(px(9.5))
+                            .text_size(crate::theme::ui_px(9.5))
                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                             .overflow_hidden()
                             .child(author),
@@ -670,14 +670,14 @@ impl VcsPanel {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(10.))
+                            .text_size(crate::theme::ui_px(10.))
                             .text_color(rgb(crate::theme::Theme::fg()))
                             .overflow_hidden()
                             .child(summary),
                     )
                     .child(
                         div()
-                            .text_size(px(8.5))
+                            .text_size(crate::theme::ui_px(8.5))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .child(details_label),
                     ),
@@ -738,7 +738,7 @@ impl VcsPanel {
                         .px_2()
                         .flex()
                         .items_center()
-                        .text_size(px(9.))
+                        .text_size(crate::theme::ui_px(9.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(crate::theme::Theme::fg_faint()))
                         .child(format!(
@@ -765,7 +765,7 @@ impl VcsPanel {
                             .child(
                                 div()
                                     .w(px(20.))
-                                    .text_size(px(9.5))
+                                    .text_size(crate::theme::ui_px(9.5))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(history_action_color(&file.action)))
                                     .child(file.action.clone()),
@@ -774,7 +774,7 @@ impl VcsPanel {
                                 div()
                                     .flex_1()
                                     .min_w_0()
-                                    .text_size(px(9.5))
+                                    .text_size(crate::theme::ui_px(9.5))
                                     .text_color(rgb(crate::theme::Theme::fg_dim()))
                                     .overflow_hidden()
                                     .child(path),
@@ -793,7 +793,7 @@ impl VcsPanel {
                         .items_center()
                         .justify_center()
                         .gap_2()
-                        .text_size(px(9.))
+                        .text_size(crate::theme::ui_px(9.))
                         .text_color(rgb(crate::theme::Theme::fg_faint()));
                     footer = footer
                         .child(if page > 0 {
@@ -858,7 +858,7 @@ impl VcsPanel {
             .items_center()
             .justify_center()
             .gap_2()
-            .text_size(px(10.))
+            .text_size(crate::theme::ui_px(10.))
             .text_color(rgb(crate::theme::Theme::fg_faint()));
         if loading {
             row = row.child("正在获取历史…");
@@ -1042,7 +1042,7 @@ fn history_detail_message(text: &str, error: bool) -> Div {
     div()
         .px_2()
         .py_2()
-        .text_size(px(9.5))
+        .text_size(crate::theme::ui_px(9.5))
         .text_color(rgb(if error {
             crate::theme::Theme::danger()
         } else {
@@ -1094,7 +1094,7 @@ impl Render for VcsPanel {
             .size_full()
             .flex()
             .flex_col()
-            .text_size(px(12.));
+            .text_size(crate::theme::ui_px(12.));
 
         // 工具栏
         col = col.child(
@@ -1143,7 +1143,10 @@ impl Render for VcsPanel {
             .overflow_y_scroll();
         match self.kind {
             VcsKind::P4 => {
-                list = list.child(section_header(format!("待提交变更({})", self.opened.len())));
+                list = list.child(section_header(format!(
+                    "待提交变更({}) · A新增 M修改 D删除 R移动",
+                    self.opened.len()
+                )));
                 let default_files: Vec<(usize, OpenedFile)> = self
                     .opened
                     .iter()
@@ -1214,7 +1217,10 @@ impl Render for VcsPanel {
                 }
             }
             VcsKind::Git => {
-                list = list.child(section_header(format!("变更({})", self.git_status.len())));
+                list = list.child(section_header(format!(
+                    "变更({}) · A新增 M修改 D删除 R重命名",
+                    self.git_status.len()
+                )));
                 let entries: Vec<(usize, mf_vcs::git::GitFileEntry)> = self
                     .git_status
                     .iter()
@@ -1235,7 +1241,7 @@ impl Render for VcsPanel {
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default();
                     let staged = g.status.is_staged();
-                    let label = g.status.label();
+                    let code = g.status.code();
                     let color = if staged {
                         crate::theme::Theme::success()
                     } else {
@@ -1274,7 +1280,7 @@ impl Render for VcsPanel {
                                 )
                             })
                             .child(div().w(px(12.)).child(if checked { "☑" } else { "☐" }))
-                            .child(div().w(px(28.)).text_color(rgb(color)).child(label))
+                            .child(div().w(px(16.)).text_color(rgb(color)).child(code))
                             .child(div().text_color(rgb(crate::theme::Theme::fg())).child(name))
                             .child(
                                 div()
@@ -1330,7 +1336,7 @@ impl Render for VcsPanel {
                             d.border_color(rgb(crate::theme::Theme::accent()))
                         })
                         .on_key_down(cx.listener(Self::on_desc_key))
-                        .text_size(px(12.))
+                        .text_size(crate::theme::ui_px(12.))
                         .text_color(rgb(crate::theme::Theme::fg()))
                         .child(if self.submit_desc.is_empty() {
                             SharedString::from("提交描述(点击后输入)")
@@ -1399,7 +1405,12 @@ impl VcsPanel {
                 })
             })
             .child(div().w(px(12.)).child(if checked { "☑" } else { "☐" }))
-            .child(div().w(px(34.)).text_color(rgb(color)).child(action))
+            .child(
+                div()
+                    .w(px(16.))
+                    .text_color(rgb(color))
+                    .child(p4_history_action(&action)),
+            )
             .child(div().text_color(rgb(crate::theme::Theme::fg())).child(name))
             .child(
                 div()
@@ -1418,7 +1429,7 @@ fn section_header(text: String) -> impl IntoElement {
         .items_center()
         .px_2()
         .bg(rgb(crate::theme::Theme::bg_elevated()))
-        .text_size(px(11.))
+        .text_size(crate::theme::ui_px(11.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(crate::theme::Theme::fg_dim()))
         .child(text)
@@ -1430,7 +1441,7 @@ fn banner(color: u32, text: String) -> impl IntoElement {
         .px_2()
         .py_1()
         .overflow_hidden()
-        .text_size(px(11.))
+        .text_size(crate::theme::ui_px(11.))
         .text_color(rgb(color))
         .bg(rgb(crate::theme::Theme::bg_elevated()))
         .child(text)
@@ -1448,7 +1459,7 @@ fn tool_btn(
         .bg(rgb(crate::theme::Theme::bg_elevated()))
         .border_1()
         .border_color(rgb(crate::theme::Theme::border()))
-        .text_size(px(11.))
+        .text_size(crate::theme::ui_px(11.))
         .text_color(rgb(crate::theme::Theme::fg_dim()))
         .hover(|d| {
             d.bg(rgb(crate::theme::Theme::bg_hover()))
@@ -1466,7 +1477,7 @@ fn tool_btn_disabled(label: &str) -> impl IntoElement {
         .rounded_sm()
         .border_1()
         .border_color(rgb(crate::theme::Theme::border()))
-        .text_size(px(11.))
+        .text_size(crate::theme::ui_px(11.))
         .text_color(rgb(crate::theme::Theme::fg_faint()))
         .child(label.to_string())
 }

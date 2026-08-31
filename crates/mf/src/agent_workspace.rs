@@ -1,10 +1,9 @@
-//! Agent 工作区的四个稳定职责:
-//! - `Instances`:CLI、参数、环境、Secrets 与隔离配置的唯一编辑入口；
-//! - `Workflow`:只编排节点/依赖/指令并引用既有实例；
-//! - `Sessions`:展示所有实时 CLI/Transcript，不承担配置；
-//! - `Runs`:统一观察与处理运行状态。
-//!
-//! 旧 Pipeline 实现暂留作迁移代码，但不再暴露重复入口。
+//! Agent 工作区(ADR 0004):顶层只有「工作流 / 运行」两个页签。
+//! - `Workflows`:项目工作流编辑器(画布)与运行 Composer;
+//! - `Runs`:运行监控(DAG 与节点动作)。
+//! 会话不是顶层页面:离散会话的启动保留在任务侧栏,交互面是
+//! 运行节点详情与内部终端 overlay。Agent Type / 实例配置移入
+//! 设置 → 智能体页(画布经 OpenAgentSettings 单向事件链打开)。
 
 use crate::app_ctx::AppCtx;
 use crate::project_context::{normalize_project_path, ActivationTarget};
@@ -23,15 +22,17 @@ use std::sync::Arc;
 /// AgentWorkspace → Workspace 的意图事件(卡片打开走 activation seam)。
 pub enum AgentWorkspaceEvent {
     Activate(ActivationTarget),
+    /// 打开设置页(画布「管理智能体配置」单向事件链的终点)。
+    OpenAgentSettings,
 }
 
 impl EventEmitter<AgentWorkspaceEvent> for AgentWorkspace {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceView {
-    Instances,
-    Workflow,
-    Sessions,
+    /// 项目工作流编辑器(顶层页签)。
+    Workflows,
+    /// 运行监控(顶层页签)。
     Runs,
 }
 
@@ -117,19 +118,24 @@ pub struct AgentWorkspace {
     field_buffer: String,
     focus_handle: FocusHandle,
     pending_focus: bool,
-    /// Agent 实例页(独立实体;设计 §11.1)。
-    instances_page: gpui::Entity<crate::agent_instances_view::AgentInstancesPage>,
     /// 工作流编辑器页(独立实体;设计 §11.2)。
-    workflow_page: gpui::Entity<crate::workflow_canvas::WorkflowCanvas>,
-    runs_page: gpui::Entity<crate::run_monitor::RunMonitor>,
+    pub(crate) workflow_page: gpui::Entity<crate::workflow_canvas::WorkflowCanvas>,
+    /// 运行页(Task 7 起为 WorkflowRunsPage 宿主,内嵌 RunMonitor)。
+    pub(crate) runs_page: gpui::Entity<crate::workflow_runs_page::WorkflowRunsPage>,
+    /// 运行级「需要你」徽标计数(同一快照口径;0 = 不显示)。
+    pub attention_run_count: usize,
+    /// 运行 Composer(打开时叠加在工作流页上方;关闭设置不丢失)。
+    pub run_composer: Option<gpui::Entity<crate::workflow_run_composer::WorkflowRunComposer>>,
 }
 
 impl AgentWorkspace {
     pub fn new(app: Arc<AppCtx>, cx: &mut Context<Self>) -> AgentWorkspace {
         let app_for_pages = app.clone();
+        let workflow_page =
+            cx.new(|cx| crate::workflow_canvas::WorkflowCanvas::new(app_for_pages.clone(), cx));
         let ws = AgentWorkspace {
             app,
-            view: WorkspaceView::Instances,
+            view: WorkspaceView::Workflows,
             cards: Vec::new(),
             project_roots: Vec::new(),
             global_active_runs: 0,
@@ -153,57 +159,269 @@ impl AgentWorkspace {
             field_buffer: String::new(),
             focus_handle: cx.focus_handle(),
             pending_focus: false,
-            instances_page: cx.new(|cx| {
-                crate::agent_instances_view::AgentInstancesPage::new(app_for_pages.clone(), cx)
+            workflow_page: workflow_page.clone(),
+            runs_page: cx.new(|cx| {
+                crate::workflow_runs_page::WorkflowRunsPage::new(app_for_pages.clone(), cx)
             }),
-            workflow_page: cx
-                .new(|cx| crate::workflow_canvas::WorkflowCanvas::new(app_for_pages.clone(), cx)),
-            runs_page: cx.new(|cx| crate::run_monitor::RunMonitor::new(app_for_pages, cx)),
+            run_composer: None,
+            attention_run_count: 0,
         };
+        // 画布事件单向链:Run → Composer;OpenAgentSettings → Workspace
+        cx.subscribe(
+            &workflow_page,
+            |ws: &mut AgentWorkspace, _, ev: &crate::workflow_canvas::WorkflowCanvasEvent, cx| {
+                match ev {
+                    crate::workflow_canvas::WorkflowCanvasEvent::RunRequested {
+                        project_root,
+                        workflow_key,
+                    } => ws.open_run_composer(project_root.clone(), workflow_key.clone(), cx),
+                    crate::workflow_canvas::WorkflowCanvasEvent::OpenAgentSettings => {
+                        cx.emit(AgentWorkspaceEvent::OpenAgentSettings)
+                    }
+                }
+            },
+        )
+        .detach();
+        let runs_page = ws.runs_page.clone();
+        cx.subscribe(
+            &runs_page,
+            |ws: &mut AgentWorkspace,
+             _,
+             event: &crate::workflow_runs_page::WorkflowRunsPageEvent,
+             cx| match event {
+                crate::workflow_runs_page::WorkflowRunsPageEvent::ActivateRun {
+                    project_root,
+                    task_id,
+                    focus_step_id,
+                } => {
+                    let (project, _) = normalize_project_path(project_root);
+                    cx.emit(AgentWorkspaceEvent::Activate(ActivationTarget::Task {
+                        project,
+                        task_id: *task_id,
+                    }));
+                    ws.view = WorkspaceView::Runs;
+                    ws.runs_page.update(cx, |page, cx| {
+                        page.select_run(project_root, *task_id, *focus_step_id, cx)
+                    });
+                    cx.notify();
+                }
+                crate::workflow_runs_page::WorkflowRunsPageEvent::OpenSession {
+                    project_root,
+                    task_id,
+                    session_id,
+                    run_id,
+                    is_http,
+                } => {
+                    let (project, _) = normalize_project_path(project_root);
+                    cx.emit(AgentWorkspaceEvent::Activate(ActivationTarget::AgentRun {
+                        project,
+                        task_id: Some(*task_id),
+                        session_id: *session_id,
+                    }));
+                    ws.overlay = Some(if *is_http {
+                        Overlay::Transcript {
+                            project: project_root.clone(),
+                            session_id: *session_id,
+                            run_id: *run_id,
+                        }
+                    } else {
+                        Overlay::Terminal {
+                            project: project_root.clone(),
+                            session_id: *session_id,
+                            run_id: Some(*run_id),
+                        }
+                    });
+                    ws.overlay_input.clear();
+                    ws.active_field = Field::None;
+                    cx.notify();
+                }
+            },
+        )
+        .detach();
         ws
     }
 
+    /// 打开运行 Composer(画布只表达意图,运行本体在这里发起)。
+    pub fn open_run_composer(
+        &mut self,
+        project_root: PathBuf,
+        workflow_key: String,
+        cx: &mut Context<Self>,
+    ) {
+        let record = self.app.orchestrator_of(&project_root).and_then(|orch| {
+            orch.store
+                .load_project_workflow(&workflow_key)
+                .ok()
+                .flatten()
+        });
+        let workflow_name = record
+            .as_ref()
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| workflow_key.clone());
+        let node_count = record.as_ref().map(|r| r.nodes.len()).unwrap_or(0);
+        let allow_unsafe_parallel = record.map(|r| r.allow_unsafe_parallel).unwrap_or(false);
+        let project_name = project_root
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| project_root.display().to_string());
+        self.run_composer = Some(cx.new(|cx| {
+            crate::workflow_run_composer::WorkflowRunComposer::new(
+                crate::workflow_run_composer::WorkflowRunComposerState::new(
+                    project_root,
+                    project_name,
+                    workflow_key,
+                    workflow_name,
+                    allow_unsafe_parallel,
+                    node_count,
+                ),
+                cx,
+            )
+        }));
+        self.view = WorkspaceView::Workflows;
+        cx.notify();
+    }
+
+    /// Composer 提交(Enter):运行 → 激活 Task → 切到 Runs。
+    pub(crate) fn submit_run_composer(&mut self, cx: &mut Context<Self>) {
+        let Some(composer) = self.run_composer.clone() else {
+            return;
+        };
+        let app = self.app.clone();
+        let outcome = composer.update(cx, |c, cx| {
+            if !c.state.can_submit() {
+                return None;
+            }
+            let (root, key, goal) = (
+                c.state.project_root.clone(),
+                c.state.workflow_key.clone(),
+                c.state.goal().trim().to_string(),
+            );
+            let result = app.run_project_workflow(&root, &key, &goal);
+            match &result {
+                Ok(_) => {
+                    cx.notify();
+                }
+                Err(_) => {
+                    c.state.set_error(
+                        result
+                            .as_ref()
+                            .err()
+                            .map(|e| format!("{e:#}"))
+                            .unwrap_or_default(),
+                    );
+                    cx.notify();
+                }
+            }
+            result.ok()
+        });
+        if let Some(target) = outcome {
+            // 原子激活项目 + Task(不分别改 Workspace 的项目/Task 字段)
+            let (pid, _) = normalize_project_path(&target.project_root);
+            cx.emit(AgentWorkspaceEvent::Activate(ActivationTarget::Task {
+                project: pid,
+                task_id: target.task_id,
+            }));
+            self.run_composer = None;
+            self.view = WorkspaceView::Runs;
+        }
+        cx.notify();
+    }
+
+    /// 关闭 Composer(取消)。
+    pub fn dismiss_run_composer(&mut self, cx: &mut Context<Self>) {
+        self.run_composer = None;
+        cx.notify();
+    }
+
+    /// 顶层页签投影(测试/徽标用;隐藏看板不暴露)。
+    pub fn active_tab(&self) -> crate::workspace::AgentTab {
+        match self.view {
+            WorkspaceView::Runs => crate::workspace::AgentTab::Runs,
+            WorkspaceView::Workflows => crate::workspace::AgentTab::Workflows,
+        }
+    }
+
+    /// 运行 Composer 是否打开(测试断言用)。
+    pub(crate) fn run_composer_open(&self) -> bool {
+        self.run_composer.is_some()
+    }
+
     /// Workspace 泵推送统一快照(与 TaskSidebar 同一 revision)。
-    /// 实时会话与运行监控消费快照；工作流页维护自己的任务本地草稿。
+    /// 运行页消费同一快照;徽标计数 = attention_run_count。
     pub fn set_overview(&mut self, snapshot: Arc<ProjectOverviewSnapshot>, cx: &mut Context<Self>) {
         self.cards = snapshot.agent_cards.clone();
         self.project_roots = snapshot.projects.iter().map(|p| p.root.clone()).collect();
         self.global_active_runs = snapshot.global_active_runs;
-        // 后台事件到达:运行监控同步刷新投影
+        self.attention_run_count = snapshot.attention_run_count;
+        // 后台事件到达:运行页(列表 + 内嵌 RunMonitor)同步刷新投影
         self.runs_page
-            .update(cx, |page, cx| page.refresh_snapshot(cx));
+            .update(cx, |page, cx| page.set_overview(snapshot, cx));
         cx.notify();
     }
 
     pub fn show_tab(&mut self, tab: crate::workspace::AgentTab, cx: &mut Context<Self>) {
         self.view = match tab {
-            crate::workspace::AgentTab::Sessions => WorkspaceView::Sessions,
-            crate::workspace::AgentTab::Workflow => WorkspaceView::Workflow,
+            crate::workspace::AgentTab::Workflows => WorkspaceView::Workflows,
             crate::workspace::AgentTab::Runs => WorkspaceView::Runs,
         };
         cx.notify();
     }
 
-    pub fn set_selected_task(&mut self, sel: Option<(PathBuf, i64)>, cx: &mut Context<Self>) {
-        if self.selected_task != sel {
-            self.selected_task = sel.clone();
-            // 实例页的默认 CLI 启动挂载点跟随任务选择
-            self.instances_page
-                .update(cx, |page, cx| page.set_selected_task(sel.clone(), cx));
-            self.workflow_page
-                .update(cx, |page, cx| page.set_selected_task(sel.clone(), cx));
-            // 运行监控跟随任务选择
-            self.runs_page.update(cx, |page, cx| page.set_task(sel, cx));
+    /// 普通 Agent 入口(提醒优先):有 Needs You 运行时进入 Runs,
+    /// 否则保持上次使用页(首次默认 Workflows)。
+    pub fn enter_from_activity(&mut self, cx: &mut Context<Self>) {
+        if self.attention_run_count > 0 {
+            self.view = WorkspaceView::Runs;
+            self.runs_page.update(cx, |page, cx| {
+                page.set_filter(crate::workflow_runs_page::RunFilter::NeedsYou, cx)
+            });
+        }
+        cx.notify();
+    }
+
+    /// 跨项目「需要你」直达:原子激活由 Workspace 经 ActivationTarget::Task
+    /// 完成,这里定位 Runs 页并选中优先处理节点。
+    pub fn open_attention_run(
+        &mut self,
+        attention: &crate::project_overview::WorkflowRunAttention,
+        cx: &mut Context<Self>,
+    ) {
+        self.view = WorkspaceView::Runs;
+        self.runs_page
+            .update(cx, |page, cx| page.open_attention(attention, cx));
+        cx.notify();
+    }
+
+    /// Workspace 推送当前 Project 与当前 Task(分别传递):
+    /// 画布只需要项目;RunMonitor 跟随任务。选择 Task 不改写当前页签。
+    pub fn set_context(
+        &mut self,
+        project: Option<PathBuf>,
+        task: Option<(PathBuf, i64)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.selected_task != task {
+            self.selected_task = task.clone();
+            self.runs_page
+                .update(cx, |page, cx| page.set_task(task, cx));
             self.dirty = false;
             self.draft.clear();
             self.loaded_revision = None;
             self.selected_step = None;
-            // 切换任务时清空编辑缓冲:防止 A 的草稿文本写进 B 的字段
+            // 切换上下文时清空编辑缓冲:防止 A 的草稿文本写进 B 的字段
             self.active_field = Field::None;
             self.field_buffer.clear();
-            self.view = WorkspaceView::Workflow;
-            cx.notify();
         }
+        // 画布跟随项目(与 Task 选择无关;无 Task 时工作流仍可用)
+        self.workflow_page
+            .update(cx, |page, cx| page.set_project(project, cx));
+        cx.notify();
+    }
+
+    /// 兼容入口:任务选择变化(项目从任务推导)。
+    pub fn set_selected_task(&mut self, sel: Option<(PathBuf, i64)>, cx: &mut Context<Self>) {
+        let project = sel.as_ref().map(|(root, _)| root.clone());
+        self.set_context(project, sel, cx);
     }
 
     fn orchestrator(&self) -> Option<Arc<Orchestrator>> {
@@ -887,7 +1105,11 @@ impl AgentWorkspace {
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .child(div().text_size(crate::theme::ui_px(12.)).child(card.profile_display.clone()))
+                    .child(
+                        div()
+                            .text_size(crate::theme::ui_px(12.))
+                            .child(card.profile_display.clone()),
+                    )
                     .child(
                         div()
                             .flex_1()
@@ -1591,7 +1813,9 @@ impl AgentWorkspace {
                                             .py_1()
                                             .text_size(crate::theme::ui_px(9.5))
                                             .text_color(rgb(crate::theme::Theme::fg_faint()))
-                                            .child("无可用 Agent:请到「智能体」页确认 CLI 已检测到"),
+                                            .child(
+                                                "无可用 Agent:请到「智能体」页确认 CLI 已检测到",
+                                            ),
                                     )
                                 })
                                 .children(profiles.iter().map(|p| {
@@ -1654,7 +1878,11 @@ impl AgentWorkspace {
                                         |d| d.bg(rgb(crate::theme::Theme::accent())),
                                     ),
                             )
-                            .child(div().text_size(crate::theme::ui_px(10.5)).child("fresh(每步新会话)"))
+                            .child(
+                                div()
+                                    .text_size(crate::theme::ui_px(10.5))
+                                    .child("fresh(每步新会话)"),
+                            )
                             .on_click(cx.listener(move |ws: &mut AgentWorkspace, _, _, cx| {
                                 if let Some(k) = ws.selected_step.clone() {
                                     if let Some(s) = ws.draft.iter_mut().find(|s| s.key == k) {
@@ -1747,7 +1975,11 @@ impl AgentWorkspace {
                                     .border_color(rgb(crate::theme::Theme::fg_dim()))
                                     .when(checked, |d| d.bg(rgb(crate::theme::Theme::accent()))),
                             )
-                            .child(div().text_size(crate::theme::ui_px(10.5)).child(other.clone()))
+                            .child(
+                                div()
+                                    .text_size(crate::theme::ui_px(10.5))
+                                    .child(other.clone()),
+                            )
                             .on_click(cx.listener(move |ws: &mut AgentWorkspace, _, _, cx| {
                                 if let Some(k) = ws.selected_step.clone() {
                                     if let Some(s) = ws.draft.iter_mut().find(|s| s.key == k) {
@@ -2125,10 +2357,17 @@ fn terminal_key_bytes(ev: &gpui::KeyDownEvent) -> Option<Vec<u8>> {
 
 impl Render for AgentWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(composer) = self.run_composer.clone() {
+            composer.update(cx, |composer, cx| {
+                composer.take_pending_focus(window, cx);
+            });
+        }
         if self.pending_focus {
             self.pending_focus = false;
             window.focus(&self.focus_handle, cx);
         }
+        // 顶层只投影「工作流 / 运行」两个页签(ADR 0004);
+        // 运行页签显示与左侧入口同一运行级徽标(0 = 不显示)
         let tabs = div()
             .id("ws-tabs")
             .flex()
@@ -2138,14 +2377,22 @@ impl Render for AgentWorkspace {
             .h(px(30.))
             .border_b_1()
             .border_color(rgb(crate::theme::Theme::border()))
-            .child(tab_btn(cx, WorkspaceView::Instances, "智能体", self.view))
-            .child(tab_btn(cx, WorkspaceView::Workflow, "工作流", self.view))
-            .child(tab_btn(cx, WorkspaceView::Sessions, "会话", self.view))
-            .child(tab_btn(cx, WorkspaceView::Runs, "运行", self.view));
+            .child(tab_btn(
+                cx,
+                WorkspaceView::Workflows,
+                "工作流",
+                self.view,
+                None,
+            ))
+            .child(tab_btn(
+                cx,
+                WorkspaceView::Runs,
+                "运行",
+                self.view,
+                (self.attention_run_count > 0).then_some(self.attention_run_count),
+            ));
         let body = match self.view {
-            WorkspaceView::Instances => self.instances_page.clone().into_any_element(),
-            WorkspaceView::Workflow => self.workflow_page.clone().into_any_element(),
-            WorkspaceView::Sessions => self.render_agents_view(cx, window),
+            WorkspaceView::Workflows => self.workflow_page.clone().into_any_element(),
             WorkspaceView::Runs => self.runs_page.clone().into_any_element(),
         };
         div()
@@ -2158,6 +2405,30 @@ impl Render for AgentWorkspace {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(
                 |ws: &mut AgentWorkspace, ev: &gpui::KeyDownEvent, window, cx| {
+                    // 运行 Composer 打开时:按键直达 Composer(Enter 提交/Esc 取消)
+                    if ws.run_composer.is_some() {
+                        match ev.keystroke.key.as_str() {
+                            "escape" => ws.dismiss_run_composer(cx),
+                            "enter" => ws.submit_run_composer(cx),
+                            _ => {
+                                let composer = ws.run_composer.clone().unwrap();
+                                composer.update(cx, |c, cx| {
+                                    c.handle_key(ev, window);
+                                });
+                            }
+                        }
+                        cx.stop_propagation();
+                        return;
+                    }
+                    // 画布重命名模式:按键直达画布
+                    if ws.view == WorkspaceView::Workflows
+                        && ws.workflow_page.read(cx).is_text_editing()
+                    {
+                        ws.workflow_page
+                            .update(cx, |canvas, cx| canvas.handle_key(ev, cx));
+                        cx.stop_propagation();
+                        return;
+                    }
                     let focused = ws.focus_handle.is_focused(window);
                     if ev.keystroke.key.as_str() == "escape" {
                         // 终端覆盖层且无输入焦点:Esc 是 TUI 程序按键,直达 PTY(关闭用 ✕)
@@ -2305,6 +2576,24 @@ impl Render for AgentWorkspace {
             ))
             .child(tabs)
             .child(div().flex_1().min_h_0().flex().child(body))
+            .when(self.run_composer.is_some(), |d| {
+                let composer = self.run_composer.clone().unwrap();
+                d.child(
+                    div()
+                        .id("run-composer-backdrop")
+                        .absolute()
+                        .size_full()
+                        .top_0()
+                        .left_0()
+                        .bg(rgb(crate::theme::Theme::bg()))
+                        .opacity(0.75)
+                        .flex()
+                        .items_start()
+                        .justify_center()
+                        .pt(px(64.))
+                        .child(composer),
+                )
+            })
             .when(self.overlay.is_some(), |d| {
                 d.child(self.render_overlay(cx, window))
             })
@@ -2316,6 +2605,7 @@ fn tab_btn(
     target: WorkspaceView,
     label: &str,
     current: WorkspaceView,
+    badge: Option<usize>,
 ) -> impl IntoElement {
     let active = current == target;
     div()
@@ -2324,6 +2614,7 @@ fn tab_btn(
         .px_3()
         .flex()
         .items_center()
+        .gap_1()
         .rounded_md()
         .cursor_pointer()
         .text_size(crate::theme::ui_px(11.))
@@ -2340,21 +2631,27 @@ fn tab_btn(
         .when(active, |d| d.bg(rgb(crate::theme::Theme::bg_active())))
         .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
         .child(label.to_string())
+        .children(badge.map(|count| {
+            div()
+                .id(ElementId::Name(format!("ws-tab-badge-{label}").into()))
+                .min_w(px(14.))
+                .h(px(14.))
+                .px_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(rgb(crate::theme::Theme::danger()))
+                .text_size(crate::theme::ui_px(8.))
+                .text_color(rgb(crate::theme::Theme::bg()))
+                .child(count.to_string())
+        }))
         .on_click(cx.listener(move |ws: &mut AgentWorkspace, _, _, cx| {
-            match target {
-                WorkspaceView::Instances => {
-                    ws.instances_page.update(cx, |page, cx| {
-                        page.refresh();
-                        cx.notify();
-                    });
-                }
-                WorkspaceView::Workflow => {
-                    ws.workflow_page.update(cx, |page, cx| {
-                        page.refresh_library();
-                        cx.notify();
-                    });
-                }
-                _ => {}
+            if target == WorkspaceView::Workflows {
+                ws.workflow_page.update(cx, |page, cx| {
+                    page.refresh_library();
+                    cx.notify();
+                });
             }
             ws.view = target;
             cx.notify();

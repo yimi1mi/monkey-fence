@@ -24,6 +24,10 @@ pub struct SettingsView {
     page: Page,
     /// 应用上下文(插件注册表/检测);测试与无 GUI 场景可为 None
     app: Option<std::sync::Arc<crate::app_ctx::AppCtx>>,
+    /// 嵌入式 Agent 配置页(Agent Type / 保存实例;ADR 0004 后
+    /// 实例配置的唯一入口在设置 → 智能体)。
+    pub(crate) agent_instances:
+        Option<gpui::Entity<crate::agent_instances_view::AgentInstancesPage>>,
     /// 智能体页:当前展开详情的 profile id
     agent_expanded: Option<String>,
     /// 智能体页:命令/参数覆盖缓冲
@@ -102,6 +106,7 @@ impl SettingsView {
             draft,
             page: Page::Appearance,
             app: None,
+            agent_instances: None,
             agent_expanded: None,
             agent_cmd_s: String::new(),
             agent_args_s: String::new(),
@@ -142,6 +147,10 @@ impl SettingsView {
             .next()
             .map(|(full_id, _, _)| full_id)
             .unwrap_or_default();
+        // 嵌入式 Agent 配置页(创建一次;关闭设置不销毁工作流状态)
+        view.agent_instances = Some(cx.new(|cx| {
+            crate::agent_instances_view::AgentInstancesPage::new_embedded(app.clone(), cx)
+        }));
         view.app = Some(app);
         view.vcs_test_root = active_project_root;
         view
@@ -509,7 +518,7 @@ impl SettingsView {
             Page::Appearance => "外观",
             Page::EditorTerm => "编辑器与终端",
             Page::VersionControl => "版本控制",
-            Page::Agents => "全局 Agent 策略",
+            Page::Agents => "智能体",
             Page::Providers => "Provider 管理",
             Page::Roles => "角色绑定",
             Page::Plugins => "插件",
@@ -777,17 +786,13 @@ impl SettingsView {
         for role in ROLES {
             let selected = sel_role.as_ref() == *role;
             // 发布构建未绑定的角色显示占位,不显示 mock
-            let prov_name = draft
-                .roles
-                .get(*role)
-                .cloned()
-                .unwrap_or_else(|| {
-                    if mf_agent::config::mock_available() {
-                        "mock".into()
-                    } else {
-                        "(未绑定)".into()
-                    }
-                });
+            let prov_name = draft.roles.get(*role).cloned().unwrap_or_else(|| {
+                if mf_agent::config::mock_available() {
+                    "mock".into()
+                } else {
+                    "(未绑定)".into()
+                }
+            });
             let kind = draft
                 .providers
                 .get(&prov_name)
@@ -1629,6 +1634,45 @@ impl SettingsView {
     /// 全部归 AgentInstancesPage，工作流只保存实例引用。
     fn render_agent_policy_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let manual = self.draft.agents.permission_mode == "manual";
+        let selected_default = self.draft.agents.default_agent.clone();
+        let mut default_rows = div().flex().flex_col().gap_1();
+        for (id, label) in [
+            ("", "自动（由工作流节点决定）"),
+            ("blank-terminal", "空白终端"),
+        ] {
+            let id_owned = id.to_string();
+            default_rows = default_rows.child(toggle_row(
+                cx,
+                format!("default-agent-{id}"),
+                label,
+                selected_default == id,
+                move |settings, _, _, cx| {
+                    settings.draft.agents.default_agent = id_owned.clone();
+                    cx.notify();
+                },
+            ));
+        }
+        if let Some(app) = self.app.as_ref() {
+            for profile in app.plugins.agent_profiles().into_iter().filter(|profile| {
+                profile.id != "blank-terminal"
+                    && (profile.runtime != mf_agent::RuntimeKind::Pty
+                        || mf_plugins::builtin::detect_on_path(&profile.command).is_some())
+            }) {
+                let id = profile.id.clone();
+                let label = profile.display_name.clone();
+                let selected = selected_default == id;
+                default_rows = default_rows.child(toggle_row(
+                    cx,
+                    gpui::ElementId::Name(format!("default-agent-{id}").into()),
+                    &label,
+                    selected,
+                    move |settings, _, _, cx| {
+                        settings.draft.agents.default_agent = id.clone();
+                        cx.notify();
+                    },
+                ));
+            }
+        }
         div()
             .id("agent-policy-page")
             .flex()
@@ -1655,6 +1699,8 @@ impl SettingsView {
                 "只控制所有实例共同遵守的安全与设备策略。",
                 "全局策略",
             ))
+            .child(section("默认智能体"))
+            .child(default_rows)
             .child(section("权限参数总策略"))
             .child(toggle_row(
                 cx,
@@ -1708,8 +1754,17 @@ impl SettingsView {
                 div()
                     .text_size(crate::theme::ui_px(9.5))
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
-                    .child("插件安装与启停统一在「插件」页；Agent 类型不会在这里重复配置。"),
+                    .child("插件安装与启停统一在「插件」页;Agent 类型与保存配置在下方管理。"),
             )
+            // 同一页:先全局策略,再 Agent Type 与保存配置(嵌入式实例页)
+            .children(self.agent_instances.clone().map(|page| {
+                div()
+                    .id("settings-agents-instances")
+                    .h(px(520.))
+                    .flex()
+                    .child(page)
+                    .into_any_element()
+            }))
             .into_any_element()
     }
 
@@ -2124,7 +2179,11 @@ impl SettingsView {
                     .gap_2()
                     .py_1()
                     .flex_wrap()
-                    .child(div().text_size(crate::theme::ui_px(11.5)).child(a.name.clone()))
+                    .child(
+                        div()
+                            .text_size(crate::theme::ui_px(11.5))
+                            .child(a.name.clone()),
+                    )
                     .child(
                         div()
                             .text_size(crate::theme::ui_px(9.5))
@@ -2717,7 +2776,11 @@ fn toggle_row(
                         .bg(rgb(crate::theme::Theme::bg_elevated())),
                 ),
         )
-        .child(div().text_size(crate::theme::ui_px(11.5)).child(label.to_string()))
+        .child(
+            div()
+                .text_size(crate::theme::ui_px(11.5))
+                .child(label.to_string()),
+        )
         .on_click(cx.listener(handler))
 }
 

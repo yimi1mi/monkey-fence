@@ -33,6 +33,7 @@ fn fixture_with_concurrency(dir: &std::path::Path) -> Fixture {
         WorkflowKernel {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
+            instance_resolver: None,
         },
         scripted_routing(),
     )

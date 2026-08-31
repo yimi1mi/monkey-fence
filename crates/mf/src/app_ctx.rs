@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 /// 生产 pin 生命周期:Plugin Host 内容寻址 pin(内置合成插件走源 pin)。
-struct PluginHostPins {
-    host: Arc<PluginRegistry>,
+pub(crate) struct PluginHostPins {
+    pub(crate) host: Arc<PluginRegistry>,
 }
 
 impl WorkflowPluginPins for PluginHostPins {
@@ -210,6 +210,148 @@ pub struct ProjectHandle {
     pub orchestrator: Arc<Orchestrator>,
 }
 
+/// 工作流默认 CLI 节点引用前缀:`default-cli:<完整 Agent Type 贡献 ID>`。
+/// 只接受完整贡献 ID —— 短 id 无法唯一反查插件包,不得作为新引用。
+pub const DEFAULT_CLI_REFERENCE_PREFIX: &str = "default-cli:";
+
+/// 项目工作流运行的任务标题截断长度(显示用;完整 goal 进 Task.goal)。
+pub const PROJECT_WORKFLOW_TITLE_MAX_CHARS: usize = 80;
+
+/// 一次工作流运行的定位:项目 + 工作流 + 内部 Task/Revision
+/// (UI 据此原子激活项目与任务并进入运行详情)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunTarget {
+    pub project_root: PathBuf,
+    pub workflow_key: String,
+    pub task_id: i64,
+    pub revision_id: i64,
+}
+
+/// Orca 式权限物化(自由函数,AppCtx 方法与工作流 resolver 共用):
+/// yolo 时返回该 Agent Type 的 yolo 参数,manual 返回空。
+fn permission_argv_of(
+    plugins: &Arc<PluginRegistry>,
+    global_yolo: bool,
+    agent_type: &str,
+) -> Vec<String> {
+    if !global_yolo {
+        return Vec::new();
+    }
+    plugins
+        .contributions()
+        .agent_types()
+        .into_iter()
+        // 完整贡献 ID 优先;短 id 仅兼容显式 legacy 内置引用
+        .find(|(full_id, _, a)| full_id == agent_type || a.id == agent_type)
+        .and_then(|(_, _, a)| mf_plugins::builtin::yolo_args_of(&a.id))
+        .map(|s| s.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// 合成默认 CLI 的工作流节点快照(ADR 0004):
+/// - 只用插件默认 command + 全局权限参数;不读、不复制外部配置与 Secret;
+/// - `external_config = true`(沿用外部已有配置,适配器跳过隔离注入);
+/// - 快照随 Revision 冻结,不写入目录库(不创建隐藏持久实例)。
+fn synthesize_default_cli_snapshot(
+    plugins: &Arc<PluginRegistry>,
+    config: &Arc<Mutex<mf_agent::Config>>,
+    full_contribution_id: &str,
+) -> Result<mf_agent::AgentInstanceSnapshot> {
+    let (_, source, contribution) = plugins
+        .contributions()
+        .agent_types()
+        .into_iter()
+        .find(|(full_id, _, _)| full_id == full_contribution_id)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "默认 CLI `{full_contribution_id}` 不存在或所属插件未启用(引用必须是完整贡献 ID)"
+            )
+        })?;
+    let _ = source;
+    let enabled = plugins
+        .summaries()
+        .into_iter()
+        .any(|s| s.enabled && s.agents.contains(&contribution.id));
+    anyhow::ensure!(enabled, "默认 CLI `{}` 所属插件未启用", contribution.name);
+    anyhow::ensure!(
+        mf_plugins::builtin::detect_on_path(&contribution.command).is_some(),
+        "默认 CLI `{}` 的命令 `{}` 未检测到(先安装或加入 PATH)",
+        contribution.name,
+        contribution.command
+    );
+    // 工作流节点是提示驱动的单次执行:优先声明中的 oneshot,
+    // 只有交互模式的类型退回 interactive。
+    let declared: Vec<mf_agent::RunMode> = contribution
+        .modes
+        .iter()
+        .filter_map(|m| mf_agent::RunMode::parse(m))
+        .collect();
+    let run_mode = if declared.contains(&mf_agent::RunMode::OneShot) {
+        mf_agent::RunMode::OneShot
+    } else {
+        declared
+            .first()
+            .copied()
+            .unwrap_or(mf_agent::RunMode::OneShot)
+    };
+    let global_yolo = {
+        let cfg = config.lock();
+        cfg.agents.permission_mode != "manual"
+    };
+    Ok(mf_agent::AgentInstanceSnapshot {
+        id: format!("{DEFAULT_CLI_REFERENCE_PREFIX}{full_contribution_id}"),
+        name: format!("{} 默认 CLI", contribution.name),
+        agent_type: full_contribution_id.to_string(),
+        version: 0,
+        enabled: true,
+        run_mode,
+        executable: contribution.command.clone(),
+        argv: permission_argv_of(plugins, global_yolo, full_contribution_id),
+        env: vec![],
+        config: serde_json::json!({}),
+        // done/进程退出/终端空闲不得自动结算 —— 与离散默认 CLI 一致
+        execution_contract: serde_json::json!({ "completion": "manual" }),
+        sealed_secret_ids: vec![],
+        external_config: true,
+    })
+}
+
+/// 插件感知的工作流实例解析器(生产注入 WorkflowKernel):
+/// - 普通字符串 → 目录库 Agent Instance(既有行为不变);
+/// - `default-cli:<完整贡献 ID>` → 合成临时快照(不落库)。
+pub(crate) struct PluginInstanceResolver {
+    plugins: Arc<PluginRegistry>,
+    catalog: Arc<CatalogStore>,
+    config: Arc<Mutex<mf_agent::Config>>,
+}
+
+impl PluginInstanceResolver {
+    pub(crate) fn new(
+        plugins: Arc<PluginRegistry>,
+        catalog: Arc<CatalogStore>,
+        config: Arc<Mutex<mf_agent::Config>>,
+    ) -> PluginInstanceResolver {
+        PluginInstanceResolver {
+            plugins,
+            catalog,
+            config,
+        }
+    }
+}
+
+impl mf_agent::orchestrator::WorkflowInstanceResolver for PluginInstanceResolver {
+    fn resolve(&self, reference: &str) -> Result<mf_agent::AgentInstanceSnapshot> {
+        if let Some(full_contribution_id) = reference.strip_prefix(DEFAULT_CLI_REFERENCE_PREFIX) {
+            return synthesize_default_cli_snapshot(
+                &self.plugins,
+                &self.config,
+                full_contribution_id,
+            );
+        }
+        self.catalog.snapshot_agent_instance(reference, None)
+    }
+}
+
 /// 单项目的会话恢复状态(新格式;全部字段带兼容默认)。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ProjectSessionState {
@@ -353,6 +495,28 @@ impl AppCtx {
     ) -> Arc<AppCtx> {
         let skills = mf_skills::load_skills(None);
         let plugins = PluginRegistry::load_with_catalog(catalog_store.clone(), &config, &skills);
+        Self::with_parts_and_plugins(config, catalog_store, plugins, start_pipe)
+    }
+
+    /// 测试装配:注入自定义插件注册表(临时根;不触用户 ~/.monkeyfence)。
+    /// 必须先于 open_project 调用(RuntimeHost/overview 都在打开项目时接线)。
+    #[cfg(test)]
+    pub fn with_parts_and_plugins_for_tests(
+        config: mf_agent::Config,
+        catalog_store: Arc<CatalogStore>,
+        plugins: Arc<PluginRegistry>,
+    ) -> Arc<AppCtx> {
+        Self::with_parts_and_plugins(config, catalog_store, plugins, false)
+    }
+
+    /// 装配内核(生产与测试共用;plugins 由调用方决定来源)。
+    fn with_parts_and_plugins(
+        config: mf_agent::Config,
+        catalog_store: Arc<CatalogStore>,
+        plugins: Arc<PluginRegistry>,
+        start_pipe: bool,
+    ) -> Arc<AppCtx> {
+        let skills = mf_skills::load_skills(None);
         let registry = SessionRegistry::new(config.clone());
         let limiter = GlobalLimiter::new(config.engine.global_concurrency.max(1));
         let keep_awake = Arc::new(KeepAwake::new());
@@ -497,6 +661,13 @@ impl AppCtx {
                 pins: Some(Arc::new(PluginHostPins {
                     host: self.plugins.clone(),
                 })),
+                // 插件感知实例解析:default-cli:<完整贡献 ID> 保留引用
+                // 在此合成快照;普通实例引用仍走目录库。
+                instance_resolver: Some(Arc::new(PluginInstanceResolver {
+                    plugins: self.plugins.clone(),
+                    catalog: self.catalog_store.clone(),
+                    config: self.config.clone(),
+                })),
             },
             mf_agent::orchestrator::DirectoryRouting {
                 current_pin: directory_pin,
@@ -612,18 +783,7 @@ impl AppCtx {
             let cfg = self.config.lock();
             cfg.agents.permission_mode != "manual"
         };
-        if !global_yolo {
-            return Vec::new();
-        }
-        self.plugins
-            .contributions()
-            .agent_types()
-            .into_iter()
-            // 完整贡献 ID 优先;短 id 仅兼容显式 legacy 内置引用
-            .find(|(full_id, _, a)| full_id == agent_type || a.id == agent_type)
-            .and_then(|(_, _, a)| mf_plugins::builtin::yolo_args_of(&a.id))
-            .map(|s| s.split_whitespace().map(str::to_string).collect())
-            .unwrap_or_default()
+        permission_argv_of(&self.plugins, global_yolo, agent_type)
     }
 
     /// 在项目任务下创建离散 CLI 会话(设计 §4.7 / §10):
@@ -738,6 +898,75 @@ impl AppCtx {
         let index = adapter_launch::workflow_plugin_index(&self.plugins);
         orch.assign_and_confirm_task_local(task_id, &index)?;
         Ok(())
+    }
+
+    /// ---------- 项目工作流直接运行(ADR 0004 / Task 4) ----------
+
+    /// 从项目工作流直接发起运行:读 Project Workflow → 创建 Task →
+    /// 投影为临时模板版本 → 编译冻结 Revision → confirm_and_run。
+    /// - 标题取 goal 第一非空行(截断显示长度),完整 goal 写入 Task.goal;
+    /// - 编译/pin/确认失败回滚刚建的 Draft Task,不留孤儿;
+    /// - 调度启动后的运行期错误保留 Task/Revision 交给 Needs You;
+    /// - 不把项目工作流自动保存成全局模板。
+    pub fn run_project_workflow(
+        &self,
+        root: &Path,
+        workflow_key: &str,
+        goal: &str,
+    ) -> Result<WorkflowRunTarget> {
+        let orch = self
+            .orchestrator_of(root)
+            .ok_or_else(|| anyhow::anyhow!("项目未打开: {}", root.display()))?;
+        let record = orch
+            .store
+            .load_project_workflow(workflow_key)?
+            .ok_or_else(|| anyhow::anyhow!("项目工作流 `{workflow_key}` 不存在"))?;
+        let goal = goal.trim();
+        anyhow::ensure!(!goal.is_empty(), "运行目标不能为空");
+        let title: String = goal
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
+            .unwrap_or_default()
+            .chars()
+            .take(PROJECT_WORKFLOW_TITLE_MAX_CHARS)
+            .collect();
+        anyhow::ensure!(!title.is_empty(), "运行目标不能为空");
+        let task = orch.create_task(&title, goal)?;
+        // 投影为临时模板版本:不写目录库(不保存为全局模板),
+        // 并行风险开关沿用项目工作流的持久化值。
+        let version = WorkflowTemplateVersion {
+            version_id: 0,
+            template_key: format!("project-workflow/{workflow_key}"),
+            version: 1,
+            nodes: record.nodes.clone(),
+            created_at: String::new(),
+        };
+        let index = adapter_launch::workflow_plugin_index(&self.plugins);
+        let run = || -> Result<i64> {
+            let rev =
+                orch.assign_workflow(task.id, &version, &index, record.allow_unsafe_parallel)?;
+            orch.confirm_and_run(task.id)?;
+            Ok(rev.id)
+        };
+        match run() {
+            Ok(revision_id) => {
+                self.overview.request_refresh();
+                Ok(WorkflowRunTarget {
+                    project_root: root.to_path_buf(),
+                    workflow_key: workflow_key.to_string(),
+                    task_id: task.id,
+                    revision_id,
+                })
+            }
+            Err(e) => {
+                // 尚未开始调度(无 Agent Run):删除刚建的 Draft Task
+                if let Err(discard) = orch.discard_task(task.id) {
+                    log::warn!("项目工作流运行失败后清理 Draft 任务失败: {discard:#}");
+                }
+                Err(e)
+            }
+        }
     }
 
     /// ---------- Secret 管理(设计 §8:明文只在 Secret Store 内) ----------
@@ -895,6 +1124,158 @@ mod agent_launch_selection_tests {
         assert!(prompt.is_none(), "空白目标不得注入提示");
         apply_task_goal(&mut prompt, "修复登录超时");
         assert_eq!(prompt.as_deref(), Some("修复登录超时"));
+    }
+}
+
+/// 测试插件:贡献命令为 `command` 的 Agent Type。`cmd` 在 Windows 总能
+/// 检测到;虚构命令永远检测不到 —— 用于验证 resolver 的合成与稳定错误。
+#[cfg(test)]
+fn install_cli_plugin(
+    host: &Arc<PluginRegistry>,
+    plugin_id: &str,
+    agent_id: &str,
+    command: &str,
+) -> String {
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(
+        src.path().join("monkeyfence-plugin.toml"),
+        format!(
+            r#"[manifest]
+version = 2
+publisher = "mf-test"
+id = "{plugin_id}"
+name = "{plugin_id} Test"
+version_str = "0.1.0"
+description = "resolver test plugin"
+
+[capabilities]
+
+[[agent_types]]
+id = "{agent_id}"
+name = "{agent_id} Agent"
+adapter = "generic-command"
+command = "{command}"
+modes = ["oneshot", "interactive"]
+"#
+        ),
+    )
+    .unwrap();
+    host.install_package(
+        src.path(),
+        mf_plugins::install::InstallSource::Local {
+            path: src.path().display().to_string(),
+        },
+    )
+    .unwrap();
+    let full_id = format!("mf-test.{plugin_id}");
+    host.enable(&full_id, true).unwrap();
+    format!("{full_id}.{agent_id}")
+}
+
+#[cfg(test)]
+fn test_resolver(host: Arc<PluginRegistry>) -> PluginInstanceResolver {
+    PluginInstanceResolver::new(
+        host,
+        mf_agent::CatalogStore::memory().unwrap(),
+        Arc::new(Mutex::new(mf_agent::Config::default())),
+    )
+}
+
+#[cfg(test)]
+mod default_cli_resolver_tests {
+    use super::*;
+    use mf_agent::orchestrator::WorkflowInstanceResolver as _;
+
+    fn host() -> Arc<PluginRegistry> {
+        PluginRegistry::load_at_with_catalog(
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            mf_agent::CatalogStore::memory().unwrap(),
+            &mf_agent::Config::default(),
+            &[],
+        )
+    }
+
+    #[test]
+    fn detected_cli_synthesizes_external_config_snapshot_without_persisting() {
+        let host = host();
+        let full_id = install_cli_plugin(&host, "cmdcli", "cmd", "cmd");
+        let resolver = test_resolver(host.clone());
+        let snapshot = resolver
+            .resolve(&format!("{DEFAULT_CLI_REFERENCE_PREFIX}{full_id}"))
+            .unwrap();
+        assert!(
+            snapshot.external_config,
+            "default-cli 合成快照必须只读外部配置"
+        );
+        assert_eq!(
+            snapshot.agent_type, full_id,
+            "快照携带完整贡献 ID(pin 依据)"
+        );
+        assert_eq!(snapshot.executable, "cmd", "使用插件默认 command");
+        assert_eq!(snapshot.run_mode, mf_agent::RunMode::OneShot);
+        assert!(
+            snapshot.sealed_secret_ids.is_empty(),
+            "不从 CLI 全局配置读取 Secret"
+        );
+        assert_eq!(
+            snapshot.execution_contract["completion"], "manual",
+            "done/退出不得自动结算"
+        );
+        // 合成快照不落目录库(不创建隐藏持久实例)
+        let rows = resolver.catalog.list_agent_instances(None).unwrap();
+        assert!(rows.is_empty(), "default-cli 不得写入 CatalogStore");
+    }
+
+    #[test]
+    fn unknown_short_and_disabled_references_are_stable_errors() {
+        let host = host();
+        let full_id = install_cli_plugin(&host, "cmdcli", "cmd", "cmd");
+        let resolver = test_resolver(host.clone());
+
+        // 未知完整贡献 ID
+        let err = resolver
+            .resolve("default-cli:ghost.plugin.agent")
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("不存在"));
+        // 短 id 不是合法新引用(必须完整贡献 ID)
+        let err = resolver.resolve("default-cli:cmd").err().unwrap();
+        assert!(
+            format!("{err:#}").contains("不存在"),
+            "短 id 引用必须拒绝: {err:#}"
+        );
+        // 禁用插件
+        host.disable("mf-test.cmdcli").unwrap();
+        let err = resolver
+            .resolve(&format!("{DEFAULT_CLI_REFERENCE_PREFIX}{full_id}"))
+            .err()
+            .unwrap();
+        assert!(format!("{err:#}").contains("未启用"));
+    }
+
+    #[test]
+    fn undetected_cli_is_rejected_with_install_hint() {
+        let host = host();
+        let resolver = test_resolver(host.clone());
+        // 虚构命令:永远不会检测到 → 稳定错误
+        let full_id = install_cli_plugin(&host, "ghostcli", "ghost", "mf-ghost-cli-not-installed");
+        let err = resolver
+            .resolve(&format!("{DEFAULT_CLI_REFERENCE_PREFIX}{full_id}"))
+            .err()
+            .unwrap();
+        assert!(
+            format!("{err:#}").contains("未检测到"),
+            "未检测 CLI 必须给出明确提示: {err:#}"
+        );
+    }
+
+    #[test]
+    fn plain_reference_still_resolves_catalog_instances() {
+        let host = host();
+        let resolver = test_resolver(host);
+        // 普通引用走目录库;未知实例报目录库原错误
+        let err = resolver.resolve("inst-not-exist").err().unwrap();
+        assert!(format!("{err:#}").contains("inst-not-exist"));
     }
 }
 

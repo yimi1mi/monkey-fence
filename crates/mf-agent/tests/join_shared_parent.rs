@@ -260,6 +260,7 @@ fn join_deferral_survives_restart_and_merges_full_batch() {
         WorkflowKernel {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
+            instance_resolver: None,
         },
         pinned_routing("builtin.core", "hash-worktree"),
     )
@@ -365,6 +366,7 @@ fn join_deferral_survives_restart_and_merges_full_batch() {
         WorkflowKernel {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
+            instance_resolver: None,
         },
         pinned_routing("builtin.core", "hash-worktree"),
     )

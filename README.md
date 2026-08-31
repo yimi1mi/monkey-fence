@@ -2,7 +2,7 @@
 
 **多项目 Agent 工作台 · 插件化智能体 · 可编辑 DAG 流水线 · 原生编辑 · 人工审阅**
 
-MonkeyFence 是一个面向 Windows 研发团队的原生 AI Agent 工作台:同时打开多个项目,每个项目内创建与版本控制完全解耦的任务(ADR 0001),通过插件贡献的本地 CLI Agent、API Agent 与 mock Agent 混合执行可编辑的 DAG 流水线(ADR 0002)。
+MonkeyFence 是一个面向 Windows 研发团队的原生 AI Agent 工作台:同时打开多个项目,每个项目内维护可重复运行的项目工作流,通过插件贡献的本地 CLI Agent、API Agent 与 mock Agent 混合执行可编辑的 DAG 流水线(ADR 0002)。用户主路径是**项目工作流 → 运行 → 需要你**:从项目工作流直接发起运行,系统自动创建 Task 并冻结 Pipeline Revision;需要人工介入时以运行级提醒召回,点击直达具体节点(ADR 0004)。
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
@@ -19,7 +19,7 @@ cargo run --release -- [项目路径]
 
 - `Ctrl+Shift+O` 打开文件夹(**可重复打开多个项目**,互不干扰)
 - `Ctrl+Shift+W` 任务侧边栏(按项目分组:新建 / 选择 / 归档)
-- `Ctrl+Shift+/` Agent 工作区(`Agents` 看板 / `Pipeline` 视图)
+- `Ctrl+Shift+/` Agent 工作区(`工作流` / `运行` 两个页签;有「需要你」时直达运行)
 - `Ctrl+,` 设置(智能体 / 插件 / Provider / 引擎 / 编辑器)
 - 活动栏顶部 `⋮` 打开“所有操作”:添加项目、快速打开、任务、版控、
   Agent、Pipeline、搜索、终端、设置及常用编辑操作均可鼠标触达;快捷键只做加速
@@ -38,10 +38,14 @@ cargo run -- --agent-smoke .
 | 概念 | 说明 |
 |---|---|
 | **Project** | 同时打开的一个目录;独立的任务数据库 / 调度器 / 会话注册表 |
-| **Task** | 项目内一级目标(不绑定 Git/P4/worktree/分支/变更集) |
+| **Project Workflow** | 项目内可编辑、可重复运行的 DAG;默认编排单位,直接发起运行 |
+| **Workflow Run** | 一次项目工作流的冻结执行视图(内部由 Task + Pipeline Revision 承载) |
+| **Needs You** | 运行级提醒:存在可由用户动作解除的介入点;徽标按运行数计数 |
+| **Task** | 项目内一级目标(不绑定 Git/P4/worktree/分支/变更集);运行时自动创建 |
 | **Pipeline Revision** | Task 的不可变 DAG 版本;编辑产生新 Revision |
 | **Step** | DAG 节点:工作说明 + 依赖 + Agent 指派 + 会话策略 |
-| **Agent Profile** | 插件贡献的可配置执行器(pty / http / plugin-worker) |
+| **Agent Type** | 插件贡献的可配置执行器(pty / http / plugin-worker) |
+| **Agent Instance** | 用户保存的一套独立 Agent Type 配置 |
 | **Agent Session** | 后台 Session Registry 拥有的 CLI/API 会话,可复用 |
 | **Agent Run** | Step 的一次执行尝试,持有一次性能力令牌 |
 | **Settlement** | 显式结算(`mfctl step complete/fail` 或结构化 Runtime),唯一成功依据 |
@@ -51,27 +55,26 @@ cargo run -- --agent-smoke .
 - Step:`pending → ready → running →(awaiting-outcome|needs-input)→ succeeded/failed/blocked/skipped/cancelled`
 - 调度规则:依赖全部成功或显式跳过后 Step 就绪并**自动派发**;失败只阻塞后代,独立分支继续;`done` / `tui-idle` **不能**自动结算;默认全局并发 4、每项目 2(设置可改);运行中修改 DAG 必须先暂停,且只允许修改尚未启动的 Step。
 
-## Agent 工作区
+## Agent 工作区(工作流 / 运行 两个页签)
 
-### Agents 视图(Orca 风格四列看板)
+### 工作流页(项目工作流编辑器)
 
-- 四列:**需要你**(失败/阻塞/等待输入/未结算)· **工作中** · **已完成**(成功未确认)· **空闲**(可复用会话)
-- 默认汇总**所有打开项目**,支持按项目循环切换与文本过滤(Agent/任务/指令/回复)
-- 卡片:Agent 图标名称 · 会话名 · 最近用户指令 · 最后回复(PTY 为终端尾部)· 项目与任务 · 状态 · 未读标记
-- 点击卡片打开近全屏终端(键盘直通,重新挂载恢复当前屏幕)或 API transcript
-- 「需要你」卡片 / 详情:判定成功 · 判定失败 · 继续发送提示;已完成可确认;空闲可隐藏(历史保留)或终止
+- 左侧 Agent 库分组:**检测到的默认 CLI**(`default-cli:` 引用,沿用外部配置零写入)·**保存的智能体配置**(隔离配置)·「管理智能体配置……」(打开设置,编辑状态不丢失)
+- 中间 DAG 画布(拓扑自动分层)+ 右侧可折叠节点检查器(标题/工作说明/改绑/依赖/删除);**每个原子编辑动作后自动保存**到项目库(跨重启保留)
+- 工具栏:新建/重命名/复制/删除/从全局模板创建(复制当前版本,之后互不联动)/另存为全局模板/**运行工作流**主按钮(dirty 保存失败时阻止运行)
+- 「运行工作流」打开 Run Composer:唯一必填输入是**本次目标**(标题取第一行,完整目标进 Task.goal);提交后自动创建 Task、冻结 Revision 并开始调度
 
-### Pipeline 视图(左到右拓扑列)
+### 运行页(WorkflowRunsPage + Run Monitor)
 
-- 每列一个依赖层级;节点显示标题 · Agent · 状态 · 尝试次数 · 依赖
-- 选中节点编辑器:标题 · 工作说明 · Agent Profile · session policy(fresh / reuse:key)· 前置步骤
-- 工具栏:从模板创建 · AI 生成(Planner 草案,**不得绕过用户确认**)· 添加 Step · 校验 · 保存修改 · 确认并运行 · 暂停 / 继续 · 取消
-- 失败节点:重试 · 跳过(必须人工确认)· 替换 Agent(产生新 Revision)
+- 左侧过滤:**需要你** · 运行中 · 最近完成;列表项以一次运行(内部 Task)为单位,只把存在 Pipeline Revision 的 Task 投影为工作流运行
+- 右侧复用 Run Monitor 展示 DAG 与节点动作 —— 继续会话、新会话重试、跳过(人工确认)、人工结算、取消;未知状态(重启后 interrupted)提供"继续观察/结算/重试",绝不显示成功徽标
+- 需要人工介入时,左侧 Agent 入口与「运行」页签显示同一**运行级徽标**(按运行数计数,不按被阻塞节点数);点击直达优先处理节点(等待输入 → 待结算 → 合并冲突 → 失败/中断)
+- 处理完成后徽标经统一 overview 快照消失(不手工减计数);重启恢复完全依赖 Store + overview 重建
 
 
 ## Agent 工作流(实例 / 工作流 / 运行监控)
 
-- **Agent 实例**(工作区 → 实例):同一 Agent Type 可创建任意数量的独立实例;每个实例有自己的命令、参数、环境与加密 Secret(Secret 只以引用存在,明文仅启动瞬间解密并零化)。未检测到 CLI 的类型可见但不可保存实例。编辑实例只影响下一次启动,绝不写 `~/.claude`、`~/.codex` 等真实 CLI 全局配置 —— Claude 用每次运行独立的 `CLAUDE_CONFIG_DIR`,Codex 用独立 `CODEX_HOME`。
+- **Agent 实例**(设置 → 智能体):同一 Agent Type 可创建任意数量的独立实例;每个实例有自己的命令、参数、环境与加密 Secret(Secret 只以引用存在,明文仅启动瞬间解密并零化)。未检测到 CLI 的类型可见但不可保存实例。编辑实例只影响下一次启动,绝不写 `~/.claude`、`~/.codex` 等真实 CLI 全局配置 —— Claude 用每次运行独立的 `CLAUDE_CONFIG_DIR`,Codex 用独立 `CODEX_HOME`。
 - **工作流编辑器**(工作区 → 工作流):左侧实例库、中间 DAG 画布(拓扑自动分层)、右侧可折叠节点检查器(默认布局 B;可切换上下布局 A 并记住偏好)。环与自依赖在编辑期即拒绝;保存为任务本地草稿(默认私有,可另存为全局模板)。
 - **任务 + 菜单**:任务列表行尾 `＋` 可添加普通终端、已检测的默认 CLI(沿用外部已有配置,零写入)、既有 Agent 实例(冻结隔离配置)或临时实例。离散 CLI 会话不改变任务状态,可显式提交 Handoff。
 - **Run Monitor**:Pipeline 页按节点展示状态与动作 —— 新会话重试、续会话重试、跳过、人工结算、取消;未知状态(重启后 interrupted)提供"继续观察/结算/重试",绝不显示成功徽标;失败与合并冲突集中进"需要你"。

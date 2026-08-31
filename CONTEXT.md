@@ -17,9 +17,21 @@ _避免_: 工作项、Run
 可复用的 DAG 定义,包含节点、依赖、输入输出与默认运行策略;分配给 Task 后在启动时冻结为 Pipeline Revision。
 _避免_: Pipeline Revision、运行记录
 
+**项目工作流（Project Workflow）**:
+项目内可编辑、可重复运行的 DAG 定义,是默认的编排单位;用户从项目工作流直接发起运行,无需先创建 Task。
+_避免_: Task、任务本地草稿
+
+**全局工作流模板（Global Workflow Template）**:
+跨项目复用的工作流蓝图;创建项目工作流时复制其当前版本,此后两者互不联动,复用是显式动作。
+_避免_: 项目工作流
+
 **流水线版本（Pipeline Revision）**:
 Task 的一个不可变 DAG 快照,固定工作流、Agent Instance 与插件版本。编辑已运行的流水线会产生新 Revision;历史 Revision 只读。
 _避免_: 计划(Plan)、执行(Execution)
+
+**工作流运行（Workflow Run）**:
+一次项目工作流的冻结执行视图,内部由 Task 与 Pipeline Revision 承载;实时 DAG、节点详情与人工介入动作都挂在运行上。
+_避免_: Agent Run(专指 Step 的一次尝试)、会话
 
 **步骤（Step）**:
 DAG 节点,包含工作说明、依赖声明和 Agent 指派。
@@ -49,6 +61,10 @@ _避免_: Dispatch、执行(Execution)
 **结算（Settlement）**:
 Agent Run 的显式终结动作:通过 `mfctl step complete|fail`、结构化 Runtime API 或用户手工判定提交;相同结算幂等,冲突结算拒绝。
 _避免_: 完成(Complete 一词指结算的一种结果)、收敛
+
+**需要你（Needs You）**:
+存在至少一个可由用户采取动作解除的运行级提醒;`done`、进程退出或终端空闲不能自动等同于成功结算,这些情况进入需要你。
+_避免_: Task 状态、节点计数
 
 **结构化交接（Handoff）**:
 Agent Run 向下游提交的结果对象,包含摘要、文件、产物、验证、阻塞项、建议与自定义输出;原始终端输出只作为日志引用。

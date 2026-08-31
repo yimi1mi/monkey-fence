@@ -100,6 +100,10 @@ pub struct AgentInstanceVersion {
     pub sealed_secret_ids: Vec<String>,
     #[serde(default)]
     pub created_at: String,
+    /// 外部配置意图(Default CLI 合成快照 = true;保存实例恒为 false)。
+    /// true 时适配器跳过隔离配置注入并拒绝 `config_files`。
+    #[serde(default)]
+    pub external_config: bool,
 }
 
 /// 解析后的不可变快照:用户配置(+ 可选项目覆盖)合并的结果。
@@ -118,6 +122,10 @@ pub struct AgentInstanceSnapshot {
     pub config: serde_json::Value,
     pub execution_contract: serde_json::Value,
     pub sealed_secret_ids: Vec<String>,
+    /// 外部配置意图:保存的实例恒为 false;`default-cli:` 合成快照为
+    /// true(只读外部已有配置,适配器跳过隔离注入)。
+    #[serde(default)]
+    pub external_config: bool,
 }
 
 impl AgentInstanceSnapshot {
@@ -149,6 +157,8 @@ impl AgentInstanceSnapshot {
             config: version.config.clone(),
             execution_contract: version.execution_contract.clone(),
             sealed_secret_ids: version.sealed_secret_ids.clone(),
+            // 保存的实例永远不携带外部配置意图(只有 default-cli 合成快照为 true)
+            external_config: false,
         }
     }
 
@@ -220,6 +230,7 @@ mod tests {
             config: serde_json::json!({ "x": 1, "y": 2 }),
             execution_contract: serde_json::json!({}),
             sealed_secret_ids: vec![],
+            external_config: false,
         }
     }
 

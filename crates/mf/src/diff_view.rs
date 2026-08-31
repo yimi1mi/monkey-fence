@@ -179,7 +179,7 @@ impl Render for DiffView {
                     .border_b_1()
                     .border_color(rgb(crate::theme::Theme::border()))
                     .bg(rgb(crate::theme::Theme::bg_panel()))
-                    .text_size(px(12.))
+                    .text_size(crate::theme::ui_px(12.))
                     .child(
                         div()
                             .text_color(rgb(crate::theme::Theme::fg()))
@@ -199,7 +199,7 @@ impl Render for DiffView {
                         d.child(div().flex_1())
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(crate::theme::ui_px(11.))
                                     .text_color(rgb(if pending > 0 {
                                         crate::theme::Theme::warning()
                                     } else {
@@ -217,7 +217,7 @@ impl Render for DiffView {
                                     .border_color(rgb(crate::theme::Theme::success()))
                                     .text_color(rgb(crate::theme::Theme::success()))
                                     .cursor_pointer()
-                                    .text_size(px(10.5))
+                                    .text_size(crate::theme::ui_px(10.5))
                                     .hover(|h| h.bg(rgb(crate::theme::Theme::bg_hover())))
                                     .child("✓ 全部保留")
                                     .on_click(cx.listener(|this, _, w, cx| {
@@ -234,7 +234,7 @@ impl Render for DiffView {
                                     .border_color(rgb(crate::theme::Theme::danger()))
                                     .text_color(rgb(crate::theme::Theme::danger()))
                                     .cursor_pointer()
-                                    .text_size(px(10.5))
+                                    .text_size(crate::theme::ui_px(10.5))
                                     .hover(|h| h.bg(rgb(crate::theme::Theme::bg_hover())))
                                     .child("✕ 全部拒绝")
                                     .on_click(cx.listener(|this, _, w, cx| {
@@ -243,7 +243,7 @@ impl Render for DiffView {
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(crate::theme::ui_px(10.))
                                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                                     .child("Alt+Y/Z"),
                             )
@@ -286,7 +286,7 @@ impl Render for DiffView {
                                             .border_b_1()
                                             .border_color(rgb(crate::theme::Theme::border()))
                                             .bg(rgb(crate::theme::Theme::bg_elevated()))
-                                            .text_size(px(10.5))
+                                            .text_size(crate::theme::ui_px(10.5))
                                             .child(div().text_color(rgb(color)).child(format!(
                                                 "HUNK #{} · {}",
                                                 hi + 1,
@@ -377,13 +377,13 @@ impl Render for DiffView {
                                     out.push(
                                         div()
                                             .id(("dl", ix))
-                                            .h(px(20.))
+                                            .h(px(22.))
                                             .flex()
                                             .items_center()
                                             .pl_2()
                                             .bg(row_bg)
                                             .font_family("Consolas")
-                                            .text_size(px(12.))
+                                            .text_size(crate::theme::ui_px(12.))
                                             .child(
                                                 div()
                                                     .text_color(
@@ -409,7 +409,7 @@ impl Render for DiffView {
                             out.push(
                                 div()
                                     .p_2()
-                                    .text_size(px(11.))
+                                    .text_size(crate::theme::ui_px(11.))
                                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                                     .child(format!(
                                         "… 其余 {} 行未渲染(超大 diff)",

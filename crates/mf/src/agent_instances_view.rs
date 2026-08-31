@@ -175,6 +175,9 @@ pub struct AgentInstancesPage {
     secret_value_input: zeroize::Zeroizing<String>,
     /// select 类型 config 字段的选项弹出(打开的字段索引);None = 全关。
     config_popover: Option<usize>,
+    /// 嵌入模式(设置页内):去掉页头、不占 size_full,
+    /// 让设置页滚动区决定布局。
+    pub embedded: bool,
 }
 
 impl AgentInstancesPage {
@@ -194,8 +197,19 @@ impl AgentInstancesPage {
             secret_name_input: String::new(),
             secret_value_input: zeroize::Zeroizing::new(String::new()),
             config_popover: None,
+            embedded: false,
         };
         page.refresh();
+        page
+    }
+
+    /// 嵌入式构造(设置 → 智能体页内):无重复页头、不占满窗口。
+    pub fn new_embedded(
+        app: std::sync::Arc<crate::app_ctx::AppCtx>,
+        cx: &mut Context<Self>,
+    ) -> AgentInstancesPage {
+        let mut page = Self::new(app, cx);
+        page.embedded = true;
         page
     }
 
@@ -321,6 +335,7 @@ impl AgentInstancesPage {
             config: serde_json::json!({}),
             execution_contract: serde_json::json!({ "completion": "manual" }),
             sealed_secret_ids: vec![],
+            external_config: false,
         };
         match self.app.create_ad_hoc_session(
             &root,
@@ -1849,9 +1864,11 @@ impl Render for AgentInstancesPage {
         } else {
             self.filter.clone()
         };
+        let embedded = self.embedded;
         gpui::div()
             .id("instances-page")
-            .size_full()
+            .when(embedded, |d| d.flex_1().min_h_0())
+            .when(!embedded, |d| d.size_full())
             .flex()
             .gap_2()
             .p_2()
@@ -1867,18 +1884,20 @@ impl Render for AgentInstancesPage {
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child(
-                        gpui::div()
-                            .text_size(crate::theme::ui_px(12.))
-                            .text_color(rgb(crate::theme::Theme::fg()))
-                            .child("智能体 · 实例配置"),
-                    )
-                    .child(
-                        gpui::div()
-                            .text_size(crate::theme::ui_px(9.))
-                            .text_color(rgb(crate::theme::Theme::fg_faint()))
-                            .child("CLI、参数、环境、Secret 与隔离配置的唯一编辑入口"),
-                    )
+                    .when(!embedded, |d| {
+                        d.child(
+                            gpui::div()
+                                .text_size(crate::theme::ui_px(12.))
+                                .text_color(rgb(crate::theme::Theme::fg()))
+                                .child("智能体 · 实例配置"),
+                        )
+                        .child(
+                            gpui::div()
+                                .text_size(crate::theme::ui_px(9.))
+                                .text_color(rgb(crate::theme::Theme::fg_faint()))
+                                .child("CLI、参数、环境、Secret 与隔离配置的唯一编辑入口"),
+                        )
+                    })
                     .child(
                         gpui::div()
                             .id("inst-filter-box")

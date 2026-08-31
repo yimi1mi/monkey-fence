@@ -1,4 +1,4 @@
-use gpui::Hsla;
+use gpui::{px, Hsla, Pixels};
 use std::sync::RwLock;
 
 /// 双色板;运行时可切(设置页外观),渲染处每帧经函数访问器读取
@@ -48,8 +48,8 @@ pub const DARK: Palette = Palette {
     bg_active: 0x273546,
     border: 0x334152,
     fg: 0xdde5ef,
-    fg_dim: 0x96a4b5,
-    fg_faint: 0x607084,
+    fg_dim: 0xa6b4c6,
+    fg_faint: 0x7d8ca1,
     accent: 0x62aaf7,
     accent_dim: 0x315f91,
     success: 0x4ec97e,
@@ -81,8 +81,8 @@ pub const LIGHT: Palette = Palette {
     bg_active: 0xd8e0eb,
     border: 0xd4d3ce,
     fg: 0x252a31,
-    fg_dim: 0x5f6874,
-    fg_faint: 0x8c949d,
+    fg_dim: 0x59626e,
+    fg_faint: 0x7a828c,
     accent: 0x356fc4,
     accent_dim: 0xa9bfdd,
     success: 0x3f8f4f,
@@ -107,6 +107,20 @@ pub const LIGHT: Palette = Palette {
 
 static PALETTE: RwLock<Palette> = RwLock::new(DARK);
 static THEME_ID: RwLock<&'static str> = RwLock::new(NIGHT_VOYAGE_ID);
+
+/// 全局 UI 字号缩放:界面基础字号(8.5~13px)在高分屏上偏小,统一放大。
+/// 仅作用于界面文字;编辑器/终端正文走 EditorConfig.font_size,不受影响。
+pub const UI_FONT_SCALE: f32 = 1.2;
+
+/// 界面(UI chrome)字体族。默认 .SystemUIFont 在中文 Windows 上解析为宋体,
+/// 拉丁字形与中文点阵观感差;显式用 Segoe UI,CJK 由 DirectWrite 回退微软雅黑。
+/// 编辑器/终端等宽正文不在此列(走 EditorConfig.font_family)。
+pub const UI_FONT_FAMILY: &str = "Segoe UI";
+
+/// 界面文字字号统一入口:`text_size(ui_px(11.))` 等价于 11px 基准 × UI_FONT_SCALE。
+pub fn ui_px(base: f32) -> Pixels {
+    px(base * UI_FONT_SCALE)
+}
 
 /// 按稳定 ID 切换主题；未知 ID 安全回退到夜航。
 pub fn set_theme_id(id: &str) -> &'static str {

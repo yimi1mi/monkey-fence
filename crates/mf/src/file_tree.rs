@@ -197,7 +197,7 @@ impl Render for FileTree {
                                 .when(is_selected, |d| d.bg(rgb(crate::theme::Theme::bg_active())))
                                 .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                                 .cursor_pointer()
-                                .text_size(px(13.))
+                                .text_size(crate::theme::ui_px(13.))
                                 .child(
                                     div()
                                         .w(px(14.))

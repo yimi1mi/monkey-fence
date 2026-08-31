@@ -13,7 +13,7 @@ use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
 use mf_agent::pipeline::PipelineDraft;
 use mf_plugins::PluginRegistry;
 use parking_lot::{Mutex, RwLock};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -61,6 +61,181 @@ pub struct AgentCardOverview {
     pub is_http: bool,
 }
 
+/// 运行级「需要你」投影(ADR 0004 / Task 7):一次工作流运行
+/// (内部 Task)最多贡献一个徽标计数;reason_count 是直接可操作
+/// 原因数(仅用于展示,不参与计数),focus_step_id 是优先处理节点。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunAttention {
+    pub project_root: PathBuf,
+    pub task_id: i64,
+    pub task_title: String,
+    pub reason_count: usize,
+    /// 优先处理节点(等待输入 → 待结算 → 合并冲突 → 失败/中断;
+    /// 同优先级按 Step ID 稳定排序取最小)。
+    pub focus_step_id: Option<i64>,
+}
+
+/// 直接可操作的关注原因(可由用户动作解除)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectAttentionReason {
+    /// Step needs-input。
+    NeedsInput,
+    /// Step/Run awaiting-outcome(含进程退出/会话死亡未结算)。
+    AwaitingOutcome,
+    /// 待处理合并冲突。
+    MergeConflict,
+    /// 失败且可以重试、判定或跳过的节点。
+    Failed,
+    /// 重启恢复的 interrupted。
+    Interrupted,
+}
+
+impl DirectAttentionReason {
+    /// focus 选择优先级(小值优先)。
+    pub fn priority(self) -> u8 {
+        match self {
+            DirectAttentionReason::NeedsInput => 0,
+            DirectAttentionReason::AwaitingOutcome => 1,
+            DirectAttentionReason::MergeConflict => 2,
+            DirectAttentionReason::Failed | DirectAttentionReason::Interrupted => 3,
+        }
+    }
+}
+
+/// 一个节点的直接关注(纯函数;唯一判定口径)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectAttention {
+    pub step_id: i64,
+    pub reason: DirectAttentionReason,
+}
+
+/// 「需要你」唯一判定口径(ADR 0004 / Task 7):
+/// project_overview、RunMonitor 与 WorkflowRunsPage 都复用它,
+/// 禁止三处各写一份状态匹配。
+///
+/// 直接可操作:needs-input / awaiting-outcome(Step 或 Run)/ 失败可
+/// 处置 / interrupted / 待处理合并冲突。
+/// 不计数:仅因上游失败而 blocked 的后代、pending/ready、
+/// 正在自动重试(重新派发后状态不再是 Failed)、已取消/已归档。
+pub fn direct_attention_for_step(
+    step: &StepView,
+    latest_run: Option<&RunView>,
+    session_unavailable: bool,
+    has_merge_conflict: bool,
+) -> Option<DirectAttention> {
+    let reason = if step.status == StepStatus::NeedsInput {
+        DirectAttentionReason::NeedsInput
+    } else if step.status == StepStatus::AwaitingOutcome
+        || (step.status == StepStatus::Running
+            && matches!(
+                latest_run.map(|run| run.status),
+                Some(RunStatus::AwaitingOutcome)
+            ))
+        || (step.status == StepStatus::Running
+            && latest_run.is_some_and(|run| run.status == RunStatus::Running)
+            && session_unavailable)
+    {
+        DirectAttentionReason::AwaitingOutcome
+    } else if has_merge_conflict {
+        // 合并冲突属于工作目录归并阶段，节点可能已 succeeded，也可能仍
+        // blocked/pending；归属由 merge batch/lease step key 决定，而非状态猜测。
+        DirectAttentionReason::MergeConflict
+    } else if step.status == StepStatus::Failed {
+        DirectAttentionReason::Failed
+    } else if step.status == StepStatus::Running
+        && matches!(
+            latest_run.map(|run| run.status),
+            Some(RunStatus::Interrupted)
+        )
+    {
+        DirectAttentionReason::Interrupted
+    } else {
+        // 仅因上游失败而 blocked 的后代 / pending / ready /
+        // succeeded / skipped / cancelled:非直接可操作
+        return None;
+    };
+    Some(DirectAttention {
+        step_id: step.id,
+        reason,
+    })
+}
+
+/// 一次运行的聚合(纯函数):直接原因数 + 优先处理节点。
+/// 已取消/已归档运行不产生徽标;一个运行最多贡献一个徽标
+/// (调用方按 Task 调用一次,天然去重 blocked 后代)。
+pub fn attention_for_task(
+    task: &TaskView,
+    steps: &[StepView],
+    latest_run_by_step: &HashMap<i64, RunView>,
+    unavailable_session_steps: &HashSet<i64>,
+    merge_conflict_step_ids: &HashSet<i64>,
+    has_unmapped_merge_conflict: bool,
+    open_questions: usize,
+) -> Option<WorkflowRunAttention> {
+    if matches!(task.status, TaskStatus::Cancelled | TaskStatus::Archived) {
+        return None;
+    }
+    // 只有存在 Pipeline Revision 的 Task 才是工作流运行
+    if task.revision_count == 0 {
+        return None;
+    }
+    let mut directs: Vec<DirectAttention> = steps
+        .iter()
+        .filter_map(|step| {
+            direct_attention_for_step(
+                step,
+                latest_run_by_step.get(&step.id),
+                unavailable_session_steps.contains(&step.id),
+                merge_conflict_step_ids.contains(&step.id),
+            )
+        })
+        .collect();
+    if has_unmapped_merge_conflict && steps.is_empty() {
+        // 无步骤投影但存在待处理冲突(极端恢复态):仍按冲突计数
+        return Some(WorkflowRunAttention {
+            project_root: PathBuf::new(),
+            task_id: task.id,
+            task_title: task.title.clone(),
+            reason_count: 1,
+            focus_step_id: None,
+        });
+    }
+    if directs.is_empty() && !has_unmapped_merge_conflict && open_questions == 0 {
+        return None;
+    }
+    let mut reason_count = directs.len();
+    if has_unmapped_merge_conflict
+        && !directs
+            .iter()
+            .any(|d| d.reason == DirectAttentionReason::MergeConflict)
+    {
+        reason_count += 1;
+    }
+    if open_questions > 0 {
+        reason_count += open_questions;
+    }
+    // focus:优先级升序,同优先级按 Step ID 稳定排序
+    directs.sort_by_key(|d| (d.reason.priority(), d.step_id));
+    let focus_step_id = directs.first().map(|d| d.step_id);
+    if directs.is_empty() {
+        // 只有冲突/问题等运行级原因:focus 无节点
+        return Some(WorkflowRunAttention {
+            project_root: PathBuf::new(),
+            task_id: task.id,
+            task_title: task.title.clone(),
+            reason_count,
+            focus_step_id: None,
+        });
+    }
+    Some(WorkflowRunAttention {
+        project_root: PathBuf::new(),
+        task_id: task.id,
+        task_title: task.title.clone(),
+        reason_count,
+        focus_step_id,
+    })
+}
+
 /// 唯一发布物:revision 单调递增,内容整体替换。
 pub struct ProjectOverviewSnapshot {
     pub revision: u64,
@@ -68,6 +243,10 @@ pub struct ProjectOverviewSnapshot {
     pub agent_cards: Vec<AgentCardOverview>,
     pub global_active_runs: usize,
     pub templates: Vec<(String, String, PipelineDraft)>,
+    /// 运行级「需要你」投影(Task 7):一个运行最多一项。
+    pub attention_runs: Vec<WorkflowRunAttention>,
+    /// 徽标计数 = attention_runs.len()(按运行数,不按被阻塞节点数)。
+    pub attention_run_count: usize,
 }
 
 /// Hub 共享的跨项目资源。
@@ -114,6 +293,8 @@ impl ProjectOverviewHub {
                 agent_cards: Vec::new(),
                 global_active_runs: 0,
                 templates: Vec::new(),
+                attention_runs: Vec::new(),
+                attention_run_count: 0,
             })),
             // 通知只表达「至少有一次重建需求」；容量 1 + try_send 天然合并，
             // drain 线程永不等待 rebuilder，因此不会把背压传回 Orchestrator。
@@ -127,20 +308,22 @@ impl ProjectOverviewHub {
         let weak = Arc::downgrade(self);
         std::thread::Builder::new()
             .name("mf-overview-rebuild".into())
-            .spawn(move || loop {
-                let Some(hub) = weak.upgrade() else {
-                    return;
-                };
-                match hub.notify.1.recv_timeout(Duration::from_millis(200)) {
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
-                    Ok(()) => {}
+            .spawn(move || {
+                loop {
+                    let Some(hub) = weak.upgrade() else {
+                        return;
+                    };
+                    match hub.notify.1.recv_timeout(Duration::from_millis(200)) {
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                        Ok(()) => {}
+                    }
+                    // 固定合并窗，而不是等待「连续 50ms 无事件」；高频输出也必须
+                    // 在有界时间内发布。后续通知留在容量 1 的槽中触发下一轮。
+                    std::thread::sleep(Duration::from_millis(20));
+                    while hub.notify.1.try_recv().is_ok() {}
+                    hub.rebuild();
                 }
-                // 固定合并窗，而不是等待「连续 50ms 无事件」；高频输出也必须
-                // 在有界时间内发布。后续通知留在容量 1 的槽中触发下一轮。
-                std::thread::sleep(Duration::from_millis(20));
-                while hub.notify.1.try_recv().is_ok() {}
-                hub.rebuild();
             })
             .expect("overview rebuilder 线程启动失败");
     }
@@ -155,21 +338,23 @@ impl ProjectOverviewHub {
             let orchestrator = orchestrator.clone();
             std::thread::Builder::new()
                 .name(format!("mf-event-drain-{}", root.display()))
-                .spawn(move || loop {
-                    if stop.load(Ordering::SeqCst) {
-                        break;
-                    }
-                    // 持续消费:比 bounded receiver 更靠近 Orchestrator,
-                    // UI 是否读 snapshot 不影响调度正确性。
-                    match orchestrator
-                        .events_rx
-                        .recv_timeout(Duration::from_millis(200))
-                    {
-                        Ok(_) => {
-                            let _ = notify_tx.try_send(());
+                .spawn(move || {
+                    loop {
+                        if stop.load(Ordering::SeqCst) {
+                            break;
                         }
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                        // 持续消费:比 bounded receiver 更靠近 Orchestrator,
+                        // UI 是否读 snapshot 不影响调度正确性。
+                        match orchestrator
+                            .events_rx
+                            .recv_timeout(Duration::from_millis(200))
+                        {
+                            Ok(_) => {
+                                let _ = notify_tx.try_send(());
+                            }
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                        }
                     }
                 })
                 .ok()
@@ -225,6 +410,7 @@ impl ProjectOverviewHub {
         };
         let mut projects = Vec::new();
         let mut agent_cards = Vec::new();
+        let mut attention_runs = Vec::new();
         for (root, orch) in &orchs {
             let project_name = root
                 .file_name()
@@ -256,6 +442,97 @@ impl ProjectOverviewHub {
                     open_questions,
                     needs_you_reasons: reasons,
                 });
+                // 运行级「需要你」(Task 7):每运行(内部 Task)最多一项,
+                // 徽标按运行数计数,不按被阻塞节点数
+                let latest_run_by_step: HashMap<i64, RunView> =
+                    runs.iter().fold(HashMap::new(), |mut acc, r| {
+                        let entry = acc.entry(r.step_id).or_insert(r.clone());
+                        if r.id > entry.id {
+                            *entry = r.clone();
+                        }
+                        acc
+                    });
+                let sessions_by_id: HashMap<i64, &SessionView> = sessions
+                    .iter()
+                    .map(|session| (session.id, session))
+                    .collect();
+                let project_key = root.to_string_lossy().to_string();
+                let unavailable_session_steps: HashSet<i64> = latest_run_by_step
+                    .iter()
+                    .filter_map(|(step_id, run)| {
+                        if run.status != RunStatus::Running {
+                            return None;
+                        }
+                        let session_id = run.session_id?;
+                        let unavailable = match sessions_by_id.get(&session_id) {
+                            None => true,
+                            Some(session) => {
+                                session.status == SessionStatus::Dead
+                                    || (session.status == SessionStatus::Idle
+                                        && session.runtime != "http"
+                                        && !self
+                                            .ctx
+                                            .registry
+                                            .session_alive(&project_key, session_id))
+                            }
+                        };
+                        unavailable.then_some(*step_id)
+                    })
+                    .collect();
+                let pending_merges = orch
+                    .store
+                    .list_pending_merges(Some(t.id))
+                    .unwrap_or_default();
+                let has_merge_conflict = pending_merges.iter().any(|row| !row.conflicts.is_empty());
+                let mut merge_conflict_step_ids: HashSet<i64> = HashSet::new();
+                if has_merge_conflict {
+                    let batches = orch
+                        .store
+                        .list_merge_batches_for_recovery()
+                        .unwrap_or_default();
+                    for batch in batches
+                        .iter()
+                        .filter(|batch| batch.task_id == t.id && batch.status == "needs_user")
+                    {
+                        let step_key = batch
+                            .join_step_key
+                            .strip_prefix("__single__:")
+                            .unwrap_or(&batch.join_step_key);
+                        if let Some(step) = steps.iter().find(|step| step.step_key == step_key) {
+                            merge_conflict_step_ids.insert(step.id);
+                        }
+                    }
+                    // 兼容没有 merge_batches 的旧投影：租约 metadata 仍带来源 step_key。
+                    if merge_conflict_step_ids.is_empty() {
+                        for row in &pending_merges {
+                            let step_key = row
+                                .lease
+                                .metadata
+                                .get("step_key")
+                                .and_then(|value| value.as_str());
+                            if let Some(step) = step_key
+                                .and_then(|key| steps.iter().find(|step| step.step_key == key))
+                            {
+                                merge_conflict_step_ids.insert(step.id);
+                            }
+                        }
+                    }
+                }
+                let has_unmapped_merge_conflict =
+                    has_merge_conflict && merge_conflict_step_ids.is_empty();
+                if let Some(mut attention) = attention_for_task(
+                    t,
+                    &steps,
+                    &latest_run_by_step,
+                    &unavailable_session_steps,
+                    &merge_conflict_step_ids,
+                    has_unmapped_merge_conflict,
+                    open_questions,
+                ) {
+                    attention.project_root = root.clone();
+                    attention.task_title = t.title.clone();
+                    attention_runs.push(attention);
+                }
             }
             let active_sessions = sessions
                 .iter()
@@ -336,6 +613,8 @@ impl ProjectOverviewHub {
         let live_roots: std::collections::HashSet<&PathBuf> = state.attachments.keys().collect();
         projects.retain(|project| live_roots.contains(&project.root));
         agent_cards.retain(|card| live_roots.contains(&card.project_root));
+        attention_runs.retain(|run| live_roots.contains(&run.project_root));
+        let attention_run_count = attention_runs.len();
         state.revision += 1;
         let revision = state.revision;
         *self.snapshot.write() = Arc::new(ProjectOverviewSnapshot {
@@ -344,6 +623,8 @@ impl ProjectOverviewHub {
             agent_cards,
             global_active_runs: self.ctx.limiter.active(),
             templates,
+            attention_runs,
+            attention_run_count,
         });
     }
 }

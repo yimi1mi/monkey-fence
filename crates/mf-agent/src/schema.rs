@@ -9,7 +9,7 @@ use anyhow::Result;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-pub const PROJECT_SCHEMA_VERSION: i64 = 5;
+pub const PROJECT_SCHEMA_VERSION: i64 = 6;
 pub const CATALOG_SCHEMA_VERSION: i64 = 1;
 
 /// 项目库路径:`<project>/.mf-agent/workflow-v1.db`。
@@ -49,21 +49,24 @@ pub fn upgrade_project(conn: &mut Connection, target: i64) -> Result<()> {
         return Ok(());
     }
     let tx = conn.transaction()?;
-    if current < 1 {
+    if current < 1 && target >= 1 {
         tx.execute_batch(PROJECT_SCHEMA_V1)?;
     }
-    if current < 2 {
+    if current < 2 && target >= 2 {
         tx.execute_batch(PROJECT_SCHEMA_V2_DELTA)?;
         backfill_early_dev_columns(&tx)?;
     }
-    if current < 3 {
+    if current < 3 && target >= 3 {
         backfill_digest_columns(&tx)?;
     }
-    if current < 4 {
+    if current < 4 && target >= 4 {
         backfill_merge_batch_columns(&tx)?;
     }
-    if current < 5 {
+    if current < 5 && target >= 5 {
         backfill_merge_owner_columns(&tx)?;
+    }
+    if current < 6 && target >= 6 {
+        tx.execute_batch(PROJECT_SCHEMA_V6_DELTA)?;
     }
     tx.pragma_update(None, "user_version", target)?;
     tx.commit()?;
@@ -503,4 +506,19 @@ CREATE TABLE IF NOT EXISTS plugin_pins (
     PRIMARY KEY (run_key, full_id, version, content_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_plugin_pins_hash ON plugin_pins(content_hash);
+";
+
+/// v6 增量(ADR 0004):独立的项目工作流存储。项目工作流是项目内
+/// 一级对象(可编辑、可重复运行),与 `task_workflows`(Task 本地
+/// 草稿)互不迁移、互不改写;只存当前版本,运行时冻结为 Revision。
+pub const PROJECT_SCHEMA_V6_DELTA: &str = "
+CREATE TABLE IF NOT EXISTS project_workflows (
+    workflow_key TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    graph_json TEXT NOT NULL,
+    allow_unsafe_parallel INTEGER NOT NULL DEFAULT 0,
+    content_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 ";

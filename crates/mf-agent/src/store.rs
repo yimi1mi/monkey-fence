@@ -1110,8 +1110,7 @@ impl Store {
         })
     }
 
-    const RUN_COLS: &'static str =
-        "id, task_id, step_id, revision_id, session_id, status, agent_state, capability_token, outcome, outcome_payload, started_at, ended_at";
+    const RUN_COLS: &'static str = "id, task_id, step_id, revision_id, session_id, status, agent_state, capability_token, outcome, outcome_payload, started_at, ended_at";
 
     pub fn create_run(
         &self,
@@ -2302,6 +2301,143 @@ impl Store {
                 nodes,
             }))
         })
+    }
+
+    // ---------- Project Workflow(ADR 0004) ----------
+
+    /// 保存/覆盖项目工作流。校验 key/name 非空、nodes 非空;DAG 完整
+    /// 校验(环/未知依赖)仍由 Workflow Compiler 在运行前负责。
+    /// 同内容保存按内容摘要幂等,不刷新 `updated_at`(与任务本地草稿
+    /// 的 I8 语义一致)。返回保存后的记录。
+    pub fn save_project_workflow(
+        &self,
+        draft: &crate::workflow::ProjectWorkflowDraft,
+    ) -> Result<crate::workflow::ProjectWorkflowRecord> {
+        anyhow::ensure!(!draft.key.trim().is_empty(), "项目工作流 key 不能为空");
+        anyhow::ensure!(!draft.name.trim().is_empty(), "项目工作流名称不能为空");
+        anyhow::ensure!(!draft.nodes.is_empty(), "项目工作流至少需要一个节点");
+        let graph_json = serde_json::to_string(&draft.nodes)?;
+        let digest =
+            crate::workflow::workflow_content_digest(&draft.nodes, draft.allow_unsafe_parallel);
+        let ts = now();
+        self.with_conn(|c| {
+            let existing: Option<String> = c
+                .query_row(
+                    "SELECT content_digest FROM project_workflows WHERE workflow_key = ?1",
+                    params![draft.key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if existing.as_deref() != Some(digest.as_str()) {
+                c.execute(
+                    "INSERT INTO project_workflows
+                        (workflow_key, name, graph_json, allow_unsafe_parallel,
+                         content_digest, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
+                     ON CONFLICT(workflow_key) DO UPDATE SET
+                        name = excluded.name,
+                        graph_json = excluded.graph_json,
+                        allow_unsafe_parallel = excluded.allow_unsafe_parallel,
+                        content_digest = excluded.content_digest,
+                        updated_at = excluded.updated_at",
+                    params![
+                        draft.key,
+                        draft.name,
+                        graph_json,
+                        draft.allow_unsafe_parallel as i64,
+                        digest,
+                        ts
+                    ],
+                )?;
+            } else if existing.is_some() {
+                // 内容相同但名称可能变化:名称参与用户可见列表,单独刷新
+                c.execute(
+                    "UPDATE project_workflows SET name = ?2 WHERE workflow_key = ?1 AND name <> ?2",
+                    params![draft.key, draft.name],
+                )?;
+            }
+            Self::project_workflow_row(c, &draft.key)
+                .transpose()
+                .unwrap_or_else(|| Err(anyhow::anyhow!("项目工作流保存后读取失败")))
+        })
+    }
+
+    /// 读取项目工作流(无记录为 None;graph_json 损坏时报错而非静默空)。
+    pub fn load_project_workflow(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::workflow::ProjectWorkflowRecord>> {
+        self.with_conn(|c| Self::project_workflow_row(c, key))
+    }
+
+    /// 项目工作流列表,按名称(不区分 ASCII 大小写)再按 key 稳定排序。
+    pub fn list_project_workflows(&self) -> Result<Vec<crate::workflow::ProjectWorkflowRecord>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT workflow_key FROM project_workflows
+                 ORDER BY name COLLATE NOCASE, workflow_key",
+            )?;
+            let keys = stmt
+                .query_map([], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            drop(stmt);
+            keys.iter()
+                .map(|k| {
+                    Self::project_workflow_row(c, k)
+                        .transpose()
+                        .unwrap_or_else(|| Err(anyhow::anyhow!("项目工作流行在列表后消失")))
+                })
+                .collect()
+        })
+    }
+
+    /// 删除项目工作流;返回是否确实删除了一行。
+    /// 不影响 `task_workflows` 与已冻结的 Pipeline Revision。
+    pub fn delete_project_workflow(&self, key: &str) -> Result<bool> {
+        self.with_conn(|c| {
+            Ok(c.execute(
+                "DELETE FROM project_workflows WHERE workflow_key = ?1",
+                params![key],
+            )? > 0)
+        })
+    }
+
+    fn project_workflow_row(
+        c: &Connection,
+        key: &str,
+    ) -> Result<Option<crate::workflow::ProjectWorkflowRecord>> {
+        let row: Option<(String, String, i64, String, String, String)> = c
+            .query_row(
+                "SELECT name, graph_json, allow_unsafe_parallel, content_digest,
+                        created_at, updated_at
+                 FROM project_workflows WHERE workflow_key = ?1",
+                params![key],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((name, graph_json, flag, digest, created_at, updated_at)) = row else {
+            return Ok(None);
+        };
+        let nodes: Vec<crate::workflow::WorkflowNodeDraft> = serde_json::from_str(&graph_json)
+            .with_context(|| format!("项目工作流 `{key}` 图数据损坏"))?;
+        Ok(Some(crate::workflow::ProjectWorkflowRecord {
+            key: key.to_string(),
+            name,
+            nodes,
+            allow_unsafe_parallel: flag != 0,
+            content_digest: digest,
+            created_at,
+            updated_at,
+        }))
     }
 
     // ---------- Execution Lease ----------

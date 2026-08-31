@@ -169,6 +169,7 @@ fn start_phase(
         WorkflowKernel {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
+            instance_resolver: None,
         },
         DirectoryRouting {
             current_pin,

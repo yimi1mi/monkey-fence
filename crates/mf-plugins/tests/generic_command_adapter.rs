@@ -36,6 +36,7 @@ fn snapshot_with_args(argv: &[&str]) -> AgentInstanceSnapshot {
             "completion": "process-exit"
         }),
         sealed_secret_ids: vec![],
+        external_config: false,
     }
 }
 

@@ -98,6 +98,7 @@ fn start_instance(
         WorkflowKernel {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
+            instance_resolver: None,
         },
         mf_agent::orchestrator::DirectoryRouting {
             current_pin: Some(plugin_pin("scripted", "hash-scripted")),
@@ -189,6 +190,7 @@ fn cross_instance_complete_merges_full_batch_exactly_once() {
                 WorkflowKernel {
                     catalog: fx.catalog.clone(),
                     pins: Some(fx.pins.clone()),
+                    instance_resolver: None,
                 },
                 mf_agent::orchestrator::DirectoryRouting {
                     current_pin: Some(plugin_pin("scripted", "hash-scripted")),

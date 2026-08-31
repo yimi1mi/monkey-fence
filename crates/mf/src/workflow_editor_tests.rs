@@ -143,3 +143,37 @@ fn compiler_diagnostics_surface_in_editor() {
     assert!(empty.diagnostics().iter().any(|d| d.contains("一个节点")));
     let _ = state;
 }
+
+// ---------- 项目工作流编辑(Task 5) ----------
+
+#[test]
+fn next_workflow_key_is_stable_and_collision_free() {
+    use crate::workflow_editor::next_workflow_key;
+    assert_eq!(next_workflow_key(&[]), "wf-1");
+    let existing: Vec<String> = ["wf-1", "wf-2"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(next_workflow_key(&existing), "wf-3");
+    // 空洞跳跃:2 被删后取 wf-2 而不是 wf-3
+    let existing: Vec<String> = ["wf-1", "wf-3"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(next_workflow_key(&existing), "wf-2");
+    let existing: Vec<String> = ["wf-1", "wf-2", "wf-3"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    assert_eq!(next_workflow_key(&existing), "wf-4");
+}
+
+#[test]
+fn selected_node_instructions_and_instance_can_be_edited() {
+    let mut state = WorkflowEditorState::load(&MemoryPrefs::default());
+    state.drag_from_library("inst-a");
+    let key = state.nodes()[0].key.clone();
+    state.select(&key);
+    state.set_selected_instructions("先跑测试");
+    state.set_selected_instance("default-cli:test.plugin.agent");
+    assert_eq!(state.nodes()[0].instructions, "先跑测试");
+    assert_eq!(
+        state.nodes()[0].instance_id,
+        "default-cli:test.plugin.agent",
+        "默认 CLI 保留引用进入编辑器节点"
+    );
+}

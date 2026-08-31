@@ -609,3 +609,60 @@ fn handoff_output_renders_any_legal_json_except_null() {
         "null 不显示: {lines:?}"
     );
 }
+
+#[test]
+fn workflow_node_exposes_its_latest_session_interaction_target() {
+    let step = step(StepStatus::Running);
+    let mut older = run(RunStatus::Running, None);
+    older.id = 1;
+    older.step_id = step.id;
+    older.session_id = Some(10);
+    let mut latest = older.clone();
+    latest.id = 2;
+    latest.session_id = Some(11);
+    let mut snapshot =
+        crate::run_monitor::RunMonitorSnapshot::from_parts(vec![step.clone()], vec![older, latest]);
+    snapshot.sessions = vec![mf_agent::model::SessionView {
+        id: 11,
+        session_key: None,
+        runtime: "http".into(),
+        agent_profile: "agent".into(),
+        title: "transcript".into(),
+        status: mf_agent::SessionStatus::Working,
+        last_instruction: None,
+        last_reply: None,
+        unread: false,
+        created_at: String::new(),
+        updated_at: String::new(),
+    }];
+    assert_eq!(
+        snapshot.session_target_for_step(step.id),
+        Some((11, 2, true)),
+        "节点应打开最新 Run 绑定的 transcript"
+    );
+}
+
+/// Task 7:「需要你」直达定位 — focus_step 记录优先处理节点,
+/// 切换任务时清除旧定位(不串扰)。
+#[gpui::test]
+fn focus_step_pins_and_clears_with_task_switch(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    let catalog = mf_agent::CatalogStore::memory().unwrap();
+    let ctx = crate::app_ctx::AppCtx::with_catalog_for_tests(catalog);
+    let project = tempfile::tempdir().unwrap();
+    let orch = ctx.open_project(project.path().to_path_buf()).unwrap();
+    let task = orch.create_task("定位", "g").unwrap();
+
+    let monitor = cx.new(|cx| crate::run_monitor::RunMonitor::new(ctx.clone(), cx));
+    cx.update_entity(&monitor, |m, cx| {
+        m.set_task(Some((project.path().to_path_buf(), task.id)), cx);
+        assert_eq!(m.focused_step(), None, "未定位");
+        m.focus_step(42, cx);
+        assert_eq!(m.focused_step(), Some(42), "focus_step 记录优先处理节点");
+        // 切换任务:旧定位失效
+        m.set_task(None, cx);
+        assert_eq!(m.focused_step(), None, "切换任务清除旧定位");
+    });
+    orch.stop();
+    ctx.close_project(&project.path().to_path_buf());
+}

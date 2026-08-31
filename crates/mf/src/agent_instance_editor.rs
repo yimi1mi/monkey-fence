@@ -453,6 +453,8 @@ impl AgentInstanceEditorState {
             config: draft.config,
             execution_contract: draft.execution_contract,
             sealed_secret_ids: draft.sealed_secret_ids,
+            // 临时实例仍是隔离配置(非 default-cli 外部配置意图)
+            external_config: false,
         }
     }
 }

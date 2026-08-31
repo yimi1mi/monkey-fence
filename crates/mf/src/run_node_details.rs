@@ -46,6 +46,8 @@ pub struct NodeExtras {
 #[derive(Debug, Clone)]
 pub struct RunNodeDetails {
     pub run_id: i64,
+    /// 步骤数据库 id(「需要你」直达定位用;Task 7)。
+    pub step_id: i64,
     pub step_key: String,
     pub step_title: String,
     pub status: RunStatus,
@@ -94,6 +96,7 @@ impl<'a> From<(&'a RunView, &'a StepView)> for RunNodeDetails {
         }
         RunNodeDetails {
             run_id: run.id,
+            step_id: step.id,
             step_key: step.step_key.clone(),
             step_title: step.title.clone(),
             status: run.status,

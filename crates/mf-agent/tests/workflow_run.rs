@@ -113,6 +113,7 @@ impl Fixture {
             WorkflowKernel {
                 catalog: catalog.clone(),
                 pins: Some(pins.clone()),
+                instance_resolver: None,
             },
             scripted_routing(),
         )
@@ -811,6 +812,7 @@ fn merge_conflicts_persist_across_restart_and_resolve() {
         WorkflowKernel {
             catalog: fx.catalog.clone(),
             pins: Some(fx.pins.clone()),
+            instance_resolver: None,
         },
         scripted_routing(),
     )
@@ -855,6 +857,7 @@ fn merge_conflicts_persist_across_restart_and_resolve() {
         WorkflowKernel {
             catalog: fx.catalog.clone(),
             pins: Some(fx.pins.clone()),
+            instance_resolver: None,
         },
         scripted_routing(),
     )
@@ -1302,6 +1305,7 @@ fn parallel_siblings_same_file_conflict_needs_user_with_real_worktrees() {
         WorkflowKernel {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
+            instance_resolver: None,
         },
         pinned_routing("builtin.core", "hash-worktree"),
     )

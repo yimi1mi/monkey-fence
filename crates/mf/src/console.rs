@@ -418,7 +418,7 @@ impl Render for ConsolePane {
                     .bg(rgb(crate::theme::Theme::bg_elevated()))
                     .border_b_1()
                     .border_color(rgb(crate::theme::Theme::border()))
-                    .text_size(px(11.))
+                    .text_size(crate::theme::ui_px(11.))
                     .child(
                         div()
                             .text_color(rgb(if is_dead {
@@ -448,7 +448,7 @@ impl Render for ConsolePane {
                     )
                     .child(
                         div()
-                            .text_size(px(10.))
+                            .text_size(crate::theme::ui_px(10.))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .child(format!("{}×{}", cols, rows)),
                     ),
@@ -682,7 +682,7 @@ impl Render for ConsoleDock {
                 .border_color(rgb(crate::theme::Theme::border()))
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(crate::theme::ui_px(11.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(rgb(crate::theme::Theme::fg_faint()))
                         .child("终端"),
@@ -736,7 +736,7 @@ impl Render for ConsoleDock {
                 .border_t_1()
                 .border_color(rgb(crate::theme::Theme::border()))
                 .bg(rgb(crate::theme::Theme::bg_elevated()))
-                .text_size(px(10.))
+                .text_size(crate::theme::ui_px(10.))
                 .text_color(rgb(crate::theme::Theme::fg_faint()))
                 .child(div().child(format!("{} panes", pane_count)))
                 .child(
@@ -764,7 +764,7 @@ fn dock_btn(
         .bg(rgb(crate::theme::Theme::bg_elevated()))
         .border_1()
         .border_color(rgb(crate::theme::Theme::border()))
-        .text_size(px(11.))
+        .text_size(crate::theme::ui_px(11.))
         .text_color(rgb(crate::theme::Theme::fg_dim()))
         .cursor_pointer()
         .hover(|d| {
@@ -822,13 +822,13 @@ fn render_node(
                         .absolute()
                         .top_1()
                         .right_1()
-                        .w(px(16.))
-                        .h(px(16.))
+                        .w(px(18.))
+                        .h(px(18.))
                         .flex()
                         .items_center()
                         .justify_center()
                         .rounded_sm()
-                        .text_size(px(11.))
+                        .text_size(crate::theme::ui_px(11.))
                         .text_color(rgb(crate::theme::Theme::fg_faint()))
                         .hover(|d| {
                             d.bg(rgb(crate::theme::Theme::danger()))

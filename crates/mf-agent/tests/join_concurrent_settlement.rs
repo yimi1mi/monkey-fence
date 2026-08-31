@@ -148,6 +148,7 @@ fn merge_batch_state_is_persisted_and_recovered_on_restart() {
         WorkflowKernel {
             catalog: fx.catalog.clone(),
             pins: Some(fx.pins.clone()),
+            instance_resolver: None,
         },
         scripted_routing(),
     )

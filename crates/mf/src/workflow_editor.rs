@@ -84,7 +84,8 @@ impl EditorPrefs for MemoryPrefs {
     }
 }
 
-/// 画布节点(编辑期):引用 Agent Instance id(不引用 Profile)。
+/// 画布节点(编辑期):引用 Agent Instance id 或 `default-cli:<完整贡献 ID>`
+/// 保留引用(不引用 Profile)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct EditorNode {
     pub key: String,
@@ -93,6 +94,18 @@ pub struct EditorNode {
     pub deps: Vec<String>,
     /// 节点工作说明(保存草稿时随图持久化)。
     pub instructions: String,
+}
+
+/// 生成不与 `existing` 冲突的稳定项目工作流 key(wf-1、wf-2 …;
+/// 取第一个空闲编号,删除后可复用空洞)。
+/// key 只在此处生成,不使用 task id(ADR 0004)。
+pub fn next_workflow_key(existing: &[String]) -> String {
+    let taken: HashSet<&str> = existing.iter().map(|s| s.as_str()).collect();
+    let mut n = 1usize;
+    while taken.contains(format!("wf-{n}").as_str()) {
+        n += 1;
+    }
+    format!("wf-{n}")
 }
 
 /// 编辑器状态(纯逻辑)。
@@ -152,6 +165,24 @@ impl WorkflowEditorState {
         if let Some(key) = self.selected.clone() {
             if let Some(node) = self.nodes.iter_mut().find(|n| n.key == key) {
                 node.title = title.to_string();
+            }
+        }
+    }
+
+    /// 修改选中节点工作说明(检查器输入;原子编辑动作)。
+    pub fn set_selected_instructions(&mut self, instructions: &str) {
+        if let Some(key) = self.selected.clone() {
+            if let Some(node) = self.nodes.iter_mut().find(|n| n.key == key) {
+                node.instructions = instructions.to_string();
+            }
+        }
+    }
+
+    /// 修改选中节点的 Agent 绑定(默认 CLI 引用或保存实例 id;原子编辑动作)。
+    pub fn set_selected_instance(&mut self, reference: &str) {
+        if let Some(key) = self.selected.clone() {
+            if let Some(node) = self.nodes.iter_mut().find(|n| n.key == key) {
+                node.instance_id = reference.to_string();
             }
         }
     }

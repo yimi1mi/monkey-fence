@@ -837,6 +837,7 @@ fn ad_hoc_snapshot_for(
         config: serde_json::json!({}),
         execution_contract: serde_json::json!({ "completion": "manual" }),
         sealed_secret_ids: vec![],
+        external_config: false,
     }
 }
 

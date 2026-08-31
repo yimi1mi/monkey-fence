@@ -90,6 +90,7 @@ fn fixture_restart(dir: &std::path::Path) -> Fixture {
         WorkflowKernel {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
+            instance_resolver: None,
         },
         mf_agent::orchestrator::DirectoryRouting {
             current_pin: Some(plugin_pin("scripted", "hash-scripted")),
@@ -143,6 +144,7 @@ fn merge_batch_rejects_mixed_pins_anywhere_in_batch() {
         WorkflowKernel {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
+            instance_resolver: None,
         },
         mf_agent::orchestrator::DirectoryRouting {
             current_pin: Some(current),
@@ -307,6 +309,7 @@ fn absent_pin_lease_never_routes_to_isolating_provider() {
         WorkflowKernel {
             catalog: catalog.clone(),
             pins: Some(pins.clone()),
+            instance_resolver: None,
         },
         mf_agent::orchestrator::DirectoryRouting {
             current_pin: None,

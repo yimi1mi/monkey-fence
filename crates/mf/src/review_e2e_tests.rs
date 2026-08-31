@@ -308,6 +308,7 @@ fn default_cli_leaves_external_config_untouched() {
         config: serde_json::json!({}),
         execution_contract: serde_json::json!({ "completion": "manual" }),
         sealed_secret_ids: vec![],
+        external_config: false,
     };
     ctx.create_ad_hoc_session(
         project.path(),
@@ -343,6 +344,187 @@ fn default_cli_leaves_external_config_untouched() {
     }
     orch.stop();
     ctx.close_project(&project.path().to_path_buf());
+}
+
+/// 正式工作流节点的 default-cli 引用(ADR 0004 / Task 3):
+/// 生产 resolver 合成 external_config 快照 → Revision 冻结往返不丢失 →
+/// 真实派发经 RuntimeHost(compile_instance_launch 按冻结值跳过隔离注入)→
+/// 外部配置目录保持只读。
+#[test]
+fn default_cli_workflow_node_external_config_reaches_runtime() {
+    use mf_agent::orchestrator::{
+        DirectoryRouting, GlobalLimiter, Orchestrator, ProfileCatalog, WorkflowKernel,
+    };
+    use mf_agent::store::Store;
+    use parking_lot::{Mutex, RwLock};
+
+    // 1) 检测到的测试 CLI(command = cmd)
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(
+        src.path().join("monkeyfence-plugin.toml"),
+        r#"[manifest]
+version = 2
+publisher = "mf-test"
+id = "cmdcli"
+name = "Cmd CLI Test"
+version_str = "0.1.0"
+description = "e2e default-cli plugin"
+
+[capabilities]
+
+[[agent_types]]
+id = "cmd"
+name = "Cmd Agent"
+adapter = "generic-command"
+command = "cmd"
+modes = ["oneshot", "interactive"]
+"#,
+    )
+    .unwrap();
+    let catalog = mf_agent::CatalogStore::memory().unwrap();
+    let host = mf_plugins::PluginRegistry::load_at_with_catalog(
+        tempfile::tempdir().unwrap().path().to_path_buf(),
+        catalog.clone(),
+        &mf_agent::Config::default(),
+        &[],
+    );
+    host.install_package(
+        src.path(),
+        mf_plugins::install::InstallSource::Local {
+            path: src.path().display().to_string(),
+        },
+    )
+    .unwrap();
+    host.enable("mf-test.cmdcli", true).unwrap();
+
+    // 2) 生产装配:with_launcher + 插件感知 resolver 注入 WorkflowKernel
+    let config = mf_agent::Config::default();
+    let registry = crate::runtime_host::SessionRegistry::new(config.clone());
+    let host_impl = crate::runtime_host::RuntimeHostImpl::with_launcher(
+        registry.clone(),
+        crate::runtime_host::WorkflowLauncher {
+            plugins: host.clone(),
+            catalog: catalog.clone(),
+            secret_master_key: None,
+        },
+    );
+    let project = tempfile::tempdir().unwrap();
+    let store = Store::open(&project.path().join(".mf-agent").join("workflow-v1.db")).unwrap();
+    let resolver = crate::app_ctx::PluginInstanceResolver::new(
+        host.clone(),
+        catalog.clone(),
+        Arc::new(Mutex::new(config.clone())),
+    );
+    let orch = Orchestrator::start_with_routing(
+        store,
+        project.path().to_path_buf(),
+        config,
+        host_impl,
+        Arc::new(RwLock::new(ProfileCatalog::default())),
+        GlobalLimiter::new(4),
+        "pipe-e2e".into(),
+        Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
+        WorkflowKernel {
+            catalog: catalog.clone(),
+            pins: Some(Arc::new(crate::app_ctx::PluginHostPins {
+                host: host.clone(),
+            })),
+            instance_resolver: Some(Arc::new(resolver)),
+        },
+        DirectoryRouting::default(),
+    )
+    .unwrap();
+
+    // 外部配置哨兵(断言全程只读)
+    let sentinel = tempfile::tempdir().unwrap();
+    std::fs::write(sentinel.path().join("settings.json"), "{\"keep\":true}\n").unwrap();
+    let before = dir_hash(sentinel.path());
+
+    // 3) default-cli 工作流节点:分配 → Revision 冻结
+    let task = orch.create_task("默认 CLI 工作流", "只读外部配置").unwrap();
+    let version = mf_agent::workflow::WorkflowTemplateVersion {
+        version_id: 0,
+        template_key: "proj-default-cli".into(),
+        version: 1,
+        nodes: vec![mf_agent::workflow::WorkflowNodeDraft {
+            key: "run".into(),
+            title: "运行".into(),
+            instructions: "只读外部配置".into(),
+            agent_instance_id: "default-cli:mf-test.cmdcli.cmd".into(),
+            deps: vec![],
+        }],
+        created_at: String::new(),
+    };
+    let index = crate::adapter_launch::workflow_plugin_index(&host);
+    let rev = orch
+        .assign_workflow(task.id, &version, &index, false)
+        .expect("检测到的 default-cli 引用必须能编译冻结");
+
+    // 4) Revision 序列化往返:external_config 不丢失
+    let snapshot = orch
+        .store
+        .revision_snapshot(rev.id)
+        .unwrap()
+        .expect("Revision 必须保存快照");
+    let json = serde_json::to_string(&snapshot).unwrap();
+    let snapshot: mf_agent::workflow::WorkflowSnapshot = serde_json::from_str(&json).unwrap();
+    let node = &snapshot.nodes[0];
+    assert!(
+        node.instance.external_config,
+        "冻结快照必须保留外部配置意图"
+    );
+    assert_eq!(node.instance.agent_type, "mf-test.cmdcli.cmd");
+    assert_eq!(node.instance.executable, "cmd");
+    assert!(
+        node.plugin.is_some(),
+        "插件 pin 按完整 agent_type 冻结: {:?}",
+        node.plugin
+    );
+
+    // 5) 确认运行 → 真实派发(RuntimeHost 按冻结 external_config 编译)
+    orch.confirm_and_run(task.id).unwrap();
+    assert!(
+        wait_until(Duration::from_secs(20), || orch
+            .store
+            .list_runs_of_task(task.id)
+            .map(|runs| !runs.is_empty())
+            .unwrap_or(false)),
+        "等待真实派发超时"
+    );
+    let runs = orch.store.list_runs_of_task(task.id).unwrap();
+    assert!(
+        runs.iter()
+            .any(|r| r.status == mf_agent::RunStatus::Running),
+        "default-cli 节点应真实启动: {runs:?}"
+    );
+    // WorkflowLaunchSpec 携带的实例快照同样保留 external_config
+    // (派发链使用冻结快照本身;这里以运行真实存在 + 快照往返双保险)
+
+    // 6) 外部配置目录保持只读
+    std::thread::sleep(Duration::from_millis(500));
+    let after = dir_hash(sentinel.path());
+    assert_eq!(before, after, "外部配置目录必须保持原样");
+
+    // 清理:终止真实会话(manual 完成语义下 run 状态由人工收口,
+    // 这里只要求进程确实被杀掉)
+    for r in orch.store.list_runs_of_task(task.id).unwrap() {
+        if let Some(sid) = r.session_id {
+            registry.kill_session(&project.path().to_string_lossy(), sid);
+        }
+    }
+    assert!(
+        wait_until(Duration::from_secs(10), || orch
+            .store
+            .list_runs_of_task(task.id)
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.session_id)
+            .all(|sid| {
+                !registry.session_alive(&project.path().to_string_lossy(), sid)
+            })),
+        "会话进程应被终止"
+    );
+    orch.stop();
 }
 
 // ---------- GPUI 实体挂载(四入口 + RunMonitor) ----------

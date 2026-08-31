@@ -351,7 +351,7 @@ impl TaskComposer {
                     .rounded_md()
                     .border_1()
                     .border_color(rgb(crate::theme::Theme::border()))
-                    .text_size(px(10.5))
+                    .text_size(crate::theme::ui_px(10.5))
                     .cursor_pointer()
                     .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                     .child(project_label)
@@ -374,7 +374,7 @@ impl TaskComposer {
                     } else {
                         crate::theme::Theme::border()
                     }))
-                    .text_size(px(11.))
+                    .text_size(crate::theme::ui_px(11.))
                     .cursor_pointer()
                     .on_click(cx.listener(|c: &mut TaskComposer, _, window, cx| {
                         c.active_field = ComposerField::Title;
@@ -401,7 +401,7 @@ impl TaskComposer {
                     .rounded_md()
                     .border_1()
                     .border_color(rgb(crate::theme::Theme::border()))
-                    .text_size(px(10.5))
+                    .text_size(crate::theme::ui_px(10.5))
                     .cursor_pointer()
                     .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                     .child(self.state.workflow_choice_label())
@@ -419,7 +419,7 @@ impl TaskComposer {
                 div()
                     .id("composer-unsafe-parallel")
                     .px_2()
-                    .h(px(20.))
+                    .h(px(22.))
                     .flex()
                     .items_center()
                     .rounded_md()
@@ -429,7 +429,7 @@ impl TaskComposer {
                     } else {
                         crate::theme::Theme::border()
                     }))
-                    .text_size(px(9.5))
+                    .text_size(crate::theme::ui_px(9.5))
                     .cursor_pointer()
                     .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                     .child(if self.state.allow_unsafe_parallel() {
@@ -455,7 +455,7 @@ impl TaskComposer {
                     } else {
                         crate::theme::Theme::border()
                     }))
-                    .text_size(px(11.))
+                    .text_size(crate::theme::ui_px(11.))
                     .cursor_pointer()
                     .on_click(cx.listener(|c: &mut TaskComposer, _, window, cx| {
                         c.active_field = ComposerField::Goal;
@@ -481,13 +481,13 @@ impl TaskComposer {
                         div()
                             .id("composer-cancel")
                             .px_2()
-                            .h(px(20.))
+                            .h(px(22.))
                             .flex()
                             .items_center()
                             .rounded_md()
                             .border_1()
                             .border_color(rgb(crate::theme::Theme::border()))
-                            .text_size(px(10.))
+                            .text_size(crate::theme::ui_px(10.))
                             .cursor_pointer()
                             .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                             .child("取消(Esc)")
@@ -500,11 +500,11 @@ impl TaskComposer {
                         div()
                             .id("composer-submit")
                             .px_2()
-                            .h(px(20.))
+                            .h(px(22.))
                             .flex()
                             .items_center()
                             .rounded_md()
-                            .text_size(px(10.))
+                            .text_size(crate::theme::ui_px(10.))
                             .cursor_pointer()
                             .when(valid, |d| {
                                 d.bg(rgb(crate::theme::Theme::accent()))

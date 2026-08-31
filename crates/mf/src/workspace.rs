@@ -58,7 +58,7 @@ pub(crate) fn workspace_command_entries(
         ("toggle_explorer", "显示资源管理器  Ctrl+Shift+E"),
         ("toggle_tasks", "显示任务与项目管理  Ctrl+Shift+W"),
         ("toggle_vcs", "显示版本控制  Ctrl+Shift+G"),
-        ("show_agents", "Agent 会话  Ctrl+Shift+/"),
+        ("show_agents", "Agent 工作区  Ctrl+Shift+/"),
         ("show_pipeline", "工作流编排"),
         ("toggle_console", "显示 / 隐藏终端  Ctrl+`"),
         ("project_search", "项目搜索…  Ctrl+Shift+F"),
@@ -217,6 +217,9 @@ pub struct Workspace {
     bottom_panel_height: Pixels,
     activity_bar_width: Pixels,
     panel_drag: Option<PanelDrag>,
+    /// 运行级「需要你」投影(Task 7):左侧 Agent 入口徽标 + 直达定位。
+    attention_runs: Vec<crate::project_overview::WorkflowRunAttention>,
+    attention_run_count: usize,
 }
 
 impl Workspace {
@@ -248,6 +251,8 @@ impl Workspace {
             editor_font: editor_config,
             left_panel_width: px(284.),
             bottom_panel_height: px(228.),
+            attention_runs: Vec::new(),
+            attention_run_count: 0,
             // 默认即展开形态:图标 + 中文名;拖窄到 72px 以下退回纯图标
             activity_bar_width: px(96.),
             panel_drag: None,
@@ -263,6 +268,9 @@ impl Workspace {
                         last = snap.revision;
                         let alive = this
                             .update(cx, |ws: &mut Workspace, cx| {
+                                // 运行级「需要你」徽标(Task 7):统一快照口径
+                                ws.attention_runs = snap.attention_runs.clone();
+                                ws.attention_run_count = snap.attention_run_count;
                                 if let Some(sb) = &ws.task_sidebar {
                                     let s = snap.clone();
                                     sb.update(cx, |sb, cx| sb.set_overview(s, cx));
@@ -310,6 +318,11 @@ impl Workspace {
             |ws, _aw, ev: &crate::agent_workspace::AgentWorkspaceEvent, cx| match ev {
                 crate::agent_workspace::AgentWorkspaceEvent::Activate(target) => {
                     ws.apply_activation(target, cx);
+                }
+                // 画布「管理智能体配置」单向事件链终点:打开设置
+                // (AgentWorkspace 状态保留,关闭设置后工作流编辑不丢失)
+                crate::agent_workspace::AgentWorkspaceEvent::OpenAgentSettings => {
+                    ws.open_settings(cx);
                 }
             },
         )
@@ -620,7 +633,11 @@ impl Workspace {
             });
         }
         if let Some(aw) = &self.agent_workspace {
-            aw.update(cx, |aw, cx| aw.set_selected_task(selection, cx));
+            // Project 与 Task 分别传递(ADR 0004):画布只需要项目;
+            // 没有 Task 时工作流页仍可用;选择 Task 不改写当前页签。
+            aw.update(cx, |aw, cx| {
+                aw.set_context(active.project.as_ref().map(|p| p.root()), selection, cx)
+            });
         }
     }
 
@@ -1050,8 +1067,8 @@ impl Workspace {
                                 "toggle_explorer" => ws.navigation.apply(NavAction::ShowExplorer),
                                 "toggle_vcs" => ws.navigation.apply(NavAction::ShowVcs),
                                 "toggle_tasks" => ws.navigation.apply(NavAction::ShowTasks),
-                                "show_agents" => ws.show_agent_workspace(AgentTab::Sessions, cx),
-                                "show_pipeline" => ws.show_agent_workspace(AgentTab::Workflow, cx),
+                                "show_agents" => ws.show_agent_workspace_default(cx),
+                                "show_pipeline" => ws.show_agent_workspace(AgentTab::Workflows, cx),
                                 "toggle_console" => ws.toggle_console(cx),
                                 "project_search" => ws.open_project_search(cx),
                                 "open_settings" => ws.open_settings(cx),
@@ -1131,6 +1148,37 @@ impl Workspace {
         cx.notify();
     }
 
+    /// 普通 Agent 入口(提醒优先,Task 7):
+    /// - 0 个提醒:进入 Workflows 或上次页;
+    /// - 1 个提醒:原子激活该项目/Task 后直达 Runs + 优先处理节点;
+    /// - 多个提醒:进入 Runs/需要你 列表,默认选中排序第一项。
+    fn show_agent_workspace_default(&mut self, cx: &mut Context<Self>) {
+        self.navigation.apply(NavAction::ShowWork);
+        let single = (self.attention_run_count == 1)
+            .then(|| self.attention_runs.first().cloned())
+            .flatten();
+        if let Some(attention) = single {
+            // 跨项目提醒:先原子激活项目/Task(activation seam),再定位
+            let (pid, _) = normalize_project_path(&attention.project_root);
+            self.apply_activation(
+                &ActivationTarget::Task {
+                    project: pid,
+                    task_id: attention.task_id,
+                },
+                cx,
+            );
+            if let Some(aw) = &self.agent_workspace {
+                let attention = attention.clone();
+                aw.update(cx, |aw, cx| aw.open_attention_run(&attention, cx));
+            }
+        } else if let Some(aw) = &self.agent_workspace {
+            aw.update(cx, |aw, cx| {
+                aw.enter_from_activity(cx);
+            });
+        }
+        cx.notify();
+    }
+
     // ---------- 打开文件夹对话框 ----------
 
     fn prompt_open_folder(&mut self, cx: &mut Context<Self>) {
@@ -1179,7 +1227,7 @@ impl Workspace {
     }
 
     fn act_show_agent(&mut self, _: &ShowAgent, _: &mut Window, cx: &mut Context<Self>) {
-        self.show_agent_workspace(AgentTab::Sessions, cx);
+        self.show_agent_workspace_default(cx);
     }
 
     fn act_show_work(&mut self, _: &ShowWork, _: &mut Window, cx: &mut Context<Self>) {
@@ -1334,11 +1382,10 @@ fn surface_cwd(root: &Path) -> PathBuf {
     root.to_path_buf()
 }
 
-/// AgentWorkspace 顶层页签(命令面板用)。
-#[derive(Debug, Clone, Copy)]
+/// AgentWorkspace 顶层页签(命令面板用;ADR 0004:只保留两个)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentTab {
-    Sessions,
-    Workflow,
+    Workflows,
     Runs,
 }
 
@@ -1373,7 +1420,12 @@ impl Workspace {
                             .text_color(rgb(crate::theme::Theme::bg()))
                             .cursor_pointer()
                             .hover(|d| d.bg(rgb(0x72b3ff)))
-                            .child(div().w(px(22.)).text_size(px(18.)).child("▱"))
+                            .child(
+                                div()
+                                    .w(px(22.))
+                                    .text_size(crate::theme::ui_px(18.))
+                                    .child("▱"),
+                            )
                             .child(
                                 div()
                                     .flex()
@@ -1381,13 +1433,13 @@ impl Workspace {
                                     .gap_0p5()
                                     .child(
                                         div()
-                                            .text_size(px(12.5))
+                                            .text_size(crate::theme::ui_px(12.5))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .child("打开文件夹"),
                                     )
                                     .child(
                                         div()
-                                            .text_size(px(9.5))
+                                            .text_size(crate::theme::ui_px(9.5))
                                             .child("Ctrl+Shift+O(可同时打开多个项目)"),
                                     ),
                             )
@@ -1422,7 +1474,7 @@ impl Workspace {
                                     .child(
                                         div()
                                             .w(px(18.))
-                                            .text_size(px(16.))
+                                            .text_size(crate::theme::ui_px(16.))
                                             .text_color(rgb(crate::theme::Theme::accent()))
                                             .child("⌕"),
                                     )
@@ -1433,13 +1485,13 @@ impl Workspace {
                                             .gap_0p5()
                                             .child(
                                                 div()
-                                                    .text_size(px(11.5))
+                                                    .text_size(crate::theme::ui_px(11.5))
                                                     .text_color(rgb(crate::theme::Theme::fg()))
                                                     .child("快速打开"),
                                             )
                                             .child(
                                                 div()
-                                                    .text_size(px(9.5))
+                                                    .text_size(crate::theme::ui_px(9.5))
                                                     .text_color(
                                                         rgb(crate::theme::Theme::fg_faint()),
                                                     )
@@ -1471,7 +1523,7 @@ impl Workspace {
                                     .child(
                                         div()
                                             .w(px(18.))
-                                            .text_size(px(15.))
+                                            .text_size(crate::theme::ui_px(15.))
                                             .text_color(rgb(crate::theme::Theme::accent()))
                                             .child("✦"),
                                     )
@@ -1482,13 +1534,13 @@ impl Workspace {
                                             .gap_0p5()
                                             .child(
                                                 div()
-                                                    .text_size(px(11.5))
+                                                    .text_size(crate::theme::ui_px(11.5))
                                                     .text_color(rgb(crate::theme::Theme::fg()))
                                                     .child("Agent 工作区"),
                                             )
                                             .child(
                                                 div()
-                                                    .text_size(px(9.5))
+                                                    .text_size(crate::theme::ui_px(9.5))
                                                     .text_color(
                                                         rgb(crate::theme::Theme::fg_faint()),
                                                     )
@@ -1496,7 +1548,7 @@ impl Workspace {
                                             ),
                                     )
                                     .on_click(cx.listener(|ws: &mut Workspace, _, _, cx| {
-                                        ws.show_agent_workspace(AgentTab::Sessions, cx);
+                                        ws.show_agent_workspace_default(cx);
                                     })),
                             ),
                     ),
@@ -1531,7 +1583,12 @@ impl Workspace {
                             .text_color(rgb(crate::theme::Theme::bg()))
                             .cursor_pointer()
                             .hover(|d| d.bg(rgb(0x72b3ff)))
-                            .child(div().w(px(22.)).text_size(px(17.)).child("⌕"))
+                            .child(
+                                div()
+                                    .w(px(22.))
+                                    .text_size(crate::theme::ui_px(17.))
+                                    .child("⌕"),
+                            )
                             .child(
                                 div()
                                     .flex()
@@ -1539,11 +1596,13 @@ impl Workspace {
                                     .gap_0p5()
                                     .child(
                                         div()
-                                            .text_size(px(12.5))
+                                            .text_size(crate::theme::ui_px(12.5))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .child("快速打开文件"),
                                     )
-                                    .child(div().text_size(px(9.5)).child("Ctrl+P")),
+                                    .child(
+                                        div().text_size(crate::theme::ui_px(9.5)).child("Ctrl+P"),
+                                    ),
                             )
                             .on_click(cx.listener(|ws: &mut Workspace, _, window, cx| {
                                 ws.show_quick_open_files(&QuickOpenFiles, window, cx);
@@ -1576,7 +1635,7 @@ impl Workspace {
                                     .child(
                                         div()
                                             .w(px(18.))
-                                            .text_size(px(15.))
+                                            .text_size(crate::theme::ui_px(15.))
                                             .text_color(rgb(crate::theme::Theme::accent()))
                                             .child("▦"),
                                     )
@@ -1587,13 +1646,13 @@ impl Workspace {
                                             .gap_0p5()
                                             .child(
                                                 div()
-                                                    .text_size(px(11.5))
+                                                    .text_size(crate::theme::ui_px(11.5))
                                                     .text_color(rgb(crate::theme::Theme::fg()))
                                                     .child("新建任务"),
                                             )
                                             .child(
                                                 div()
-                                                    .text_size(px(9.5))
+                                                    .text_size(crate::theme::ui_px(9.5))
                                                     .text_color(
                                                         rgb(crate::theme::Theme::fg_faint()),
                                                     )
@@ -1626,7 +1685,7 @@ impl Workspace {
                                     .child(
                                         div()
                                             .w(px(18.))
-                                            .text_size(px(15.))
+                                            .text_size(crate::theme::ui_px(15.))
                                             .text_color(rgb(crate::theme::Theme::accent()))
                                             .child("⌘"),
                                     )
@@ -1637,13 +1696,13 @@ impl Workspace {
                                             .gap_0p5()
                                             .child(
                                                 div()
-                                                    .text_size(px(11.5))
+                                                    .text_size(crate::theme::ui_px(11.5))
                                                     .text_color(rgb(crate::theme::Theme::fg()))
                                                     .child("命令面板"),
                                             )
                                             .child(
                                                 div()
-                                                    .text_size(px(9.5))
+                                                    .text_size(crate::theme::ui_px(9.5))
                                                     .text_color(
                                                         rgb(crate::theme::Theme::fg_faint()),
                                                     )
@@ -1697,7 +1756,7 @@ impl Workspace {
                     .px_3()
                     .h(px(29.))
                     .rounded_t_lg()
-                    .text_size(px(12.))
+                    .text_size(crate::theme::ui_px(12.))
                     .cursor_pointer()
                     .when(is_active, |d| {
                         d.bg(rgb(crate::theme::Theme::bg_elevated()))
@@ -1729,7 +1788,7 @@ impl Workspace {
                             .px_1()
                             .rounded_sm()
                             .cursor_pointer()
-                            .text_size(px(10.))
+                            .text_size(crate::theme::ui_px(10.))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .hover(|d| {
                                 d.bg(rgb(crate::theme::Theme::bg_hover()))
@@ -1781,6 +1840,7 @@ impl Workspace {
             "所有操作",
             expanded,
             self.quick_open.is_some(),
+            None,
             cx.listener(|this: &mut Workspace, _, window, cx| {
                 if this.quick_open.is_some() {
                     this.dismiss_quick_open(cx);
@@ -1805,7 +1865,7 @@ impl Workspace {
                     .flex()
                     .items_center()
                     .rounded_md()
-                    .text_size(px(17.))
+                    .text_size(crate::theme::ui_px(17.))
                     .cursor_pointer()
                     .when(expanded, |d| d.w_full().h(px(36.)).px_2().gap_2())
                     .when(!expanded, |d| d.size(px(36.)).justify_center())
@@ -1819,7 +1879,13 @@ impl Workspace {
                     })
                     .child(icon)
                     .when(expanded, |d| {
-                        d.child(div().min_w_0().flex_1().text_size(px(12.)).child(text))
+                        d.child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .text_size(crate::theme::ui_px(12.))
+                                .child(text),
+                        )
                     })
                     .when(badge > 0, |d| {
                         d.child(
@@ -1827,8 +1893,8 @@ impl Workspace {
                                 .absolute()
                                 .top(px(1.))
                                 .right(px(1.))
-                                .min_w(px(14.))
-                                .h(px(14.))
+                                .min_w(px(16.))
+                                .h(px(16.))
                                 .px_1()
                                 .rounded_full()
                                 .flex()
@@ -1840,7 +1906,7 @@ impl Workspace {
                                     crate::theme::Theme::accent()
                                 }))
                                 .text_color(rgb(crate::theme::Theme::bg()))
-                                .text_size(px(9.))
+                                .text_size(crate::theme::ui_px(9.))
                                 .child(badge.to_string()),
                         )
                     })
@@ -1871,6 +1937,7 @@ impl Workspace {
                 "搜索",
                 expanded,
                 search_active,
+                None,
                 cx.listener(|this: &mut Workspace, _, _, cx| {
                     if this.navigation.bottom == Some(BottomPanel::Search) {
                         this.navigation.apply(NavAction::CloseBottom);
@@ -1886,6 +1953,7 @@ impl Workspace {
                 "终端",
                 expanded,
                 terminal_active,
+                None,
                 cx.listener(|this: &mut Workspace, _, _, cx| this.toggle_console(cx)),
             ))
             .child(activity_button(
@@ -1894,9 +1962,8 @@ impl Workspace {
                 "Agent",
                 expanded,
                 agent_active,
-                cx.listener(|this: &mut Workspace, _, _, cx| {
-                    this.show_agent_workspace(AgentTab::Sessions, cx)
-                }),
+                (self.attention_run_count > 0).then_some(self.attention_run_count),
+                cx.listener(|this: &mut Workspace, _, _, cx| this.show_agent_workspace_default(cx)),
             ))
             .child(activity_button(
                 "⚙",
@@ -1904,6 +1971,7 @@ impl Workspace {
                 "设置",
                 expanded,
                 self.settings_open.is_some(),
+                None,
                 cx.listener(|this: &mut Workspace, _, _, cx| this.open_settings(cx)),
             ))
     }
@@ -1950,7 +2018,7 @@ impl Workspace {
                             }))
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(crate::theme::ui_px(12.))
                                     .text_color(rgb(crate::theme::Theme::accent()))
                                     .child("▱"),
                             )
@@ -1959,27 +2027,27 @@ impl Workspace {
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(px(11.))
+                                    .text_size(crate::theme::ui_px(11.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(active_name),
                             )
                             .child(
                                 div()
-                                    .min_w(px(18.))
-                                    .h(px(18.))
+                                    .min_w(px(20.))
+                                    .h(px(20.))
                                     .px_1()
                                     .rounded_full()
                                     .flex()
                                     .items_center()
                                     .justify_center()
                                     .bg(rgb(crate::theme::Theme::bg_active()))
-                                    .text_size(px(9.))
+                                    .text_size(crate::theme::ui_px(9.))
                                     .text_color(rgb(crate::theme::Theme::fg_dim()))
                                     .child(count.to_string()),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(crate::theme::ui_px(10.))
                                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                                     .child(if expanded { "⌃" } else { "⌄" }),
                             ),
@@ -1995,7 +2063,7 @@ impl Workspace {
                             .border_1()
                             .border_color(rgb(crate::theme::Theme::border()))
                             .cursor_pointer()
-                            .text_size(px(15.))
+                            .text_size(crate::theme::ui_px(15.))
                             .text_color(rgb(crate::theme::Theme::accent()))
                             .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                             .child("+")
@@ -2019,7 +2087,7 @@ impl Workspace {
                     div()
                         .px_2()
                         .py_2()
-                        .text_size(px(10.))
+                        .text_size(crate::theme::ui_px(10.))
                         .text_color(rgb(crate::theme::Theme::fg_faint()))
                         .child("还没有项目，点击右上角 + 添加"),
                 );
@@ -2055,7 +2123,7 @@ impl Workspace {
                                         .flex_1()
                                         .min_w_0()
                                         .truncate()
-                                        .text_size(px(10.5))
+                                        .text_size(crate::theme::ui_px(10.5))
                                         .text_color(rgb(crate::theme::Theme::fg()))
                                         .child(item.name),
                                 ),
@@ -2064,7 +2132,7 @@ impl Workspace {
                             div()
                                 .ml(px(13.))
                                 .truncate()
-                                .text_size(px(8.5))
+                                .text_size(crate::theme::ui_px(8.5))
                                 .text_color(rgb(crate::theme::Theme::fg_faint()))
                                 .child(item.path),
                         ),
@@ -2092,7 +2160,7 @@ impl Workspace {
                         .into_any_element(),
                     None => div()
                         .p_3()
-                        .text_size(px(12.))
+                        .text_size(crate::theme::ui_px(12.))
                         .text_color(rgb(crate::theme::Theme::fg_faint()))
                         .child("从上方选择或添加一个项目")
                         .into_any_element(),
@@ -2109,7 +2177,7 @@ impl Workspace {
                 Some(v) => div().size_full().flex().child(v.clone()).into_any_element(),
                 None => div()
                     .p_3()
-                    .text_size(px(12.))
+                    .text_size(crate::theme::ui_px(12.))
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child("尚未打开文件夹")
                     .into_any_element(),
@@ -2118,7 +2186,7 @@ impl Workspace {
                 Some(t) => div().size_full().flex().child(t.clone()).into_any_element(),
                 None => div()
                     .p_3()
-                    .text_size(px(12.))
+                    .text_size(crate::theme::ui_px(12.))
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child("—")
                     .into_any_element(),
@@ -2146,7 +2214,7 @@ impl Workspace {
                     .child(
                         div()
                             .px_2()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::ui_px(11.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                             .child(title),
@@ -2224,7 +2292,7 @@ impl Workspace {
                                 .flex()
                                 .items_center()
                                 .cursor_pointer()
-                                .text_size(px(10.5))
+                                .text_size(crate::theme::ui_px(10.5))
                                 .text_color(rgb(if active {
                                     crate::theme::Theme::fg()
                                 } else {
@@ -2424,7 +2492,7 @@ impl Workspace {
             .bg(rgb(crate::theme::Theme::bg_panel()))
             .border_t_1()
             .border_color(rgb(crate::theme::Theme::border()))
-            .text_size(px(11.))
+            .text_size(crate::theme::ui_px(11.))
             .text_color(rgb(crate::theme::Theme::fg_dim()))
             .child(div().child(if projects > 1 {
                 format!("{root_name} · {projects} 个项目")
@@ -2503,13 +2571,13 @@ impl Workspace {
                     .gap_2()
                     .child(
                         div()
-                            .text_size(px(13.))
+                            .text_size(crate::theme::ui_px(13.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(format!("关闭项目「{}」?", cc.name)),
                     )
                     .child(
                         div()
-                            .text_size(px(11.5))
+                            .text_size(crate::theme::ui_px(11.5))
                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                             .child(format!(
                                 "该项目有 {} 个活动 Agent Run。关闭将停止这些 Agent(需要你确认)。",
@@ -2530,7 +2598,7 @@ impl Workspace {
                                     .border_1()
                                     .border_color(rgb(crate::theme::Theme::border()))
                                     .cursor_pointer()
-                                    .text_size(px(11.))
+                                    .text_size(crate::theme::ui_px(11.))
                                     .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                                     .child("取消")
                                     .on_click(cx.listener(|ws: &mut Workspace, _, _, cx| {
@@ -2546,7 +2614,7 @@ impl Workspace {
                                     .bg(rgb(crate::theme::Theme::danger()))
                                     .text_color(rgb(crate::theme::Theme::bg()))
                                     .cursor_pointer()
-                                    .text_size(px(11.))
+                                    .text_size(crate::theme::ui_px(11.))
                                     .hover(|d| d.opacity(0.85))
                                     .child("停止并关闭")
                                     .on_click(cx.listener(|ws: &mut Workspace, _, _, cx| {
@@ -2565,6 +2633,7 @@ fn activity_button(
     text: &str,
     expanded: bool,
     active: bool,
+    badge: Option<usize>,
     listener: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
@@ -2586,14 +2655,38 @@ fn activity_button(
             d.bg(rgb(crate::theme::Theme::bg_hover()))
                 .text_color(rgb(crate::theme::Theme::fg()))
         })
-        .child(div().text_size(px(16.)).child(icon.to_string()))
+        .child(
+            div()
+                .text_size(crate::theme::ui_px(16.))
+                .child(icon.to_string()),
+        )
         .when(expanded, |d| {
             d.child(
                 div()
                     .min_w_0()
                     .flex_1()
-                    .text_size(px(12.))
+                    .text_size(crate::theme::ui_px(12.))
                     .child(text.to_string()),
+            )
+        })
+        // 可选数字徽标(Task 7:运行级「需要你」计数;0 = 不显示)
+        .when(badge.is_some_and(|n| n > 0), |d| {
+            d.child(
+                div()
+                    .absolute()
+                    .top(px(1.))
+                    .right(px(1.))
+                    .min_w(px(16.))
+                    .h(px(16.))
+                    .px_1()
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(rgb(crate::theme::Theme::danger()))
+                    .text_size(crate::theme::ui_px(8.))
+                    .text_color(rgb(crate::theme::Theme::bg()))
+                    .child(badge.unwrap_or(0).to_string()),
             )
         })
         .on_click(move |event, window, cx| listener(event, window, cx))
@@ -2733,6 +2826,7 @@ impl Render for Workspace {
             .flex_col()
             .bg(rgb(crate::theme::Theme::bg()))
             .text_color(rgb(crate::theme::Theme::fg()))
+            .font_family(crate::theme::UI_FONT_FAMILY)
             .when(
                 matches!(
                     self.panel_drag,

@@ -130,6 +130,11 @@ impl DeclarativeForm {
         self.values.get(id)
     }
 
+    /// 清除字段值(select 字段的"清空"入口);未知字段安全忽略。
+    pub fn clear_value(&mut self, id: &str) {
+        self.values.remove(id);
+    }
+
     /// 展示值:Secret 字段一律掩码(UI 默认遮罩,设计 §8)。
     pub fn masked_value(&self, id: &str) -> String {
         match self.values.get(id) {

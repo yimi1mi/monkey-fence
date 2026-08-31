@@ -8,6 +8,8 @@ mod agent_instances_view;
 #[cfg(test)]
 mod agent_workflow_e2e_tests;
 mod agent_workspace;
+#[cfg(test)]
+mod agent_workspace_tests;
 mod app_ctx;
 mod console;
 mod declarative_form;
@@ -49,12 +51,18 @@ mod theme;
 mod vcs_panel;
 #[allow(dead_code)]
 mod work_items;
+#[cfg(test)]
+mod workflow_attention_tests;
 mod workflow_canvas;
 #[cfg(test)]
 mod workflow_canvas_tests;
 mod workflow_editor;
 mod workflow_editor_tests;
 mod workflow_node_inspector;
+mod workflow_run_composer;
+#[cfg(test)]
+mod workflow_run_composer_tests;
+mod workflow_runs_page;
 mod workspace;
 #[cfg(test)]
 mod workspace_interaction_tests;

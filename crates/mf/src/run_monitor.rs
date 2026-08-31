@@ -152,6 +152,20 @@ impl RunMonitorSnapshot {
             })
             .collect()
     }
+
+    pub fn session_target_for_step(&self, step_id: i64) -> Option<(i64, i64, bool)> {
+        let run = self
+            .runs
+            .iter()
+            .filter(|run| run.step_id == step_id)
+            .max_by_key(|run| run.id)?;
+        let session_id = run.session_id?;
+        let session = self
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)?;
+        Some((session_id, run.id, session.runtime == "http"))
+    }
 }
 
 fn placeholder_run() -> RunView {
@@ -286,8 +300,20 @@ fn details_task(orch: &Arc<mf_agent::Orchestrator>, details: &RunNodeDetails) ->
 // ---------- GPUI 视图(真实 Entity,挂载于 AgentWorkspace) ----------
 
 use gpui::prelude::*;
-use gpui::{px, rgb, AnyElement, Context, FocusHandle, Window};
+use gpui::{px, rgb, AnyElement, Context, EventEmitter, FocusHandle, Window};
 use std::path::PathBuf;
+
+pub enum RunMonitorEvent {
+    OpenSession {
+        project_root: PathBuf,
+        task_id: i64,
+        session_id: i64,
+        run_id: i64,
+        is_http: bool,
+    },
+}
+
+impl EventEmitter<RunMonitorEvent> for RunMonitor {}
 
 /// Run Monitor 页:当前任务的 DAG 运行监控。
 /// 动作全部经完整 Orchestrator(继续/重试/跳过/结算/取消);
@@ -302,6 +328,8 @@ pub struct RunMonitor {
     status: String,
     /// 危险动作的待确认意图(显式确认后才执行)。
     pending_confirm: Option<PendingConfirm>,
+    /// 「需要你」直达定位的步骤(Task 7;渲染高亮)。
+    focused_step_id: Option<i64>,
     focus_handle: FocusHandle,
 }
 
@@ -315,6 +343,7 @@ impl RunMonitor {
             input_focused: false,
             status: String::new(),
             pending_confirm: None,
+            focused_step_id: None,
             focus_handle: cx.focus_handle(),
         }
     }
@@ -322,8 +351,21 @@ impl RunMonitor {
     /// Workspace 推送当前任务(切换即刷新投影)。
     pub fn set_task(&mut self, task: Option<(PathBuf, i64)>, cx: &mut Context<Self>) {
         self.task = task;
+        self.focused_step_id = None;
         self.refresh();
         cx.notify();
+    }
+
+    /// 定位到优先处理节点(Task 7「需要你」直达):刷新投影并高亮该步骤。
+    pub fn focus_step(&mut self, step_id: i64, cx: &mut Context<Self>) {
+        self.focused_step_id = Some(step_id);
+        self.refresh();
+        cx.notify();
+    }
+
+    /// 当前定位的节点(测试/诊断)。
+    pub fn focused_step(&self) -> Option<i64> {
+        self.focused_step_id
     }
 
     /// 投影节点数(测试/诊断)。
@@ -468,7 +510,7 @@ impl RunMonitor {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(11.))
+                .text_size(crate::theme::ui_px(11.))
                 .text_color(rgb(crate::theme::Theme::fg_dim()))
                 .child("选择任务后监控其工作流运行")
                 .into_any_element();
@@ -488,13 +530,13 @@ impl RunMonitor {
                     .border_color(rgb(crate::theme::Theme::warning()))
                     .child(
                         gpui::div()
-                            .text_size(px(10.))
+                            .text_size(crate::theme::ui_px(10.))
                             .text_color(rgb(crate::theme::Theme::warning()))
                             .child("隔离目录汇合冲突(租约保持持有,解决后重试合并)"),
                     )
                     .children(self.snapshot.pending_conflicts.iter().map(|c| {
                         gpui::div()
-                            .text_size(px(9.))
+                            .text_size(crate::theme::ui_px(9.))
                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                             .child(format!("• {c}"))
                     }))
@@ -502,13 +544,13 @@ impl RunMonitor {
                         gpui::div()
                             .id("rm-merge-retry")
                             .px_2()
-                            .h(px(20.))
+                            .h(px(22.))
                             .flex()
                             .items_center()
                             .rounded_md()
                             .border_1()
                             .border_color(rgb(crate::theme::Theme::warning()))
-                            .text_size(px(9.))
+                            .text_size(crate::theme::ui_px(9.))
                             .cursor_pointer()
                             .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                             .child("重试合并")
@@ -519,6 +561,9 @@ impl RunMonitor {
             );
         }
         for (idx, detail) in details.iter().enumerate() {
+            let focused = self.focused_step_id == Some(detail.step_id);
+            let session_target = self.snapshot.session_target_for_step(detail.step_id);
+            let task_target = self.task.clone();
             let mut row = gpui::div()
                 .flex()
                 .gap_2()
@@ -527,15 +572,27 @@ impl RunMonitor {
                 .py_1()
                 .rounded_md()
                 .border_1()
-                .border_color(rgb(crate::theme::Theme::border()))
+                .border_color(rgb(if focused {
+                    crate::theme::Theme::accent()
+                } else {
+                    crate::theme::Theme::border()
+                }))
+                .when(focused, |d| {
+                    d.bg(rgb(crate::theme::Theme::bg_active())).child(
+                        gpui::div()
+                            .text_size(crate::theme::ui_px(8.))
+                            .text_color(rgb(crate::theme::Theme::accent()))
+                            .child("★ 优先处理"),
+                    )
+                })
                 .child(
                     gpui::div()
-                        .text_size(px(10.5))
+                        .text_size(crate::theme::ui_px(10.5))
                         .child(format!("{} · {}", detail.step_key, detail.step_title)),
                 )
                 .child(
                     gpui::div()
-                        .text_size(px(9.))
+                        .text_size(crate::theme::ui_px(9.))
                         .text_color(rgb(crate::theme::Theme::fg_dim()))
                         .child(format!(
                             "run {:?} · step {:?}",
@@ -544,7 +601,7 @@ impl RunMonitor {
                 )
                 .child(
                     gpui::div()
-                        .text_size(px(9.))
+                        .text_size(crate::theme::ui_px(9.))
                         .text_color(rgb(crate::theme::Theme::fg_faint()))
                         .child(format!(
                             "尝试 {} 次 · run #{}",
@@ -560,9 +617,43 @@ impl RunMonitor {
                         .id(gpui::ElementId::Name(
                             format!("rm-extra-{idx}-{line_idx}").into(),
                         ))
-                        .text_size(px(8.5))
+                        .text_size(crate::theme::ui_px(8.5))
                         .text_color(rgb(crate::theme::Theme::fg_dim()))
                         .child(line.clone()),
+                );
+            }
+            if let (Some((session_id, run_id, is_http)), Some((project_root, task_id))) =
+                (session_target, task_target)
+            {
+                row = row.child(
+                    gpui::div()
+                        .id(gpui::ElementId::Name(
+                            format!("rm-open-session-{idx}").into(),
+                        ))
+                        .px_2()
+                        .h(px(20.))
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(crate::theme::Theme::accent()))
+                        .text_size(crate::theme::ui_px(9.))
+                        .cursor_pointer()
+                        .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
+                        .child(if is_http {
+                            "打开 transcript"
+                        } else {
+                            "打开终端"
+                        })
+                        .on_click(cx.listener(move |_monitor, _ev, _w, cx| {
+                            cx.emit(RunMonitorEvent::OpenSession {
+                                project_root: project_root.clone(),
+                                task_id,
+                                session_id,
+                                run_id,
+                                is_http,
+                            });
+                        })),
                 );
             }
             for action in &detail.actions {
@@ -582,7 +673,7 @@ impl RunMonitor {
                             format!("rm-action-{idx}-{label}").into(),
                         ))
                         .px_2()
-                        .h(px(18.))
+                        .h(px(20.))
                         .flex()
                         .items_center()
                         .rounded_md()
@@ -592,7 +683,7 @@ impl RunMonitor {
                         } else {
                             crate::theme::Theme::accent()
                         }))
-                        .text_size(px(9.))
+                        .text_size(crate::theme::ui_px(9.))
                         .cursor_pointer()
                         .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                         .child(label)
@@ -636,20 +727,20 @@ impl RunMonitor {
             .rounded_md()
             .border_1()
             .border_color(rgb(crate::theme::Theme::danger()))
-            .text_size(px(10.))
+            .text_size(crate::theme::ui_px(10.))
             .text_color(rgb(crate::theme::Theme::warning()))
             .child(prompt)
             .child(
                 gpui::div()
                     .id("rm-confirm-yes")
                     .px_2()
-                    .h(px(20.))
+                    .h(px(22.))
                     .flex()
                     .items_center()
                     .rounded_md()
                     .border_1()
                     .border_color(rgb(crate::theme::Theme::danger()))
-                    .text_size(px(9.))
+                    .text_size(crate::theme::ui_px(9.))
                     .cursor_pointer()
                     .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                     .child("确认执行")
@@ -661,13 +752,13 @@ impl RunMonitor {
                 gpui::div()
                     .id("rm-confirm-no")
                     .px_2()
-                    .h(px(20.))
+                    .h(px(22.))
                     .flex()
                     .items_center()
                     .rounded_md()
                     .border_1()
                     .border_color(rgb(crate::theme::Theme::border()))
-                    .text_size(px(9.))
+                    .text_size(crate::theme::ui_px(9.))
                     .cursor_pointer()
                     .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                     .child("取消")
@@ -693,7 +784,7 @@ impl RunMonitor {
                 crate::theme::Theme::border()
             }))
             .rounded_md()
-            .text_size(px(10.))
+            .text_size(crate::theme::ui_px(10.))
             .cursor_pointer()
             .child(if self.input.is_empty() {
                 "继续/结算输入(Enter=结算,「失败:」前缀提交失败)…".to_string()
@@ -759,11 +850,11 @@ impl Render for RunMonitor {
             .gap_2()
             .track_focus(&self.focus_handle)
             .child(
-                gpui::div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(gpui::div().text_size(px(12.)).child(header)),
+                gpui::div().flex().items_center().gap_2().child(
+                    gpui::div()
+                        .text_size(crate::theme::ui_px(12.))
+                        .child(header),
+                ),
             )
             .child(nodes)
             .child(confirm)
@@ -771,7 +862,7 @@ impl Render for RunMonitor {
             .when(!status.is_empty(), |d| {
                 d.child(
                     gpui::div()
-                        .text_size(px(9.))
+                        .text_size(crate::theme::ui_px(9.))
                         .text_color(rgb(crate::theme::Theme::fg_dim()))
                         .child(status),
                 )

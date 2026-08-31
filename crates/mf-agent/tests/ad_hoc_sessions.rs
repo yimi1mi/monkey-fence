@@ -191,6 +191,7 @@ fn snapshot() -> AgentInstanceSnapshot {
         config: serde_json::json!({}),
         execution_contract: serde_json::json!({}),
         sealed_secret_ids: vec![],
+        external_config: false,
     }
 }
 

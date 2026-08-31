@@ -491,13 +491,13 @@ impl Render for QuickOpen {
                             .border_color(rgb(crate::theme::Theme::border()))
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(crate::theme::ui_px(11.))
                                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                                     .child(mode_label),
                             )
                             .child(
                                 div()
-                                    .text_size(px(15.))
+                                    .text_size(crate::theme::ui_px(15.))
                                     .text_color(rgb(crate::theme::Theme::fg()))
                                     .child(format!("{}{}", query, caret)),
                             )
@@ -554,7 +554,7 @@ impl Render for QuickOpen {
                                             }))
                                             .child(
                                                 div()
-                                                    .text_size(px(12.))
+                                                    .text_size(crate::theme::ui_px(12.))
                                                     .text_color(
                                                         rgb(crate::theme::Theme::fg_faint()),
                                                     )
@@ -562,7 +562,7 @@ impl Render for QuickOpen {
                                             )
                                             .child(
                                                 div()
-                                                    .text_size(px(13.))
+                                                    .text_size(crate::theme::ui_px(13.))
                                                     .text_color(rgb(crate::theme::Theme::fg()))
                                                     .child(label),
                                             )
@@ -570,7 +570,7 @@ impl Render for QuickOpen {
                                                 d.child(
                                                     div()
                                                         .ml_auto()
-                                                        .text_size(px(11.))
+                                                        .text_size(crate::theme::ui_px(11.))
                                                         .text_color(rgb(
                                                             crate::theme::Theme::fg_faint(),
                                                         ))

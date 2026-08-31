@@ -396,7 +396,10 @@ fn builtin_yolo_args_table_covers_cli_agents() {
         mf_plugins::builtin::yolo_args_of("codex").as_deref(),
         Some("--dangerously-bypass-approvals-and-sandbox")
     );
-    assert_eq!(mf_plugins::builtin::yolo_args_of("gemini").as_deref(), Some("--yolo"));
+    assert_eq!(
+        mf_plugins::builtin::yolo_args_of("gemini").as_deref(),
+        Some("--yolo")
+    );
     assert_eq!(mf_plugins::builtin::yolo_args_of("opencode"), None);
     assert_eq!(mf_plugins::builtin::yolo_args_of("not-a-cli"), None);
 }

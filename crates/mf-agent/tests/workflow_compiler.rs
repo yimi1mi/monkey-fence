@@ -33,6 +33,7 @@ fn snapshot_of(
         config: serde_json::json!({}),
         execution_contract: serde_json::json!({ "completion": "process-exit" }),
         sealed_secret_ids: vec![],
+        external_config: false,
     }
 }
 
@@ -321,4 +322,126 @@ fn errors_are_deterministic_in_node_key_order() {
     sorted.sort();
     assert_eq!(nodes, sorted, "错误应按节点键稳定排序: {errors:?}");
     assert!(errors.iter().all(|e| !e.message.is_empty()));
+}
+
+// ---------- default-cli 保留引用(Task 3) ----------
+
+/// 模拟插件感知 resolver(生产为 mf::app_ctx::PluginInstanceResolver):
+/// 普通字符串按实例表解析;`default-cli:<完整贡献 ID>` 合成临时快照。
+fn plugin_aware_resolver<'i>(
+    instances: &'i [(&'static str, AgentInstanceSnapshot)],
+    available_cli: &'static [&'static str],
+) -> impl Fn(&str) -> anyhow::Result<AgentInstanceSnapshot> + 'i {
+    move |reference| {
+        let Some(full_contribution_id) = reference.strip_prefix("default-cli:") else {
+            return resolver_for(instances)(reference);
+        };
+        if !available_cli.contains(&full_contribution_id) {
+            anyhow::bail!(
+                "默认 CLI `{full_contribution_id}` 不存在或所属插件未启用(引用必须是完整贡献 ID)"
+            );
+        }
+        Ok(AgentInstanceSnapshot {
+            id: format!("default-cli:{full_contribution_id}"),
+            name: format!("{full_contribution_id} 默认 CLI"),
+            agent_type: full_contribution_id.to_string(),
+            version: 0,
+            enabled: true,
+            run_mode: RunMode::OneShot,
+            executable: "agent.exe".into(),
+            argv: vec![],
+            env: vec![],
+            config: serde_json::json!({}),
+            execution_contract: serde_json::json!({ "completion": "manual" }),
+            sealed_secret_ids: vec![],
+            external_config: true,
+        })
+    }
+}
+
+fn plugin_index_with(extra_agent_type: &str) -> HashMap<String, PluginSourcePin> {
+    let mut map = agent_types().clone();
+    map.insert(
+        extra_agent_type.to_string(),
+        PluginSourcePin {
+            full_id: "test.plugin".into(),
+            version: "0.1.0".into(),
+            content_hash: "hash-test-plugin".into(),
+            contribution_id: String::new(),
+        },
+    );
+    map
+}
+
+#[test]
+fn default_cli_reference_compiles_to_frozen_external_config_snapshot() {
+    // 检测到的 default-cli 引用编译为冻结快照:external_config 与完整
+    // agent_type(插件 pin 依据)都保留;普通实例引用行为不变
+    let instances = default_instances();
+    let resolve = plugin_aware_resolver(&instances, &["test.plugin.agent"]);
+    let template = template_with(vec![
+        node("a", &[], "做 A", "inst-a"),
+        node("b", &["a"], "做 B", "default-cli:test.plugin.agent"),
+    ]);
+    let mut input = input(&template, &resolve);
+    let index = plugin_index_with("test.plugin.agent");
+    input.agent_type_plugins = &index;
+    let snapshot = compiler().compile(input).unwrap();
+    let a = snapshot.nodes.iter().find(|n| n.key == "a").unwrap();
+    let b = snapshot.nodes.iter().find(|n| n.key == "b").unwrap();
+    assert!(!a.instance.external_config, "保存实例仍是隔离配置");
+    assert!(
+        b.instance.external_config,
+        "default-cli 合成快照 external_config 必须为 true"
+    );
+    assert_eq!(b.instance.agent_type, "test.plugin.agent");
+    assert_eq!(
+        b.plugin.as_ref().map(|p| p.full_id.as_str()),
+        Some("test.plugin"),
+        "插件 pin 按快照中的完整 agent_type 冻结"
+    );
+    // 快照经序列化往返不丢失 external_config(Revision 存的就是它)
+    let json = serde_json::to_string(&snapshot).unwrap();
+    let round: mf_agent::workflow::WorkflowSnapshot = serde_json::from_str(&json).unwrap();
+    assert!(round.nodes[1].instance.external_config);
+}
+
+#[test]
+fn default_cli_unknown_contribution_id_is_stable_error() {
+    // 未检测/未知贡献 ID:同一稳定错误,以 unknown-instance 报在节点上
+    let instances = default_instances();
+    let resolve = plugin_aware_resolver(&instances, &[]);
+    let template = template_with(vec![node(
+        "a",
+        &[],
+        "做 A",
+        "default-cli:ghost.plugin.agent",
+    )]);
+    let mut input = input(&template, &resolve);
+    let index = plugin_index_with("ghost.plugin.agent");
+    input.agent_type_plugins = &index;
+    let errors = compiler().compile(input).unwrap_err();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].code, "unknown-instance");
+    assert_eq!(errors[0].node, "a");
+    assert!(
+        errors[0].message.contains("完整贡献 ID"),
+        "错误必须说明引用必须是完整贡献 ID: {}",
+        errors[0].message
+    );
+}
+
+#[test]
+fn plain_instance_ids_resolve_through_plugin_aware_resolver_unchanged() {
+    // 插件感知 resolver 下普通实例 ID 仍按实例表解析(既有行为不变)
+    let instances = default_instances();
+    let resolve = plugin_aware_resolver(&instances, &["test.plugin.agent"]);
+    let template = template_with(vec![node("a", &[], "做 A", "inst-a")]);
+    let snapshot = compiler().compile(input(&template, &resolve)).unwrap();
+    assert_eq!(snapshot.nodes[0].instance.id, "inst-a");
+    assert!(!snapshot.nodes[0].instance.external_config);
+    // 未知普通实例 ID 仍报 unknown-instance
+    let missing = template_with(vec![node("a", &[], "做 A", "inst-missing")]);
+    let errors = compiler().compile(input(&missing, &resolve)).unwrap_err();
+    assert_eq!(errors[0].code, "unknown-instance");
 }
