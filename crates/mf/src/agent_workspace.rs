@@ -211,6 +211,29 @@ impl AgentWorkspace {
         self.app.orchestrator_of(root)
     }
 
+    /// 新步骤/AI 草案/替换 Agent 的默认 profile:
+    /// 调试构建沿用 mock(写死的调试用途);发布构建取目录里
+    /// 第一个可用 profile,兜底空白终端(始终可用)。
+    fn default_step_profile(&self) -> String {
+        let mock_ok = mf_agent::config::mock_available();
+        let catalog = self.app.catalog.read();
+        let mut ids: Vec<String> = catalog
+            .index
+            .entries
+            .iter()
+            .filter(|(_, av)| av.installed && av.enabled && av.detected)
+            .filter(|(id, _)| mock_ok || id.as_str() != "mock")
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        if mock_ok && ids.iter().any(|id| id == "mock") {
+            return "mock".into();
+        }
+        ids.into_iter()
+            .next()
+            .unwrap_or_else(|| "blank-terminal".into())
+    }
+
     fn refresh_pipeline_state(&mut self) {
         let Some((root, task_id)) = self.selected_task.clone() else {
             self.task = None;
@@ -321,12 +344,13 @@ impl AgentWorkspace {
             return;
         };
         let title_head: String = task.title.chars().take(20).collect();
+        let default_profile = self.default_step_profile();
         self.draft = vec![
             StepDraft {
                 key: "plan".into(),
                 title: format!("规划:{title_head}"),
                 instructions: "分析任务目标,给出执行清单。".into(),
-                agent_profile: "mock".into(),
+                agent_profile: default_profile.clone(),
                 session_policy: SessionPolicy::Fresh,
                 deps: vec![],
             },
@@ -334,7 +358,7 @@ impl AgentWorkspace {
                 key: "execute".into(),
                 title: "执行主工作".into(),
                 instructions: task.goal.clone(),
-                agent_profile: "mock".into(),
+                agent_profile: default_profile,
                 session_policy: SessionPolicy::Fresh,
                 deps: vec!["plan".into()],
             },
@@ -350,11 +374,12 @@ impl AgentWorkspace {
         while self.draft.iter().any(|s| s.key == format!("step-{n}")) {
             n += 1;
         }
+        let default_profile = self.default_step_profile();
         self.draft.push(StepDraft {
             key: format!("step-{n}"),
             title: format!("新步骤 {n}"),
             instructions: String::new(),
-            agent_profile: "mock".into(),
+            agent_profile: default_profile,
             session_policy: SessionPolicy::Fresh,
             deps: Vec::new(),
         });
@@ -390,6 +415,7 @@ impl AgentWorkspace {
         let Some(orch) = self.orchestrator() else {
             return;
         };
+        let default_profile = self.default_step_profile();
         let result: std::result::Result<String, String> = match action {
             "retry" => orch
                 .retry_step(step_id, mf_agent::RetryMode::FreshSession)
@@ -400,7 +426,7 @@ impl AgentWorkspace {
                 .map(|_| "已跳过".into())
                 .map_err(|e| format!("{e:#}")),
             "replace" => orch
-                .replace_agent(step_id, profile.unwrap_or("mock"))
+                .replace_agent(step_id, profile.unwrap_or(&default_profile))
                 .map(|_| "已替换 Agent(新 Revision)".into())
                 .map_err(|e| format!("{e:#}")),
             "retry-continue" => orch
@@ -533,7 +559,7 @@ impl AgentWorkspace {
             .border_color(rgb(crate::theme::Theme::border()))
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(crate::theme::ui_px(11.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(crate::theme::Theme::fg()))
                     .child("实时会话"),
@@ -548,7 +574,7 @@ impl AgentWorkspace {
                     .rounded_md()
                     .border_1()
                     .border_color(rgb(crate::theme::Theme::border()))
-                    .text_size(px(10.5))
+                    .text_size(crate::theme::ui_px(10.5))
                     .cursor_pointer()
                     .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                     .child(filter_label)
@@ -589,7 +615,7 @@ impl AgentWorkspace {
                             crate::theme::Theme::border()
                         },
                     ))
-                    .text_size(px(10.5))
+                    .text_size(crate::theme::ui_px(10.5))
                     .cursor_pointer()
                     .on_click(cx.listener(|ws: &mut AgentWorkspace, _, window, cx| {
                         ws.active_field = Field::FilterText;
@@ -610,7 +636,7 @@ impl AgentWorkspace {
             .child(div().flex_1())
             .child(
                 div()
-                    .text_size(px(10.))
+                    .text_size(crate::theme::ui_px(10.))
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child(format!(
                         "{} 会话 · 活动运行 {} · 全局并发上限 {}",
@@ -659,7 +685,7 @@ impl AgentWorkspace {
                 body = body.child(
                     div()
                         .p_2()
-                        .text_size(px(10.))
+                        .text_size(crate::theme::ui_px(10.))
                         .text_color(rgb(crate::theme::Theme::fg_faint()))
                         .child("—"),
                 );
@@ -679,13 +705,13 @@ impl AgentWorkspace {
                             .child(div().size(px(8.)).rounded_full().bg(rgb(accent)))
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(crate::theme::ui_px(11.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(col.title()),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(crate::theme::ui_px(10.))
                                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                                     .child(col_cards.len().to_string()),
                             ),
@@ -861,13 +887,13 @@ impl AgentWorkspace {
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .child(div().text_size(px(12.)).child(card.profile_display.clone()))
+                    .child(div().text_size(crate::theme::ui_px(12.)).child(card.profile_display.clone()))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(10.5))
+                            .text_size(crate::theme::ui_px(10.5))
                             .text_color(rgb(crate::theme::Theme::fg()))
                             .child(session_title),
                     )
@@ -881,7 +907,7 @@ impl AgentWorkspace {
                     })
                     .child(
                         div()
-                            .text_size(px(9.))
+                            .text_size(crate::theme::ui_px(9.))
                             .text_color(rgb(accent))
                             .child(status_label),
                     ),
@@ -889,7 +915,7 @@ impl AgentWorkspace {
             .child(
                 div()
                     .mt_1()
-                    .text_size(px(9.5))
+                    .text_size(crate::theme::ui_px(9.5))
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child(format!(
                         "{} · {}",
@@ -901,7 +927,7 @@ impl AgentWorkspace {
                 d.child(
                     div()
                         .mt_1()
-                        .text_size(px(10.))
+                        .text_size(crate::theme::ui_px(10.))
                         .text_color(rgb(crate::theme::Theme::fg_dim()))
                         .child(format!("▶ {last_user}")),
                 )
@@ -910,7 +936,7 @@ impl AgentWorkspace {
                 d.child(
                     div()
                         .mt_0p5()
-                        .text_size(px(10.))
+                        .text_size(crate::theme::ui_px(10.))
                         .text_color(rgb(crate::theme::Theme::fg_faint()))
                         .child(format!("◀ {last_reply}")),
                 )
@@ -930,7 +956,7 @@ impl AgentWorkspace {
                 .flex()
                 .items_center()
                 .justify_center()
-                .text_size(px(12.))
+                .text_size(crate::theme::ui_px(12.))
                 .text_color(rgb(crate::theme::Theme::fg_faint()))
                 .child("在左侧任务列表选择或新建一个任务")
                 .into_any_element();
@@ -947,7 +973,7 @@ impl AgentWorkspace {
             .border_color(rgb(crate::theme::Theme::border()))
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(crate::theme::ui_px(11.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(rgb(crate::theme::Theme::fg()))
                     .child(format!(
@@ -1058,7 +1084,7 @@ impl AgentWorkspace {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .text_size(px(10.))
+                    .text_size(crate::theme::ui_px(10.))
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child(self.status_message.clone()),
             );
@@ -1085,7 +1111,7 @@ impl AgentWorkspace {
             cols = cols.child(
                 div()
                     .p_3()
-                    .text_size(px(11.))
+                    .text_size(crate::theme::ui_px(11.))
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child("还没有步骤;从模板创建、AI 生成或「添加 Step」开始。"),
             );
@@ -1153,12 +1179,12 @@ impl AgentWorkspace {
                                         .flex_1()
                                         .min_w_0()
                                         .truncate()
-                                        .text_size(px(11.))
+                                        .text_size(crate::theme::ui_px(11.))
                                         .child(dstep.title.clone()),
                                 )
                                 .child(
                                     div()
-                                        .text_size(px(9.))
+                                        .text_size(crate::theme::ui_px(9.))
                                         .text_color(rgb(crate::theme::Theme::fg_faint()))
                                         .child(if attempts > 0 {
                                             format!("×{attempts}")
@@ -1170,14 +1196,14 @@ impl AgentWorkspace {
                         .child(
                             div()
                                 .mt_1()
-                                .text_size(px(9.5))
+                                .text_size(crate::theme::ui_px(9.5))
                                 .text_color(rgb(crate::theme::Theme::fg_faint()))
                                 .child(format!("{} · {}", dstep.agent_profile, status.label_cn())),
                         )
                         .child(
                             div()
                                 .mt_0p5()
-                                .text_size(px(9.))
+                                .text_size(crate::theme::ui_px(9.))
                                 .text_color(rgb(crate::theme::Theme::fg_faint()))
                                 .child(if dstep.deps.is_empty() {
                                     "无依赖".to_string()
@@ -1235,7 +1261,7 @@ impl AgentWorkspace {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(px(9.5))
+                            .text_size(crate::theme::ui_px(9.5))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .child(format!("L{li}")),
                     )
@@ -1260,7 +1286,7 @@ impl AgentWorkspace {
                     .py_1p5()
                     .border_t_1()
                     .border_color(rgb(crate::theme::Theme::danger()))
-                    .text_size(px(10.))
+                    .text_size(crate::theme::ui_px(10.))
                     .text_color(rgb(crate::theme::Theme::danger()))
                     .children(self.validation.iter().map(|e| div().child(e.clone()))),
             )
@@ -1321,7 +1347,7 @@ impl AgentWorkspace {
                     .rounded_md()
                     .cursor_pointer()
                     .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
-                    .text_size(px(11.))
+                    .text_size(crate::theme::ui_px(11.))
                     .child(format!("{name} · {steps} 步 · {id}"))
                     .on_click(cx.listener(move |ws: &mut AgentWorkspace, _, _, cx| {
                         ws.draft = steps_copy.clone();
@@ -1348,7 +1374,15 @@ impl AgentWorkspace {
         };
         let profiles: Vec<String> = {
             let catalog = self.app.catalog.read();
-            let mut ids: Vec<String> = catalog.index.entries.keys().cloned().collect();
+            // 只列出可用 Profile(已安装+已启用+已检测到),与编译检查的
+            // is_usable 同口径;未配置的 CLI 不应出现在指派列表里
+            let mut ids: Vec<String> = catalog
+                .index
+                .entries
+                .iter()
+                .filter(|(_, av)| av.installed && av.enabled && av.detected)
+                .map(|(id, _)| id.clone())
+                .collect();
             ids.sort();
             ids
         };
@@ -1402,7 +1436,7 @@ impl AgentWorkspace {
                     .border_color(rgb(crate::theme::Theme::border()))
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::ui_px(11.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(format!("Step `{key}`")),
                     ),
@@ -1417,7 +1451,7 @@ impl AgentWorkspace {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(px(9.5))
+                            .text_size(crate::theme::ui_px(9.5))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .child("标题"),
                     )
@@ -1435,7 +1469,7 @@ impl AgentWorkspace {
                             } else {
                                 crate::theme::Theme::border()
                             }))
-                            .text_size(px(10.5))
+                            .text_size(crate::theme::ui_px(10.5))
                             .cursor_pointer()
                             .on_click(cx.listener(|ws: &mut AgentWorkspace, _, window, cx| {
                                 ws.active_field = Field::Title;
@@ -1468,7 +1502,7 @@ impl AgentWorkspace {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(px(9.5))
+                            .text_size(crate::theme::ui_px(9.5))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .child("工作说明"),
                     )
@@ -1484,7 +1518,7 @@ impl AgentWorkspace {
                             } else {
                                 crate::theme::Theme::border()
                             }))
-                            .text_size(px(10.5))
+                            .text_size(crate::theme::ui_px(10.5))
                             .cursor_pointer()
                             .on_click(cx.listener(|ws: &mut AgentWorkspace, _, window, cx| {
                                 ws.active_field = Field::Instructions;
@@ -1516,7 +1550,7 @@ impl AgentWorkspace {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(px(9.5))
+                            .text_size(crate::theme::ui_px(9.5))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .child("Agent Profile"),
                     )
@@ -1531,7 +1565,7 @@ impl AgentWorkspace {
                             .border_1()
                             .border_color(rgb(crate::theme::Theme::border()))
                             .cursor_pointer()
-                            .text_size(px(10.5))
+                            .text_size(crate::theme::ui_px(10.5))
                             .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                             .child(step.agent_profile.clone())
                             .on_click(cx.listener(|ws: &mut AgentWorkspace, _, _, cx| {
@@ -1550,13 +1584,23 @@ impl AgentWorkspace {
                                 .border_color(rgb(crate::theme::Theme::border()))
                                 .flex()
                                 .flex_col()
+                                .when(profiles.is_empty(), |d| {
+                                    d.child(
+                                        div()
+                                            .px_2()
+                                            .py_1()
+                                            .text_size(crate::theme::ui_px(9.5))
+                                            .text_color(rgb(crate::theme::Theme::fg_faint()))
+                                            .child("无可用 Agent:请到「智能体」页确认 CLI 已检测到"),
+                                    )
+                                })
                                 .children(profiles.iter().map(|p| {
                                     let p = p.clone();
                                     div()
                                         .id(ElementId::Name(format!("profile-{p}").into()))
                                         .px_2()
                                         .py_1()
-                                        .text_size(px(10.5))
+                                        .text_size(crate::theme::ui_px(10.5))
                                         .cursor_pointer()
                                         .hover(|h| h.bg(rgb(crate::theme::Theme::bg_hover())))
                                         .child(p.clone())
@@ -1588,7 +1632,7 @@ impl AgentWorkspace {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(px(9.5))
+                            .text_size(crate::theme::ui_px(9.5))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .child("会话策略(相同 key 串行复用)"),
                     )
@@ -1610,7 +1654,7 @@ impl AgentWorkspace {
                                         |d| d.bg(rgb(crate::theme::Theme::accent())),
                                     ),
                             )
-                            .child(div().text_size(px(10.5)).child("fresh(每步新会话)"))
+                            .child(div().text_size(crate::theme::ui_px(10.5)).child("fresh(每步新会话)"))
                             .on_click(cx.listener(move |ws: &mut AgentWorkspace, _, _, cx| {
                                 if let Some(k) = ws.selected_step.clone() {
                                     if let Some(s) = ws.draft.iter_mut().find(|s| s.key == k) {
@@ -1639,7 +1683,7 @@ impl AgentWorkspace {
                                         |d| d.bg(rgb(crate::theme::Theme::accent())),
                                     ),
                             )
-                            .child(div().text_size(px(10.5)).child("reuse:"))
+                            .child(div().text_size(crate::theme::ui_px(10.5)).child("reuse:"))
                             .child(
                                 div()
                                     .id("edit-session-key")
@@ -1655,7 +1699,7 @@ impl AgentWorkspace {
                                     } else {
                                         crate::theme::Theme::border()
                                     }))
-                                    .text_size(px(10.5))
+                                    .text_size(crate::theme::ui_px(10.5))
                                     .child(session_key_value.clone()),
                             )
                             .on_click(cx.listener(|ws: &mut AgentWorkspace, _, window, cx| {
@@ -1682,7 +1726,7 @@ impl AgentWorkspace {
                     .gap_1()
                     .child(
                         div()
-                            .text_size(px(9.5))
+                            .text_size(crate::theme::ui_px(9.5))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .child("前置步骤"),
                     )
@@ -1703,7 +1747,7 @@ impl AgentWorkspace {
                                     .border_color(rgb(crate::theme::Theme::fg_dim()))
                                     .when(checked, |d| d.bg(rgb(crate::theme::Theme::accent()))),
                             )
-                            .child(div().text_size(px(10.5)).child(other.clone()))
+                            .child(div().text_size(crate::theme::ui_px(10.5)).child(other.clone()))
                             .on_click(cx.listener(move |ws: &mut AgentWorkspace, _, _, cx| {
                                 if let Some(k) = ws.selected_step.clone() {
                                     if let Some(s) = ws.draft.iter_mut().find(|s| s.key == k) {
@@ -1783,7 +1827,7 @@ impl AgentWorkspace {
                         .map(|line| {
                             div()
                                 .id(ElementId::Name(format!("trow-{}", line.len()).into()))
-                                .text_size(px(11.5))
+                                .text_size(crate::theme::ui_px(11.5))
                                 .font_family("Consolas")
                                 .text_color(rgb(0xd4d4d4))
                                 .line_height(px(15.))
@@ -1819,7 +1863,7 @@ impl AgentWorkspace {
                         .py_2()
                         .rounded_lg()
                         .bg(rgb(bg))
-                        .text_size(px(11.5))
+                        .text_size(crate::theme::ui_px(11.5))
                         .child(format!("[{role}] {text}"))
                 }))
                 .into_any_element()
@@ -1857,14 +1901,14 @@ impl AgentWorkspace {
                     .border_color(rgb(crate::theme::Theme::border()))
                     .child(
                         div()
-                            .text_size(px(11.5))
+                            .text_size(crate::theme::ui_px(11.5))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(title),
                     )
                     .when(awaiting, |d| {
                         d.child(
                             div()
-                                .text_size(px(10.5))
+                                .text_size(crate::theme::ui_px(10.5))
                                 .text_color(rgb(crate::theme::Theme::warning()))
                                 .child("待结算:Agent 已结束但未显式结算"),
                         )
@@ -1902,7 +1946,7 @@ impl AgentWorkspace {
                             .px_2()
                             .rounded_md()
                             .cursor_pointer()
-                            .text_size(px(11.))
+                            .text_size(crate::theme::ui_px(11.))
                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                             .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
                             .child("✕ 关闭(Esc)")
@@ -1942,7 +1986,7 @@ impl AgentWorkspace {
                                     crate::theme::Theme::border()
                                 },
                             ))
-                            .text_size(px(11.))
+                            .text_size(crate::theme::ui_px(11.))
                             .cursor_pointer()
                             .on_click(cx.listener(|ws: &mut AgentWorkspace, _, window, cx| {
                                 ws.active_field = Field::PromptInput;
@@ -2014,13 +2058,13 @@ where
     div()
         .id(id)
         .px_2()
-        .h(px(20.))
+        .h(px(22.))
         .flex()
         .items_center()
         .rounded_md()
         .border_1()
         .border_color(rgb(color))
-        .text_size(px(9.5))
+        .text_size(crate::theme::ui_px(9.5))
         .text_color(rgb(color))
         .cursor_pointer()
         .hover(move |d| d.bg(rgb(color)).text_color(rgb(crate::theme::Theme::bg())))
@@ -2282,7 +2326,7 @@ fn tab_btn(
         .items_center()
         .rounded_md()
         .cursor_pointer()
-        .text_size(px(11.))
+        .text_size(crate::theme::ui_px(11.))
         .font_weight(if active {
             FontWeight::SEMIBOLD
         } else {

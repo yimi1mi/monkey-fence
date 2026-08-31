@@ -192,22 +192,46 @@ pub struct Config {
     pub plugin_instances: HashMap<String, PluginInstanceConfig>,
 }
 
+/// mock 提供方是否可用:仅调试用途,写死在代码里。
+/// debug 构建自动可用;发布构建默认关闭(UI 不显示、默认配置与
+/// 示例模板不落盘),需要时 `--features mf-agent/debug-mock` 显式开启。
+pub fn mock_available() -> bool {
+    cfg!(any(debug_assertions, feature = "debug-mock"))
+}
+
+/// 生成 provider 缺失时的运行期回退(不落盘):调试用 mock,
+/// 发布用 openai(占位,等待用户配置)。
+fn runtime_fallback_provider() -> ProviderConfig {
+    ProviderConfig {
+        kind: if mock_available() {
+            ProviderKind::Mock
+        } else {
+            ProviderKind::Openai
+        },
+        base_url: String::new(),
+        api_key: String::new(),
+        model: String::new(),
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         let mut providers = HashMap::new();
-        providers.insert(
-            "mock".into(),
-            ProviderConfig {
-                kind: ProviderKind::Mock,
-                base_url: String::new(),
-                api_key: String::new(),
-                model: String::new(),
-            },
-        );
         let mut roles = HashMap::new();
-        roles.insert("planner".into(), "mock".into());
-        roles.insert("worker".into(), "mock".into());
-        roles.insert("reviewer".into(), "mock".into());
+        if mock_available() {
+            providers.insert(
+                "mock".into(),
+                ProviderConfig {
+                    kind: ProviderKind::Mock,
+                    base_url: String::new(),
+                    api_key: String::new(),
+                    model: String::new(),
+                },
+            );
+            roles.insert("planner".into(), "mock".into());
+            roles.insert("worker".into(), "mock".into());
+            roles.insert("reviewer".into(), "mock".into());
+        }
         Self {
             providers,
             roles,
@@ -244,40 +268,11 @@ impl Config {
         Ok(cfg)
     }
 
-    /// 首次运行写入示例配置(含注释模板)
+    /// 首次运行写入示例配置(含注释模板);mock 仅调试构建出现
     fn save_example(&self) -> Result<()> {
         let dir = Self::config_dir();
         std::fs::create_dir_all(&dir)?;
-        let template = r#"# MonkeyFence 配置
-# 提供方:kind = mock | openai(OpenAI 兼容) | anthropic
-[providers.mock]
-kind = "mock"
-
-# 示例:智谱 GLM(OpenAI 兼容)
-# [providers.glm]
-# kind = "openai"
-# base_url = "https://open.bigmodel.cn/api/paas/v4"
-# api_key = "your-key"
-# model = "glm-4.6"
-
-# 示例:Anthropic
-# [providers.claude]
-# kind = "anthropic"
-# base_url = "https://api.anthropic.com"
-# api_key = "sk-..."
-# model = "claude-sonnet-4-5"
-
-# 角色 → 提供方
-[roles]
-planner = "mock"
-worker = "mock"
-
-[engine]
-workers = 2
-max_iterations = 24
-max_failures = 3
-"#;
-        std::fs::write(Self::config_path(), template)?;
+        std::fs::write(Self::config_path(), example_template())?;
         Ok(())
     }
 
@@ -299,12 +294,7 @@ max_failures = 3
         self.providers
             .get(&name)
             .cloned()
-            .unwrap_or(ProviderConfig {
-                kind: ProviderKind::Mock,
-                base_url: String::new(),
-                api_key: String::new(),
-                model: String::new(),
-            })
+            .unwrap_or_else(runtime_fallback_provider)
     }
 
     /// 读取插件实例字段；用户未覆盖时返回插件清单给出的默认值。
@@ -331,6 +321,68 @@ max_failures = 3
     }
 }
 
+/// 首次运行的示例配置模板:mock 仅调试构建写入,发布构建不含。
+fn example_template() -> &'static str {
+    if mock_available() {
+        r#"# MonkeyFence 配置
+# 提供方:kind = mock(仅调试) | openai(OpenAI 兼容) | anthropic
+[providers.mock]
+kind = "mock"
+
+# 示例:智谱 GLM(OpenAI 兼容)
+# [providers.glm]
+# kind = "openai"
+# base_url = "https://open.bigmodel.cn/api/paas/v4"
+# api_key = "your-key"
+# model = "glm-4.6"
+
+# 示例:Anthropic
+# [providers.claude]
+# kind = "anthropic"
+# base_url = "https://api.anthropic.com"
+# api_key = "sk-..."
+# model = "claude-sonnet-4-5"
+
+# 角色 → 提供方
+[roles]
+planner = "mock"
+worker = "mock"
+
+[engine]
+workers = 2
+max_iterations = 24
+max_failures = 3
+"#
+    } else {
+        r#"# MonkeyFence 配置
+# 提供方:kind = openai(OpenAI 兼容) | anthropic
+# 示例:智谱 GLM(OpenAI 兼容)
+# [providers.glm]
+# kind = "openai"
+# base_url = "https://open.bigmodel.cn/api/paas/v4"
+# api_key = "your-key"
+# model = "glm-4.6"
+
+# 示例:Anthropic
+# [providers.claude]
+# kind = "anthropic"
+# base_url = "https://api.anthropic.com"
+# api_key = "sk-..."
+# model = "claude-sonnet-4-5"
+
+# 角色 → 提供方(绑定到已配置的提供方名)
+[roles]
+# planner = "glm"
+# worker = "glm"
+
+[engine]
+workers = 2
+max_iterations = 24
+max_failures = 3
+"#
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,5 +403,34 @@ mod tests {
             "p4"
         );
         assert_eq!(restored.editor.theme, "morning-mist");
+    }
+
+    /// mock 仅调试构建:cargo test(debug)验证 mock 默认存在。
+    #[cfg(any(debug_assertions, feature = "debug-mock"))]
+    #[test]
+    fn debug_defaults_and_template_include_mock() {
+        let config = Config::default();
+        assert!(config.providers.contains_key("mock"));
+        assert!(config.roles.values().all(|v| v == "mock"));
+        let template = example_template();
+        assert!(template.contains("[providers.mock]"));
+        assert!(template.contains("planner = \"mock\""));
+    }
+
+    /// 发布构建(cargo test --release):默认配置与示例模板不落 mock。
+    #[cfg(not(any(debug_assertions, feature = "debug-mock")))]
+    #[test]
+    fn release_defaults_and_template_exclude_mock() {
+        let config = Config::default();
+        assert!(!config.providers.contains_key("mock"));
+        assert!(config.roles.is_empty());
+        // 序列化后的默认配置不含 mock 字样(不落盘)
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(!text.contains("mock"), "发布默认配置不得包含 mock:{text}");
+        let template = example_template();
+        assert!(!template.contains("mock"), "发布示例模板不得包含 mock");
+        // 未配置角色时运行期回退为 openai 占位(不写配置)
+        let fallback = config.provider_for_role("planner");
+        assert_eq!(fallback.kind, ProviderKind::Openai);
     }
 }

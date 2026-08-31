@@ -190,6 +190,11 @@ fn bind_keys(cx: &mut App) {
 /// 无 GUI 的 v2 冒烟:多步 DAG(mock HTTP Agent 结构化结算)→ 失败进「需要你」
 /// → 能力令牌校验 → 人工跳过 → 收敛。同时打印 CLI Agent PATH 检测表。
 fn agent_smoke(project: Option<String>) -> i32 {
+    // 冒烟依赖 mock 提供方(仅调试构建);发布构建直接拒绝
+    if !mf_agent::config::mock_available() {
+        eprintln!("[agent-smoke] 仅调试构建可用(发布构建无 mock 提供方)");
+        return 2;
+    }
     use mf_agent::model::*;
     use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
     use mf_agent::pipeline::{PipelineDraft, SessionPolicy, StepDraft};

@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# mock 提供方仅调试用:debug 构建自动可用;发布构建如需临时启用
+# 可 `cargo build --release --features mf-agent/debug-mock`
+debug-mock = []
+
 [dependencies]
 anyhow.workspace = true
 log.workspace = true

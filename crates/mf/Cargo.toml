@@ -9,6 +9,11 @@ description = "MonkeyFence — AI code editor with agent orchestration"
 name = "monkeyfence"
 path = "src/main.rs"
 
+[features]
+# 调试专用 mock:debug 构建自动可用;发布构建临时启用用
+# `cargo build --release --features debug-mock`
+debug-mock = ["mf-agent/debug-mock"]
+
 [dependencies]
 zeroize.workspace = true
 sha2.workspace = true

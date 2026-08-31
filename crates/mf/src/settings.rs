@@ -97,7 +97,7 @@ impl SettingsView {
             .get("planner")
             .cloned()
             .or_else(|| draft.providers.keys().next().cloned())
-            .unwrap_or_else(|| "mock".into());
+            .unwrap_or_else(fallback_provider_name);
         Self {
             draft,
             page: Page::Appearance,
@@ -155,16 +155,11 @@ impl SettingsView {
             .roles
             .get(&role)
             .cloned()
-            .unwrap_or_else(|| "mock".into());
+            .unwrap_or_else(fallback_provider_name);
         self.draft
             .providers
             .entry(name)
-            .or_insert_with(|| ProviderConfig {
-                kind: ProviderKind::Mock,
-                base_url: String::new(),
-                api_key: String::new(),
-                model: String::new(),
-            })
+            .or_insert_with(fallback_provider_config)
     }
 
     fn selected_provider(&self) -> ProviderConfig {
@@ -173,17 +168,12 @@ impl SettingsView {
             .roles
             .get(self.selected_role.as_ref())
             .cloned()
-            .unwrap_or_else(|| "mock".into());
+            .unwrap_or_else(fallback_provider_name);
         self.draft
             .providers
             .get(&name)
             .cloned()
-            .unwrap_or(ProviderConfig {
-                kind: ProviderKind::Mock,
-                base_url: String::new(),
-                api_key: String::new(),
-                model: String::new(),
-            })
+            .unwrap_or_else(fallback_provider_config)
     }
 
     fn field_text(&self, f: &Field) -> String {
@@ -285,23 +275,13 @@ impl SettingsView {
             .providers
             .get(&self.selected_provider_name)
             .cloned()
-            .unwrap_or_else(|| ProviderConfig {
-                kind: ProviderKind::Mock,
-                base_url: String::new(),
-                api_key: String::new(),
-                model: String::new(),
-            })
+            .unwrap_or_else(fallback_provider_config)
     }
     fn cur_provider_mut(&mut self) -> &mut ProviderConfig {
         self.draft
             .providers
             .entry(self.selected_provider_name.clone())
-            .or_insert_with(|| ProviderConfig {
-                kind: ProviderKind::Mock,
-                base_url: String::new(),
-                api_key: String::new(),
-                model: String::new(),
-            })
+            .or_insert_with(fallback_provider_config)
     }
     fn select_provider(&mut self, name: &str, cx: &mut Context<Self>) {
         self.selected_provider_name = name.to_string();
@@ -332,10 +312,16 @@ impl SettingsView {
     fn delete_provider(&mut self, cx: &mut Context<Self>) {
         let name = self.selected_provider_name.clone();
         self.draft.providers.remove(&name);
-        for (_, v) in self.draft.roles.iter_mut() {
-            if *v == name {
-                *v = "mock".into();
+        if mf_agent::config::mock_available() {
+            // 调试构建:角色回退到 mock
+            for (_, v) in self.draft.roles.iter_mut() {
+                if *v == name {
+                    *v = "mock".into();
+                }
             }
+        } else {
+            // 发布构建不把 mock 写进配置:直接解除角色绑定
+            self.draft.roles.retain(|_, v| *v != name);
         }
         self.selected_provider_name = self
             .draft
@@ -343,7 +329,7 @@ impl SettingsView {
             .keys()
             .next()
             .cloned()
-            .unwrap_or_else(|| "mock".into());
+            .unwrap_or_else(fallback_provider_name);
         self.test_status = format!("已删除 {name}").into();
         self.active_field = None;
         cx.notify();
@@ -454,7 +440,7 @@ impl SettingsView {
             .px_4()
             .border_b_1()
             .border_color(rgb(crate::theme::Theme::border()))
-            .text_size(px(13.))
+            .text_size(crate::theme::ui_px(13.))
             .font_weight(FontWeight::SEMIBOLD)
             .child("设置");
 
@@ -499,7 +485,7 @@ impl SettingsView {
                     .child(
                         div()
                             .id("settings-hint")
-                            .text_size(px(11.))
+                            .text_size(crate::theme::ui_px(11.))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .child("引擎/提供方改动在下次打开项目或新建运行时生效；VCS 环境保存后立即刷新当前项目。"),
                     ),
@@ -538,7 +524,7 @@ impl SettingsView {
                         .px_2()
                         .pt_3()
                         .pb_1()
-                        .text_size(px(9.5))
+                        .text_size(crate::theme::ui_px(9.5))
                         .text_color(rgb(crate::theme::Theme::fg_faint()))
                         .child(gname.to_string())
                         .into_any_element(),
@@ -554,7 +540,7 @@ impl SettingsView {
                         .pl_3()
                         .rounded_sm()
                         .cursor_pointer()
-                        .text_size(px(12.))
+                        .text_size(crate::theme::ui_px(12.))
                         .when(cur, |d| {
                             d.bg(rgb(crate::theme::Theme::accent_dim()))
                                 .text_color(rgb(crate::theme::Theme::fg()))
@@ -698,7 +684,7 @@ impl SettingsView {
                     })
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(crate::theme::ui_px(12.))
                             .text_color(rgb(crate::theme::Theme::fg()))
                             .child(name.clone()),
                     )
@@ -706,7 +692,7 @@ impl SettingsView {
                     .child(div().flex_1())
                     .child(
                         div()
-                            .text_size(px(10.5))
+                            .text_size(crate::theme::ui_px(10.5))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .child(p.model.clone()),
                     )
@@ -751,7 +737,7 @@ impl SettingsView {
                     .when(!self.test_status.is_empty(), |d| {
                         d.child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(crate::theme::ui_px(11.))
                                 .text_color(rgb(if self.test_status.starts_with('✓') {
                                     crate::theme::Theme::success()
                                 } else {
@@ -790,11 +776,18 @@ impl SettingsView {
         let mut rows = vec![section("角色 → 提供方").into_any_element()];
         for role in ROLES {
             let selected = sel_role.as_ref() == *role;
+            // 发布构建未绑定的角色显示占位,不显示 mock
             let prov_name = draft
                 .roles
                 .get(*role)
                 .cloned()
-                .unwrap_or_else(|| "mock".into());
+                .unwrap_or_else(|| {
+                    if mf_agent::config::mock_available() {
+                        "mock".into()
+                    } else {
+                        "(未绑定)".into()
+                    }
+                });
             let kind = draft
                 .providers
                 .get(&prov_name)
@@ -833,7 +826,7 @@ impl SettingsView {
     fn role_label(&self, role: &str, selected: bool) -> Div {
         div()
             .w(px(80.))
-            .text_size(px(12.))
+            .text_size(crate::theme::ui_px(12.))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(rgb(if selected {
                 crate::theme::Theme::accent()
@@ -846,7 +839,7 @@ impl SettingsView {
     fn role_value(&self, prov_name: &str) -> Div {
         div()
             .flex_1()
-            .text_size(px(12.))
+            .text_size(crate::theme::ui_px(12.))
             .text_color(rgb(crate::theme::Theme::fg()))
             .child(prov_name.to_string())
     }
@@ -907,7 +900,7 @@ impl SettingsView {
         let Some(app) = self.app.clone() else {
             return div()
                 .p_3()
-                .text_size(px(12.))
+                .text_size(crate::theme::ui_px(12.))
                 .child("此页面需要应用上下文")
                 .into_any_element();
         };
@@ -968,7 +961,7 @@ impl SettingsView {
                     .child(
                         div()
                             .w(px(90.))
-                            .text_size(px(12.))
+                            .text_size(crate::theme::ui_px(12.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(provider.name.clone()),
                     )
@@ -976,7 +969,7 @@ impl SettingsView {
                     .child(div().flex_1())
                     .child(
                         div()
-                            .text_size(px(9.5))
+                            .text_size(crate::theme::ui_px(9.5))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .child(format!(
                                 "{} {}",
@@ -994,7 +987,7 @@ impl SettingsView {
             .child(section(format!("{} 环境", selected_provider.name)))
             .child(
                 div()
-                    .text_size(px(10.5))
+                    .text_size(crate::theme::ui_px(10.5))
                     .text_color(rgb(crate::theme::Theme::fg_dim()))
                     .child(selected_provider.description.clone()),
             );
@@ -1047,7 +1040,7 @@ impl SettingsView {
                                 } else {
                                     crate::theme::Theme::border()
                                 }))
-                                .text_size(px(10.5))
+                                .text_size(crate::theme::ui_px(10.5))
                                 .text_color(rgb(if active {
                                     crate::theme::Theme::accent()
                                 } else {
@@ -1084,7 +1077,7 @@ impl SettingsView {
                 fields = fields.child(
                     div()
                         .ml(px(118.))
-                        .text_size(px(9.5))
+                        .text_size(crate::theme::ui_px(9.5))
                         .text_color(rgb(crate::theme::Theme::fg_faint()))
                         .child(field.description),
                 );
@@ -1111,7 +1104,7 @@ impl SettingsView {
                     ))
                     .child(
                         div()
-                            .text_size(px(10.5))
+                            .text_size(crate::theme::ui_px(10.5))
                             .text_color(rgb(if self.vcs_test_status.starts_with('✓') {
                                 crate::theme::Theme::success()
                             } else if self.vcs_test_status.starts_with('✕') {
@@ -1127,7 +1120,7 @@ impl SettingsView {
                     .p_2()
                     .rounded_sm()
                     .bg(rgb(crate::theme::Theme::bg_elevated()))
-                    .text_size(px(10.))
+                    .text_size(crate::theme::ui_px(10.))
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child("这些值只保存在 MonkeyFence 的单一插件实例中，不会改写 Git 或 Perforce 的全局配置。"),
             )
@@ -1192,7 +1185,7 @@ impl SettingsView {
                 div()
                     .id("settings-status")
                     .flex_1()
-                    .text_size(px(11.))
+                    .text_size(crate::theme::ui_px(11.))
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child(self.status.clone()),
             )
@@ -1227,7 +1220,7 @@ impl SettingsView {
             .when(is_active, |d| {
                 d.border_color(rgb(crate::theme::Theme::accent()))
             })
-            .text_size(px(12.))
+            .text_size(crate::theme::ui_px(12.))
             .text_color(rgb(crate::theme::Theme::fg()))
             .overflow_hidden()
             .on_click(cx.listener(move |s, _, window, cx| {
@@ -1379,7 +1372,7 @@ impl SettingsView {
 
 fn section(title: impl Into<SharedString>) -> Div {
     div()
-        .text_size(px(11.))
+        .text_size(crate::theme::ui_px(11.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(crate::theme::Theme::accent()))
         .child(title.into())
@@ -1393,11 +1386,35 @@ fn field_row(label: &str, input: impl IntoElement) -> Div {
         .child(
             div()
                 .w(px(110.))
-                .text_size(px(12.))
+                .text_size(crate::theme::ui_px(12.))
                 .text_color(rgb(crate::theme::Theme::fg_dim()))
                 .child(label.to_string()),
         )
         .child(input)
+}
+
+/// 选中项缺失时的回退名:调试用 mock,发布用 provider-1
+/// (一个合法、可保存的名字,绝不把 mock 写进配置)。
+fn fallback_provider_name() -> String {
+    if mf_agent::config::mock_available() {
+        "mock".into()
+    } else {
+        "provider-1".into()
+    }
+}
+
+/// 按需创建提供方时的回退配置:调试用 mock,发布用 openai 占位。
+fn fallback_provider_config() -> ProviderConfig {
+    ProviderConfig {
+        kind: if mf_agent::config::mock_available() {
+            ProviderKind::Mock
+        } else {
+            ProviderKind::Openai
+        },
+        base_url: String::new(),
+        api_key: String::new(),
+        model: String::new(),
+    }
 }
 
 fn field_row_kind(label: &str, current: ProviderKind, cx: &Context<SettingsView>) -> Div {
@@ -1408,16 +1425,19 @@ fn field_row_kind(label: &str, current: ProviderKind, cx: &Context<SettingsView>
         .child(
             div()
                 .w(px(110.))
-                .text_size(px(12.))
+                .text_size(crate::theme::ui_px(12.))
                 .text_color(rgb(crate::theme::Theme::fg_dim()))
                 .child(label.to_string()),
         )
-        .child(kind_btn(
-            "mock",
-            current == ProviderKind::Mock,
-            ProviderKind::Mock,
-            cx,
-        ))
+        // mock 仅调试构建显示(发布构建不出现,也不进配置文件)
+        .when(mf_agent::config::mock_available(), |d| {
+            d.child(kind_btn(
+                "mock",
+                current == ProviderKind::Mock,
+                ProviderKind::Mock,
+                cx,
+            ))
+        })
         .child(kind_btn(
             "openai",
             current == ProviderKind::Openai,
@@ -1449,7 +1469,7 @@ fn kind_btn(
         } else {
             crate::theme::Theme::border()
         }))
-        .text_size(px(11.))
+        .text_size(crate::theme::ui_px(11.))
         .text_color(rgb(if active {
             crate::theme::Theme::accent()
         } else {
@@ -1474,7 +1494,7 @@ fn primary_btn(
         .py(px(4.))
         .rounded_sm()
         .bg(rgb(crate::theme::Theme::accent()))
-        .text_size(px(12.))
+        .text_size(crate::theme::ui_px(12.))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(rgb(0xffffff))
         .cursor_pointer()
@@ -1495,7 +1515,7 @@ fn secondary_btn(
         .border_1()
         .border_color(rgb(crate::theme::Theme::border()))
         .bg(rgb(crate::theme::Theme::bg_elevated()))
-        .text_size(px(12.))
+        .text_size(crate::theme::ui_px(12.))
         .text_color(rgb(crate::theme::Theme::fg_dim()))
         .cursor_pointer()
         .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
@@ -1522,7 +1542,7 @@ fn small_btn(
         .border_1()
         .border_color(rgb(crate::theme::Theme::border()))
         .cursor_pointer()
-        .text_size(px(11.))
+        .text_size(crate::theme::ui_px(11.))
         .text_color(rgb(crate::theme::Theme::fg_dim()))
         .hover(|d| d.border_color(rgb(crate::theme::Theme::accent())))
         .child(label.to_string())
@@ -1580,7 +1600,7 @@ fn theme_btn(
                         .flex_col()
                         .child(
                             div()
-                                .text_size(px(11.5))
+                                .text_size(crate::theme::ui_px(11.5))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(rgb(if active {
                                     crate::theme::Theme::accent()
@@ -1591,7 +1611,7 @@ fn theme_btn(
                         )
                         .child(
                             div()
-                                .text_size(px(9.5))
+                                .text_size(crate::theme::ui_px(9.5))
                                 .text_color(rgb(crate::theme::Theme::fg_faint()))
                                 .child(description),
                         ),
@@ -1661,7 +1681,7 @@ impl SettingsView {
                     .p_2()
                     .rounded_sm()
                     .bg(rgb(crate::theme::Theme::bg_elevated()))
-                    .text_size(px(9.5))
+                    .text_size(crate::theme::ui_px(9.5))
                     .text_color(rgb(if manual {
                         crate::theme::Theme::fg_faint()
                     } else {
@@ -1686,7 +1706,7 @@ impl SettingsView {
             ))
             .child(
                 div()
-                    .text_size(px(9.5))
+                    .text_size(crate::theme::ui_px(9.5))
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child("插件安装与启停统一在「插件」页；Agent 类型不会在这里重复配置。"),
             )
@@ -1702,7 +1722,7 @@ impl SettingsView {
         let Some(app) = self.app.clone() else {
             return div()
                 .p_3()
-                .text_size(px(12.))
+                .text_size(crate::theme::ui_px(12.))
                 .child("此页面需要应用上下文")
                 .into_any_element();
         };
@@ -1771,7 +1791,7 @@ impl SettingsView {
             }))
             .child(
                 div()
-                    .text_size(px(10.))
+                    .text_size(crate::theme::ui_px(10.))
                     .text_color(rgb(crate::theme::Theme::warning()))
                     .child("⚠ 权限模式只约束 MonkeyFence 传给 Agent 的参数;worker 进程与 CLI 仍以当前 Windows 用户权限运行。"),
             );
@@ -1812,18 +1832,18 @@ impl SettingsView {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(crate::theme::ui_px(12.))
                                     .child(p.icon.clone().unwrap_or_default()),
                             )
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(crate::theme::ui_px(12.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(p.display_name.clone()),
                             )
                             .child(
                                 div()
-                                    .text_size(px(9.5))
+                                    .text_size(crate::theme::ui_px(9.5))
                                     .text_color(rgb(if detected {
                                         crate::theme::Theme::success()
                                     } else {
@@ -2077,7 +2097,7 @@ impl SettingsView {
         if installable.is_empty() {
             col = col.child(
                 div()
-                    .text_size(px(10.5))
+                    .text_size(crate::theme::ui_px(10.5))
                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                     .child("全部内置 Agent 均已检测到(在 PATH)。"),
             );
@@ -2104,17 +2124,17 @@ impl SettingsView {
                     .gap_2()
                     .py_1()
                     .flex_wrap()
-                    .child(div().text_size(px(11.5)).child(a.name.clone()))
+                    .child(div().text_size(crate::theme::ui_px(11.5)).child(a.name.clone()))
                     .child(
                         div()
-                            .text_size(px(9.5))
+                            .text_size(crate::theme::ui_px(9.5))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .child(format!("`{}`", a.command)),
                     )
                     .when_some(spec.clone(), |d, sp| {
                         d.child(
                             div()
-                                .text_size(px(9.))
+                                .text_size(crate::theme::ui_px(9.))
                                 .px_1()
                                 .rounded_sm()
                                 .bg(rgb(crate::theme::Theme::bg_active()))
@@ -2126,7 +2146,7 @@ impl SettingsView {
                     .when_some(missing_tool, |d, tool| {
                         d.child(
                             div()
-                                .text_size(px(9.5))
+                                .text_size(crate::theme::ui_px(9.5))
                                 .text_color(rgb(crate::theme::Theme::warning()))
                                 .child(format!("缺少 {tool}")),
                         )
@@ -2147,7 +2167,7 @@ impl SettingsView {
                     .when(spec.is_none(), |d| {
                         d.child(
                             div()
-                                .text_size(px(9.))
+                                .text_size(crate::theme::ui_px(9.))
                                 .text_color(rgb(crate::theme::Theme::fg_faint()))
                                 .child("官方独立安装器"),
                         )
@@ -2259,7 +2279,7 @@ impl SettingsView {
         let Some(app) = self.app.clone() else {
             return div()
                 .p_3()
-                .text_size(px(12.))
+                .text_size(crate::theme::ui_px(12.))
                 .child("此页面需要应用上下文")
                 .into_any_element();
         };
@@ -2297,13 +2317,13 @@ impl SettingsView {
                             .gap_2()
                             .child(
                                 div()
-                                    .text_size(px(12.))
+                                    .text_size(crate::theme::ui_px(12.))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .child(s.name.clone()),
                             )
                             .child(
                                 div()
-                                    .text_size(px(9.5))
+                                    .text_size(crate::theme::ui_px(9.5))
                                     .text_color(rgb(crate::theme::Theme::fg_faint()))
                                     .child(format!(
                                         "v{} · {} · {}",
@@ -2313,7 +2333,7 @@ impl SettingsView {
                             .when(s.has_worker, |d| {
                                 d.child(
                                     div()
-                                        .text_size(px(9.))
+                                        .text_size(crate::theme::ui_px(9.))
                                         .px_1()
                                         .rounded_sm()
                                         .bg(rgb(crate::theme::Theme::bg_active()))
@@ -2323,7 +2343,7 @@ impl SettingsView {
                             .child(div().flex_1())
                             .child(
                                 div()
-                                    .text_size(px(9.5))
+                                    .text_size(crate::theme::ui_px(9.5))
                                     .text_color(rgb(if enabled {
                                         crate::theme::Theme::success()
                                     } else {
@@ -2352,7 +2372,7 @@ impl SettingsView {
                             let perms = row.requested_permissions.join(", ");
                             d.child(
                                 div()
-                                    .text_size(px(9.))
+                                    .text_size(crate::theme::ui_px(9.))
                                     .text_color(rgb(crate::theme::Theme::fg_dim()))
                                     .child(format!(
                                         "贡献({counts})权限: {perms} · worker/CLI 以当前系统用户运行"
@@ -2373,7 +2393,7 @@ impl SettingsView {
                                 .unwrap();
                             d.child(
                                 div()
-                                    .text_size(px(9.))
+                                    .text_size(crate::theme::ui_px(9.))
                                     .text_color(rgb(if row.compatible {
                                         crate::theme::Theme::fg_dim()
                                     } else {
@@ -2393,7 +2413,7 @@ impl SettingsView {
                     )
                     .child(
                         div()
-                            .text_size(px(10.))
+                            .text_size(crate::theme::ui_px(10.))
                             .text_color(rgb(crate::theme::Theme::fg_dim()))
                             .child(if s.description.is_empty() {
                                 "—".to_string()
@@ -2403,7 +2423,7 @@ impl SettingsView {
                     )
                     .child(
                         div()
-                            .text_size(px(9.5))
+                            .text_size(crate::theme::ui_px(9.5))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
                             .child(format!(
                                 "权限: fs_read={} fs_write={} net={} spawn={} hooks={} · 授权:{}",
@@ -2518,7 +2538,7 @@ impl SettingsView {
                                             .child(
                                                 div()
                                                     .flex_1()
-                                                    .text_size(px(10.))
+                                                    .text_size(crate::theme::ui_px(10.))
                                                     .text_color(rgb(crate::theme::Theme::warning()))
                                                     .child("重新授权将接受该插件当前的能力声明、worker 命令与钩子配置。"),
                                             )
@@ -2594,14 +2614,14 @@ impl SettingsView {
             )
             .child(
                 div()
-                    .text_size(px(10.))
+                    .text_size(crate::theme::ui_px(10.))
                     .text_color(rgb(crate::theme::Theme::warning()))
                     .child("⚠ 插件权限只约束其与 MonkeyFence 宿主接口的交互;worker 进程与 CLI 仍以当前 Windows 用户权限运行。"),
             )
             .child(
                 div()
                     .id("plugin-status-line")
-                    .text_size(px(10.5))
+                    .text_size(crate::theme::ui_px(10.5))
                     .text_color(rgb(crate::theme::Theme::fg_dim()))
                     .child(self.plugin_status.clone()),
             );
@@ -2620,7 +2640,7 @@ impl Toggle for bool {
 
 fn label_value(text: &str) -> impl IntoElement {
     div()
-        .text_size(px(11.5))
+        .text_size(crate::theme::ui_px(11.5))
         .text_color(rgb(crate::theme::Theme::fg()))
         .child(text.to_string())
 }
@@ -2637,7 +2657,7 @@ fn responsibility_row(title: &str, description: &str, badge: &str) -> impl IntoE
         .child(
             div()
                 .w(px(72.))
-                .text_size(px(10.5))
+                .text_size(crate::theme::ui_px(10.5))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(crate::theme::Theme::fg()))
                 .child(title.to_string()),
@@ -2645,7 +2665,7 @@ fn responsibility_row(title: &str, description: &str, badge: &str) -> impl IntoE
         .child(
             div()
                 .flex_1()
-                .text_size(px(9.5))
+                .text_size(crate::theme::ui_px(9.5))
                 .text_color(rgb(crate::theme::Theme::fg_dim()))
                 .child(description.to_string()),
         )
@@ -2655,7 +2675,7 @@ fn responsibility_row(title: &str, description: &str, badge: &str) -> impl IntoE
                 .py_0p5()
                 .rounded_sm()
                 .bg(rgb(crate::theme::Theme::bg_active()))
-                .text_size(px(8.5))
+                .text_size(crate::theme::ui_px(8.5))
                 .text_color(rgb(crate::theme::Theme::accent()))
                 .child(badge.to_string()),
         )
@@ -2678,8 +2698,8 @@ fn toggle_row(
         .cursor_pointer()
         .child(
             div()
-                .w(px(30.))
-                .h(px(16.))
+                .w(px(34.))
+                .h(px(18.))
                 .rounded_full()
                 .bg(rgb(if on {
                     crate::theme::Theme::accent()
@@ -2691,13 +2711,13 @@ fn toggle_row(
                     div()
                         .absolute()
                         .top(px(2.))
-                        .left(px(if on { 16. } else { 2. }))
-                        .size(px(12.))
+                        .left(px(if on { 18. } else { 2. }))
+                        .size(px(14.))
                         .rounded_full()
                         .bg(rgb(crate::theme::Theme::bg_elevated())),
                 ),
         )
-        .child(div().text_size(px(11.5)).child(label.to_string()))
+        .child(div().text_size(crate::theme::ui_px(11.5)).child(label.to_string()))
         .on_click(cx.listener(handler))
 }
 
@@ -2712,13 +2732,13 @@ fn mini_btn(
     div()
         .id(id)
         .px_2()
-        .h(px(18.))
+        .h(px(20.))
         .flex()
         .items_center()
         .rounded_md()
         .border_1()
         .border_color(rgb(color))
-        .text_size(px(9.5))
+        .text_size(crate::theme::ui_px(9.5))
         .text_color(rgb(color))
         .cursor_pointer()
         .hover(move |d| d.bg(rgb(color)).text_color(rgb(crate::theme::Theme::bg())))
@@ -2730,13 +2750,13 @@ fn mini_btn_disabled(id: impl Into<gpui::ElementId>, label: &str) -> impl IntoEl
     div()
         .id(id)
         .px_2()
-        .h(px(18.))
+        .h(px(20.))
         .flex()
         .items_center()
         .rounded_md()
         .border_1()
         .border_color(rgb(crate::theme::Theme::border()))
-        .text_size(px(9.5))
+        .text_size(crate::theme::ui_px(9.5))
         .text_color(rgb(crate::theme::Theme::fg_faint()))
         .child(label.to_string())
 }
@@ -2750,11 +2770,11 @@ fn link_btn(
     div()
         .id(id)
         .px_2()
-        .h(px(18.))
+        .h(px(20.))
         .flex()
         .items_center()
         .rounded_md()
-        .text_size(px(9.5))
+        .text_size(crate::theme::ui_px(9.5))
         .text_color(rgb(crate::theme::Theme::accent()))
         .cursor_pointer()
         .hover(|d| d.underline())
