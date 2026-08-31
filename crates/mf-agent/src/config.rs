@@ -85,6 +85,9 @@ pub struct EditorConfig {
     pub font_family: String,
     #[serde(default = "default_font_size")]
     pub font_size: f32,
+    /// night-voyage | morning-mist；未知值回退 night-voyage。
+    #[serde(default = "default_theme")]
+    pub theme: String,
 }
 
 fn default_font_family() -> String {
@@ -93,12 +96,16 @@ fn default_font_family() -> String {
 fn default_font_size() -> f32 {
     13.0
 }
+fn default_theme() -> String {
+    "night-voyage".into()
+}
 
 impl Default for EditorConfig {
     fn default() -> Self {
         Self {
             font_family: default_font_family(),
             font_size: default_font_size(),
+            theme: default_theme(),
         }
     }
 }
@@ -137,6 +144,15 @@ pub struct AgentsConfig {
     pub default_agent: String,
 }
 
+/// 插件贡献实例的用户配置。核心不理解字段语义，只按完整贡献 ID
+/// 保存插件声明的键值；默认值仍由插件清单提供，避免插件升级时把默认值
+/// 复制进用户配置。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginInstanceConfig {
+    #[serde(default)]
+    pub values: HashMap<String, String>,
+}
+
 fn default_permission_mode() -> String {
     "yolo".into()
 }
@@ -171,6 +187,9 @@ pub struct Config {
     pub terminal: TerminalConfig,
     #[serde(default)]
     pub agents: AgentsConfig,
+    /// 完整贡献 ID → 单一实例配置。当前不修改 Git/P4/Agent 的全局配置文件。
+    #[serde(default)]
+    pub plugin_instances: HashMap<String, PluginInstanceConfig>,
 }
 
 impl Default for Config {
@@ -196,6 +215,7 @@ impl Default for Config {
             editor: EditorConfig::default(),
             terminal: TerminalConfig::default(),
             agents: AgentsConfig::default(),
+            plugin_instances: HashMap::new(),
         }
     }
 }
@@ -285,5 +305,51 @@ max_failures = 3
                 api_key: String::new(),
                 model: String::new(),
             })
+    }
+
+    /// 读取插件实例字段；用户未覆盖时返回插件清单给出的默认值。
+    pub fn plugin_value(&self, contribution_id: &str, field_id: &str, default: &str) -> String {
+        self.plugin_instances
+            .get(contribution_id)
+            .and_then(|instance| instance.values.get(field_id))
+            .cloned()
+            .unwrap_or_else(|| default.to_string())
+    }
+
+    /// 写入单一插件实例字段。配置只属于 MonkeyFence，不触碰工具的全局配置。
+    pub fn set_plugin_value(
+        &mut self,
+        contribution_id: impl Into<String>,
+        field_id: impl Into<String>,
+        value: impl Into<String>,
+    ) {
+        self.plugin_instances
+            .entry(contribution_id.into())
+            .or_default()
+            .values
+            .insert(field_id.into(), value.into());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_instance_values_round_trip_without_tool_global_state() {
+        let mut config = Config::default();
+        config.editor.theme = "morning-mist".into();
+        config.set_plugin_value("monkeyfence.vcs.git", "executable", "C:/Git/bin/git.exe");
+        let text = toml::to_string(&config).unwrap();
+        let restored: Config = toml::from_str(&text).unwrap();
+        assert_eq!(
+            restored.plugin_value("monkeyfence.vcs.git", "executable", "git"),
+            "C:/Git/bin/git.exe"
+        );
+        assert_eq!(
+            restored.plugin_value("monkeyfence.vcs.p4", "executable", "p4"),
+            "p4"
+        );
+        assert_eq!(restored.editor.theme, "morning-mist");
     }
 }

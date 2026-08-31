@@ -8,12 +8,14 @@ fn parses_every_v2_contribution() {
     assert_eq!(manifest.agent_types.len(), 1);
     assert_eq!(manifest.node_types.len(), 1);
     assert_eq!(manifest.execution_directory_providers.len(), 1);
+    assert_eq!(manifest.vcs_providers.len(), 1);
     assert_eq!(manifest.secret_stores.len(), 1);
     assert_eq!(manifest.ui_schemas.len(), 1);
     let agent = &manifest.agent_types[0];
     assert_eq!(agent.adapter, "generic-command");
     assert_eq!(agent.detect_commands, vec!["demo".to_string()]);
     assert!(agent.modes.contains(&"interactive".to_string()));
+    assert_eq!(manifest.vcs_providers[0].settings.len(), 2);
 }
 
 #[test]

@@ -36,18 +36,21 @@ pub struct Palette {
     pub syn_attribute: u32,
 }
 
-/// 深色(默认):与 docs/requirements/prototype.html 的 Zed 深色原型同源。
+pub const NIGHT_VOYAGE_ID: &str = "night-voyage";
+pub const MORNING_MIST_ID: &str = "morning-mist";
+
+/// 夜航:低眩光海军蓝暗色主题。
 pub const DARK: Palette = Palette {
-    bg: 0x1a1f26,
-    bg_panel: 0x22272f,
-    bg_elevated: 0x282e38,
-    bg_hover: 0x303743,
-    bg_active: 0x282e38,
-    border: 0x333a45,
-    fg: 0xd7dce3,
-    fg_dim: 0x8b95a3,
-    fg_faint: 0x596371,
-    accent: 0x4d9fff,
+    bg: 0x151b24,
+    bg_panel: 0x1c2430,
+    bg_elevated: 0x232d3a,
+    bg_hover: 0x2b3746,
+    bg_active: 0x273546,
+    border: 0x334152,
+    fg: 0xdde5ef,
+    fg_dim: 0x96a4b5,
+    fg_faint: 0x607084,
+    accent: 0x62aaf7,
     accent_dim: 0x315f91,
     success: 0x4ec97e,
     warning: 0xe0b23c,
@@ -69,19 +72,19 @@ pub const DARK: Palette = Palette {
     syn_attribute: 0x9cdcfe,
 };
 
-/// 浅色(纸面感,语法色降饱和)
+/// 晨雾:略带暖灰的纸面亮色主题。
 pub const LIGHT: Palette = Palette {
-    bg: 0xf6f7f9,
-    bg_panel: 0xffffff,
-    bg_elevated: 0xeef0f4,
-    bg_hover: 0xe4e8ee,
-    bg_active: 0xd9dfe8,
-    border: 0xd4d8e0,
-    fg: 0x24292f,
-    fg_dim: 0x5d6470,
-    fg_faint: 0x8a919c,
-    accent: 0x2f6fdb,
-    accent_dim: 0x9db8e4,
+    bg: 0xf3f2ee,
+    bg_panel: 0xfbfaf7,
+    bg_elevated: 0xeae9e4,
+    bg_hover: 0xe1e4e8,
+    bg_active: 0xd8e0eb,
+    border: 0xd4d3ce,
+    fg: 0x252a31,
+    fg_dim: 0x5f6874,
+    fg_faint: 0x8c949d,
+    accent: 0x356fc4,
+    accent_dim: 0xa9bfdd,
     success: 0x3f8f4f,
     warning: 0xb07d24,
     danger: 0xc93a52,
@@ -103,15 +106,25 @@ pub const LIGHT: Palette = Palette {
 };
 
 static PALETTE: RwLock<Palette> = RwLock::new(DARK);
+static THEME_ID: RwLock<&'static str> = RwLock::new(NIGHT_VOYAGE_ID);
 
-/// 切换主题(调用方负责随后 cx.notify 触发重绘)
-pub fn set_theme(light: bool) {
-    let mut p = PALETTE.write().unwrap();
-    *p = if light { LIGHT } else { DARK };
+/// 按稳定 ID 切换主题；未知 ID 安全回退到夜航。
+pub fn set_theme_id(id: &str) -> &'static str {
+    let (id, palette) = match id {
+        MORNING_MIST_ID => (MORNING_MIST_ID, LIGHT),
+        _ => (NIGHT_VOYAGE_ID, DARK),
+    };
+    *PALETTE.write().unwrap() = palette;
+    *THEME_ID.write().unwrap() = id;
+    id
+}
+
+pub fn current_theme_id() -> &'static str {
+    *THEME_ID.read().unwrap()
 }
 
 pub fn is_light() -> bool {
-    PALETTE.read().unwrap().fg > 0x80_00_00
+    current_theme_id() == MORNING_MIST_ID
 }
 
 fn p() -> Palette {

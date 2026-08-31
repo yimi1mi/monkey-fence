@@ -82,6 +82,7 @@ pub fn summaries_from_registry(
                     "execution_directories".into(),
                     s.execution_directories_count,
                 ),
+                ("vcs_providers".into(), s.vcs_providers_count),
                 ("secret_stores".into(), s.secret_stores_count),
                 ("workflow_templates".into(), s.workflow_templates_count),
                 ("skills".into(), s.skills_count),

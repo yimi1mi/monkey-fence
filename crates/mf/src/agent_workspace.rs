@@ -1,9 +1,10 @@
-//! Agent Workspace:Work 表面的中心职责(替代旧 Cockpit)。
+//! Agent 工作区的四个稳定职责:
+//! - `Instances`:CLI、参数、环境、Secrets 与隔离配置的唯一编辑入口；
+//! - `Workflow`:只编排节点/依赖/指令并引用既有实例；
+//! - `Sessions`:展示所有实时 CLI/Transcript，不承担配置；
+//! - `Runs`:统一观察与处理运行状态。
 //!
-//! - `Agents` 视图:Orca 风格四列看板(需要你 / 工作中 / 已完成 / 空闲),
-//!   默认汇总所有打开项目,支持按项目与文本过滤;卡片点开近全屏终端或 transcript。
-//! - `Pipeline` 视图:左到右拓扑列布局 + 节点编辑器 + 工具栏
-//!   (从模板创建 / AI 生成 / 添加 Step / 校验 / 确认并运行 / 暂停 / 继续 / 取消)。
+//! 旧 Pipeline 实现暂留作迁移代码，但不再暴露重复入口。
 
 use crate::app_ctx::AppCtx;
 use crate::project_context::{normalize_project_path, ActivationTarget};
@@ -28,10 +29,9 @@ impl EventEmitter<AgentWorkspaceEvent> for AgentWorkspace {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkspaceView {
-    Agents,
-    Pipeline,
     Instances,
     Workflow,
+    Sessions,
     Runs,
 }
 
@@ -129,7 +129,7 @@ impl AgentWorkspace {
         let app_for_pages = app.clone();
         let ws = AgentWorkspace {
             app,
-            view: WorkspaceView::Agents,
+            view: WorkspaceView::Instances,
             cards: Vec::new(),
             project_roots: Vec::new(),
             global_active_runs: 0,
@@ -164,15 +164,11 @@ impl AgentWorkspace {
     }
 
     /// Workspace 泵推送统一快照(与 TaskSidebar 同一 revision)。
-    /// Pipeline detail 在 revision 变化时刷新;不恢复独立全局轮询。
+    /// 实时会话与运行监控消费快照；工作流页维护自己的任务本地草稿。
     pub fn set_overview(&mut self, snapshot: Arc<ProjectOverviewSnapshot>, cx: &mut Context<Self>) {
         self.cards = snapshot.agent_cards.clone();
-        self.templates = snapshot.templates.clone();
         self.project_roots = snapshot.projects.iter().map(|p| p.root.clone()).collect();
         self.global_active_runs = snapshot.global_active_runs;
-        if !self.dirty {
-            self.refresh_pipeline_state();
-        }
         // 后台事件到达:运行监控同步刷新投影
         self.runs_page
             .update(cx, |page, cx| page.refresh_snapshot(cx));
@@ -181,8 +177,8 @@ impl AgentWorkspace {
 
     pub fn show_tab(&mut self, tab: crate::workspace::AgentTab, cx: &mut Context<Self>) {
         self.view = match tab {
-            crate::workspace::AgentTab::Agents => WorkspaceView::Agents,
-            crate::workspace::AgentTab::Pipeline => WorkspaceView::Pipeline,
+            crate::workspace::AgentTab::Sessions => WorkspaceView::Sessions,
+            crate::workspace::AgentTab::Workflow => WorkspaceView::Workflow,
             crate::workspace::AgentTab::Runs => WorkspaceView::Runs,
         };
         cx.notify();
@@ -205,8 +201,7 @@ impl AgentWorkspace {
             // 切换任务时清空编辑缓冲:防止 A 的草稿文本写进 B 的字段
             self.active_field = Field::None;
             self.field_buffer.clear();
-            self.view = WorkspaceView::Pipeline;
-            self.refresh_pipeline_state();
+            self.view = WorkspaceView::Workflow;
             cx.notify();
         }
     }
@@ -536,6 +531,13 @@ impl AgentWorkspace {
             .h(px(34.))
             .border_b_1()
             .border_color(rgb(crate::theme::Theme::border()))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(crate::theme::Theme::fg()))
+                    .child("实时会话"),
+            )
             .child(
                 div()
                     .id("filter-project")
@@ -2092,16 +2094,14 @@ impl Render for AgentWorkspace {
             .h(px(30.))
             .border_b_1()
             .border_color(rgb(crate::theme::Theme::border()))
-            .child(tab_btn(cx, WorkspaceView::Agents, "Agents", self.view))
-            .child(tab_btn(cx, WorkspaceView::Pipeline, "Pipeline", self.view))
-            .child(tab_btn(cx, WorkspaceView::Instances, "实例", self.view))
+            .child(tab_btn(cx, WorkspaceView::Instances, "智能体", self.view))
             .child(tab_btn(cx, WorkspaceView::Workflow, "工作流", self.view))
-            .child(tab_btn(cx, WorkspaceView::Runs, "运行监控", self.view));
+            .child(tab_btn(cx, WorkspaceView::Sessions, "会话", self.view))
+            .child(tab_btn(cx, WorkspaceView::Runs, "运行", self.view));
         let body = match self.view {
-            WorkspaceView::Agents => self.render_agents_view(cx, window),
-            WorkspaceView::Pipeline => self.render_pipeline_view(cx, window),
             WorkspaceView::Instances => self.instances_page.clone().into_any_element(),
             WorkspaceView::Workflow => self.workflow_page.clone().into_any_element(),
+            WorkspaceView::Sessions => self.render_agents_view(cx, window),
             WorkspaceView::Runs => self.runs_page.clone().into_any_element(),
         };
         div()
@@ -2297,6 +2297,21 @@ fn tab_btn(
         .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
         .child(label.to_string())
         .on_click(cx.listener(move |ws: &mut AgentWorkspace, _, _, cx| {
+            match target {
+                WorkspaceView::Instances => {
+                    ws.instances_page.update(cx, |page, cx| {
+                        page.refresh();
+                        cx.notify();
+                    });
+                }
+                WorkspaceView::Workflow => {
+                    ws.workflow_page.update(cx, |page, cx| {
+                        page.refresh_library();
+                        cx.notify();
+                    });
+                }
+                _ => {}
+            }
             ws.view = target;
             cx.notify();
         }))

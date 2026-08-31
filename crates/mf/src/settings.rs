@@ -11,6 +11,7 @@ pub struct Dismissed;
 pub enum Page {
     Appearance,
     EditorTerm,
+    VersionControl,
     Providers,
     Roles,
     Engine,
@@ -38,6 +39,10 @@ pub struct SettingsView {
     plugin_local_s: String,
     plugin_git_s: String,
     plugin_status: SharedString,
+    /// 版本控制页:当前选中的插件贡献完整 ID 与测试状态。
+    selected_vcs_provider: String,
+    vcs_test_status: SharedString,
+    vcs_test_root: Option<std::path::PathBuf>,
     /// Provider 管理页当前选中的提供方名
     selected_provider_name: String,
     test_status: SharedString,
@@ -58,7 +63,7 @@ actions!(settings, [Dismiss]);
 
 const ROLES: &[&str] = &["planner", "worker", "reviewer"];
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 enum Field {
     RoleProvider,
     BaseUrl,
@@ -76,6 +81,8 @@ enum Field {
     AgentEnv,
     PluginLocal,
     PluginGit,
+    /// 插件声明式设置字段(完整贡献 ID + 字段 ID)。
+    PluginSetting(String, String),
 }
 
 impl SettingsView {
@@ -105,6 +112,9 @@ impl SettingsView {
             plugin_local_s: String::new(),
             plugin_git_s: String::new(),
             plugin_status: "".into(),
+            selected_vcs_provider: String::new(),
+            vcs_test_status: "".into(),
+            vcs_test_root: None,
             selected_provider_name,
             test_status: "".into(),
             selected_role: "planner".into(),
@@ -120,10 +130,20 @@ impl SettingsView {
 
     pub fn new_with_app(
         app: std::sync::Arc<crate::app_ctx::AppCtx>,
+        active_project_root: Option<std::path::PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
         let mut view = Self::new(cx);
+        view.selected_vcs_provider = app
+            .plugins
+            .contributions()
+            .vcs_providers()
+            .into_iter()
+            .next()
+            .map(|(full_id, _, _)| full_id)
+            .unwrap_or_default();
         view.app = Some(app);
+        view.vcs_test_root = active_project_root;
         view
     }
 
@@ -166,7 +186,7 @@ impl SettingsView {
             })
     }
 
-    fn field_text(&self, f: Field) -> String {
+    fn field_text(&self, f: &Field) -> String {
         match f {
             Field::RoleProvider => self
                 .draft
@@ -189,6 +209,19 @@ impl SettingsView {
             Field::AgentEnv => self.agent_env_s.clone(),
             Field::PluginLocal => self.plugin_local_s.clone(),
             Field::PluginGit => self.plugin_git_s.clone(),
+            Field::PluginSetting(contribution_id, field_id) => self
+                .vcs_provider(contribution_id)
+                .and_then(|provider| {
+                    provider
+                        .settings
+                        .iter()
+                        .find(|field| field.id == *field_id)
+                        .map(|field| {
+                            self.draft
+                                .plugin_value(contribution_id, field_id, &field.default)
+                        })
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -221,6 +254,7 @@ impl SettingsView {
         self.max_iters_s = self.draft.engine.max_iterations.to_string();
         self.max_failures_s = self.draft.engine.max_failures.to_string();
         self.font_size_s = format!("{:.1}", self.draft.editor.font_size);
+        crate::theme::set_theme_id(&self.draft.editor.theme);
         self.status = "已恢复默认(未保存)".into();
         self.active_field = None;
         cx.notify();
@@ -334,12 +368,13 @@ impl SettingsView {
         })
         .detach();
     }
-    fn apply_theme(&mut self, light: bool, cx: &mut Context<Self>) {
-        crate::theme::set_theme(light);
-        self.status = if light {
-            "已切换浅色主题(即时生效)"
+    fn apply_theme(&mut self, theme_id: &'static str, cx: &mut Context<Self>) {
+        let applied = crate::theme::set_theme_id(theme_id);
+        self.draft.editor.theme = applied.into();
+        self.status = if applied == crate::theme::MORNING_MIST_ID {
+            "已切换「晨雾」亮色主题(即时生效，保存后记住)"
         } else {
-            "已切换深色主题(即时生效)"
+            "已切换「夜航」暗色主题(即时生效，保存后记住)"
         }
         .into();
         cx.notify();
@@ -380,7 +415,9 @@ impl Render for SettingsView {
             .on_key_down(
                 cx.listener(|s: &mut SettingsView, e: &KeyDownEvent, window, cx| {
                     // 所有轻量输入共用窗口焦点;active_field 决定字符去向(用户既有模式)
-                    let Some(field) = s.active_field else { return };
+                    let Some(field) = s.active_field.clone() else {
+                        return;
+                    };
                     if !s.focus_handle.is_focused(window) {
                         return;
                     }
@@ -394,7 +431,7 @@ impl Render for SettingsView {
                                 let printable: String =
                                     chars.chars().filter(|c| !c.is_control()).collect();
                                 if !printable.is_empty() {
-                                    s.push_field(field, &printable, cx);
+                                    s.push_field(field.clone(), &printable, cx);
                                 }
                             }
                         }
@@ -464,7 +501,7 @@ impl SettingsView {
                             .id("settings-hint")
                             .text_size(px(11.))
                             .text_color(rgb(crate::theme::Theme::fg_faint()))
-                            .child("引擎/提供方改动在下次打开项目或新建运行时生效;主题与字体立即应用。"),
+                            .child("引擎/提供方改动在下次打开项目或新建运行时生效；VCS 环境保存后立即刷新当前项目。"),
                     ),
             )
             .into_any_element()
@@ -474,16 +511,19 @@ impl SettingsView {
     fn render_nav(&self, cx: &Context<Self>) -> AnyElement {
         let general = [Page::Appearance, Page::EditorTerm];
         let agent = [Page::Agents, Page::Providers, Page::Roles, Page::Plugins];
+        let vcs = [Page::VersionControl];
         let engine = [Page::Engine];
         let groups: Vec<(&str, &[Page])> = vec![
             ("通用", &general),
             ("Agent 与模型", &agent),
+            ("项目工具", &vcs),
             ("引擎", &engine),
         ];
         let page_name = |p: Page| match p {
             Page::Appearance => "外观",
             Page::EditorTerm => "编辑器与终端",
-            Page::Agents => "智能体",
+            Page::VersionControl => "版本控制",
+            Page::Agents => "全局 Agent 策略",
             Page::Providers => "Provider 管理",
             Page::Roles => "角色绑定",
             Page::Plugins => "插件",
@@ -552,10 +592,11 @@ impl SettingsView {
         match self.page {
             Page::Appearance => self.render_appearance_section(window, cx),
             Page::EditorTerm => self.render_editor_section(window, cx),
+            Page::VersionControl => self.render_vcs_page(window, cx),
             Page::Providers => self.render_providers_page(window, cx),
             Page::Roles => self.render_roles_page(window, cx),
             Page::Engine => self.render_engine_section(window, cx),
-            Page::Agents => self.render_agents_page(window, cx),
+            Page::Agents => self.render_agent_policy_page(cx),
             Page::Plugins => self.render_plugins_page(window, cx),
         }
     }
@@ -565,7 +606,7 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let light = crate::theme::is_light();
+        let theme_id = crate::theme::current_theme_id();
         div()
             .id("appearance-fields")
             .flex()
@@ -575,16 +616,25 @@ impl SettingsView {
             .child(
                 div()
                     .flex()
-                    .items_center()
                     .gap_2()
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(rgb(crate::theme::Theme::fg_dim()))
-                            .child("主题"),
-                    )
-                    .child(theme_btn("深色", !light, false, cx))
-                    .child(theme_btn("浅色", light, true, cx)),
+                    .child(theme_btn(
+                        "夜航",
+                        "暗色 · 低眩光海军蓝",
+                        theme_id == crate::theme::NIGHT_VOYAGE_ID,
+                        crate::theme::NIGHT_VOYAGE_ID,
+                        0x151b24,
+                        0x62aaf7,
+                        cx,
+                    ))
+                    .child(theme_btn(
+                        "晨雾",
+                        "亮色 · 暖灰纸面",
+                        theme_id == crate::theme::MORNING_MIST_ID,
+                        crate::theme::MORNING_MIST_ID,
+                        0xf3f2ee,
+                        0x356fc4,
+                        cx,
+                    )),
             )
             .child(field_row(
                 "字号(px)",
@@ -801,6 +851,289 @@ impl SettingsView {
             .child(prov_name.to_string())
     }
 
+    fn vcs_provider(&self, full_id: &str) -> Option<mf_plugins::manifest::VcsProviderContribution> {
+        self.app
+            .as_ref()?
+            .plugins
+            .contributions()
+            .find_vcs_provider(full_id)
+            .map(|(_, provider)| provider)
+    }
+
+    fn test_vcs_provider(&mut self, cx: &mut Context<Self>) {
+        let Some(app) = self.app.clone() else {
+            self.vcs_test_status = "应用上下文不可用".into();
+            cx.notify();
+            return;
+        };
+        let full_id = self.selected_vcs_provider.clone();
+        if full_id.is_empty() {
+            self.vcs_test_status = "没有已启用的 VCS Provider 插件".into();
+            cx.notify();
+            return;
+        }
+        let registry = app.plugins.contributions();
+        let config = self.draft.clone();
+        let cwd = self
+            .vcs_test_root
+            .clone()
+            .or_else(|| app.project_roots().into_iter().next())
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        self.vcs_test_status = "正在测试插件实例…".into();
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    mf_plugins::vcs_provider::test_provider(&registry, &config, &full_id, &cwd)
+                })
+                .await;
+            this.update(cx, |settings, cx| {
+                settings.vcs_test_status = match result {
+                    Ok(detail) => format!("✓ {detail}").into(),
+                    Err(error) => format!("✕ {error:#}").into(),
+                };
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 通用 VCS 插件设置页。列表、字段、默认值和适配器说明全部来自
+    /// ContributionRegistry；增加第三方 Provider 不需要修改这里的字段代码。
+    fn render_vcs_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(app) = self.app.clone() else {
+            return div()
+                .p_3()
+                .text_size(px(12.))
+                .child("此页面需要应用上下文")
+                .into_any_element();
+        };
+        let providers = app.plugins.contributions().vcs_providers();
+        if providers.is_empty() {
+            return div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(section("版本控制"))
+                .child("没有已启用且贡献 VCS Provider 的插件。")
+                .into_any_element();
+        }
+        if !providers
+            .iter()
+            .any(|(full_id, _, _)| *full_id == self.selected_vcs_provider)
+        {
+            self.selected_vcs_provider = providers[0].0.clone();
+        }
+        let selected_id = self.selected_vcs_provider.clone();
+        let selected_provider = providers
+            .iter()
+            .find(|(full_id, _, _)| *full_id == selected_id)
+            .map(|(_, _, provider)| provider.clone())
+            .unwrap_or_else(|| providers[0].2.clone());
+
+        let mut provider_list = div()
+            .id("vcs-provider-list")
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(section("已启用的 VCS Provider 插件"));
+        for (full_id, source, provider) in &providers {
+            let selected = *full_id == selected_id;
+            let id = full_id.clone();
+            provider_list = provider_list.child(
+                div()
+                    .id(ElementId::Name(format!("vcs-provider-{full_id}").into()))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .when(selected, |row| {
+                        row.bg(rgb(crate::theme::Theme::bg_active()))
+                            .border_l_2()
+                            .border_color(rgb(crate::theme::Theme::accent()))
+                    })
+                    .hover(|row| row.bg(rgb(crate::theme::Theme::bg_hover())))
+                    .on_click(cx.listener(move |settings, _, _, cx| {
+                        settings.selected_vcs_provider = id.clone();
+                        settings.vcs_test_status = "".into();
+                        settings.active_field = None;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(90.))
+                            .text_size(px(12.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(provider.name.clone()),
+                    )
+                    .child(kind_badge(&provider.adapter))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .text_color(rgb(crate::theme::Theme::fg_faint()))
+                            .child(format!(
+                                "{} {}",
+                                source.plugin_full_id, source.plugin_version
+                            )),
+                    ),
+            );
+        }
+
+        let mut fields = div()
+            .id("vcs-provider-settings")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(section(format!("{} 环境", selected_provider.name)))
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgb(crate::theme::Theme::fg_dim()))
+                    .child(selected_provider.description.clone()),
+            );
+        for field in selected_provider.settings.clone() {
+            let value = self
+                .draft
+                .plugin_value(&selected_id, &field.id, &field.default);
+            match field.kind.as_str() {
+                "boolean" => {
+                    let on = value.parse::<bool>().unwrap_or(false);
+                    let contribution_id = selected_id.clone();
+                    let field_id = field.id.clone();
+                    fields = fields.child(toggle_row(
+                        cx,
+                        ElementId::Name(format!("vcs-setting-{contribution_id}-{field_id}").into()),
+                        &field.label,
+                        on,
+                        move |settings, _, _, cx| {
+                            settings.draft.set_plugin_value(
+                                contribution_id.clone(),
+                                field_id.clone(),
+                                (!on).to_string(),
+                            );
+                            settings.vcs_test_status = "".into();
+                            cx.notify();
+                        },
+                    ));
+                }
+                "select" => {
+                    let mut choices = div().flex().items_center().gap_1();
+                    for option in field.options.clone() {
+                        let active = value == option.value;
+                        let contribution_id = selected_id.clone();
+                        let field_id = field.id.clone();
+                        let option_value = option.value.clone();
+                        choices = choices.child(
+                            div()
+                                .id(ElementId::Name(
+                                    format!(
+                                        "vcs-setting-{contribution_id}-{field_id}-{option_value}"
+                                    )
+                                    .into(),
+                                ))
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(if active {
+                                    crate::theme::Theme::accent()
+                                } else {
+                                    crate::theme::Theme::border()
+                                }))
+                                .text_size(px(10.5))
+                                .text_color(rgb(if active {
+                                    crate::theme::Theme::accent()
+                                } else {
+                                    crate::theme::Theme::fg_dim()
+                                }))
+                                .cursor_pointer()
+                                .hover(|item| item.bg(rgb(crate::theme::Theme::bg_hover())))
+                                .child(option.label)
+                                .on_click(cx.listener(move |settings, _, _, cx| {
+                                    settings.draft.set_plugin_value(
+                                        contribution_id.clone(),
+                                        field_id.clone(),
+                                        option_value.clone(),
+                                    );
+                                    settings.vcs_test_status = "".into();
+                                    cx.notify();
+                                })),
+                        );
+                    }
+                    fields = fields.child(field_row(&field.label, choices));
+                }
+                _ => {
+                    fields = fields.child(field_row(
+                        &field.label,
+                        self.text_input(
+                            Field::PluginSetting(selected_id.clone(), field.id.clone()),
+                            window,
+                            cx,
+                        ),
+                    ));
+                }
+            }
+            if !field.description.is_empty() {
+                fields = fields.child(
+                    div()
+                        .ml(px(118.))
+                        .text_size(px(9.5))
+                        .text_color(rgb(crate::theme::Theme::fg_faint()))
+                        .child(field.description),
+                );
+            }
+        }
+
+        div()
+            .id("vcs-settings-page")
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(provider_list)
+            .child(fields)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(small_btn(
+                        "测试环境",
+                        "vcs-test-environment",
+                        cx,
+                        cx.listener(|settings, _, _, cx| settings.test_vcs_provider(cx)),
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(rgb(if self.vcs_test_status.starts_with('✓') {
+                                crate::theme::Theme::success()
+                            } else if self.vcs_test_status.starts_with('✕') {
+                                crate::theme::Theme::danger()
+                            } else {
+                                crate::theme::Theme::fg_dim()
+                            }))
+                            .child(self.vcs_test_status.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .p_2()
+                    .rounded_sm()
+                    .bg(rgb(crate::theme::Theme::bg_elevated()))
+                    .text_size(px(10.))
+                    .text_color(rgb(crate::theme::Theme::fg_faint()))
+                    .child("这些值只保存在 MonkeyFence 的单一插件实例中，不会改写 Git 或 Perforce 的全局配置。"),
+            )
+            .into_any_element()
+    }
+
     fn render_engine_section(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("engine-fields")
@@ -878,12 +1211,12 @@ impl SettingsView {
         window: &mut Window,
         cx: &Context<Self>,
     ) -> impl IntoElement {
-        let text = self.field_text(field);
-        let is_active = self.active_field == Some(field) && self.focus_handle.is_focused(window);
+        let text = self.field_text(&field);
+        let is_active =
+            self.active_field.as_ref() == Some(&field) && self.focus_handle.is_focused(window);
+        let element_id = format!("settings-input-{field:?}");
         div()
-            .id(ElementId::Name(
-                format!("settings-input-{:?}", field).into(),
-            ))
+            .id(ElementId::Name(element_id.into()))
             .flex_1()
             .h(px(24.))
             .px_2()
@@ -898,7 +1231,7 @@ impl SettingsView {
             .text_color(rgb(crate::theme::Theme::fg()))
             .overflow_hidden()
             .on_click(cx.listener(move |s, _, window, cx| {
-                s.active_field = Some(field);
+                s.active_field = Some(field.clone());
                 let focus_handle = s.focus_handle.clone();
                 window.focus(&focus_handle, cx);
                 cx.notify();
@@ -944,6 +1277,24 @@ impl SettingsView {
             Field::AgentEnv => self.agent_env_s.push_str(text),
             Field::PluginLocal => self.plugin_local_s.push_str(text),
             Field::PluginGit => self.plugin_git_s.push_str(text),
+            Field::PluginSetting(contribution_id, field_id) => {
+                let default = self
+                    .vcs_provider(&contribution_id)
+                    .and_then(|provider| {
+                        provider
+                            .settings
+                            .into_iter()
+                            .find(|field| field.id == field_id)
+                            .map(|field| field.default)
+                    })
+                    .unwrap_or_default();
+                let current = self
+                    .draft
+                    .plugin_value(&contribution_id, &field_id, &default);
+                self.draft
+                    .set_plugin_value(contribution_id, field_id, format!("{current}{text}"));
+                self.vcs_test_status = "".into();
+            }
         }
         cx.notify();
     }
@@ -1001,6 +1352,25 @@ impl SettingsView {
             }
             Field::PluginGit => {
                 self.plugin_git_s.pop();
+            }
+            Field::PluginSetting(contribution_id, field_id) => {
+                let default = self
+                    .vcs_provider(&contribution_id)
+                    .and_then(|provider| {
+                        provider
+                            .settings
+                            .into_iter()
+                            .find(|field| field.id == field_id)
+                            .map(|field| field.default)
+                    })
+                    .unwrap_or_default();
+                let mut current = self
+                    .draft
+                    .plugin_value(&contribution_id, &field_id, &default);
+                current.pop();
+                self.draft
+                    .set_plugin_value(contribution_id, field_id, current);
+                self.vcs_test_status = "".into();
             }
         }
         cx.notify();
@@ -1161,40 +1531,174 @@ fn small_btn(
 
 fn theme_btn(
     label: &str,
+    description: &str,
     active: bool,
-    light: bool,
+    theme_id: &'static str,
+    preview_bg: u32,
+    preview_accent: u32,
     cx: &Context<SettingsView>,
 ) -> impl IntoElement {
     let label = label.to_string();
+    let description = description.to_string();
     div()
         .id(ElementId::Name(format!("theme-{}", label).into()))
-        .px_2()
-        .py_1()
+        .flex_1()
+        .p_2()
         .rounded_sm()
         .border_1()
         .cursor_pointer()
-        .text_size(px(11.))
         .border_color(rgb(if active {
             crate::theme::Theme::accent()
         } else {
             crate::theme::Theme::border()
         }))
-        .text_color(rgb(if active {
-            crate::theme::Theme::accent()
-        } else {
-            crate::theme::Theme::fg_dim()
-        }))
+        .when(active, |d| d.bg(rgb(crate::theme::Theme::bg_active())))
         .hover(|d| d.bg(rgb(crate::theme::Theme::bg_hover())))
-        .child(label)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .size(px(24.))
+                        .rounded_sm()
+                        .bg(rgb(preview_bg))
+                        .border_1()
+                        .border_color(rgb(preview_accent))
+                        .child(
+                            div()
+                                .m(px(7.))
+                                .size(px(8.))
+                                .rounded_full()
+                                .bg(rgb(preview_accent)),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(if active {
+                                    crate::theme::Theme::accent()
+                                } else {
+                                    crate::theme::Theme::fg()
+                                }))
+                                .child(label),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(9.5))
+                                .text_color(rgb(crate::theme::Theme::fg_faint()))
+                                .child(description),
+                        ),
+                ),
+        )
         .on_click(cx.listener(move |s, _, _, cx| {
-            s.apply_theme(light, cx);
+            s.apply_theme(theme_id, cx);
         }))
 }
 
 // ---------- 智能体设置页 / 插件管理页 ----------
 
 impl SettingsView {
-    fn render_agents_page(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    /// 设置页只保留跨实例的全局策略；命令、参数、环境、Secret 与隔离配置
+    /// 全部归 AgentInstancesPage，工作流只保存实例引用。
+    fn render_agent_policy_page(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let manual = self.draft.agents.permission_mode == "manual";
+        div()
+            .id("agent-policy-page")
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(section("职责边界"))
+            .child(responsibility_row(
+                "智能体",
+                "创建和编辑实例：CLI、参数、环境变量、Secret、隔离配置与启停。",
+                "唯一配置入口",
+            ))
+            .child(responsibility_row(
+                "工作流",
+                "编排节点、依赖和指令；节点只引用现有实例，不复制实例配置。",
+                "只做编排",
+            ))
+            .child(responsibility_row(
+                "会话 / 运行",
+                "查看实时 CLI、Transcript 和运行状态；不承载配置。",
+                "只做观察",
+            ))
+            .child(responsibility_row(
+                "本页",
+                "只控制所有实例共同遵守的安全与设备策略。",
+                "全局策略",
+            ))
+            .child(section("权限参数总策略"))
+            .child(toggle_row(
+                cx,
+                "perm-manual",
+                "手动确认（不自动附加权限参数）",
+                manual,
+                |settings, _, _, cx| {
+                    settings.draft.agents.permission_mode = "manual".into();
+                    cx.notify();
+                },
+            ))
+            .child(toggle_row(
+                cx,
+                "perm-yolo",
+                "自动批准（使用实例适配器生成的权限参数）",
+                !manual,
+                |settings, _, _, cx| {
+                    settings.draft.agents.permission_mode = "yolo".into();
+                    cx.notify();
+                },
+            ))
+            .child(
+                div()
+                    .p_2()
+                    .rounded_sm()
+                    .bg(rgb(crate::theme::Theme::bg_elevated()))
+                    .text_size(px(9.5))
+                    .text_color(rgb(if manual {
+                        crate::theme::Theme::fg_faint()
+                    } else {
+                        crate::theme::Theme::warning()
+                    }))
+                    .child(if manual {
+                        "实例仍可定义自己的权限模式，但 MonkeyFence 不会自动把权限参数附加到 CLI。"
+                    } else {
+                        "自动批准会减少交互中断；具体参数仍由每个 Agent 实例所属的适配器决定。"
+                    }),
+            )
+            .child(section("设备策略"))
+            .child(toggle_row(
+                cx,
+                "keep-awake",
+                "Agent 工作时保持系统唤醒",
+                self.draft.agents.keep_awake,
+                |settings, _, _, cx| {
+                    settings.draft.agents.keep_awake.toggle();
+                    cx.notify();
+                },
+            ))
+            .child(
+                div()
+                    .text_size(px(9.5))
+                    .text_color(rgb(crate::theme::Theme::fg_faint()))
+                    .child("插件安装与启停统一在「插件」页；Agent 类型不会在这里重复配置。"),
+            )
+            .into_any_element()
+    }
+
+    #[allow(dead_code)]
+    fn render_agents_page_legacy(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(app) = self.app.clone() else {
             return div()
                 .p_3()
@@ -2119,6 +2623,42 @@ fn label_value(text: &str) -> impl IntoElement {
         .text_size(px(11.5))
         .text_color(rgb(crate::theme::Theme::fg()))
         .child(text.to_string())
+}
+
+fn responsibility_row(title: &str, description: &str, badge: &str) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .p_2()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(crate::theme::Theme::border()))
+        .child(
+            div()
+                .w(px(72.))
+                .text_size(px(10.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(crate::theme::Theme::fg()))
+                .child(title.to_string()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .text_size(px(9.5))
+                .text_color(rgb(crate::theme::Theme::fg_dim()))
+                .child(description.to_string()),
+        )
+        .child(
+            div()
+                .px_1p5()
+                .py_0p5()
+                .rounded_sm()
+                .bg(rgb(crate::theme::Theme::bg_active()))
+                .text_size(px(8.5))
+                .text_color(rgb(crate::theme::Theme::accent()))
+                .child(badge.to_string()),
+        )
 }
 
 fn toggle_row(

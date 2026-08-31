@@ -313,6 +313,7 @@ pub struct AppCtx {
     #[allow(dead_code)]
     pub catalog_store: Arc<CatalogStore>,
     pub limiter: Arc<GlobalLimiter>,
+    pub keep_awake: Arc<KeepAwake>,
     pub catalog: Arc<RwLock<ProfileCatalog>>,
     pub config: Arc<Mutex<mf_agent::Config>>,
     /// 统一项目总览快照 + Orchestrator Event Hub(UI 不再直接扫描项目列表)。
@@ -355,6 +356,7 @@ impl AppCtx {
         let registry = SessionRegistry::new(config.clone());
         let limiter = GlobalLimiter::new(config.engine.global_concurrency.max(1));
         let keep_awake = Arc::new(KeepAwake::new());
+        keep_awake.set_enabled(config.agents.keep_awake);
         let catalog = Arc::new(RwLock::new(ProfileCatalog::default()));
         let orchs: Arc<Mutex<Vec<Arc<Orchestrator>>>> = Arc::new(Mutex::new(Vec::new()));
         let pipe_server = if start_pipe {
@@ -371,6 +373,7 @@ impl AppCtx {
             plugins: plugins.clone(),
             catalog_store,
             limiter: limiter.clone(),
+            keep_awake: keep_awake.clone(),
             catalog: catalog.clone(),
             config: Arc::new(Mutex::new(config)),
             overview: ProjectOverviewHub::new(Arc::new(HubCtx {
@@ -406,6 +409,16 @@ impl AppCtx {
     /// 打开的项目数。
     pub fn project_count(&self) -> usize {
         self.projects.lock().len()
+    }
+
+    /// 当前打开项目根目录快照。设置页用首个项目作为 VCS 环境测试 cwd；
+    /// 不暴露内部 ProjectHandle，也不改变前后台项目状态。
+    pub fn project_roots(&self) -> Vec<PathBuf> {
+        self.projects
+            .lock()
+            .iter()
+            .map(|project| project.root.clone())
+            .collect()
     }
 
     /// 插件注册表 → Orchestrator 的 Profile 目录投影。

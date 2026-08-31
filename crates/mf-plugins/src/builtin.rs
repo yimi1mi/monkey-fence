@@ -261,6 +261,7 @@ pub fn synthetic_manifest(agent: &BuiltinAgent) -> PluginManifest {
         }],
         node_types: vec![],
         execution_directory_providers: vec![],
+        vcs_providers: vec![],
         secret_stores: vec![],
         workflow_templates: vec![],
         skills: vec![],

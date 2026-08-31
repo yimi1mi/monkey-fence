@@ -1,8 +1,8 @@
 //! 插件根清单 `monkeyfence-plugin.toml` 的类型与校验(v2 贡献词汇表)。
 //!
 //! v2 移除 v1 的 `agents` 字段(不做兼容别名),改用 Agent Type /
-//! Node Type / Execution Directory / Secret Store / Workflow Template /
-//! UI Schema 等统一贡献词汇(ADR 0002 / 0003)。
+//! Node Type / Execution Directory / VCS Provider / Secret Store /
+//! Workflow Template / UI Schema 等统一贡献词汇(ADR 0002 / 0003)。
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,8 @@ pub struct PluginManifest {
     pub node_types: Vec<NodeTypeContribution>,
     #[serde(default)]
     pub execution_directory_providers: Vec<ExecutionDirectoryContribution>,
+    #[serde(default)]
+    pub vcs_providers: Vec<VcsProviderContribution>,
     #[serde(default)]
     pub secret_stores: Vec<SecretStoreContribution>,
     #[serde(default)]
@@ -153,6 +155,47 @@ pub struct ExecutionDirectoryContribution {
     pub description: String,
 }
 
+/// VCS Provider:版本控制环境与设置表单均由插件贡献。宿主只识别稳定的
+/// adapter 契约，并按 `settings` 声明渲染，不写死 Git/P4 字段。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VcsProviderContribution {
+    pub id: String,
+    pub name: String,
+    /// 运行时适配器契约(git-cli | perforce-cli | plugin-worker ...)。
+    pub adapter: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub settings: Vec<SettingFieldContribution>,
+}
+
+/// 声明式设置字段。`kind` 首版支持 text/path/boolean/select。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingFieldContribution {
+    pub id: String,
+    pub label: String,
+    #[serde(default = "default_setting_kind")]
+    pub kind: String,
+    #[serde(default)]
+    pub default: String,
+    #[serde(default)]
+    pub placeholder: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub options: Vec<SettingOptionContribution>,
+}
+
+fn default_setting_kind() -> String {
+    "text".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SettingOptionContribution {
+    pub value: String,
+    pub label: String,
+}
+
 /// Secret Store:加密 Secret 的存储实现。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretStoreContribution {
@@ -265,6 +308,10 @@ impl PluginManifest {
                 .collect(),
         )?;
         ensure_unique(
+            "vcs_providers",
+            self.vcs_providers.iter().map(|a| a.id.as_str()).collect(),
+        )?;
+        ensure_unique(
             "secret_stores",
             self.secret_stores.iter().map(|a| a.id.as_str()).collect(),
         )?;
@@ -283,6 +330,36 @@ impl PluginManifest {
         for a in &self.agent_types {
             if a.adapter.trim().is_empty() {
                 bail!("agent_type `{}` 缺少 adapter 契约标识", a.id);
+            }
+        }
+        for provider in &self.vcs_providers {
+            if provider.adapter.trim().is_empty() {
+                bail!("vcs_provider `{}` 缺少 adapter 契约标识", provider.id);
+            }
+            ensure_unique(
+                &format!("vcs_provider `{}` settings", provider.id),
+                provider
+                    .settings
+                    .iter()
+                    .map(|field| field.id.as_str())
+                    .collect(),
+            )?;
+            for field in &provider.settings {
+                if !matches!(field.kind.as_str(), "text" | "path" | "boolean" | "select") {
+                    bail!(
+                        "vcs_provider `{}` 字段 `{}` kind 不支持: {}",
+                        provider.id,
+                        field.id,
+                        field.kind
+                    );
+                }
+                if field.kind == "select" && field.options.is_empty() {
+                    bail!(
+                        "vcs_provider `{}` select 字段 `{}` 缺少 options",
+                        provider.id,
+                        field.id
+                    );
+                }
             }
         }
         for t in &self.ui_schemas {

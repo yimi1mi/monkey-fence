@@ -58,8 +58,8 @@ pub(crate) fn workspace_command_entries(
         ("toggle_explorer", "显示资源管理器  Ctrl+Shift+E"),
         ("toggle_tasks", "显示任务与项目管理  Ctrl+Shift+W"),
         ("toggle_vcs", "显示版本控制  Ctrl+Shift+G"),
-        ("show_agents", "Agent 看板  Ctrl+Shift+/"),
-        ("show_pipeline", "Pipeline 视图"),
+        ("show_agents", "Agent 会话  Ctrl+Shift+/"),
+        ("show_pipeline", "工作流编排"),
         ("toggle_console", "显示 / 隐藏终端  Ctrl+`"),
         ("project_search", "项目搜索…  Ctrl+Shift+F"),
         ("open_settings", "打开设置  Ctrl+,"),
@@ -222,6 +222,8 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let app = AppCtx::new();
+        let editor_config = app.config.lock().editor.clone();
+        crate::theme::set_theme_id(&editor_config.theme);
         let task_sidebar = cx.new(|cx| TaskSidebar::new(app.clone(), cx));
         let agent_workspace = cx.new(|cx| AgentWorkspace::new(app.clone(), cx));
         let mut ws = Self {
@@ -243,7 +245,7 @@ impl Workspace {
             focus_handle: cx.focus_handle(),
             focus_editor_next: false,
             pending_focus: None,
-            editor_font: mf_agent::EditorConfig::default(),
+            editor_font: editor_config,
             left_panel_width: px(284.),
             bottom_panel_height: px(228.),
             // 默认即展开形态:图标 + 中文名;拖窄到 72px 以下退回纯图标
@@ -642,7 +644,8 @@ impl Workspace {
             });
         });
         self.file_tree = Some(tree);
-        let vcs = cx.new(|cx| VcsPanel::new(root.clone(), cx));
+        let vcs_environment = self.vcs_environment();
+        let vcs = cx.new(|cx| VcsPanel::new(root.clone(), vcs_environment, cx));
         let weak = cx.weak_entity();
         vcs.update(cx, |vcs, _| {
             vcs.set_on_open_diff(move |title, local_path, _window, cx| {
@@ -665,6 +668,14 @@ impl Workspace {
                 }
             }
         }
+    }
+
+    fn vcs_environment(&self) -> mf_plugins::vcs_provider::VcsEnvironment {
+        let config = self.app.config.lock().clone();
+        mf_plugins::vcs_provider::VcsEnvironment::resolve(
+            &self.app.plugins.contributions(),
+            &config,
+        )
     }
 
     /// 请求关闭项目;存在活动 Agent Run 时弹确认。
@@ -796,64 +807,39 @@ impl Workspace {
         let Some(root) = root else {
             return;
         };
-        let (diff_text, git_review) = {
-            let p4 = mf_vcs::p4::P4::new(&root);
+        let vcs_environment = self.vcs_environment();
+        let (diff_text, git_review) = if let Some(p4) = vcs_environment.p4(&root) {
             match p4.diff_file(local_path) {
                 Ok(t) if !t.trim().is_empty() => (t, false),
                 Ok(_) => ("(无差异)".to_string(), false),
-                Err(_) => {
-                    let rel = local_path.strip_prefix(&root).unwrap_or(local_path);
-                    let diff = mf_vcs::git::Git::open(&root)
-                        .and_then(|g| g.diff_file(rel))
-                        .unwrap_or_else(|e| format!("获取 diff 失败: {e}"));
-                    (diff, true)
-                }
+                Err(_) => git_diff(&root, local_path, vcs_environment.git.is_some()),
             }
+        } else {
+            git_diff(&root, local_path, vcs_environment.git.is_some())
         };
         let view = cx.new(|cx| DiffView::new(title, &diff_text, cx));
         let view_id = view.entity_id();
         let weak = cx.weak_entity();
         let root_for_reject = root.clone();
         let root_for_remove = root.clone();
+        let git_cli = vcs_environment.git_cli(&root);
         if git_review {
             view.update(cx, |dv, _| {
                 dv.set_on_reject(move |patch, _window, cx| {
                     let weak = weak.clone();
                     let review_root = root_for_reject.clone();
                     let remove_root = root_for_remove.clone();
+                    let git_cli = git_cli.clone();
                     cx.spawn(async move |cx| {
-                        let command_root = review_root.clone();
                         let applied = cx.background_executor().spawn(async move {
-                            use std::io::Write as _;
-                            let child = std::process::Command::new("git")
-                                .arg("apply")
-                                .arg("-R")
-                                .arg("--recount")
-                                .current_dir(&command_root)
-                                .stdin(std::process::Stdio::piped())
-                                .stdout(std::process::Stdio::piped())
-                                .stderr(std::process::Stdio::piped())
-                                .spawn();
-                            match child {
-                                Ok(mut c) => {
-                                    if let Some(mut sin) = c.stdin.take() {
-                                        let _ = sin.write_all(patch.as_bytes());
-                                    }
-                                    let out = c.wait_with_output();
-                                    out.map(|o| {
-                                        if o.status.success() {
-                                            Ok(())
-                                        } else {
-                                            Err(String::from_utf8_lossy(&o.stderr)
-                                                .chars()
-                                                .take(200)
-                                                .collect())
-                                        }
-                                    })
-                                    .unwrap_or_else(|e| Err(e.to_string()))
-                                }
-                                Err(e) => Err(e.to_string()),
-                            }
+                            let _ = review_root;
+                            git_cli
+                                .ok_or_else(|| "Git 插件实例已关闭".to_string())
+                                .and_then(|cli| {
+                                    cli.apply_reverse(&patch)
+                                        .map(|_| ())
+                                        .map_err(|e| e.to_string())
+                                })
                         });
                         let r = applied.await;
                         weak.update(cx, move |ws: &mut Workspace, cx| {
@@ -1064,8 +1050,8 @@ impl Workspace {
                                 "toggle_explorer" => ws.navigation.apply(NavAction::ShowExplorer),
                                 "toggle_vcs" => ws.navigation.apply(NavAction::ShowVcs),
                                 "toggle_tasks" => ws.navigation.apply(NavAction::ShowTasks),
-                                "show_agents" => ws.show_agent_workspace(AgentTab::Agents, cx),
-                                "show_pipeline" => ws.show_agent_workspace(AgentTab::Pipeline, cx),
+                                "show_agents" => ws.show_agent_workspace(AgentTab::Sessions, cx),
+                                "show_pipeline" => ws.show_agent_workspace(AgentTab::Workflow, cx),
                                 "toggle_console" => ws.toggle_console(cx),
                                 "project_search" => ws.open_project_search(cx),
                                 "open_settings" => ws.open_settings(cx),
@@ -1193,7 +1179,7 @@ impl Workspace {
     }
 
     fn act_show_agent(&mut self, _: &ShowAgent, _: &mut Window, cx: &mut Context<Self>) {
-        self.show_agent_workspace(AgentTab::Agents, cx);
+        self.show_agent_workspace(AgentTab::Sessions, cx);
     }
 
     fn act_show_work(&mut self, _: &ShowWork, _: &mut Window, cx: &mut Context<Self>) {
@@ -1294,7 +1280,8 @@ impl Workspace {
         }
         self.quick_open = None;
         let app = self.app.clone();
-        let s = cx.new(|cx| SettingsView::new_with_app(app, cx));
+        let active_root = self.active_root();
+        let s = cx.new(|cx| SettingsView::new_with_app(app, active_root, cx));
         cx.subscribe(&s, move |ws, _, ev: &Saved, cx| {
             ws.apply_editor_font(&ev.0.editor, cx);
             ws.editor_font = ev.0.editor.clone();
@@ -1304,6 +1291,11 @@ impl Workspace {
                 .set_max(ev.0.engine.global_concurrency.max(1));
             *ws.app.config.lock() = ev.0.clone();
             ws.app.registry.update_config(ev.0.clone());
+            ws.app.keep_awake.set_enabled(ev.0.agents.keep_awake);
+            let environment = ws.vcs_environment();
+            if let Some(panel) = &ws.vcs_panel {
+                panel.update(cx, |panel, cx| panel.set_environment(environment, cx));
+            }
             ws.status_message = "设置已保存".into();
             cx.notify();
         })
@@ -1326,6 +1318,17 @@ impl Workspace {
     }
 }
 
+fn git_diff(root: &Path, local_path: &Path, enabled: bool) -> (String, bool) {
+    if !enabled {
+        return ("Git 与 Perforce 插件实例均未启用".into(), false);
+    }
+    let rel = local_path.strip_prefix(root).unwrap_or(local_path);
+    let diff = mf_vcs::git::Git::open(root)
+        .and_then(|git| git.diff_file(rel))
+        .unwrap_or_else(|error| format!("获取 diff 失败: {error}"));
+    (diff, true)
+}
+
 /// 终端 cwd:项目 root;无项目时不创建终端。
 fn surface_cwd(root: &Path) -> PathBuf {
     root.to_path_buf()
@@ -1334,8 +1337,8 @@ fn surface_cwd(root: &Path) -> PathBuf {
 /// AgentWorkspace 顶层页签(命令面板用)。
 #[derive(Debug, Clone, Copy)]
 pub enum AgentTab {
-    Agents,
-    Pipeline,
+    Sessions,
+    Workflow,
     Runs,
 }
 
@@ -1493,7 +1496,7 @@ impl Workspace {
                                             ),
                                     )
                                     .on_click(cx.listener(|ws: &mut Workspace, _, _, cx| {
-                                        ws.show_agent_workspace(AgentTab::Agents, cx);
+                                        ws.show_agent_workspace(AgentTab::Sessions, cx);
                                     })),
                             ),
                     ),
@@ -1892,7 +1895,7 @@ impl Workspace {
                 expanded,
                 agent_active,
                 cx.listener(|this: &mut Workspace, _, _, cx| {
-                    this.show_agent_workspace(AgentTab::Agents, cx)
+                    this.show_agent_workspace(AgentTab::Sessions, cx)
                 }),
             ))
             .child(activity_button(

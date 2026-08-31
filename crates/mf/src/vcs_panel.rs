@@ -1,5 +1,6 @@
 use gpui::prelude::*;
 use gpui::*;
+use mf_plugins::vcs_provider::VcsEnvironment;
 use mf_vcs::git::Git;
 use mf_vcs::p4::{Change, OpenedFile, P4};
 use std::collections::HashSet;
@@ -9,6 +10,7 @@ use std::path::PathBuf;
 pub struct VcsPanel {
     kind: VcsKind,
     root: PathBuf,
+    environment: VcsEnvironment,
     p4_info: Option<mf_vcs::p4::P4Info>,
     opened: Vec<OpenedFile>,
     pending: Vec<Change>,
@@ -19,6 +21,7 @@ pub struct VcsPanel {
     selected: HashSet<String>,
     submit_desc: String,
     loading: bool,
+    pending_environment_refresh: bool,
     error: Option<String>,
     notice: Option<String>,
     show_history: bool,
@@ -44,10 +47,11 @@ struct LoadedData {
 }
 
 impl VcsPanel {
-    pub fn new(root: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub fn new(root: PathBuf, environment: VcsEnvironment, cx: &mut Context<Self>) -> Self {
         let mut panel = Self {
             kind: VcsKind::P4,
             root,
+            environment,
             p4_info: None,
             opened: Vec::new(),
             pending: Vec::new(),
@@ -59,6 +63,7 @@ impl VcsPanel {
             submit_desc: String::new(),
             desc_focus: cx.focus_handle(),
             loading: false,
+            pending_environment_refresh: false,
             error: None,
             notice: None,
             show_history: false,
@@ -66,6 +71,15 @@ impl VcsPanel {
         };
         panel.refresh(cx);
         panel
+    }
+
+    pub fn set_environment(&mut self, environment: VcsEnvironment, cx: &mut Context<Self>) {
+        self.environment = environment;
+        if self.loading {
+            self.pending_environment_refresh = true;
+            return;
+        }
+        self.refresh(cx);
     }
 
     pub fn set_on_open_diff(
@@ -103,10 +117,11 @@ impl VcsPanel {
         self.loading = true;
         self.error = None;
         let root = self.root.clone();
+        let environment = self.environment.clone();
         let show_history = self.show_history;
         cx.spawn(async move |this, cx| {
             let result = cx
-                .background_spawn(async move { load_vcs(&root, show_history) })
+                .background_spawn(async move { load_vcs(&root, &environment, show_history) })
                 .await;
             this.update(cx, |p, cx| {
                 p.loading = false;
@@ -134,7 +149,12 @@ impl VcsPanel {
                     }
                     Err(e) => p.error = Some(e.to_string()),
                 }
-                cx.notify();
+                if p.pending_environment_refresh {
+                    p.pending_environment_refresh = false;
+                    p.refresh(cx);
+                } else {
+                    cx.notify();
+                }
             })
             .ok();
         })
@@ -166,8 +186,8 @@ impl VcsPanel {
         .detach();
     }
 
-    fn p4(&self) -> P4 {
-        P4::new(&self.root)
+    fn p4(&self) -> Option<P4> {
+        self.environment.p4(&self.root)
     }
 
     fn selected_local_paths(&self) -> Vec<PathBuf> {
@@ -201,7 +221,11 @@ impl VcsPanel {
         self.submit_desc.clear();
         match self.kind {
             VcsKind::P4 => {
-                let p4 = self.p4();
+                let Some(p4) = self.p4() else {
+                    self.error = Some("Perforce 插件实例已关闭".into());
+                    cx.notify();
+                    return;
+                };
                 self.run_op("提交", move || p4.submit(&desc, &files), cx);
             }
             VcsKind::Git => {
@@ -241,12 +265,17 @@ impl VcsPanel {
         }
         match self.kind {
             VcsKind::P4 => {
-                let p4 = self.p4();
+                let Some(p4) = self.p4() else {
+                    self.error = Some("Perforce 插件实例已关闭".into());
+                    cx.notify();
+                    return;
+                };
                 self.run_op("还原", move || p4.revert(&files), cx);
             }
             VcsKind::Git => {
                 // git 还原 = checkout HEAD;MVP 用命令行 git 以简化
                 let root = self.root.clone();
+                let git_cli = self.environment.git_cli(&root);
                 let rels: Vec<String> = self
                     .git_status
                     .iter()
@@ -259,19 +288,10 @@ impl VcsPanel {
                 self.run_op(
                     "还原",
                     move || {
+                        let git_cli =
+                            git_cli.ok_or_else(|| anyhow::anyhow!("Git 插件实例已关闭"))?;
                         for rel in &rels {
-                            let st = std::process::Command::new("git")
-                                .args(["checkout", "--", rel])
-                                .current_dir(&root)
-                                .output()
-                                .map_err(anyhow::Error::from)?;
-                            if !st.status.success() {
-                                anyhow::bail!(
-                                    "git checkout {}: {}",
-                                    rel,
-                                    String::from_utf8_lossy(&st.stderr)
-                                );
-                            }
+                            git_cli.checkout(rel)?;
                         }
                         Ok("已还原".into())
                     },
@@ -289,7 +309,11 @@ impl VcsPanel {
         } else {
             self.submit_desc.clone()
         };
-        let p4 = self.p4();
+        let Some(p4) = self.p4() else {
+            self.error = Some("Perforce 插件实例已关闭".into());
+            cx.notify();
+            return;
+        };
         self.run_op(
             "搁置",
             move || {
@@ -305,7 +329,11 @@ impl VcsPanel {
     }
 
     fn act_sync(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let p4 = self.p4();
+        let Some(p4) = self.p4() else {
+            self.error = Some("Perforce 插件实例已关闭".into());
+            cx.notify();
+            return;
+        };
         self.run_op("同步", move || p4.sync(None), cx);
     }
 
@@ -401,7 +429,11 @@ impl VcsPanel {
     }
 }
 
-fn load_vcs(root: &PathBuf, with_history: bool) -> anyhow::Result<LoadedData> {
+fn load_vcs(
+    root: &PathBuf,
+    environment: &VcsEnvironment,
+    with_history: bool,
+) -> anyhow::Result<LoadedData> {
     let mut data = LoadedData {
         p4_info: None,
         opened: Vec::new(),
@@ -412,27 +444,28 @@ fn load_vcs(root: &PathBuf, with_history: bool) -> anyhow::Result<LoadedData> {
         git_branch: String::new(),
     };
     // 优先探测 P4(工作区在 client root 下且 p4 可用)
-    let p4 = P4::new(root);
-    if let Ok(info) = p4.info() {
-        let in_client = !info.client_root.is_empty()
-            && root
-                .to_string_lossy()
-                .to_lowercase()
-                .starts_with(&info.client_root.to_lowercase());
-        if in_client {
-            data.p4_info = Some(info.clone());
-            data.opened = p4.opened().unwrap_or_default();
-            data.pending = p4.pending_changes(20).unwrap_or_default();
-            if with_history {
-                data.history = p4
-                    .submitted_history(&info.client_stream, 30)
-                    .unwrap_or_default();
+    if let Some(p4) = environment.p4(root) {
+        if let Ok(info) = p4.info() {
+            let in_client = !info.client_root.is_empty()
+                && root
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .starts_with(&info.client_root.to_lowercase());
+            if in_client {
+                data.p4_info = Some(info.clone());
+                data.opened = p4.opened().unwrap_or_default();
+                data.pending = p4.pending_changes(20).unwrap_or_default();
+                if with_history {
+                    data.history = p4
+                        .submitted_history(&info.client_stream, 30)
+                        .unwrap_or_default();
+                }
+                return Ok(data);
             }
-            return Ok(data);
         }
     }
     // 回退 Git
-    if Git::is_repo(root) {
+    if environment.git.is_some() && Git::is_repo(root) {
         if let Ok(git) = Git::open(root) {
             data.git_branch = git.branch().unwrap_or_default();
             data.git_status = git.status().unwrap_or_default();

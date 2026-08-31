@@ -4,7 +4,7 @@
 
 use crate::manifest::{
     NodeTypeContribution, PluginManifest, SecretStoreContribution, UiSchemaContribution,
-    WorkflowTemplateContribution,
+    VcsProviderContribution, WorkflowTemplateContribution,
 };
 use crate::PluginEntry;
 
@@ -112,6 +112,35 @@ impl ContributionRegistry {
             .map(|e| (src.clone(), e))
     }
 
+    /// 全部 VCS Provider 贡献:(完整贡献 ID, 来源, 贡献),按完整 ID 排序。
+    pub fn vcs_providers(&self) -> Vec<(String, ContributionSource, VcsProviderContribution)> {
+        let mut out = Vec::new();
+        for (src, manifest) in &self.records {
+            for provider in &manifest.vcs_providers {
+                out.push((
+                    format!("{}.{}", src.plugin_full_id, provider.id),
+                    src.clone(),
+                    provider.clone(),
+                ));
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    pub fn find_vcs_provider(
+        &self,
+        full_contribution_id: &str,
+    ) -> Option<(ContributionSource, VcsProviderContribution)> {
+        let (src, manifest, id) = self.locate(full_contribution_id)?;
+        manifest
+            .vcs_providers
+            .iter()
+            .find(|provider| provider.id == id)
+            .cloned()
+            .map(|provider| (src.clone(), provider))
+    }
+
     pub fn find_secret_store(
         &self,
         full_contribution_id: &str,
@@ -201,6 +230,7 @@ mod tests {
                 .collect(),
             node_types: vec![],
             execution_directory_providers: vec![],
+            vcs_providers: vec![],
             secret_stores: vec![],
             workflow_templates: vec![],
             skills: vec![],

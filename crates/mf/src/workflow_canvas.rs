@@ -65,7 +65,12 @@ impl WorkflowCanvas {
             .app
             .catalog_store
             .list_agent_instances(None)
-            .map(|rows| rows.into_iter().map(|i| (i.id, i.name)).collect::<Vec<_>>())
+            .map(|rows| {
+                rows.into_iter()
+                    .filter(|instance| instance.enabled)
+                    .map(|instance| (instance.id, instance.name))
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
     }
 
@@ -74,6 +79,7 @@ impl WorkflowCanvas {
         task: Option<(std::path::PathBuf, i64)>,
         cx: &mut Context<Self>,
     ) {
+        self.refresh_library();
         self.selected_task = task.clone();
         // 加载该任务在该项目下的本地工作流草稿(project+task 双键,
         // 跨项目同 task id 互不串扰)
@@ -323,7 +329,7 @@ impl WorkflowCanvas {
                 gpui::div()
                     .text_size(px(9.))
                     .text_color(rgb(crate::theme::Theme::fg_dim()))
-                    .child("还没有 Agent 实例:到「实例」页创建"),
+                    .child("还没有可分配实例：先到「智能体」页创建"),
             );
         }
         for (idx, (id, name)) in self.library.iter().enumerate() {
@@ -358,7 +364,7 @@ impl WorkflowCanvas {
                 gpui::div()
                     .text_size(px(11.))
                     .text_color(rgb(crate::theme::Theme::fg()))
-                    .child("Agent 实例库"),
+                    .child("可分配实例"),
             )
             .child(
                 gpui::div()
@@ -643,7 +649,7 @@ impl WorkflowCanvas {
                 gpui::div()
                     .text_size(px(9.))
                     .text_color(rgb(crate::theme::Theme::fg_dim()))
-                    .child(format!("实例:{}", instance_name)),
+                    .child(format!("执行实例（只读）：{}", instance_name)),
             )
             .child(
                 gpui::div()
@@ -735,7 +741,13 @@ impl Render for WorkflowCanvas {
                         gpui::div()
                             .text_size(px(12.))
                             .text_color(rgb(crate::theme::Theme::fg()))
-                            .child("工作流编辑器"),
+                            .child("工作流编排"),
+                    )
+                    .child(
+                        gpui::div()
+                            .text_size(px(9.))
+                            .text_color(rgb(crate::theme::Theme::fg_faint()))
+                            .child("节点只引用现有实例；CLI、参数和环境在「智能体」页统一修改"),
                     )
                     .child(
                         gpui::div()

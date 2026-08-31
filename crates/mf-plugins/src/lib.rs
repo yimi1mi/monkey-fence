@@ -23,6 +23,7 @@ pub mod install;
 pub mod manifest;
 pub mod proc_tree;
 pub mod project_directory_provider;
+pub mod vcs_provider;
 pub mod worker;
 pub mod worker_directory_provider;
 pub mod worker_protocol;
@@ -78,6 +79,7 @@ pub struct PluginSummary {
     pub node_types_count: usize,
     pub ui_schemas_count: usize,
     pub execution_directories_count: usize,
+    pub vcs_providers_count: usize,
     pub secret_stores_count: usize,
     pub workflow_templates_count: usize,
     pub skills_count: usize,

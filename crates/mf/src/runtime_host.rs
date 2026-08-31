@@ -1936,6 +1936,8 @@ impl RuntimeHost for RuntimeHostImpl {
 /// 保持唤醒(Windows SetThreadExecutionState)。
 pub struct KeepAwake {
     active: AtomicBool,
+    working: AtomicBool,
+    enabled: AtomicBool,
 }
 
 #[cfg(test)]
@@ -2169,19 +2171,32 @@ impl KeepAwake {
     pub fn new() -> KeepAwake {
         KeepAwake {
             active: AtomicBool::new(false),
+            working: AtomicBool::new(false),
+            enabled: AtomicBool::new(true),
         }
     }
     pub fn set_working(&self, working: bool) {
-        if working == self.active.load(Ordering::SeqCst) {
+        self.working.store(working, Ordering::SeqCst);
+        self.apply();
+    }
+
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::SeqCst);
+        self.apply();
+    }
+
+    fn apply(&self) {
+        let active = self.working.load(Ordering::SeqCst) && self.enabled.load(Ordering::SeqCst);
+        if active == self.active.load(Ordering::SeqCst) {
             return;
         }
-        self.active.store(working, Ordering::SeqCst);
+        self.active.store(active, Ordering::SeqCst);
         #[cfg(windows)]
         unsafe {
             const ES_CONTINUOUS: u32 = 0x80000000;
             const ES_SYSTEM_REQUIRED: u32 = 0x00000001;
             const ES_DISPLAY_REQUIRED: u32 = 0x00000002;
-            let flags = if working {
+            let flags = if active {
                 ES_CONTINUOUS | ES_SYSTEM_REQUIRED
             } else {
                 ES_CONTINUOUS
@@ -2203,6 +2218,15 @@ pub fn provider_kind_of(spec: &AgentProfileSpec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keep_awake_global_policy_can_suppress_working_state() {
+        let keep_awake = KeepAwake::new();
+        keep_awake.set_enabled(false);
+        keep_awake.set_working(true);
+        assert!(!keep_awake.active.load(Ordering::SeqCst));
+        keep_awake.set_working(false);
+    }
 
     #[test]
     fn ad_hoc_and_display_ids_are_distinct_namespaces() {

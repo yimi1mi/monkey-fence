@@ -217,6 +217,7 @@ impl PluginHost {
                     .collect(),
                 node_types: vec![],
                 execution_directory_providers: vec![],
+                vcs_providers: vec![],
                 secret_stores: vec![],
                 workflow_templates: vec![],
                 skills: vec![],
@@ -266,12 +267,31 @@ impl PluginHost {
                     crate::project_directory_provider::contribution(),
                     crate::git_worktree_provider::contribution(),
                 ],
+                vcs_providers: vec![],
                 secret_stores: vec![],
                 workflow_templates: vec![],
                 skills: vec![],
                 tools: vec![],
                 ui_schemas: vec![],
             };
+            plugins.push(PluginEntry {
+                content_hash: String::new(),
+                permission_fingerprint: m.permission_fingerprint("builtin"),
+                full_id: m.full_id(),
+                manifest: m,
+                root: None,
+                source: InstallSource::Bundled,
+                enabled: true,
+                authorized_at: Some(chrono::Utc::now().to_rfc3339()),
+                builtin: true,
+                detected: HashMap::new(),
+            });
+        }
+
+        // 版本控制环境(内置合成):Git / Perforce 均以 VCS Provider 贡献出现。
+        // 设置页和运行时通过同一 ContributionRegistry 解析，不由宿主 UI 写死。
+        {
+            let m = crate::vcs_provider::synthetic_manifest();
             plugins.push(PluginEntry {
                 content_hash: String::new(),
                 permission_fingerprint: m.permission_fingerprint("builtin"),
@@ -305,6 +325,7 @@ impl PluginHost {
                 agent_types: vec![],
                 node_types: vec![],
                 execution_directory_providers: vec![],
+                vcs_providers: vec![],
                 secret_stores: vec![],
                 workflow_templates: vec![],
                 skills: skills
@@ -535,6 +556,7 @@ impl PluginHost {
                 node_types_count: p.manifest.node_types.len(),
                 ui_schemas_count: p.manifest.ui_schemas.len(),
                 execution_directories_count: p.manifest.execution_directory_providers.len(),
+                vcs_providers_count: p.manifest.vcs_providers.len(),
                 secret_stores_count: p.manifest.secret_stores.len(),
                 workflow_templates_count: p.manifest.workflow_templates.len(),
                 skills_count: p.manifest.skills.len(),
@@ -1059,6 +1081,7 @@ mod tests {
             agent_types: vec![],
             node_types: vec![],
             execution_directory_providers: vec![],
+            vcs_providers: vec![],
             secret_stores: vec![],
             workflow_templates: vec![],
             skills: vec![],
@@ -1124,6 +1147,19 @@ mod tests {
         // mock(API)始终检测为可用;CLI 至少命令结构正确
         let mock = profiles.iter().find(|p| p.id == "mock").unwrap();
         assert_eq!(mock.runtime, mf_agent::runtime::RuntimeKind::Http);
+        let vcs_ids = host
+            .contributions()
+            .vcs_providers()
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            vcs_ids,
+            vec![
+                "monkeyfence.vcs.git".to_string(),
+                "monkeyfence.vcs.p4".to_string()
+            ]
+        );
     }
 
     #[test]

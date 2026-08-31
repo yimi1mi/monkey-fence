@@ -1,12 +1,41 @@
 use anyhow::{anyhow, Context, Result};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// p4 CLI 封装(-ztag 机器可读输出)
 /// 所有命令以 workspace 为当前目录执行,自动继承 P4CONFIG/P4CLIENT
+#[derive(Clone, Debug)]
 pub struct P4 {
     cwd: PathBuf,
+    config: P4CommandConfig,
+}
+
+/// 单个 MonkeyFence P4 插件实例的命令环境。`use_p4config=true` 时
+/// 继承当前进程环境并可覆盖 P4CONFIG；手动模式会清除继承的 P4 连接变量，
+/// 再只注入用户填写的值，避免两种配置来源混用。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct P4CommandConfig {
+    pub executable: String,
+    pub use_p4config: bool,
+    pub p4config: String,
+    pub port: String,
+    pub user: String,
+    pub client: String,
+    pub charset: String,
+}
+
+impl Default for P4CommandConfig {
+    fn default() -> Self {
+        Self {
+            executable: "p4".into(),
+            use_p4config: true,
+            p4config: String::new(),
+            port: String::new(),
+            user: String::new(),
+            client: String::new(),
+            charset: String::new(),
+        }
+    }
 }
 
 /// ztag 解析结果:一条记录 = 有序键值对(键可重复)
@@ -126,17 +155,48 @@ pub struct FilelogEntry {
 
 impl P4 {
     pub fn new(cwd: impl AsRef<Path>) -> Self {
+        Self::with_config(cwd, P4CommandConfig::default())
+    }
+
+    pub fn with_config(cwd: impl AsRef<Path>, config: P4CommandConfig) -> Self {
         Self {
             cwd: cwd.as_ref().to_path_buf(),
+            config,
         }
     }
 
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.config.executable);
+        command.current_dir(&self.cwd);
+        if self.config.use_p4config {
+            if !self.config.p4config.trim().is_empty() {
+                command.env("P4CONFIG", self.config.p4config.trim());
+            }
+        } else {
+            for key in ["P4CONFIG", "P4PORT", "P4USER", "P4CLIENT", "P4CHARSET"] {
+                command.env_remove(key);
+            }
+            for (key, value) in [
+                ("P4PORT", &self.config.port),
+                ("P4USER", &self.config.user),
+                ("P4CLIENT", &self.config.client),
+                ("P4CHARSET", &self.config.charset),
+            ] {
+                if !value.trim().is_empty() {
+                    command.env(key, value.trim());
+                }
+            }
+        }
+        command
+    }
+
     fn run(&self, args: &[&str]) -> Result<String> {
-        let out = Command::new("p4")
-            .args(args)
-            .current_dir(&self.cwd)
-            .output()
-            .map_err(|e| anyhow!("无法启动 p4: {e}(请确认已安装并在 PATH)"))?;
+        let out = self.command().args(args).output().map_err(|e| {
+            anyhow!(
+                "无法启动 P4 `{}`: {e}(请在设置 → 版本控制中检查路径)",
+                self.config.executable
+            )
+        })?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
@@ -162,9 +222,9 @@ impl P4 {
 
     fn run_stdin(&self, args: &[&str], stdin: &str) -> Result<String> {
         use std::io::Write;
-        let mut child = Command::new("p4")
+        let mut child = self
+            .command()
             .args(args)
-            .current_dir(&self.cwd)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

@@ -89,7 +89,7 @@ impl AgentInstancesViewModel {
                 kind: "default-cli",
                 title: t.name.clone(),
                 subtitle: if t.detected {
-                    format!("{} · 默认 CLI(不保存实例)", t.plugin_name)
+                    format!("{} · 类型入口（点击创建实例）", t.plugin_name)
                 } else {
                     format!("{} · 未检测到 {}", t.plugin_name, t.default_command)
                 },
@@ -680,13 +680,32 @@ fn action_chip(
     chip
 }
 
+fn instance_list_section(label: &str) -> impl IntoElement {
+    gpui::div()
+        .pt_1()
+        .pb_0p5()
+        .text_size(px(8.5))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(rgb(crate::theme::Theme::fg_faint()))
+        .child(label.to_string())
+}
+
 impl Render for AgentInstancesPage {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let filter = self.filter.clone();
         let entries = self.model.filtered(&filter);
-        let mut list = gpui::div().flex().flex_col().gap_1();
+        let mut list = gpui::div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(instance_list_section("可用 Agent 类型"));
+        let mut instance_header_added = false;
         for (idx, entry) in entries.iter().enumerate() {
             let is_default = entry.kind == "default-cli";
+            if !is_default && !instance_header_added {
+                list = list.child(instance_list_section("已配置实例"));
+                instance_header_added = true;
+            }
             let (title_color, sub_color) = if entry.available {
                 (crate::theme::Theme::fg(), crate::theme::Theme::fg_dim())
             } else {
@@ -752,7 +771,7 @@ impl Render for AgentInstancesPage {
                                 d.child(
                                     action_chip(
                                         gpui::ElementId::Name(format!("inst-launch-{idx}").into()),
-                                        "启动",
+                                        "启动临时会话",
                                         crate::theme::Theme::accent(),
                                         true,
                                     )
@@ -791,7 +810,7 @@ impl Render for AgentInstancesPage {
                 .justify_center()
                 .text_color(rgb(crate::theme::Theme::fg_dim()))
                 .text_size(px(11.))
-                .child("从左侧选择 Agent 类型新建实例,或点击既有实例编辑")
+                .child("从左侧选择 Agent 类型创建实例，或选择已有实例继续编辑")
                 .into_any_element(),
             Some(state) => {
                 let errors = state.validation();
@@ -1597,7 +1616,13 @@ impl Render for AgentInstancesPage {
                         gpui::div()
                             .text_size(px(12.))
                             .text_color(rgb(crate::theme::Theme::fg()))
-                            .child("Agent 实例"),
+                            .child("智能体 · 实例配置"),
+                    )
+                    .child(
+                        gpui::div()
+                            .text_size(px(9.))
+                            .text_color(rgb(crate::theme::Theme::fg_faint()))
+                            .child("CLI、参数、环境、Secret 与隔离配置的唯一编辑入口"),
                     )
                     .child(
                         gpui::div()

@@ -39,6 +39,32 @@ name = "Project Directory"
 kind = "project-dir"
 supports_parallel = false
 
+[[vcs_providers]]
+id = "demo-vcs"
+name = "Demo VCS"
+adapter = "plugin-worker"
+description = "声明式 VCS 环境"
+
+[[vcs_providers.settings]]
+id = "executable"
+label = "Executable"
+kind = "path"
+default = "demo-vcs"
+
+[[vcs_providers.settings]]
+id = "mode"
+label = "Mode"
+kind = "select"
+default = "auto"
+
+[[vcs_providers.settings.options]]
+value = "auto"
+label = "Auto"
+
+[[vcs_providers.settings.options]]
+value = "manual"
+label = "Manual"
+
 [[secret_stores]]
 id = "local"
 name = "Local Secret Store"
