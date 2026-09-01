@@ -1,0 +1,1522 @@
+{
+  "schema": "monkeyfence.windows-baseline.v1",
+  "description": "capture.ps1 输出的机器可读契约期望。fixture 注入路径以占位符表示,不绑定开发机用户名或绝对路径;由 run-tests.ps1 -UpdateGolden 生成 fixtures.*.expected。",
+  "placeholders": {
+    "<USER_HOME>": "capture.ps1 -UserHome 注入的 fixture 用户主目录",
+    "<PROJECT_ROOT>": "capture.ps1 -ProjectRoot 注入的 fixture 项目根",
+    "<REPO_ROOT>": "capture.ps1 -RepoRoot 注入的 fixture 仓库根",
+    "<LOCAL_APP_DATA>": "capture.ps1 -LocalAppData 注入的 fixture AppData\\Local",
+    "<APP_DATA_ROAMING>": "capture.ps1 -AppDataRoaming 注入的 fixture Roaming AppData"
+  },
+  "capability_expectations": {
+    "msi_installer": "absent",
+    "bootstrapper_exe": "absent",
+    "uninstaller": "absent",
+    "updater": "absent",
+    "side_by_side_versions": "absent",
+    "current_json_pointer": "absent",
+    "windows_service": "absent",
+    "autostart": "absent",
+    "launcher": "absent",
+    "tray": "absent",
+    "picker": "absent",
+    "core_service_bin": "absent",
+    "elevated_broker": "absent",
+    "discovery_file": "absent",
+    "user_data_migration": "absent",
+    "online_sqlite_backup": "absent",
+    "user_db_backup_routine": "absent",
+    "agent_cli_config_backup": "present"
+  },
+  "strict_compare_ignore_paths": [
+    "runtime_facts.binaries.path_lookup",
+    "residue.processes.running"
+  ],
+  "invariants": {
+    "byte_stable_same_fixture_same_shell": "同一 fixture 同一 shell 连跑两次输出字节一致",
+    "sorted_ordinal_ignore_case": "全部枚举按 OrdinalIgnoreCase 排序",
+    "no_timestamps_no_pids_no_sizes": "不输出时间戳/PID/文件大小/随机值",
+    "strict_json_primitive_types": "golden 比较区分 boolean/number/string JSON 类型",
+    "output_path_non_overwrite": "OutputPath 原子拒绝现有文件、受保护目录及 extended/device/UNC/ADS/8.3 short-name 别名",
+    "fixture_tree_unchanged": "采集前后 fixture 输入树(含哈希)不变",
+    "registry_unchanged": "采集前后被读取的注册表键/服务/计划任务状态不变"
+  },
+  "fixtures": {
+    "clean": {
+      "scenario": "干净用户环境:home/project/local/roaming 无任何 MonkeyFence 数据;repo 仅最小 Cargo.toml 与 vendor/gpui_platform,无构建产物",
+      "expected": {
+        "schema": "monkeyfence.windows-baseline.v1",
+        "capture": {
+          "inputs": {
+            "user_home": "<USER_HOME>",
+            "project_root": "<PROJECT_ROOT>",
+            "repo_root": "<REPO_ROOT>",
+            "local_app_data": "<LOCAL_APP_DATA>",
+            "app_data_roaming": "<APP_DATA_ROAMING>"
+          },
+          "read_only": true
+        },
+        "runtime_facts": {
+          "startup_form": {
+            "form": "cargo-run-gpui-desktop",
+            "process_model": "single-process",
+            "run_command": "cargo run / cargo build(根 Cargo.toml default-members 默认目标为主程序)",
+            "main_bin": {
+              "name": "monkeyfence",
+              "crate": "crates/mf",
+              "ui": "gpui-desktop(gpui 为本地 path 依赖 + vendor/gpui_platform)"
+            },
+            "cli_bin": {
+              "name": "mfctl",
+              "crate": "crates/mfctl",
+              "transport": "named-pipe-per-process(能力令牌 MF_RUN_TOKEN)"
+            },
+            "workspace_version": "0.1.0",
+            "workspace_members": [
+              "crates/mf",
+              "crates/mf-core",
+              "crates/mf-agent",
+              "crates/mf-vcs",
+              "crates/mf-skills",
+              "crates/mf-plugins",
+              "crates/mfctl"
+            ],
+            "gpui": {
+              "dependency_kind": "path",
+              "vendored_platform_dir_present": true
+            }
+          },
+          "binaries": {
+            "repo_target": [
+              {
+                "bin": "mf-broker",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\mf-broker.exe"
+              },
+              {
+                "bin": "mf-install-host",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\mf-install-host.exe"
+              },
+              {
+                "bin": "mf-root-host",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\mf-root-host.exe"
+              },
+              {
+                "bin": "mfctl",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\mfctl.exe"
+              },
+              {
+                "bin": "monkeyfence-bootstrapper",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\monkeyfence-bootstrapper.exe"
+              },
+              {
+                "bin": "monkeyfence-core",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\monkeyfence-core.exe"
+              },
+              {
+                "bin": "monkeyfence-launcher",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\monkeyfence-launcher.exe"
+              },
+              {
+                "bin": "monkeyfence-picker",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\monkeyfence-picker.exe"
+              },
+              {
+                "bin": "monkeyfence-tray",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\monkeyfence-tray.exe"
+              },
+              {
+                "bin": "monkeyfence-updater",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\monkeyfence-updater.exe"
+              },
+              {
+                "bin": "monkeyfence",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\monkeyfence.exe"
+              },
+              {
+                "bin": "mf-broker",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\mf-broker.exe"
+              },
+              {
+                "bin": "mf-install-host",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\mf-install-host.exe"
+              },
+              {
+                "bin": "mf-root-host",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\mf-root-host.exe"
+              },
+              {
+                "bin": "mfctl",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\mfctl.exe"
+              },
+              {
+                "bin": "monkeyfence-bootstrapper",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\monkeyfence-bootstrapper.exe"
+              },
+              {
+                "bin": "monkeyfence-core",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\monkeyfence-core.exe"
+              },
+              {
+                "bin": "monkeyfence-launcher",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\monkeyfence-launcher.exe"
+              },
+              {
+                "bin": "monkeyfence-picker",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\monkeyfence-picker.exe"
+              },
+              {
+                "bin": "monkeyfence-tray",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\monkeyfence-tray.exe"
+              },
+              {
+                "bin": "monkeyfence-updater",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\monkeyfence-updater.exe"
+              },
+              {
+                "bin": "monkeyfence",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\monkeyfence.exe"
+              },
+              {
+                "bin": "mf-broker",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\mf-broker.exe"
+              },
+              {
+                "bin": "mf-install-host",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\mf-install-host.exe"
+              },
+              {
+                "bin": "mf-root-host",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\mf-root-host.exe"
+              },
+              {
+                "bin": "mfctl",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\mfctl.exe"
+              },
+              {
+                "bin": "monkeyfence-bootstrapper",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\monkeyfence-bootstrapper.exe"
+              },
+              {
+                "bin": "monkeyfence-core",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\monkeyfence-core.exe"
+              },
+              {
+                "bin": "monkeyfence-launcher",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\monkeyfence-launcher.exe"
+              },
+              {
+                "bin": "monkeyfence-picker",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\monkeyfence-picker.exe"
+              },
+              {
+                "bin": "monkeyfence-tray",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\monkeyfence-tray.exe"
+              },
+              {
+                "bin": "monkeyfence-updater",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\monkeyfence-updater.exe"
+              },
+              {
+                "bin": "monkeyfence",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\monkeyfence.exe"
+              },
+              {
+                "bin": "mf-broker",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\mf-broker.exe"
+              },
+              {
+                "bin": "mf-install-host",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\mf-install-host.exe"
+              },
+              {
+                "bin": "mf-root-host",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\mf-root-host.exe"
+              },
+              {
+                "bin": "mfctl",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\mfctl.exe"
+              },
+              {
+                "bin": "monkeyfence-bootstrapper",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\monkeyfence-bootstrapper.exe"
+              },
+              {
+                "bin": "monkeyfence-core",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\monkeyfence-core.exe"
+              },
+              {
+                "bin": "monkeyfence-launcher",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\monkeyfence-launcher.exe"
+              },
+              {
+                "bin": "monkeyfence-picker",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\monkeyfence-picker.exe"
+              },
+              {
+                "bin": "monkeyfence-tray",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\monkeyfence-tray.exe"
+              },
+              {
+                "bin": "monkeyfence-updater",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\monkeyfence-updater.exe"
+              },
+              {
+                "bin": "monkeyfence",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\monkeyfence.exe"
+              }
+            ],
+            "path_lookup": []
+          }
+        },
+        "data_locations": {
+          "user": {
+            "dir": "<USER_HOME>\\.monkeyfence",
+            "probe_ok": true,
+            "exists": false,
+            "catalog_schema_version_current": 1,
+            "redirection_env_vars": [
+              "MF_CATALOG_DB",
+              "MONKEYFENCE_SESSION_PATH"
+            ],
+            "well_known": [
+              {
+                "name": "config.toml",
+                "kind": "file",
+                "present": false
+              },
+              {
+                "name": "catalog-v1.db",
+                "kind": "file",
+                "present": false
+              },
+              {
+                "name": "session.json",
+                "kind": "file",
+                "present": false
+              },
+              {
+                "name": "ui-prefs.json",
+                "kind": "file",
+                "present": false
+              },
+              {
+                "name": "skills",
+                "kind": "directory",
+                "present": false
+              }
+            ],
+            "entries": []
+          },
+          "project": {
+            "dir": "<PROJECT_ROOT>\\.mf-agent",
+            "probe_ok": true,
+            "exists": false,
+            "project_schema_version_current": 6,
+            "well_known": [
+              {
+                "name": "workflow-v1.db",
+                "kind": "file",
+                "present": false
+              },
+              {
+                "name": "work-items.json",
+                "kind": "file",
+                "present": false
+              }
+            ],
+            "legacy_residue": [
+              {
+                "name": "orchestration.db",
+                "kind": "file",
+                "present": false
+              },
+              {
+                "name": "workspaces.json",
+                "kind": "file",
+                "present": false
+              }
+            ],
+            "entries": []
+          },
+          "project_monkeyfence": {
+            "dir": "<PROJECT_ROOT>\\.monkeyfence",
+            "probe_ok": true,
+            "exists": false,
+            "purpose": "project 级技能目录 <project>/.monkeyfence/skills(mf-skills)",
+            "entries": []
+          }
+        },
+        "residue": {
+          "registry": {
+            "uninstall_keys": {
+              "probe_ok": true,
+              "probed_paths": [
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+                "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+                "HKLM\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"
+              ],
+              "matches": []
+            },
+            "run_keys": {
+              "probe_ok": true,
+              "probed_paths": [
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+                "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce"
+              ],
+              "matches": []
+            }
+          },
+          "startup_folder": {
+            "path": "<APP_DATA_ROAMING>\\Microsoft\\Windows\\Start Menu\\Programs\\Startup",
+            "probe_ok": true,
+            "matches": []
+          },
+          "services": {
+            "probe_ok": true,
+            "matches": [],
+            "auto_start_matches": []
+          },
+          "scheduled_tasks": {
+            "probe_ok": true,
+            "matches": []
+          },
+          "processes": {
+            "names_probed": [
+              "mf-broker",
+              "mf-install-host",
+              "mf-root-host",
+              "mfctl",
+              "monkeyfence",
+              "monkeyfence-bootstrapper",
+              "monkeyfence-core",
+              "monkeyfence-launcher",
+              "monkeyfence-picker",
+              "monkeyfence-tray",
+              "monkeyfence-updater"
+            ],
+            "running": []
+          },
+          "agent_cli_config_backups": {
+            "probe_ok": true,
+            "dirs_probed": [
+              "<USER_HOME>\\.claude",
+              "<USER_HOME>\\.codex",
+              "<USER_HOME>\\.config",
+              "<USER_HOME>\\.gemini"
+            ],
+            "matches": []
+          },
+          "install_locations": {
+            "per_user_bundle_root": {
+              "path": "<LOCAL_APP_DATA>\\Programs\\MonkeyFence",
+              "probe_ok": true,
+              "present": false
+            },
+            "versions_dir": {
+              "path": "<LOCAL_APP_DATA>\\Programs\\MonkeyFence\\versions",
+              "probe_ok": true,
+              "present": false,
+              "version_dir_names": []
+            },
+            "current_json": {
+              "path": "<LOCAL_APP_DATA>\\Programs\\MonkeyFence\\current.json",
+              "probe_ok": true,
+              "present": false
+            },
+            "discovery_dir": {
+              "path": "<LOCAL_APP_DATA>\\MonkeyFence",
+              "probe_ok": true,
+              "present": false
+            },
+            "discovery_json": {
+              "path": "<LOCAL_APP_DATA>\\MonkeyFence\\discovery.json",
+              "probe_ok": true,
+              "present": false
+            }
+          }
+        },
+        "delivery_capabilities": {
+          "msi_installer": {
+            "status": "absent",
+            "evidence": [
+              "uninstall_key_matches=0",
+              "windows_installer_entries=0",
+              "per_user_bundle_root_present=false"
+            ]
+          },
+          "bootstrapper_exe": {
+            "status": "absent",
+            "evidence": [
+              "bootstrapper_bin_status=absent",
+              "per_user_bundle_root_present=false",
+              "code_fact=当前仓库无 bootstrapper 可执行目标"
+            ]
+          },
+          "uninstaller": {
+            "status": "absent",
+            "evidence": [
+              "uninstall_entries_with_uninstall_string=0"
+            ]
+          },
+          "updater": {
+            "status": "absent",
+            "evidence": [
+              "updater_bin_status=absent",
+              "versions_dir_present=false",
+              "current_json_present=false",
+              "code_fact=无更新器入口(当前交付仅 cargo 构建)"
+            ]
+          },
+          "side_by_side_versions": {
+            "status": "absent",
+            "evidence": [
+              "versions_dir_present=false",
+              "version_dir_count=0"
+            ]
+          },
+          "current_json_pointer": {
+            "status": "absent",
+            "evidence": [
+              "current_json_present=false"
+            ]
+          },
+          "windows_service": {
+            "status": "absent",
+            "evidence": [
+              "service_matches=0"
+            ]
+          },
+          "autostart": {
+            "status": "absent",
+            "evidence": [
+              "run_key_matches=0",
+              "startup_folder_matches=0",
+              "scheduled_task_matches=0",
+              "auto_start_service_matches=0"
+            ]
+          },
+          "launcher": {
+            "status": "absent",
+            "evidence": [
+              "bin_status=absent",
+              "code_fact=spec §11.2/T6 未来能力(当前不存在 launcher)"
+            ]
+          },
+          "tray": {
+            "status": "absent",
+            "evidence": [
+              "bin_status=absent",
+              "code_fact=spec §11.3/T6 未来能力(当前不存在 tray)"
+            ]
+          },
+          "picker": {
+            "status": "absent",
+            "evidence": [
+              "bin_status=absent",
+              "code_fact=spec §11.3/T6 未来能力(当前不存在 picker)"
+            ]
+          },
+          "core_service_bin": {
+            "status": "absent",
+            "evidence": [
+              "bin_status=absent",
+              "process_running=false",
+              "code_fact=spec §2/T6 未来能力(当前为单进程 GPUI,无独立 core bin)"
+            ]
+          },
+          "elevated_broker": {
+            "status": "absent",
+            "evidence": [
+              "bin_status=absent",
+              "code_fact=spec §10/T9 未来能力(当前无 Root Mode/Broker)"
+            ]
+          },
+          "discovery_file": {
+            "status": "absent",
+            "evidence": [
+              "discovery_json_present=false",
+              "code_fact=spec §11.1/T6 未来能力(%LOCALAPPDATA%\\MonkeyFence\\discovery.json 当前不存在)"
+            ]
+          },
+          "user_data_migration": {
+            "status": "absent",
+            "evidence": [
+              "service_v1_db_present=false",
+              "code_fact=spec §3.4/T1 未来能力(session.json→project_registry 幂等迁移未实现)"
+            ]
+          }
+        },
+        "backup_capabilities": {
+          "online_sqlite_backup": {
+            "status": "absent",
+            "evidence": [
+              "code_fact=根 Cargo.toml 中 rusqlite 仅启用 bundled feature(未启用 backup,SQLite Backup API 未编译)",
+              "code_fact=crates/mf-agent/src/schema.rs 链式迁移(user_version 逐版升级)前无一致备份步骤",
+              "spec_target=§3.1/T1 计划:schema 升级前用 SQLite Backup API 生成一致备份+manifest"
+            ]
+          },
+          "user_db_backup_routine": {
+            "status": "absent",
+            "evidence": [
+              "code_fact=无任何定时/在线的项目库与目录库备份例程",
+              "current_practice=手工离线拷贝(关闭应用后复制 .mf-agent / ~/.monkeyfence)"
+            ]
+          },
+          "agent_cli_config_backup": {
+            "status": "present",
+            "evidence": [
+              "code_fact=crates/mf-plugins/src/hooks.rs 写入 Agent CLI 配置前生成 <file>.monkeyfence-backup-<ts> 整文件备份",
+              "scope=仅覆盖 CLI 配置文件;不覆盖项目库 workflow-v1.db、目录库 catalog-v1.db 或 Secret"
+            ]
+          }
+        }
+      }
+    },
+    "existing": {
+      "scenario": "已有数据环境:~/.monkeyfence(config/catalog+wal/session/ui-prefs/skills)、~/.codex 含 monkeyfence-backup 残留、Project/.mf-agent(workflow-v1.db+wal、work-items.json、旧库 orchestration.db/workspaces.json、step-run-*.md)、Project/.monkeyfence/skills、repo target/debug 含 monkeyfence.exe 与 mfctl.exe;仍无安装器/服务/自启动",
+      "expected": {
+        "schema": "monkeyfence.windows-baseline.v1",
+        "capture": {
+          "inputs": {
+            "user_home": "<USER_HOME>",
+            "project_root": "<PROJECT_ROOT>",
+            "repo_root": "<REPO_ROOT>",
+            "local_app_data": "<LOCAL_APP_DATA>",
+            "app_data_roaming": "<APP_DATA_ROAMING>"
+          },
+          "read_only": true
+        },
+        "runtime_facts": {
+          "startup_form": {
+            "form": "cargo-run-gpui-desktop",
+            "process_model": "single-process",
+            "run_command": "cargo run / cargo build(根 Cargo.toml default-members 默认目标为主程序)",
+            "main_bin": {
+              "name": "monkeyfence",
+              "crate": "crates/mf",
+              "ui": "gpui-desktop(gpui 为本地 path 依赖 + vendor/gpui_platform)"
+            },
+            "cli_bin": {
+              "name": "mfctl",
+              "crate": "crates/mfctl",
+              "transport": "named-pipe-per-process(能力令牌 MF_RUN_TOKEN)"
+            },
+            "workspace_version": "0.1.0",
+            "workspace_members": [
+              "crates/mf",
+              "crates/mf-core",
+              "crates/mf-agent",
+              "crates/mf-vcs",
+              "crates/mf-skills",
+              "crates/mf-plugins",
+              "crates/mfctl"
+            ],
+            "gpui": {
+              "dependency_kind": "path",
+              "vendored_platform_dir_present": true
+            }
+          },
+          "binaries": {
+            "repo_target": [
+              {
+                "bin": "mf-broker",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\mf-broker.exe"
+              },
+              {
+                "bin": "mf-install-host",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\mf-install-host.exe"
+              },
+              {
+                "bin": "mf-root-host",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\mf-root-host.exe"
+              },
+              {
+                "bin": "mfctl",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\mfctl.exe"
+              },
+              {
+                "bin": "monkeyfence-bootstrapper",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\monkeyfence-bootstrapper.exe"
+              },
+              {
+                "bin": "monkeyfence-core",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\monkeyfence-core.exe"
+              },
+              {
+                "bin": "monkeyfence-launcher",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\monkeyfence-launcher.exe"
+              },
+              {
+                "bin": "monkeyfence-picker",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\monkeyfence-picker.exe"
+              },
+              {
+                "bin": "monkeyfence-tray",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\monkeyfence-tray.exe"
+              },
+              {
+                "bin": "monkeyfence-updater",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\monkeyfence-updater.exe"
+              },
+              {
+                "bin": "monkeyfence",
+                "target_dir": "target-dev",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\debug\\monkeyfence.exe"
+              },
+              {
+                "bin": "mf-broker",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\mf-broker.exe"
+              },
+              {
+                "bin": "mf-install-host",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\mf-install-host.exe"
+              },
+              {
+                "bin": "mf-root-host",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\mf-root-host.exe"
+              },
+              {
+                "bin": "mfctl",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\mfctl.exe"
+              },
+              {
+                "bin": "monkeyfence-bootstrapper",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\monkeyfence-bootstrapper.exe"
+              },
+              {
+                "bin": "monkeyfence-core",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\monkeyfence-core.exe"
+              },
+              {
+                "bin": "monkeyfence-launcher",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\monkeyfence-launcher.exe"
+              },
+              {
+                "bin": "monkeyfence-picker",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\monkeyfence-picker.exe"
+              },
+              {
+                "bin": "monkeyfence-tray",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\monkeyfence-tray.exe"
+              },
+              {
+                "bin": "monkeyfence-updater",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\monkeyfence-updater.exe"
+              },
+              {
+                "bin": "monkeyfence",
+                "target_dir": "target-dev",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target-dev\\release\\monkeyfence.exe"
+              },
+              {
+                "bin": "mf-broker",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\mf-broker.exe"
+              },
+              {
+                "bin": "mf-install-host",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\mf-install-host.exe"
+              },
+              {
+                "bin": "mf-root-host",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\mf-root-host.exe"
+              },
+              {
+                "bin": "mfctl",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": true,
+                "relative_path": "target\\debug\\mfctl.exe"
+              },
+              {
+                "bin": "monkeyfence-bootstrapper",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\monkeyfence-bootstrapper.exe"
+              },
+              {
+                "bin": "monkeyfence-core",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\monkeyfence-core.exe"
+              },
+              {
+                "bin": "monkeyfence-launcher",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\monkeyfence-launcher.exe"
+              },
+              {
+                "bin": "monkeyfence-picker",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\monkeyfence-picker.exe"
+              },
+              {
+                "bin": "monkeyfence-tray",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\monkeyfence-tray.exe"
+              },
+              {
+                "bin": "monkeyfence-updater",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\debug\\monkeyfence-updater.exe"
+              },
+              {
+                "bin": "monkeyfence",
+                "target_dir": "target",
+                "profile": "debug",
+                "probe_ok": true,
+                "exists": true,
+                "relative_path": "target\\debug\\monkeyfence.exe"
+              },
+              {
+                "bin": "mf-broker",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\mf-broker.exe"
+              },
+              {
+                "bin": "mf-install-host",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\mf-install-host.exe"
+              },
+              {
+                "bin": "mf-root-host",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\mf-root-host.exe"
+              },
+              {
+                "bin": "mfctl",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\mfctl.exe"
+              },
+              {
+                "bin": "monkeyfence-bootstrapper",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\monkeyfence-bootstrapper.exe"
+              },
+              {
+                "bin": "monkeyfence-core",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\monkeyfence-core.exe"
+              },
+              {
+                "bin": "monkeyfence-launcher",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\monkeyfence-launcher.exe"
+              },
+              {
+                "bin": "monkeyfence-picker",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\monkeyfence-picker.exe"
+              },
+              {
+                "bin": "monkeyfence-tray",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\monkeyfence-tray.exe"
+              },
+              {
+                "bin": "monkeyfence-updater",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\monkeyfence-updater.exe"
+              },
+              {
+                "bin": "monkeyfence",
+                "target_dir": "target",
+                "profile": "release",
+                "probe_ok": true,
+                "exists": false,
+                "relative_path": "target\\release\\monkeyfence.exe"
+              }
+            ],
+            "path_lookup": []
+          }
+        },
+        "data_locations": {
+          "user": {
+            "dir": "<USER_HOME>\\.monkeyfence",
+            "probe_ok": true,
+            "exists": true,
+            "catalog_schema_version_current": 1,
+            "redirection_env_vars": [
+              "MF_CATALOG_DB",
+              "MONKEYFENCE_SESSION_PATH"
+            ],
+            "well_known": [
+              {
+                "name": "config.toml",
+                "kind": "file",
+                "present": true
+              },
+              {
+                "name": "catalog-v1.db",
+                "kind": "file",
+                "present": true
+              },
+              {
+                "name": "session.json",
+                "kind": "file",
+                "present": true
+              },
+              {
+                "name": "ui-prefs.json",
+                "kind": "file",
+                "present": true
+              },
+              {
+                "name": "skills",
+                "kind": "directory",
+                "present": true
+              }
+            ],
+            "entries": [
+              {
+                "name": "catalog-v1.db",
+                "kind": "file"
+              },
+              {
+                "name": "catalog-v1.db-wal",
+                "kind": "file"
+              },
+              {
+                "name": "config.toml",
+                "kind": "file"
+              },
+              {
+                "name": "session.json",
+                "kind": "file"
+              },
+              {
+                "name": "skills",
+                "kind": "directory"
+              },
+              {
+                "name": "ui-prefs.json",
+                "kind": "file"
+              }
+            ]
+          },
+          "project": {
+            "dir": "<PROJECT_ROOT>\\.mf-agent",
+            "probe_ok": true,
+            "exists": true,
+            "project_schema_version_current": 6,
+            "well_known": [
+              {
+                "name": "workflow-v1.db",
+                "kind": "file",
+                "present": true
+              },
+              {
+                "name": "work-items.json",
+                "kind": "file",
+                "present": true
+              }
+            ],
+            "legacy_residue": [
+              {
+                "name": "orchestration.db",
+                "kind": "file",
+                "present": true
+              },
+              {
+                "name": "workspaces.json",
+                "kind": "file",
+                "present": true
+              }
+            ],
+            "entries": [
+              {
+                "name": "orchestration.db",
+                "kind": "file"
+              },
+              {
+                "name": "step-run-1.md",
+                "kind": "file"
+              },
+              {
+                "name": "work-items.json",
+                "kind": "file"
+              },
+              {
+                "name": "workflow-v1.db",
+                "kind": "file"
+              },
+              {
+                "name": "workflow-v1.db-wal",
+                "kind": "file"
+              },
+              {
+                "name": "workspaces.json",
+                "kind": "file"
+              }
+            ]
+          },
+          "project_monkeyfence": {
+            "dir": "<PROJECT_ROOT>\\.monkeyfence",
+            "probe_ok": true,
+            "exists": true,
+            "purpose": "project 级技能目录 <project>/.monkeyfence/skills(mf-skills)",
+            "entries": [
+              {
+                "name": "skills",
+                "kind": "directory"
+              }
+            ]
+          }
+        },
+        "residue": {
+          "registry": {
+            "uninstall_keys": {
+              "probe_ok": true,
+              "probed_paths": [
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+                "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+                "HKLM\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall"
+              ],
+              "matches": []
+            },
+            "run_keys": {
+              "probe_ok": true,
+              "probed_paths": [
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+                "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce"
+              ],
+              "matches": []
+            }
+          },
+          "startup_folder": {
+            "path": "<APP_DATA_ROAMING>\\Microsoft\\Windows\\Start Menu\\Programs\\Startup",
+            "probe_ok": true,
+            "matches": []
+          },
+          "services": {
+            "probe_ok": true,
+            "matches": [],
+            "auto_start_matches": []
+          },
+          "scheduled_tasks": {
+            "probe_ok": true,
+            "matches": []
+          },
+          "processes": {
+            "names_probed": [
+              "mf-broker",
+              "mf-install-host",
+              "mf-root-host",
+              "mfctl",
+              "monkeyfence",
+              "monkeyfence-bootstrapper",
+              "monkeyfence-core",
+              "monkeyfence-launcher",
+              "monkeyfence-picker",
+              "monkeyfence-tray",
+              "monkeyfence-updater"
+            ],
+            "running": []
+          },
+          "agent_cli_config_backups": {
+            "probe_ok": true,
+            "dirs_probed": [
+              "<USER_HOME>\\.claude",
+              "<USER_HOME>\\.codex",
+              "<USER_HOME>\\.config",
+              "<USER_HOME>\\.gemini"
+            ],
+            "matches": [
+              {
+                "dir": "<USER_HOME>\\.codex",
+                "name": "config.toml.monkeyfence-backup-FIXTURE"
+              }
+            ]
+          },
+          "install_locations": {
+            "per_user_bundle_root": {
+              "path": "<LOCAL_APP_DATA>\\Programs\\MonkeyFence",
+              "probe_ok": true,
+              "present": false
+            },
+            "versions_dir": {
+              "path": "<LOCAL_APP_DATA>\\Programs\\MonkeyFence\\versions",
+              "probe_ok": true,
+              "present": false,
+              "version_dir_names": []
+            },
+            "current_json": {
+              "path": "<LOCAL_APP_DATA>\\Programs\\MonkeyFence\\current.json",
+              "probe_ok": true,
+              "present": false
+            },
+            "discovery_dir": {
+              "path": "<LOCAL_APP_DATA>\\MonkeyFence",
+              "probe_ok": true,
+              "present": false
+            },
+            "discovery_json": {
+              "path": "<LOCAL_APP_DATA>\\MonkeyFence\\discovery.json",
+              "probe_ok": true,
+              "present": false
+            }
+          }
+        },
+        "delivery_capabilities": {
+          "msi_installer": {
+            "status": "absent",
+            "evidence": [
+              "uninstall_key_matches=0",
+              "windows_installer_entries=0",
+              "per_user_bundle_root_present=false"
+            ]
+          },
+          "bootstrapper_exe": {
+            "status": "absent",
+            "evidence": [
+              "bootstrapper_bin_status=absent",
+              "per_user_bundle_root_present=false",
+              "code_fact=当前仓库无 bootstrapper 可执行目标"
+            ]
+          },
+          "uninstaller": {
+            "status": "absent",
+            "evidence": [
+              "uninstall_entries_with_uninstall_string=0"
+            ]
+          },
+          "updater": {
+            "status": "absent",
+            "evidence": [
+              "updater_bin_status=absent",
+              "versions_dir_present=false",
+              "current_json_present=false",
+              "code_fact=无更新器入口(当前交付仅 cargo 构建)"
+            ]
+          },
+          "side_by_side_versions": {
+            "status": "absent",
+            "evidence": [
+              "versions_dir_present=false",
+              "version_dir_count=0"
+            ]
+          },
+          "current_json_pointer": {
+            "status": "absent",
+            "evidence": [
+              "current_json_present=false"
+            ]
+          },
+          "windows_service": {
+            "status": "absent",
+            "evidence": [
+              "service_matches=0"
+            ]
+          },
+          "autostart": {
+            "status": "absent",
+            "evidence": [
+              "run_key_matches=0",
+              "startup_folder_matches=0",
+              "scheduled_task_matches=0",
+              "auto_start_service_matches=0"
+            ]
+          },
+          "launcher": {
+            "status": "absent",
+            "evidence": [
+              "bin_status=absent",
+              "code_fact=spec §11.2/T6 未来能力(当前不存在 launcher)"
+            ]
+          },
+          "tray": {
+            "status": "absent",
+            "evidence": [
+              "bin_status=absent",
+              "code_fact=spec §11.3/T6 未来能力(当前不存在 tray)"
+            ]
+          },
+          "picker": {
+            "status": "absent",
+            "evidence": [
+              "bin_status=absent",
+              "code_fact=spec §11.3/T6 未来能力(当前不存在 picker)"
+            ]
+          },
+          "core_service_bin": {
+            "status": "absent",
+            "evidence": [
+              "bin_status=absent",
+              "process_running=false",
+              "code_fact=spec §2/T6 未来能力(当前为单进程 GPUI,无独立 core bin)"
+            ]
+          },
+          "elevated_broker": {
+            "status": "absent",
+            "evidence": [
+              "bin_status=absent",
+              "code_fact=spec §10/T9 未来能力(当前无 Root Mode/Broker)"
+            ]
+          },
+          "discovery_file": {
+            "status": "absent",
+            "evidence": [
+              "discovery_json_present=false",
+              "code_fact=spec §11.1/T6 未来能力(%LOCALAPPDATA%\\MonkeyFence\\discovery.json 当前不存在)"
+            ]
+          },
+          "user_data_migration": {
+            "status": "absent",
+            "evidence": [
+              "service_v1_db_present=false",
+              "code_fact=spec §3.4/T1 未来能力(session.json→project_registry 幂等迁移未实现)"
+            ]
+          }
+        },
+        "backup_capabilities": {
+          "online_sqlite_backup": {
+            "status": "absent",
+            "evidence": [
+              "code_fact=根 Cargo.toml 中 rusqlite 仅启用 bundled feature(未启用 backup,SQLite Backup API 未编译)",
+              "code_fact=crates/mf-agent/src/schema.rs 链式迁移(user_version 逐版升级)前无一致备份步骤",
+              "spec_target=§3.1/T1 计划:schema 升级前用 SQLite Backup API 生成一致备份+manifest"
+            ]
+          },
+          "user_db_backup_routine": {
+            "status": "absent",
+            "evidence": [
+              "code_fact=无任何定时/在线的项目库与目录库备份例程",
+              "current_practice=手工离线拷贝(关闭应用后复制 .mf-agent / ~/.monkeyfence)"
+            ]
+          },
+          "agent_cli_config_backup": {
+            "status": "present",
+            "evidence": [
+              "code_fact=crates/mf-plugins/src/hooks.rs 写入 Agent CLI 配置前生成 <file>.monkeyfence-backup-<ts> 整文件备份",
+              "scope=仅覆盖 CLI 配置文件;不覆盖项目库 workflow-v1.db、目录库 catalog-v1.db 或 Secret"
+            ]
+          }
+        }
+      }
+    }
+  }
+}
