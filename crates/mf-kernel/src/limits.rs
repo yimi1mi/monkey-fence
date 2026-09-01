@@ -1,9 +1,10 @@
-//! 附录 A7 生命周期参数(canonical spec `docs/superpowers/specs/2026-09-01-web-interaction-core-service.md`)。
+//! 附录 A4/A7 参数(canonical spec `docs/superpowers/specs/2026-09-01-web-interaction-core-service.md`)。
 //!
-//! 本文件是 A7 的唯一数值来源:默认值、允许范围、hard cap 与派生规则。
-//! 可配置项仅能通过 `~/.monkeyfence/config.toml` 的 `[limits]` 段在允许
-//! 范围内覆盖默认值,且不得超过 hard cap;A7 各行的 hard cap 与允许范围
-//! 上限一致。`discovery_heartbeat_ms` 派生 stale 判定(stale = 3×heartbeat,
+//! 本文件是 A4(命令/审计 retention 与 GC)与 A7(生命周期)的唯一数值
+//! 来源:默认值、允许范围、hard cap 与派生规则。可配置项仅能通过
+//! `~/.monkeyfence/config.toml` 的 `[limits]` 段在允许范围内覆盖默认值,
+//! 且不得超过 hard cap;A4/A7 各行的 hard cap 与允许范围上限一致。
+//! `discovery_heartbeat_ms` 派生 stale 判定(stale = 3×heartbeat,
 //! §11.1),派生值不可独立配置。
 //!
 //! A7 表把常量落点标为 `limits.rs`、`singleton.rs`:A7 参数在本文,
@@ -11,6 +12,10 @@
 //! `shutdown_freeze_grace_ms`/`shutdown_drain_timeout_ms`/`forced_kill_grace_ms`
 //! 由安全退出(§11.4,shutdown.rs)消费,`handoff_reacquire_window_ms` 由
 //! owner handoff(§13.3)消费;T1e 先冻结数值契约,消费方随后续 ticket 落位。
+//! A4 retention/GC 参数由 command receipt / Operation / audit 的 GC
+//! (§4.6,`reconcile.rs`)与进度事件节奏消费;`gc_interval_ms` 是周期调度
+//! 与启动时 GC 的间隔,`operation_progress_interval_ms` 是 Operation 进度
+//! 事件的最低间隔(节流阈值,不是禁止更早的终态事件)。
 
 /// 单个 A7 参数的三元组描述(默认 / 允许范围 / hard cap)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +132,127 @@ impl LifecycleLimits {
     /// (§11.1 stale = 3×heartbeat;不可独立配置)。
     pub fn discovery_stale_after_ms(&self) -> u64 {
         self.discovery_heartbeat_ms * DISCOVERY_STALE_HEARTBEATS
+    }
+}
+
+// ─────────────────────── 附录 A4:命令/审计 retention 与 GC ───────────────────────
+
+/// 单个 A4 参数的三元组描述(默认 / 允许范围 / hard cap)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionParamSpec {
+    /// A4 参数名(`config.toml [limits]` 键)。
+    pub name: &'static str,
+    pub default: u64,
+    pub min: u64,
+    pub max: u64,
+    /// 安全上限:取值不得超过;A4 全部行 hard cap == 允许范围上限。
+    pub hard_cap: u64,
+}
+
+/// A4 全量参数表(表驱动校验与 `limits_defaults` 契约测试的权威输入)。
+pub const RETENTION_PARAMS: [RetentionParamSpec; 6] = [
+    RetentionParamSpec {
+        name: "receipt_retention_days",
+        default: 30,
+        min: 7,
+        max: 365,
+        hard_cap: 365,
+    },
+    RetentionParamSpec {
+        name: "receipt_max_rows_per_store",
+        default: 200_000,
+        min: 10_000,
+        max: 1_000_000,
+        hard_cap: 1_000_000,
+    },
+    RetentionParamSpec {
+        name: "operation_retention_days",
+        default: 90,
+        min: 7,
+        max: 365,
+        hard_cap: 365,
+    },
+    RetentionParamSpec {
+        name: "audit_retention_days",
+        default: 365,
+        min: 30,
+        max: 3_650,
+        hard_cap: 3_650,
+    },
+    RetentionParamSpec {
+        name: "gc_interval_ms",
+        default: 3_600_000,
+        min: 300_000,
+        max: 86_400_000,
+        hard_cap: 86_400_000,
+    },
+    RetentionParamSpec {
+        name: "operation_progress_interval_ms",
+        default: 1_000,
+        min: 250,
+        max: 10_000,
+        hard_cap: 10_000,
+    },
+];
+
+/// 超出允许范围的配置值(A4:任何取值不得超过 hard cap)。
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("invalid_limits:{name}={value} 超出允许范围 [{min}, {max}](hard cap {hard_cap})")]
+pub struct RetentionLimitsError {
+    pub name: &'static str,
+    pub value: u64,
+    pub min: u64,
+    pub max: u64,
+    pub hard_cap: u64,
+}
+
+/// A4 retention/GC 参数的运行时取值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetentionLimits {
+    pub receipt_retention_days: u64,
+    pub receipt_max_rows_per_store: u64,
+    pub operation_retention_days: u64,
+    pub audit_retention_days: u64,
+    pub gc_interval_ms: u64,
+    pub operation_progress_interval_ms: u64,
+}
+
+impl Default for RetentionLimits {
+    fn default() -> Self {
+        Self {
+            receipt_retention_days: RETENTION_PARAMS[0].default,
+            receipt_max_rows_per_store: RETENTION_PARAMS[1].default,
+            operation_retention_days: RETENTION_PARAMS[2].default,
+            audit_retention_days: RETENTION_PARAMS[3].default,
+            gc_interval_ms: RETENTION_PARAMS[4].default,
+            operation_progress_interval_ms: RETENTION_PARAMS[5].default,
+        }
+    }
+}
+
+impl RetentionLimits {
+    /// 校验全部取值落在 A4 允许范围内(范围上限即 hard cap)。
+    /// 越界一律拒绝,不静默钳制——调用方(未来的 config 装配)负责回错。
+    pub fn validate(&self) -> Result<(), RetentionLimitsError> {
+        for (value, spec) in [
+            (self.receipt_retention_days, &RETENTION_PARAMS[0]),
+            (self.receipt_max_rows_per_store, &RETENTION_PARAMS[1]),
+            (self.operation_retention_days, &RETENTION_PARAMS[2]),
+            (self.audit_retention_days, &RETENTION_PARAMS[3]),
+            (self.gc_interval_ms, &RETENTION_PARAMS[4]),
+            (self.operation_progress_interval_ms, &RETENTION_PARAMS[5]),
+        ] {
+            if value < spec.min || value > spec.max {
+                return Err(RetentionLimitsError {
+                    name: spec.name,
+                    value,
+                    min: spec.min,
+                    max: spec.max,
+                    hard_cap: spec.hard_cap,
+                });
+            }
+        }
+        Ok(())
     }
 }
 

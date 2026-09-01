@@ -17,7 +17,7 @@ use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 /// service 库 schema 版本(新库新版本链,从 v1 起)。
-pub const SERVICE_SCHEMA_VERSION: i64 = 2;
+pub const SERVICE_SCHEMA_VERSION: i64 = 3;
 
 /// 稳定错误码:与主规格 §7.5 problem code `schema_future_version` 对齐。
 pub const CODE_SCHEMA_FUTURE_VERSION: &str = "schema_future_version";
@@ -170,6 +170,37 @@ pub const SERVICE_SCHEMA_V2_DELTA: &str = "
 ALTER TABLE command_intent ADD COLUMN problem_code TEXT;
 ";
 
+/// T1g 增量(Issue #22,§4/§4.2):Operation saga 的幂等 step receipt
+/// 协调表。每个 step 在 accept 时冻结身份(target store/aggregate/
+/// semantic_digest/expected/compensates)并以 `pending` 落盘;执行只由
+/// durable target receipt 推进(`succeeded`),重启 reconcile 只终结
+/// (`revoked`/`failed`),绝不重放业务写。行随所属 operation 级联清理
+/// (GC 只删终态 operation,§4.6)。`operation` 表(§3.4 固定列)不动:
+/// 终态 problem 记录在 `progress_json` 的稳定 DTO 内。
+pub const SERVICE_SCHEMA_V3_DELTA: &str = "
+CREATE TABLE IF NOT EXISTS operation_step (
+    operation_handle TEXT NOT NULL
+        REFERENCES operation(operation_handle) ON DELETE CASCADE,
+    step_index INTEGER NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('forward', 'compensate')),
+    step_id TEXT NOT NULL UNIQUE,
+    target_store TEXT NOT NULL,
+    aggregate TEXT NOT NULL,
+    semantic_digest TEXT NOT NULL,
+    expected_json TEXT NOT NULL DEFAULT '[]',
+    compensates INTEGER,
+    state TEXT NOT NULL
+        CHECK(state IN ('pending', 'succeeded', 'failed', 'revoked')),
+    result_json TEXT NOT NULL DEFAULT '{}',
+    problem_code TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(operation_handle, step_index)
+);
+CREATE INDEX IF NOT EXISTS idx_operation_step_state
+    ON operation_step(operation_handle, state);
+";
+
 /// 与 DDL 配套的 singleton 种子行(初始化事务内与 DDL 同事务执行)。
 /// `meta.instance_id` 是该 service 库的持久实例身份(建库时生成一次,
 /// 重开不变);`root_state` 建库即 `mode=off`(§3.4:Core 启动强制 off)。
@@ -187,18 +218,31 @@ pub(crate) fn seed_singletons(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// 同为 `user_version=1` 的其他 SQLite 文件不得被误当成 service-v1。
-/// 精确列指纹也防止中断/手工损坏的 current-version 库被静默接受。
+/// 当前版本(v3)精确指纹:V1 全量 + V2/V3 delta。
 pub(crate) fn service_schema_ready(conn: &Connection) -> Result<bool> {
-    let expected = Connection::open_in_memory()?;
-    expected.execute_batch(SERVICE_SCHEMA_V1)?;
-    expected.execute_batch(SERVICE_SCHEMA_V2_DELTA)?;
-    Ok(schema_fingerprint(conn)? == schema_fingerprint(&expected)?)
+    service_schema_version_ready(conn, SERVICE_SCHEMA_VERSION)
 }
 
 pub(crate) fn service_schema_v1_ready(conn: &Connection) -> Result<bool> {
+    service_schema_version_ready(conn, 1)
+}
+
+/// 既有 v2 库升级前的完整性校验指纹。
+pub(crate) fn service_schema_v2_ready(conn: &Connection) -> Result<bool> {
+    service_schema_version_ready(conn, 2)
+}
+
+/// 指定历史版本的完整 DDL 指纹(逐版本链式应用;同为该 user_version 的
+/// 其他/残缺 SQLite 文件不得被误当成 service 库,静默接受)。
+fn service_schema_version_ready(conn: &Connection, version: i64) -> Result<bool> {
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(SERVICE_SCHEMA_V1)?;
+    if version >= 2 {
+        expected.execute_batch(SERVICE_SCHEMA_V2_DELTA)?;
+    }
+    if version >= 3 {
+        expected.execute_batch(SERVICE_SCHEMA_V3_DELTA)?;
+    }
     Ok(schema_fingerprint(conn)? == schema_fingerprint(&expected)?)
 }
 

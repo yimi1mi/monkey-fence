@@ -10,8 +10,8 @@ use crate::support::{
 };
 use mf_kernel::project_registry::{ProjectStatus, ServiceStore};
 use mf_kernel::service_schema::{
-    error_code, ServiceSchemaError, CODE_SCHEMA_FUTURE_VERSION, SERVICE_SCHEMA_V1,
-    SERVICE_SCHEMA_VERSION,
+    error_code, guard_future_version, ServiceSchemaError, CODE_SCHEMA_FUTURE_VERSION,
+    SERVICE_SCHEMA_V1, SERVICE_SCHEMA_V2_DELTA, SERVICE_SCHEMA_V3_DELTA, SERVICE_SCHEMA_VERSION,
 };
 use rusqlite::{params, Connection};
 
@@ -21,7 +21,8 @@ fn service_db(tmp: &tempfile::TempDir) -> std::path::PathBuf {
     tmp.path().join("service-v1.db")
 }
 
-/// 全新库:恰好 §3.4 的 8 张表,user_version=1,重开不产生多余 schema 对象。
+/// 全新库:恰好 §3.4 的 8 张表 + v3 的 operation_step,user_version=
+/// 当前版本,重开不产生多余 schema 对象。
 #[test]
 fn fresh_service_db_has_exactly_spec_tables() {
     let tmp = tempfile::tempdir().unwrap();
@@ -37,6 +38,7 @@ fn fresh_service_db_has_exactly_spec_tables() {
         "meta",
         "migration_marker",
         "operation",
+        "operation_step",
         "project_registry",
         "root_state",
     ];
@@ -101,7 +103,7 @@ fn meta_and_root_state_singletons_with_stable_identity() {
 }
 
 #[test]
-fn service_v1_upgrades_to_v2_after_verified_backup() {
+fn service_v1_upgrades_to_current_after_verified_backup() {
     let tmp = tempfile::tempdir().unwrap();
     let db = service_db(&tmp);
     {
@@ -129,21 +131,22 @@ fn service_v1_upgrades_to_v2_after_verified_backup() {
     }
     let backup_dir = mf_agent::migration::backup_dir_for(&db);
     let store = ServiceStore::open(&db).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 2);
+    assert_eq!(store.schema_version().unwrap(), SERVICE_SCHEMA_VERSION);
     assert_eq!(
         store.list_projects().unwrap()[0].project_handle,
         "proj_keep"
     );
     assert!(column_names_of(&db, "command_intent").contains(&"problem_code".to_string()));
+    assert!(column_names_of(&db, "operation_step").contains(&"step_id".to_string()));
     let meta_version: i64 = read_only(&db)
         .query_row("SELECT schema_version FROM meta WHERE id=1", [], |row| {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(meta_version, 2);
+    assert_eq!(meta_version, SERVICE_SCHEMA_VERSION);
 
     let artifacts = mf_agent::migration::published_artifact_dirs(&backup_dir).unwrap();
-    assert_eq!(artifacts.len(), 1, "v1→v2 必须先发布一个完整备份");
+    assert_eq!(artifacts.len(), 1, "跨版本升级必须先发布一个完整备份");
     let backup = artifacts[0].join("backup.db");
     assert_eq!(user_version_of(&backup), 1);
     assert!(!column_names_of(&backup, "command_intent")
@@ -155,6 +158,112 @@ fn service_v1_upgrades_to_v2_after_verified_backup() {
         })
         .unwrap();
     assert_eq!(old_project, "proj_keep");
+}
+
+/// T1g v2→v3:既有 service-v2 数据(operation/intent 行)升级后完整保留;
+/// 备份是 v2;只知 v2 的旧 bundle 对 v3 库 fail-closed(回滚走
+/// side-by-side/备份,而不是旧二进制直开)。
+#[test]
+fn service_v2_upgrades_to_v3_preserving_operation_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = service_db(&tmp);
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(SERVICE_SCHEMA_V1).unwrap();
+        conn.execute_batch(SERVICE_SCHEMA_V2_DELTA).unwrap();
+        conn.execute(
+            "INSERT INTO meta(id, instance_id, schema_version, owner_epoch)
+             VALUES(1, '018f0000-0000-7000-8000-000000000002', 2, 4)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO root_state(id, mode, root_epoch) VALUES(1, 'off', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO command_intent
+                 (command_id, semantic_digest, target_store, aggregate, principal, client_id,
+                  controller_epoch, root_epoch, state, created_at, problem_code)
+             VALUES('018f0000-0000-7000-8000-0000000000d1', 'd', 'project:proj_x', 'wf',
+                     'user', 'client', 3, NULL, 'applied',
+                     '2026-09-01T00:00:00Z', NULL)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO operation
+                 (operation_handle, command_id, kind, state, saga_state, progress_json,
+                  created_at, updated_at)
+             VALUES('op_018f0000-0000-7000-8000-0000000000d2',
+                    '018f0000-0000-7000-8000-0000000000d1', 'install', 'completed',
+                    '{}', '{}', '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+    }
+    let backup_dir = mf_agent::migration::backup_dir_for(&db);
+    let store = ServiceStore::open(&db).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 3);
+    // 旧数据逐行保留(旧代码语义不被 v3 迁移改写)。
+    let (state, problem): (String, Option<String>) = read_only(&db)
+        .query_row(
+            "SELECT state, problem_code FROM command_intent WHERE command_id=?1",
+            ["018f0000-0000-7000-8000-0000000000d1"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((state.as_str(), problem), ("applied", None));
+    let (op_state, kind): (String, String) = read_only(&db)
+        .query_row(
+            "SELECT state, kind FROM operation WHERE operation_handle=?1",
+            ["op_018f0000-0000-7000-8000-0000000000d2"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((op_state.as_str(), kind.as_str()), ("completed", "install"));
+    assert_eq!(
+        counts_of(&db, "operation_step"),
+        0,
+        "v2 库没有 operation_step;迁移只建表不补造"
+    );
+    // 备份是升级前的 v2 原样。
+    let artifacts = mf_agent::migration::published_artifact_dirs(&backup_dir).unwrap();
+    assert_eq!(artifacts.len(), 1);
+    let backup = artifacts[0].join("backup.db");
+    assert_eq!(user_version_of(&backup), 2);
+    assert!(
+        !table_names_of(&backup)
+            .iter()
+            .any(|table| table == "operation_step"),
+        "v2 备份不含 v3 表"
+    );
+    drop(store);
+
+    // 回滚保护:只知 v2 的旧 bundle 对 v3 库 fail-closed(稳定错误码)。
+    let conn = Connection::open(&db).unwrap();
+    let err = guard_future_version(&conn, 2).unwrap_err();
+    assert!(format!("{err:#}").contains("schema_future_version"));
+    match err.downcast_ref::<ServiceSchemaError>() {
+        Some(ServiceSchemaError::FutureVersion { found, known }) => {
+            assert_eq!((*found, *known), (3, 2));
+        }
+        other => panic!("必须是 FutureVersion 判别值: {other:?}"),
+    }
+    // v3 delta 幂等:对已是 v3 的库重放 delta 不报错、不重复建对象。
+    let objects_before = schema_objects_of(&db);
+    conn.execute_batch(SERVICE_SCHEMA_V3_DELTA).unwrap();
+    assert_eq!(schema_objects_of(&db), objects_before);
+}
+
+fn counts_of(db: &std::path::Path, table: &str) -> i64 {
+    read_only(db)
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap()
 }
 
 /// `project_registry` 列形状(§3.4 逐列)与唯一约束。
@@ -291,6 +400,111 @@ fn command_intent_and_operation_shape_and_constraints() {
     );
 }
 
+/// `operation_step`(T1g v3)列形状、状态 CHECK、FK 级联与 step_id 唯一。
+#[test]
+fn operation_step_shape_and_constraints() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = service_db(&tmp);
+    drop(ServiceStore::open(&db).unwrap());
+
+    assert_eq!(
+        column_names_of(&db, "operation_step"),
+        vec![
+            "operation_handle",
+            "step_index",
+            "role",
+            "step_id",
+            "target_store",
+            "aggregate",
+            "semantic_digest",
+            "expected_json",
+            "compensates",
+            "state",
+            "result_json",
+            "problem_code",
+            "created_at",
+            "updated_at",
+        ]
+    );
+    assert_unique_index(&db, "operation_step", &["step_id"]);
+
+    let conn = Connection::open(&db).unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.execute(
+        "INSERT INTO command_intent
+             (command_id, semantic_digest, target_store, aggregate, principal, client_id,
+              controller_epoch, state, created_at)
+         VALUES ('cmd-step', 'd', 'project:p', 'wf', 'u', 'c', 1, 'reserved',
+                 '2026-09-01T00:00:00Z')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO operation
+             (operation_handle, command_id, kind, state, created_at, updated_at)
+         VALUES ('op_step', 'cmd-step', 'k', 'running', '2026-09-01T00:00:00Z',
+                 '2026-09-01T00:00:00Z')",
+        [],
+    )
+    .unwrap();
+    for (sql, reason) in [
+        (
+            "INSERT INTO operation_step
+                 (operation_handle, step_index, role, step_id, target_store, aggregate,
+                  semantic_digest, state, created_at, updated_at)
+             VALUES ('missing', 0, 'forward', 's0', 'project:p', 'wf', 'd', 'pending',
+                     '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')",
+            "operation_step 必须外键约束 operation",
+        ),
+        (
+            "INSERT INTO operation_step
+                 (operation_handle, step_index, role, step_id, target_store, aggregate,
+                  semantic_digest, state, created_at, updated_at)
+             VALUES ('op_step', 0, 'bogus', 's0', 'project:p', 'wf', 'd', 'pending',
+                     '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')",
+            "role CHECK 必须拒绝未知值",
+        ),
+        (
+            "INSERT INTO operation_step
+                 (operation_handle, step_index, role, step_id, target_store, aggregate,
+                  semantic_digest, state, created_at, updated_at)
+             VALUES ('op_step', 0, 'forward', 's0', 'project:p', 'wf', 'd', 'bogus',
+                     '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')",
+            "state CHECK 必须拒绝未知值",
+        ),
+    ] {
+        assert!(conn.execute(sql, []).is_err(), "{reason}");
+    }
+    for index in 0..2 {
+        conn.execute(
+            "INSERT INTO operation_step
+                 (operation_handle, step_index, role, step_id, target_store, aggregate,
+                  semantic_digest, state, created_at, updated_at)
+             VALUES ('op_step', ?1, 'forward', ?2, 'project:p', 'wf', 'd', 'pending',
+                     '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')",
+            params![index, format!("s{index}")],
+        )
+        .unwrap();
+    }
+    // step_id 全局唯一(跨 operation)。
+    assert!(
+        conn.execute(
+            "INSERT INTO operation_step
+                 (operation_handle, step_index, role, step_id, target_store, aggregate,
+                  semantic_digest, state, created_at, updated_at)
+             VALUES ('op_step', 2, 'forward', 's0', 'project:p', 'wf', 'd', 'pending',
+                     '2026-09-01T00:00:00Z', '2026-09-01T00:00:00Z')",
+            [],
+        )
+        .is_err(),
+        "step_id 必须全局唯一"
+    );
+    // 级联清理:operation 删除时 step 行随行消失(GC 只删终态 operation)。
+    conn.execute("DELETE FROM operation WHERE operation_handle='op_step'", [])
+        .unwrap();
+    assert_eq!(counts_of(&db, "operation_step"), 0);
+}
+
 /// `audit`/`durable_feature`/`migration_marker` 列形状。
 #[test]
 fn remaining_tables_shape_matches_spec() {
@@ -368,7 +582,7 @@ fn project_registry_status_check_rejects_unknown_values() {
     assert!(insert("bogus").is_err(), "status CHECK 必须拒绝未知值");
 }
 
-/// future guard:`user_version = 3`(> 2)打开拒绝,稳定错误码,库不动
+/// future guard:`user_version = 4`(> 3)打开拒绝,稳定错误码,库不动
 /// (字节不变、无 DDL、无 journal 模式改写、无 sidecar)。
 #[test]
 fn future_version_fails_closed_without_side_effects() {
@@ -378,8 +592,8 @@ fn future_version_fails_closed_without_side_effects() {
         let conn = Connection::open(&db).unwrap();
         conn.execute_batch(
             "CREATE TABLE future_marker (id INTEGER PRIMARY KEY, note TEXT NOT NULL);
-             INSERT INTO future_marker (id, note) VALUES (1, 'v2-data');
-             PRAGMA user_version = 3;",
+             INSERT INTO future_marker (id, note) VALUES (1, 'v3-data');
+             PRAGMA user_version = 4;",
         )
         .unwrap();
     }
@@ -398,7 +612,7 @@ fn future_version_fails_closed_without_side_effects() {
     );
     match err.downcast_ref::<ServiceSchemaError>() {
         Some(ServiceSchemaError::FutureVersion { found, known }) => {
-            assert_eq!(*found, 3);
+            assert_eq!(*found, 4);
             assert_eq!(*known, SERVICE_SCHEMA_VERSION);
         }
         other => panic!("必须是 FutureVersion 判别值: {other:?}"),
@@ -409,7 +623,7 @@ fn future_version_fails_closed_without_side_effects() {
         hash_before,
         "拒绝路径不得改写数据库文件字节"
     );
-    assert_eq!(user_version_of(&db), 3, "user_version 不变");
+    assert_eq!(user_version_of(&db), 4, "user_version 不变");
     assert_eq!(
         journal_mode_of(&db),
         "delete",
@@ -430,7 +644,7 @@ fn future_version_fails_closed_without_side_effects() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(note, "v2-data", "既有数据不动");
+    assert_eq!(note, "v3-data", "既有数据不动");
 }
 
 /// 同为 user_version=1 的其他/残缺 SQLite 文件不能被静默当成

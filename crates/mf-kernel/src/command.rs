@@ -215,6 +215,26 @@ impl CommandEnvelope {
         &self.target
     }
 
+    pub const fn command_type(&self) -> CommandType {
+        self.command_type
+    }
+
+    pub fn principal(&self) -> &Principal {
+        &self.principal
+    }
+
+    pub fn client_id(&self) -> &ClientId {
+        &self.client_id
+    }
+
+    pub const fn controller_epoch(&self) -> u64 {
+        self.controller_epoch
+    }
+
+    pub const fn root_epoch(&self) -> Option<u64> {
+        self.root_epoch
+    }
+
     pub fn semantic_digest(&self, key: &ServiceIdempotencyKey) -> Result<String, CommandProblem> {
         let payload = match &self.payload {
             CommandPayload::Plain(value) => sorted_json(value),
@@ -237,28 +257,7 @@ impl CommandEnvelope {
                 Value::Object(fields)
             }
         };
-        let mut expected = self.expected.clone();
-        expected.sort_by(|a, b| {
-            (a.aggregate.kind.as_str(), a.aggregate.handle.as_str())
-                .cmp(&(b.aggregate.kind.as_str(), b.aggregate.handle.as_str()))
-        });
-        let expected: Vec<_> = expected
-            .into_iter()
-            .map(|item| {
-                let revisions: serde_json::Map<String, Value> = item
-                    .revisions
-                    .into_iter()
-                    .map(|(axis, revision)| (axis, Value::String(revision.to_string())))
-                    .collect();
-                serde_json::json!({
-                    "aggregate": {
-                        "kind": item.aggregate.kind.as_str(),
-                        "handle": item.aggregate.handle,
-                    },
-                    "revisions": revisions,
-                })
-            })
-            .collect();
+        let expected = canonical_expected_revisions(&self.expected);
         let canonical = sorted_json(&serde_json::json!({
             "schema": COMMAND_SCHEMA,
             "type": self.command_type.as_str(),
@@ -275,7 +274,7 @@ impl CommandEnvelope {
         Ok(hex_digest(Sha256::digest(bytes)))
     }
 
-    fn lease_check(&self) -> LeaseCheck<'_> {
+    pub(crate) fn lease_check(&self) -> LeaseCheck<'_> {
         LeaseCheck {
             principal: &self.principal,
             client_id: &self.client_id,
@@ -354,8 +353,8 @@ impl ServiceIdempotencyKey {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EffectOutput {
-    result_revisions: Value,
-    projection: Value,
+    pub(crate) result_revisions: Value,
+    pub(crate) projection: Value,
 }
 
 impl EffectOutput {
@@ -386,7 +385,7 @@ pub enum IntentState {
 }
 
 impl IntentState {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Reserved => "reserved",
             Self::Applied => "applied",
@@ -505,11 +504,11 @@ impl TargetDatabase {
         }
     }
 
-    fn store_key(&self) -> &str {
+    pub(crate) fn store_key(&self) -> &str {
         &self.store_key
     }
 
-    fn with_tx<T>(
+    pub(crate) fn with_tx<T>(
         &self,
         f: impl FnOnce(&Transaction<'_>) -> Result<T, CommandProblem>,
     ) -> Result<T, CommandProblem> {
@@ -755,7 +754,7 @@ impl CommandCoordinator {
                                     service_tx,
                                     envelope.command_id.as_str(),
                                     state,
-                                    Some(&error),
+                                    Some(error.code()),
                                 )
                                 .map_err(anyhow::Error::new)?;
                             }
@@ -798,36 +797,24 @@ impl CommandCoordinator {
                 }
                 let receipt = target
                     .with_conn(|conn| {
-                        conn.query_row(
-                            "SELECT semantic_digest, aggregate_handle, result_revisions
-                             FROM command_receipt WHERE command_id=?1",
-                            [command_id.as_str()],
-                            |row| {
-                                Ok((
-                                    row.get::<_, String>(0)?,
-                                    row.get::<_, String>(1)?,
-                                    row.get::<_, String>(2)?,
-                                ))
-                            },
+                        validated_receipt_result(
+                            conn,
+                            command_id.as_str(),
+                            &intent.semantic_digest,
+                            &intent.aggregate_handle,
                         )
-                        .optional()
-                        .map_err(internal)
                     })
                     .map_err(anyhow::Error::new)?;
-                let Some((digest, aggregate, revisions)) = receipt else {
+                let Some(result_revisions) = receipt else {
                     finish_intent_tx(
                         service_tx,
                         command_id.as_str(),
                         IntentState::Revoked,
-                        Some(&CommandProblem::ControllerLeaseExpired),
+                        Some(CommandProblem::ControllerLeaseExpired.code()),
                     )
                     .map_err(anyhow::Error::new)?;
                     return Ok(ReconcileOutcome::Terminal(IntentState::Revoked));
                 };
-                if digest != intent.semantic_digest || aggregate != intent.aggregate_handle {
-                    return Err(anyhow::Error::new(CommandProblem::CommandIdReused));
-                }
-                let result_revisions: Value = serde_json::from_str(&revisions)?;
                 finish_intent_tx(service_tx, command_id.as_str(), IntentState::Applied, None)
                     .map_err(anyhow::Error::new)?;
                 Ok(ReconcileOutcome::Applied(CommandOutcome::Applied {
@@ -923,15 +910,16 @@ pub enum ReconcileOutcome {
 }
 
 #[allow(dead_code)]
-struct IntentRecord {
-    semantic_digest: String,
-    target_store: String,
-    aggregate_handle: String,
-    state: IntentState,
-    problem_code: Option<String>,
+pub(crate) struct IntentRecord {
+    pub(crate) semantic_digest: String,
+    pub(crate) target_store: String,
+    pub(crate) aggregate_handle: String,
+    pub(crate) state: IntentState,
+    pub(crate) problem_code: Option<String>,
 }
 
-fn intent_tx(
+/// service `command_intent` 行读取(operation/reconcile 复用)。
+pub(crate) fn intent_tx(
     conn: &rusqlite::Connection,
     command_id: &str,
 ) -> Result<Option<IntentRecord>, CommandProblem> {
@@ -966,13 +954,14 @@ fn intent_tx(
     .transpose()
 }
 
-fn finish_intent_tx(
+/// 终结 command intent(operation saga 与 reconcile 复用)。`problem_code`
+/// 直接取 [`CommandProblem::code`] 的稳定码,幂等重放同码不冲突。
+pub(crate) fn finish_intent_tx(
     tx: &Transaction<'_>,
     command_id: &str,
     state: IntentState,
-    problem: Option<&CommandProblem>,
+    problem_code: Option<&str>,
 ) -> Result<(), CommandProblem> {
-    let problem_code = problem.map(CommandProblem::code);
     let changed = tx
         .execute(
             "UPDATE command_intent SET state=?2, resolved_at=?3, problem_code=?4
@@ -1001,7 +990,7 @@ fn finish_intent_tx(
     }
 }
 
-fn problem_for_terminal_code(code: &str) -> Option<CommandProblem> {
+pub(crate) fn problem_for_terminal_code(code: &str) -> Option<CommandProblem> {
     match code {
         "controller_lease_expired" => Some(CommandProblem::ControllerLeaseExpired),
         "root_epoch_expired" => Some(CommandProblem::RootEpochExpired),
@@ -1018,28 +1007,56 @@ fn receipt_outcome(
     envelope: &CommandEnvelope,
     digest: &str,
 ) -> Result<Option<CommandOutcome>, CommandProblem> {
-    let receipt: Option<(String, String, String, String)> = tx
+    let Some(result_revisions) = validated_receipt_result(
+        tx,
+        envelope.command_id.as_str(),
+        digest,
+        &envelope.target.aggregate.handle,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(CommandOutcome::Applied {
+        result_revisions,
+        replayed: true,
+    }))
+}
+
+/// command 与 Operation 共用的 target-local receipt reader。身份必须匹配，
+/// 且只有 applied+finalized 的行可作为已线性化凭证。
+pub(crate) fn validated_receipt_result(
+    conn: &rusqlite::Connection,
+    receipt_id: &str,
+    semantic_digest: &str,
+    aggregate_handle: &str,
+) -> Result<Option<Value>, CommandProblem> {
+    let receipt: Option<(String, String, String, String, Option<String>)> = conn
         .query_row(
-            "SELECT semantic_digest, aggregate_handle, result_revisions, state
+            "SELECT semantic_digest, aggregate_handle, result_revisions, state, finalized_at
              FROM command_receipt WHERE command_id=?1",
-            [envelope.command_id.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            [receipt_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .optional()
         .map_err(internal)?;
-    let Some((stored_digest, aggregate, revisions, state)) = receipt else {
+    let Some((stored_digest, aggregate, revisions, state, finalized_at)) = receipt else {
         return Ok(None);
     };
-    if stored_digest != digest || aggregate != envelope.target.aggregate.handle {
+    if stored_digest != semantic_digest || aggregate != aggregate_handle {
         return Err(CommandProblem::CommandIdReused);
     }
-    if state != "applied" {
+    if state != "applied" || finalized_at.is_none() {
         return Err(CommandProblem::CommandInProgress);
     }
-    Ok(Some(CommandOutcome::Applied {
-        result_revisions: serde_json::from_str(&revisions).map_err(internal)?,
-        replayed: true,
-    }))
+    serde_json::from_str(&revisions).map(Some).map_err(internal)
 }
 
 fn sorted_json(value: &Value) -> Value {
@@ -1058,9 +1075,36 @@ fn sorted_json(value: &Value) -> Value {
     }
 }
 
-fn canonical_json(value: &Value) -> Result<String, CommandProblem> {
+pub(crate) fn canonical_json(value: &Value) -> Result<String, CommandProblem> {
     serde_json::to_string(&sorted_json(value))
         .map_err(|error| CommandProblem::Internal(error.to_string()))
+}
+
+/// command 与 Operation step 共用的 expected revision canonical 编码。
+/// 轴由 BTreeMap 保序，aggregate 列表按 kind/handle 排序。
+pub(crate) fn canonical_expected_revisions(expected: &[ExpectedRevision]) -> Vec<Value> {
+    let mut expected = expected.to_vec();
+    expected.sort_by(|a, b| {
+        (a.aggregate.kind.as_str(), a.aggregate.handle.as_str())
+            .cmp(&(b.aggregate.kind.as_str(), b.aggregate.handle.as_str()))
+    });
+    expected
+        .into_iter()
+        .map(|item| {
+            let revisions: serde_json::Map<String, Value> = item
+                .revisions
+                .into_iter()
+                .map(|(axis, revision)| (axis, Value::String(revision.to_string())))
+                .collect();
+            serde_json::json!({
+                "aggregate": {
+                    "kind": item.aggregate.kind.as_str(),
+                    "handle": item.aggregate.handle,
+                },
+                "revisions": revisions,
+            })
+        })
+        .collect()
 }
 
 fn value_contains(value: &Value, needle: &str) -> bool {
@@ -1074,7 +1118,7 @@ fn value_contains(value: &Value, needle: &str) -> bool {
     }
 }
 
-fn value_has_sensitive_field(value: &Value) -> bool {
+pub(crate) fn value_has_sensitive_field(value: &Value) -> bool {
     match value {
         Value::Array(values) => values.iter().any(value_has_sensitive_field),
         Value::Object(values) => values
@@ -1099,7 +1143,7 @@ fn is_sensitive_key(key: &str) -> bool {
         || key.ends_with("_token_ref")
 }
 
-fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
+pub(crate) fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
     bytes
         .as_ref()
         .iter()
@@ -1127,7 +1171,7 @@ fn internal(error: impl fmt::Display) -> CommandProblem {
     CommandProblem::Internal(error.to_string())
 }
 
-fn problem_from_anyhow(error: anyhow::Error) -> CommandProblem {
+pub(crate) fn problem_from_anyhow(error: anyhow::Error) -> CommandProblem {
     error
         .downcast_ref::<CommandProblem>()
         .cloned()

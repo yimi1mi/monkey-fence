@@ -1,15 +1,17 @@
 //! Project Registry:service-v1.db 的访问层(canonical spec §3.4/§3.5/§3.8)。
 //!
 //! T1d 交付:库打开(future guard fail-closed + 当前用户 ACL)与
-//! session.json → `project_registry` 幂等导入。command_intent / operation /
-//! audit 的写路径属后续 ticket;本层不接管 `crates/mf` AppCtx 的权威项目
-//! 列表——GPUI 会话状态仍是 AppCtx 的事实源,service 库当前是 dark data。
+//! session.json → `project_registry` 幂等导入。T1f/T1g 已增加 command /
+//! Operation/reconcile 的 dark write seam；audit 生产写路径仍属后续 ticket。
+//! 本层尚不接管 `crates/mf` AppCtx 的权威项目列表——GPUI 会话状态仍是
+//! AppCtx 的事实源，service 库当前是 dark data。
 
 use crate::platform_acl::restrict_service_database_to_current_user;
 use crate::service_schema::{
     guard_future_version, schema_version_of, seed_singletons, service_db_path,
-    service_schema_ready, service_schema_v1_ready, table_names_of, validate_singletons,
-    SERVICE_SCHEMA_V1, SERVICE_SCHEMA_V2_DELTA, SERVICE_SCHEMA_VERSION,
+    service_schema_ready, service_schema_v1_ready, service_schema_v2_ready, table_names_of,
+    validate_singletons, SERVICE_SCHEMA_V1, SERVICE_SCHEMA_V2_DELTA, SERVICE_SCHEMA_V3_DELTA,
+    SERVICE_SCHEMA_VERSION,
 };
 use anyhow::{Context as _, Result};
 use parking_lot::Mutex;
@@ -118,13 +120,16 @@ impl ServiceStore {
         if current == 1 && !service_schema_v1_ready(&conn)? {
             anyhow::bail!("service_schema_mismatch:文件标记为旧 service v1，但 schema 指纹不完整");
         }
+        if current == 2 && !service_schema_v2_ready(&conn)? {
+            anyhow::bail!("service_schema_mismatch:文件标记为旧 service v2，但 schema 指纹不完整");
+        }
         restrict_service_database_to_current_user(&conn)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
         if current < SERVICE_SCHEMA_VERSION {
-            // v0 全新初始化无需备份；v1→v2 必须先走统一 SQLite Backup
-            // 屏障，再在单事务加 problem_code 并更新 meta/user_version。
+            // v0 全新初始化无需备份；v1→v2/v2→v3 必须先走统一 SQLite
+            // Backup 屏障，再在单事务应用 delta 并更新 meta/user_version。
             mf_agent::migration::upgrade_with_barrier(
                 &mut conn,
                 mf_agent::migration::StoreKind::Service,
@@ -136,6 +141,9 @@ impl ServiceStore {
                     }
                     if from < 2 && to >= 2 {
                         tx.execute_batch(SERVICE_SCHEMA_V2_DELTA)?;
+                    }
+                    if from < 3 && to >= 3 {
+                        tx.execute_batch(SERVICE_SCHEMA_V3_DELTA)?;
                     }
                     tx.execute(
                         "UPDATE meta SET schema_version=?1 WHERE id=1",
