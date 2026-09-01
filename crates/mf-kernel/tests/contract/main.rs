@@ -2,6 +2,9 @@
 //! Cargo 只把 `tests/*.rs` 与 `tests/*/main.rs` 识别为集成测试 crate,
 //! 因此本文件聚合全部契约模块。
 
+mod discovery_fencing;
+mod limits_defaults;
+mod owner_lock;
 mod service_schema;
 mod session_import;
 mod support;

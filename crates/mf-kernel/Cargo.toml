@@ -17,7 +17,12 @@ thiserror = "2"
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }
+# Win32_System_Threading:T1e CoreOwnerLock 命名 mutex 与进程存活探针
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+# T1e Unix 平台可编译契约:flock owner 互斥与 kill(0) 存活探针
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

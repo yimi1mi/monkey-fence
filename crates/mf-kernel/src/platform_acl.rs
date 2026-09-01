@@ -1,9 +1,12 @@
-//! 数据库文件与专用目录的当前用户 ACL 收紧(§3.8:数据库文件当前用户 ACL)。
+//! 数据库文件与专用目录的当前用户 ACL 收紧(§3.8:数据库文件当前用户 ACL;
+//! §11.1:discovery 记录与锁文件权限仅当前用户)。
 //!
 //! 与 `crates/mf-agent/src/migration.rs` 同一实现口径,刻意不跨 crate 复用:
 //! mf-kernel 是未来的 Core 内核 crate,不反向依赖 mf-agent;#18 Catalog v2
-//! 并行改动 mf-agent 时两侧互不影响。收紧只作用于 service 库自身与其
-//! `.monkeyfence` 专用父目录,绝不误改其他目录。
+//! 并行改动 mf-agent 时两侧互不影响。service 库路径收紧
+//! (`restrict_service_database_to_current_user`)只作用于库自身与其
+//! `.monkeyfence` 专用父目录;singleton(`core.lock`/`discovery.json`)复用
+//! 底层 [`restrict_current_user_only`],由调用方限定只收紧自己拥有的叶子路径。
 
 use crate::service_schema::is_service_home;
 use anyhow::Result;
@@ -46,14 +49,14 @@ pub(crate) fn restrict_service_database_to_current_user(conn: &Connection) -> Re
 }
 
 #[cfg(unix)]
-fn restrict_current_user_only(path: &Path) -> std::io::Result<()> {
+pub(crate) fn restrict_current_user_only(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let mode = if path.is_dir() { 0o700 } else { 0o600 };
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
 #[cfg(windows)]
-fn restrict_current_user_only(path: &Path) -> std::io::Result<()> {
+pub(crate) fn restrict_current_user_only(path: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{
@@ -102,6 +105,6 @@ fn restrict_current_user_only(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn restrict_current_user_only(_path: &Path) -> std::io::Result<()> {
+pub(crate) fn restrict_current_user_only(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }

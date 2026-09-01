@@ -155,6 +155,18 @@ impl ServiceStore {
         schema_version_of(&self.conn.lock())
     }
 
+    /// CoreOwnerLock 在 L-OWNER 内原子推进 service.meta.owner_epoch。
+    pub(crate) fn with_tx<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction) -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let value = f(&tx)?;
+        tx.commit()?;
+        Ok(value)
+    }
+
     /// 全部已登记 Project(按 canonical_root 排序,确定性读序)。
     pub fn list_projects(&self) -> Result<Vec<RegisteredProject>> {
         let conn = self.conn.lock();

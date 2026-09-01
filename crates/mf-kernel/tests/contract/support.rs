@@ -4,7 +4,9 @@
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 pub fn sha256_file(path: &Path) -> String {
     let mut hasher = Sha256::new();
@@ -227,6 +229,123 @@ pub fn write_session_json(path: &Path, value: &serde_json::Value) -> Vec<u8> {
     let bytes = serde_json::to_vec_pretty(value).unwrap();
     fs::write(path, &bytes).unwrap();
     bytes
+}
+
+// ─────────────────── T1e CoreOwnerLock 测试助手 ───────────────────
+
+/// 每个测试独立的 owner 互斥名(避免测试间、以及与真实 Core 的
+/// `Local\MonkeyFence.Core` 互斥冲突;Unix 平台互斥走 flock 文件,不使用名字)。
+pub fn unique_mutex_name(tag: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let serial = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        r"Local\MonkeyFence.Test.{tag}.{}.{}",
+        std::process::id(),
+        serial
+    )
+}
+
+/// 跨进程契约测试的 probe 二进制路径(同包 bin,Cargo 注入)。
+pub fn owner_lock_probe_exe() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_owner_lock_probe"))
+}
+
+/// 轮询等待文件出现并读取内容(跨进程 ack 同步;超时返回 None)。
+pub fn wait_for_file(path: &Path, timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Ok(text) = fs::read_to_string(path) {
+            return Some(text);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+}
+
+/// 断言文件仅当前用户可访问(§11.1:discovery 记录与锁文件权限仅当前用户)。
+pub fn assert_current_user_only(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let expected = if path.is_dir() { 0o700 } else { 0o600 };
+        assert_eq!(
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            expected,
+            "{} 必须仅当前用户可访问",
+            path.display()
+        );
+    }
+    #[cfg(windows)]
+    {
+        let sddl = dacl_sddl(path);
+        assert!(
+            sddl.contains(";;;OW)"),
+            "{} 必须只授权 object owner:{sddl}",
+            path.display()
+        );
+        for broad in [";;;WD)", ";;;AU)", ";;;BU)", ";;;BG)"] {
+            assert!(
+                !sddl.contains(broad),
+                "{} 不得授权宽泛主体 {broad}:{sddl}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// T1e owner lock 的确定性 fake 装配:fake 互斥/时钟/存活探针 + tempdir。
+/// `mutex_handle()` 返回同名的 fake 互斥实例(全局注册表按名字互斥),
+/// 供 `simulate_os_reclaim`/`is_held` 注入与观察。
+pub struct OwnerFixture {
+    pub dir: tempfile::TempDir,
+    pub paths: mf_kernel::singleton::OwnerLockPaths,
+    pub mutex_name: String,
+    pub clock: std::sync::Arc<mf_kernel::singleton::FakeOwnerClock>,
+    pub liveness: std::sync::Arc<mf_kernel::singleton::FakeProcessLivenessProbe>,
+}
+
+impl OwnerFixture {
+    pub fn new(tag: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = mf_kernel::singleton::OwnerLockPaths::in_dir(dir.path());
+        let start = chrono::DateTime::parse_from_rfc3339("2026-09-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        Self {
+            paths,
+            mutex_name: unique_mutex_name(tag),
+            clock: std::sync::Arc::new(mf_kernel::singleton::FakeOwnerClock::new(start)),
+            liveness: std::sync::Arc::new(mf_kernel::singleton::FakeProcessLivenessProbe::new()),
+            dir,
+        }
+    }
+
+    pub fn mutex_handle(&self) -> mf_kernel::singleton::FakeOwnerMutex {
+        mf_kernel::singleton::FakeOwnerMutex::new(&self.mutex_name)
+    }
+
+    pub fn setup(&self) -> mf_kernel::singleton::OwnerLockSetup {
+        mf_kernel::singleton::OwnerLockSetup::new(
+            self.paths.clone(),
+            Box::new(self.mutex_handle()),
+            self.clock.clone(),
+            self.liveness.clone(),
+        )
+    }
+
+    /// 真实缝隙装配(Windows 命名 mutex / Unix flock + 系统时钟 + OS 探针),
+    /// 用于进程内真实互斥与跨进程路径。
+    pub fn real_setup(&self) -> mf_kernel::singleton::OwnerLockSetup {
+        mf_kernel::singleton::OwnerLockSetup::new(
+            self.paths.clone(),
+            mf_kernel::singleton::platform_owner_mutex(&self.mutex_name, &self.paths.flock_path()),
+            std::sync::Arc::new(mf_kernel::singleton::SystemOwnerClock),
+            std::sync::Arc::new(mf_kernel::singleton::OsProcessLivenessProbe),
+        )
+        .with_acquire_timeout(Duration::from_millis(300))
+    }
 }
 
 /// 读取 DACL 的 SDDL 文本(Windows ACL 断言用)。
