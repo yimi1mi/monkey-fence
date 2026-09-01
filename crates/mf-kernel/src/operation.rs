@@ -1179,7 +1179,10 @@ impl OperationCoordinator {
                     permit.validate_expected(tx, &lease_check)?;
                     let output = effect.take().expect("effect 只消费一次")(tx)?;
                     if value_has_sensitive_field(&output.result_revisions)
-                        || value_has_sensitive_field(&output.projection)
+                        || output
+                            .projection
+                            .as_ref()
+                            .is_some_and(value_has_sensitive_field)
                     {
                         return Err(CommandProblem::InvalidEnvelope(
                             "Secret 明文或可复用引用进入 step result/event".into(),
@@ -1200,27 +1203,29 @@ impl OperationCoordinator {
                         ],
                     )
                     .map_err(internal_command)?;
-                    let event = canonical_json(&serde_json::json!({
-                        "type": format!("{}.applied", step.command_type.as_str()),
-                        "aggregate": {
-                            "kind": step.target.aggregate.kind.as_str(),
-                            "handle": step.target.aggregate.handle,
-                        },
-                        "caused_by_command_id": operation.command_id,
-                        "operation": {
-                            "handle": handle.as_str(),
-                            "step_index": index,
-                            "step_id": step.step_id.as_str(),
-                            "role": step.role.as_str(),
-                        },
-                        "projection": output.projection,
-                    }))?;
-                    tx.execute(
-                        "INSERT INTO projection_outbox(event_json, published_at)
-                         VALUES (?1, NULL)",
-                        [event],
-                    )
-                    .map_err(internal_command)?;
+                    if let Some(projection) = output.projection {
+                        let event = canonical_json(&serde_json::json!({
+                            "type": format!("{}.applied", step.command_type.as_str()),
+                            "aggregate": {
+                                "kind": step.target.aggregate.kind.as_str(),
+                                "handle": step.target.aggregate.handle,
+                            },
+                            "caused_by_command_id": operation.command_id,
+                            "operation": {
+                                "handle": handle.as_str(),
+                                "step_index": index,
+                                "step_id": step.step_id.as_str(),
+                                "role": step.role.as_str(),
+                            },
+                            "projection": projection,
+                        }))?;
+                        tx.execute(
+                            "INSERT INTO projection_outbox(event_json, published_at)
+                             VALUES (?1, NULL)",
+                            [event],
+                        )
+                        .map_err(internal_command)?;
+                    }
                     Ok((output.result_revisions, permit))
                 });
                 let (revisions, _permit) = match target_result {

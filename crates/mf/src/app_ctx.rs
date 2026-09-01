@@ -7,15 +7,19 @@ use crate::adapter_launch;
 use crate::pipe_server::{pipe_name_for_current_process, PipeServer};
 use crate::project_overview::{HubCtx, ProjectOverviewHub};
 use crate::runtime_host::{KeepAwake, RuntimeHostImpl, SessionRegistry, WorkflowLauncher};
-use anyhow::{Context as _, Result};
+use anyhow::Result;
 use mf_agent::orchestrator::{
     GlobalLimiter, Orchestrator, ProfileCatalog, WorkflowKernel, WorkflowPluginPins,
 };
 use mf_agent::workflow::{PluginSourcePin, WorkflowTemplateVersion};
 use mf_agent::{CatalogStore, Store, TaskStatus};
+use mf_kernel::handles::{ClientId, Principal, ProjectStoreHandle};
+use mf_kernel::kernel::{InProcessKernelRuntime, KernelOutcome, KernelProblem, LegacyKernelClient};
 use mf_plugins::PluginRegistry;
 use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// 生产 pin 生命周期:Plugin Host 内容寻址 pin(内置合成插件走源 pin)。
@@ -208,6 +212,7 @@ impl mf_agent::execution_directory::DirectoryProviderResolver for PluginDirector
 pub struct ProjectHandle {
     pub root: PathBuf,
     pub orchestrator: Arc<Orchestrator>,
+    kernel_project: Option<ProjectStoreHandle>,
 }
 
 /// 工作流默认 CLI 节点引用前缀:`default-cli:<完整 Agent Type 贡献 ID>`。
@@ -447,6 +452,19 @@ fn apply_task_goal(prompt: &mut Option<String>, goal: &str) {
     }
 }
 
+/// T2a CoreKernel tracer：opaque owner runtime + facade-bound legacy client。
+/// AppCtx 看不到 service/key/具体 kernel，也不为 rename 持有写 seam。
+pub(crate) struct KernelTracer {
+    runtime: Arc<InProcessKernelRuntime>,
+    client: LegacyKernelClient,
+}
+
+fn local_principal() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "local-user".into())
+}
+
 pub struct AppCtx {
     pub registry: Arc<SessionRegistry>,
     pub plugins: Arc<PluginRegistry>,
@@ -467,6 +485,13 @@ pub struct AppCtx {
     #[allow(dead_code)]
     pipe: Mutex<Option<PipeServer>>,
     pipe_orchestrators: Option<Arc<Mutex<Vec<Arc<Orchestrator>>>>>,
+    /// T2a CoreKernel facade tracer(惰性装配;None = 禁用或装配失败,
+    /// 此时 rename 走旧入口)。AppCtx 只持有 facade,不直接写 Store。
+    kernel: Mutex<Option<Arc<KernelTracer>>>,
+    kernel_error: Mutex<Option<String>>,
+    /// 测试专用旧 bundle 模式；生产无运行时 Store 直写 rollback。
+    #[cfg(test)]
+    kernel_tracer_enabled: AtomicBool,
 }
 
 impl AppCtx {
@@ -551,6 +576,10 @@ impl AppCtx {
             secret_master_key: Mutex::new(None),
             pipe: Mutex::new(pipe_server),
             pipe_orchestrators: Some(orchs),
+            kernel: Mutex::new(None),
+            kernel_error: Mutex::new(None),
+            #[cfg(test)]
+            kernel_tracer_enabled: AtomicBool::new(false),
         });
         ctx.refresh_catalog();
         ctx
@@ -568,6 +597,101 @@ impl AppCtx {
     /// 生产不调用,走 OS keyring)。必须在 open_project 之前调用。
     pub fn set_secret_master_key_for_tests(&self, key: [u8; 32]) {
         *self.secret_master_key.lock() = Some(key);
+    }
+
+    // ---------- T2a CoreKernel tracer(Issue #23,workflow.rename) ----------
+
+    /// 惰性装配并返回 tracer。只有显式 rollback 开关关闭时返回 None；
+    /// owner/service/keyring 装配失败必须 fail-closed，禁止自动回退直写。
+    fn ensure_kernel_tracer(&self) -> Result<Option<Arc<KernelTracer>>, KernelProblem> {
+        let mut guard = self.kernel.lock();
+        if let Some(tracer) = guard.as_ref() {
+            return Ok(Some(tracer.clone()));
+        }
+        #[cfg(test)]
+        if !self.kernel_tracer_enabled.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
+        if let Some(error) = self.kernel_error.lock().clone() {
+            return Err(KernelProblem::ServiceUnavailable(error));
+        }
+        let tracer = match Self::build_production_kernel_tracer() {
+            Ok(tracer) => Arc::new(tracer),
+            Err(error) => {
+                let message = error.to_string();
+                *self.kernel_error.lock() = Some(message.clone());
+                return Err(KernelProblem::ServiceUnavailable(message));
+            }
+        };
+        *guard = Some(tracer.clone());
+        Ok(Some(tracer))
+    }
+
+    /// 生产装配由 mf-kernel opaque runtime 完成：L-OWNER → service/keyring
+    /// → facade/client。AppCtx 不接触 service/key 或具体 kernel。
+    fn build_production_kernel_tracer() -> Result<KernelTracer> {
+        let client_id = ClientId::parse("legacy-gpui-inproc")?;
+        let principal = Principal::parse(local_principal())?;
+        let (runtime, client) = InProcessKernelRuntime::acquire_default(
+            env!("CARGO_PKG_VERSION"),
+            client_id,
+            principal,
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+        Ok(KernelTracer { runtime, client })
+    }
+
+    /// 测试注入:绕过生产装配(service DB/keyring)安装 tracer。
+    /// 必须在 open_project 之前调用。
+    #[cfg(test)]
+    pub(crate) fn install_kernel_tracer_for_tests(
+        &self,
+        runtime: Arc<InProcessKernelRuntime>,
+        client: LegacyKernelClient,
+    ) {
+        *self.kernel.lock() = Some(Arc::new(KernelTracer { runtime, client }));
+        *self.kernel_error.lock() = None;
+        self.kernel_tracer_enabled.store(true, Ordering::SeqCst);
+    }
+
+    /// 测试注入:模拟回滚开关(卸载 tracer,rename 回旧入口)。
+    #[cfg(test)]
+    pub(crate) fn disable_kernel_tracer_for_tests(&self) {
+        *self.kernel.lock() = None;
+        *self.kernel_error.lock() = None;
+        self.kernel_tracer_enabled.store(false, Ordering::SeqCst);
+    }
+
+    /// `workflow.rename` tracer 的 UI 入口:经 facade dispatch 写入。
+    /// 生产总是返回 Some；None 仅供 cfg(test) 验证旧 bundle 数据兼容。
+    /// 装配/登记/dispatch 失败均返回 Some(Err)，禁止自动直写 Store。
+    pub fn rename_workflow_via_kernel(
+        &self,
+        root: &Path,
+        workflow_key: &str,
+        new_name: &str,
+    ) -> Option<Result<KernelOutcome, KernelProblem>> {
+        let tracer = match self.ensure_kernel_tracer() {
+            Ok(Some(tracer)) => tracer,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
+        };
+        let project = self
+            .projects
+            .lock()
+            .iter()
+            .find(|project| project.root == root)
+            .and_then(|project| project.kernel_project.clone());
+        let Some(project) = project else {
+            return Some(Err(KernelProblem::ServiceUnavailable(
+                "Project Store 未完成 kernel 登记".into(),
+            )));
+        };
+        Some(
+            tracer
+                .client
+                .rename_workflow(&project, workflow_key, new_name),
+        )
     }
 
     /// 打开的项目数。
@@ -627,12 +751,23 @@ impl AppCtx {
                 return Ok(p.orchestrator.clone());
             }
         }
-        let db_path = mf_agent::project_db_path(&root);
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("创建 {} 失败", parent.display()))?;
-        }
-        let store = Store::open(&db_path)?;
+        // Core owner 必须先于 authoritative Project Store 打开。
+        let tracer = self
+            .ensure_kernel_tracer()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let (kernel_project, store) = if let Some(tracer) = &tracer {
+            let project = tracer.runtime.open_project(&root)?;
+            (Some(project.handle().clone()), project.legacy_store())
+        } else {
+            #[cfg(test)]
+            {
+                (None, Store::open(&mf_agent::project_db_path(&root))?)
+            }
+            #[cfg(not(test))]
+            {
+                return Err(anyhow::anyhow!("CoreKernel runtime 未装配"));
+            }
+        };
         let config = self.config.lock().clone();
         let host = RuntimeHostImpl::with_launcher(
             self.registry.clone(),
@@ -676,10 +811,20 @@ impl AppCtx {
                     plugins: self.plugins.clone(),
                 })),
             },
-        )?;
+        );
+        let orch = match orch {
+            Ok(orch) => orch,
+            Err(error) => {
+                if let (Some(tracer), Some(project)) = (&tracer, &kernel_project) {
+                    tracer.runtime.unregister_project_store(project);
+                }
+                return Err(error);
+            }
+        };
         self.projects.lock().push(ProjectHandle {
             root: root.clone(),
             orchestrator: orch.clone(),
+            kernel_project,
         });
         // Event Hub:持续消费该 Orchestrator 的 UI 事件并构建 overview
         self.overview.attach(root, orch.clone());
@@ -717,6 +862,12 @@ impl AppCtx {
             // cancel_task 会 emit 状态事件；保持 drain 到所有取消操作结束，
             // 避免关闭大型项目时 bounded events_rx 反压当前线程。
             self.overview.detach(&h.root);
+            // T2a tracer:同项目重开时按最新 Store 实例重新登记。
+            if let Some(tracer) = self.kernel.lock().clone() {
+                if let Some(project) = &h.kernel_project {
+                    tracer.runtime.unregister_project_store(project);
+                }
+            }
         }
         self.sync_pipe_routing();
     }

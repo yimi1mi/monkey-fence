@@ -5,21 +5,27 @@
 //! stale discovery fencing(§11.1,L-OWNER)与附录 A7 生命周期参数;
 //! T1f(Issue #21)交付 command intent→target receipt/outbox 原子链;
 //! T1g(Issue #22)交付 Operation saga、重启 reconcile 与 retention/GC
-//! (§4/附录 A4),并把 T2 所需 handle/revision/intent/operation durable
-//! DTO 冻结在本 crate。kernel facade/projection 等模块随后续 ticket 落位;
-//! 本 crate 当前是 dark data——不接管 `crates/mf` AppCtx 的任何权威状态,
-//! 也不提供 standalone Core bin(`owner_lock_probe` 是跨进程契约测试的
-//! 探针工具,不是 Core)。
+//! (§4/附录 A4)。
+//!
+//! T2a(Issue #23)交付 CoreKernel facade(§2.2 唯一深模块缝隙):封闭
+//! `workflow.rename` 命令经 dispatch→Project Store→snapshot/event 贯通,
+//! `crates/mf` 的 GPUI rename 经 in-process adapter 改走 facade。除该
+//! tracer 外,本 crate 不接管 `crates/mf` AppCtx 的权威状态;standalone
+//! Core bin、WebGateway、完整可配置 journal/min-age/client queues 与
+//! attach_terminal 属后续 ticket。
 
 pub mod command;
 pub mod handles;
+pub mod kernel;
 pub mod lease;
 pub mod limits;
 pub mod operation;
 mod platform_acl;
 pub mod project_registry;
+pub mod projection;
 pub mod reconcile;
 pub mod service_schema;
+pub mod shutdown;
 pub mod singleton;
 
 // Command contracts 需要 crate-private target effect seam；源文件仍位于
@@ -33,6 +39,9 @@ mod command_support;
 #[cfg(test)]
 #[path = "../tests/contract/intent_recovery.rs"]
 mod intent_recovery;
+#[cfg(test)]
+#[path = "../tests/contract/kernel_first_tracer.rs"]
+mod kernel_first_tracer;
 #[cfg(test)]
 #[path = "../tests/contract/multistore_crash_recovery.rs"]
 mod multistore_crash_recovery;

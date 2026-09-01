@@ -421,13 +421,50 @@ impl WorkflowCanvas {
         cx.notify();
     }
 
-    /// 重命名(原子编辑:保存)。
+    /// 重命名:T2a 起优先经 CoreKernel facade(presentation 轴,只推进
+    /// presentation revision)。生产装配/登记/dispatch 失败一律表面化并
+    /// 回读权威状态；旧直写只在 cfg(test) 验证 previous-bundle 数据兼容。
     pub fn rename_workflow(&mut self, name: &str, cx: &mut Context<Self>) {
-        if self.current_key.is_none() {
+        let Some(key) = self.current_key.clone() else {
             return;
+        };
+        let via_kernel = self
+            .project_root
+            .as_ref()
+            .and_then(|root| self.app.rename_workflow_via_kernel(root, &key, name));
+        match via_kernel {
+            Some(Ok(outcome)) => {
+                let mf_kernel::kernel::KernelOutcome::Applied { revisions, .. } = outcome;
+                self.save_error = None;
+                self.workflow_name = name.to_string();
+                self.reload_workflows();
+                self.status = format!(
+                    "已重命名「{name}」(presentation r{})",
+                    revisions.presentation_revision
+                );
+            }
+            Some(Err(problem)) => {
+                let message = format!("重命名失败({}): {problem}", problem.code());
+                // 回读权威名称,丢弃本地缓冲
+                self.load_workflow(&key);
+                self.status = message.clone();
+                self.save_error = Some(message);
+            }
+            None => {
+                #[cfg(test)]
+                {
+                    // 仅测试旧 bundle 的数据兼容；生产构建无直写 rollback。
+                    self.workflow_name = name.to_string();
+                    self.save_after_edit();
+                }
+                #[cfg(not(test))]
+                {
+                    let message = "CoreKernel runtime 未装配".to_string();
+                    self.status = message.clone();
+                    self.save_error = Some(message);
+                }
+            }
         }
-        self.workflow_name = name.to_string();
-        self.save_after_edit();
         cx.notify();
     }
 

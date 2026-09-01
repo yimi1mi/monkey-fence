@@ -266,7 +266,15 @@ fn reconcile_operations(
     report: &mut ReconcileReport,
 ) -> Result<(), CommandProblem> {
     for handle in open_operations(service).map_err(op_problem)? {
-        match reconcile_operation(service, &handle, targets).map_err(op_problem)? {
+        let outcome = match reconcile_operation(service, &handle, targets) {
+            Ok(outcome) => outcome,
+            Err(crate::operation::OperationProblem::TargetStoreMismatch(_)) => {
+                report.operations_skipped += 1;
+                continue;
+            }
+            Err(error) => return Err(op_problem(error)),
+        };
+        match outcome {
             Some(OperationOutcome::Completed { .. }) => report.operations_completed += 1,
             Some(OperationOutcome::NeedsYou { .. }) => report.operations_needs_you += 1,
             Some(OperationOutcome::NotAccepted { .. }) => report.operations_not_accepted += 1,

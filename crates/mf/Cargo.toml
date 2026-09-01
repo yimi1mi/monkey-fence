@@ -21,6 +21,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 mf-core.workspace = true
 mf-agent.workspace = true
+mf-kernel.workspace = true
 mf-vcs.workspace = true
 mf-skills.workspace = true
 mf-plugins.workspace = true
@@ -42,6 +43,7 @@ windows-sys = { version = "0.59", features = ["Win32_System_Power", "Win32_Syste
 notify.workspace = true
 
 [dev-dependencies]
+mf-kernel = { workspace = true, features = ["test-support"] }
 toml.workspace = true
 tempfile = "3"
 gpui = { workspace = true, features = ["test-support"] }

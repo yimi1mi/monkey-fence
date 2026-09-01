@@ -343,7 +343,7 @@ fn save_failure_blocks_run_instead_of_running_stale_store(cx: &mut gpui::TestApp
     ctx.close_project(&project.path().to_path_buf());
 }
 
-/// 环、自依赖与未知依赖仍被拒绝(编辑器层)。
+/// 环与自依赖拒绝(编辑器层)。
 #[test]
 fn editor_still_rejects_cycles_self_and_unknown_deps() {
     use crate::workflow_editor::WorkflowEditorState;
@@ -359,4 +359,89 @@ fn editor_still_rejects_cycles_self_and_unknown_deps() {
         editor.add_dependency(&a, &b).is_err(),
         "环拒绝(b→a 后 a→b 成环)"
     );
+}
+
+/// T2a(Issue #23):rename 经 CoreKernel facade dispatch 落库 —— 只推进
+/// presentation revision,并留下 command receipt 权威链(证明没有 GPUI
+/// 直写 Store);tracer 关闭时回退旧 rename 入口仍可用。
+#[gpui::test]
+fn rename_routes_through_kernel_and_previous_bundle_remains_compatible(
+    cx: &mut gpui::TestAppContext,
+) {
+    use gpui::AppContext as _;
+    let catalog = mf_agent::CatalogStore::memory().unwrap();
+    let ctx = crate::app_ctx::AppCtx::with_catalog_for_tests(catalog);
+    let project = tempfile::tempdir().unwrap();
+
+    // tracer 装配:tempfile service 库 + 确定性 key；open_project 当场把
+    // 新项目持久登记进 registry(发放 proj_ handle)。
+    let service_dir = tempfile::tempdir().unwrap();
+    let service =
+        mf_kernel::project_registry::ServiceStore::open(&service_dir.path().join("service-v1.db"))
+            .unwrap();
+    let (runtime, client) = mf_kernel::kernel::InProcessKernelRuntime::for_test(
+        service.clone(),
+        mf_kernel::command::ServiceIdempotencyKey::for_test(vec![0x5a; 32]).unwrap(),
+        mf_kernel::handles::ClientId::parse("legacy-gpui-test").unwrap(),
+        mf_kernel::handles::Principal::parse("test-user").unwrap(),
+    )
+    .unwrap();
+    ctx.install_kernel_tracer_for_tests(runtime, client);
+
+    let orch = ctx.open_project(project.path().to_path_buf()).unwrap();
+    assert_eq!(service.list_projects().unwrap().len(), 1);
+    let instance_id = cmd_instance(&ctx, "worker");
+    let canvas = cx.new(|cx| WorkflowCanvas::new(ctx.clone(), cx));
+    cx.update_entity(&canvas, |c: &mut WorkflowCanvas, cx| {
+        c.set_project(Some(project.path().to_path_buf()), cx);
+        c.new_workflow(cx);
+        c.editor.drag_from_library(&instance_id);
+        c.save_after_edit();
+    });
+
+    // 重命名经 facade:presentation +1、semantic 不动、receipt 落库。
+    cx.update_entity(&canvas, |c: &mut WorkflowCanvas, cx| {
+        c.rename_workflow("发布检查", cx);
+        assert!(c.save_error.is_none(), "kernel rename 不得留下 dirty 状态");
+    });
+    let record = orch.store.load_project_workflow("wf-1").unwrap().unwrap();
+    assert_eq!(record.name, "发布检查");
+    assert_eq!(
+        record.semantic_revision, 1,
+        "rename 不推进 semantic revision"
+    );
+    assert_eq!(record.presentation_revision, 2);
+    let receipts: i64 = orch
+        .store
+        .with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM command_receipt", [], |row| row.get(0))
+                .map_err(anyhow::Error::from)
+        })
+        .unwrap();
+    assert_eq!(receipts, 1, "重命名必须经 dispatch 权威链(有 receipt)");
+
+    // 回滚开关:tracer 关闭后同一画布回退旧 rename 入口(整稿保存)。
+    ctx.disable_kernel_tracer_for_tests();
+    cx.update_entity(&canvas, |c: &mut WorkflowCanvas, cx| {
+        c.rename_workflow("旧入口", cx);
+        assert!(c.save_error.is_none());
+    });
+    let record = orch.store.load_project_workflow("wf-1").unwrap().unwrap();
+    assert_eq!(record.name, "旧入口");
+    assert_eq!(record.presentation_revision, 2, "旧入口按 semantic 轴保存");
+    assert_eq!(
+        record.semantic_revision, 2,
+        "旧入口(rename 并入整稿)推进 semantic revision"
+    );
+    let receipts: i64 = orch
+        .store
+        .with_conn(|conn| {
+            conn.query_row("SELECT COUNT(*) FROM command_receipt", [], |row| row.get(0))
+                .map_err(anyhow::Error::from)
+        })
+        .unwrap();
+    assert_eq!(receipts, 1, "旧入口不产生新 command receipt");
+
+    orch.stop();
+    ctx.close_project(&project.path().to_path_buf());
 }

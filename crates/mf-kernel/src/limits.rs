@@ -17,6 +17,11 @@
 //! 与启动时 GC 的间隔,`operation_progress_interval_ms` 是 Operation 进度
 //! 事件的最低间隔(节流阈值,不是禁止更早的终态事件)。
 
+/// 附录 A1 默认 journal 水位。#23 tracer 先按默认值 fail-closed；#24
+/// 将补齐完整可配置范围、hard cap、min-age 与 per-client queue。
+pub const JOURNAL_MAX_EVENTS_DEFAULT: usize = 20_000;
+pub const JOURNAL_MAX_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
+
 /// 单个 A7 参数的三元组描述(默认 / 允许范围 / hard cap)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LifecycleParamSpec {

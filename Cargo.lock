@@ -2426,6 +2426,7 @@ dependencies = [
  "log",
  "mf-agent",
  "mf-core",
+ "mf-kernel",
  "mf-plugins",
  "mf-skills",
  "mf-vcs",

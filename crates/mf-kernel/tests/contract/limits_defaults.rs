@@ -7,8 +7,14 @@
 
 use mf_kernel::limits::{
     LifecycleLimits, LifecycleParamSpec, RetentionLimits, RetentionParamSpec,
-    DISCOVERY_STALE_HEARTBEATS,
+    DISCOVERY_STALE_HEARTBEATS, JOURNAL_MAX_BYTES_DEFAULT, JOURNAL_MAX_EVENTS_DEFAULT,
 };
+
+#[test]
+fn tracer_journal_defaults_match_appendix_a1() {
+    assert_eq!(JOURNAL_MAX_EVENTS_DEFAULT, 20_000);
+    assert_eq!(JOURNAL_MAX_BYTES_DEFAULT, 64 * 1024 * 1024);
+}
 
 /// 附录 A7 原文行(唯一数值来源):name/default/min/max/hard cap。
 fn appendix_a7_rows() -> Vec<LifecycleParamSpec> {

@@ -297,6 +297,11 @@ impl CommandEnvelope {
 pub struct ServiceIdempotencyKey(Zeroizing<Vec<u8>>);
 
 impl ServiceIdempotencyKey {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn for_test(bytes: Vec<u8>) -> Result<Self, CommandProblem> {
+        Self::from_zeroizing(Zeroizing::new(bytes))
+    }
+
     #[cfg(test)]
     pub(crate) fn new(bytes: Vec<u8>) -> Result<Self, CommandProblem> {
         Self::from_zeroizing(Zeroizing::new(bytes))
@@ -354,7 +359,8 @@ impl ServiceIdempotencyKey {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EffectOutput {
     pub(crate) result_revisions: Value,
-    pub(crate) projection: Value,
+    /// None = 已线性化的 no-op，不产生 outbox；Some = 封闭投影事件。
+    pub(crate) projection: Option<Value>,
 }
 
 impl EffectOutput {
@@ -362,7 +368,7 @@ impl EffectOutput {
     pub(crate) fn for_contract(result_revisions: Value, projection: Value) -> Self {
         Self {
             result_revisions,
-            projection,
+            projection: Some(projection),
         }
     }
 }
@@ -429,6 +435,8 @@ pub enum CommandProblem {
     RootEpochExpired,
     #[error("revision_conflict")]
     RevisionConflict,
+    #[error("resource_not_found")]
+    ResourceNotFound,
     #[error("target_store_mismatch")]
     TargetStoreMismatch,
     #[error("previous_command_failed")]
@@ -450,6 +458,7 @@ impl CommandProblem {
             Self::ControllerLeaseExpired => "controller_lease_expired",
             Self::RootEpochExpired => "root_epoch_expired",
             Self::RevisionConflict => "revision_conflict",
+            Self::ResourceNotFound => "resource_not_found",
             Self::TargetStoreMismatch => "internal_error",
             Self::PreviousCommandFailed => "internal_error",
             Self::PreviousCommandCancelled => "internal_error",
@@ -688,10 +697,16 @@ impl CommandCoordinator {
                     permit.validate_expected(tx, &envelope.lease_check())?;
                     let output = effect(tx)?;
                     let sensitive_output = value_has_sensitive_field(&output.result_revisions)
-                        || value_has_sensitive_field(&output.projection);
+                        || output
+                            .projection
+                            .as_ref()
+                            .is_some_and(value_has_sensitive_field);
                     let plaintext_output = envelope.secret_plaintext().is_some_and(|secret| {
                         value_contains(&output.result_revisions, secret)
-                            || value_contains(&output.projection, secret)
+                            || output
+                                .projection
+                                .as_ref()
+                                .is_some_and(|projection| value_contains(projection, secret))
                     });
                     if sensitive_output || plaintext_output {
                         return Err(CommandProblem::InvalidEnvelope(
@@ -699,15 +714,6 @@ impl CommandCoordinator {
                         ));
                     }
                     let revisions = canonical_json(&output.result_revisions)?;
-                    let event = canonical_json(&serde_json::json!({
-                        "type": format!("{}.applied", envelope.command_type.as_str()),
-                        "aggregate": {
-                            "kind": envelope.target.aggregate.kind.as_str(),
-                            "handle": envelope.target.aggregate.handle,
-                        },
-                        "caused_by_command_id": envelope.command_id.as_str(),
-                        "projection": output.projection,
-                    }))?;
                     let now = chrono::Utc::now().to_rfc3339();
                     tx.execute(
                         "INSERT INTO command_receipt
@@ -723,12 +729,25 @@ impl CommandCoordinator {
                         ],
                     )
                     .map_err(internal)?;
-                    tx.execute(
-                        "INSERT INTO projection_outbox(event_json, published_at)
-                         VALUES (?1, NULL)",
-                        [event],
-                    )
-                    .map_err(internal)?;
+                    // 显式 None 表示命令已线性化但无投影变化
+                    // (如同名 rename no-op):receipt 照写,outbox 不产生事件。
+                    if let Some(projection) = output.projection {
+                        let event = canonical_json(&serde_json::json!({
+                            "type": format!("{}.applied", envelope.command_type.as_str()),
+                            "aggregate": {
+                                "kind": envelope.target.aggregate.kind.as_str(),
+                                "handle": envelope.target.aggregate.handle,
+                            },
+                            "caused_by_command_id": envelope.command_id.as_str(),
+                            "projection": projection,
+                        }))?;
+                        tx.execute(
+                            "INSERT INTO projection_outbox(event_json, published_at)
+                             VALUES (?1, NULL)",
+                            [event],
+                        )
+                        .map_err(internal)?;
+                    }
                     Ok((
                         CommandOutcome::Applied {
                             result_revisions: output.result_revisions,
@@ -745,7 +764,8 @@ impl CommandCoordinator {
                             CommandProblem::ControllerLeaseExpired
                             | CommandProblem::RootEpochExpired => Some(IntentState::Revoked),
                             CommandProblem::RevisionConflict
-                            | CommandProblem::InvalidEnvelope(_) => Some(IntentState::Failed),
+                            | CommandProblem::InvalidEnvelope(_)
+                            | CommandProblem::ResourceNotFound => Some(IntentState::Failed),
                             _ => None,
                         };
                         if guard_state == IntentState::Reserved {
@@ -995,6 +1015,7 @@ pub(crate) fn problem_for_terminal_code(code: &str) -> Option<CommandProblem> {
         "controller_lease_expired" => Some(CommandProblem::ControllerLeaseExpired),
         "root_epoch_expired" => Some(CommandProblem::RootEpochExpired),
         "revision_conflict" => Some(CommandProblem::RevisionConflict),
+        "resource_not_found" => Some(CommandProblem::ResourceNotFound),
         "invalid_envelope" => Some(CommandProblem::InvalidEnvelope(
             "previous command rejected".into(),
         )),

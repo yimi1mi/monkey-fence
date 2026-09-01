@@ -2,9 +2,9 @@
 //!
 //! T1d 交付:库打开(future guard fail-closed + 当前用户 ACL)与
 //! session.json → `project_registry` 幂等导入。T1f/T1g 已增加 command /
-//! Operation/reconcile 的 dark write seam；audit 生产写路径仍属后续 ticket。
-//! 本层尚不接管 `crates/mf` AppCtx 的权威项目列表——GPUI 会话状态仍是
-//! AppCtx 的事实源，service 库当前是 dark data。
+//! Operation/reconcile seam；T2a runtime 已接管 Project Store 打开与
+//! workflow.rename tracer 的 registry/command 链。audit 生产写路径与其余
+//! legacy mutation 随后续 T2 tickets 迁移。
 
 use crate::platform_acl::restrict_service_database_to_current_user;
 use crate::service_schema::{
@@ -227,6 +227,51 @@ impl ServiceStore {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// 运行时显式登记 Project。canonical root 唯一，重复打开复用既有
+    /// opaque handle；先前 missing 的路径恢复后只推进 status，不更换 handle。
+    pub fn register_project_path(&self, path: &Path) -> Result<RegisteredProject> {
+        let (canonical, warning) = canonical_root_of(path);
+        if let Some(warning) = warning {
+            anyhow::bail!("project_register_failed:{warning}");
+        }
+        let canonical_root = canonical.to_string_lossy().into_owned();
+        let display_path = path.to_string_lossy().into_owned();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "INSERT INTO project_registry
+                 (project_handle, public_id, canonical_root, display_path, registered_at, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, 'registered')
+             ON CONFLICT(canonical_root) DO UPDATE SET status='registered'",
+            params![
+                new_project_handle(),
+                new_public_id(),
+                canonical_root,
+                display_path,
+                now,
+            ],
+        )?;
+        let project = tx.query_row(
+            "SELECT project_handle, public_id, canonical_root, display_path,
+                    registered_at, status
+             FROM project_registry WHERE canonical_root=?1",
+            [&canonical_root],
+            |row| {
+                Ok(RegisteredProject {
+                    project_handle: row.get(0)?,
+                    public_id: row.get(1)?,
+                    canonical_root: row.get(2)?,
+                    display_path: row.get(3)?,
+                    registered_at: row.get(4)?,
+                    status: parse_status(&row.get::<_, String>(5)?)?,
+                })
+            },
+        )?;
+        tx.commit()?;
+        Ok(project)
     }
 
     /// session.json → `project_registry` 幂等导入(§3.5)。
