@@ -2479,6 +2479,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "mf-kernel"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs 5.0.1",
+ "log",
+ "parking_lot",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
+ "uuid",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "mf-plugins"
 version = "0.1.0"
 dependencies = [

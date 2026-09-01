@@ -7,6 +7,7 @@ members = [
     "crates/mf-vcs",
     "crates/mf-skills",
     "crates/mf-plugins",
+    "crates/mf-kernel",
     "crates/mfctl",
 ]
 # 裸命令(cargo run / build / test)的默认目标:主程序而非 mfctl 辅助程序。
@@ -18,6 +19,7 @@ default-members = [
     "crates/mf-vcs",
     "crates/mf-skills",
     "crates/mf-plugins",
+    "crates/mf-kernel",
 ]
 
 [workspace.package]
