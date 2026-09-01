@@ -357,10 +357,31 @@ impl ServiceIdempotencyKey {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ProjectionEffect {
+    /// None = command target aggregate；create/delete 可显式指定其它 aggregate。
+    pub(crate) aggregate: Option<crate::handles::AggregateRef>,
+    /// None = command type；wire override 用于 canonical event 名。
+    pub(crate) event_type: Option<String>,
+    pub(crate) projection_critical: bool,
+    pub(crate) payload: Value,
+}
+
+impl ProjectionEffect {
+    pub(crate) fn primary(payload: Value) -> Self {
+        Self {
+            aggregate: None,
+            event_type: None,
+            projection_critical: true,
+            payload,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EffectOutput {
     pub(crate) result_revisions: Value,
-    /// None = 已线性化的 no-op，不产生 outbox；Some = 封闭投影事件。
-    pub(crate) projection: Option<Value>,
+    /// 空 = 已线性化的 no-op；多项仍与业务效果/receipt 同一 target tx。
+    pub(crate) projections: Vec<ProjectionEffect>,
 }
 
 impl EffectOutput {
@@ -368,7 +389,7 @@ impl EffectOutput {
     pub(crate) fn for_contract(result_revisions: Value, projection: Value) -> Self {
         Self {
             result_revisions,
-            projection: Some(projection),
+            projections: vec![ProjectionEffect::primary(projection)],
         }
     }
 }
@@ -435,6 +456,12 @@ pub enum CommandProblem {
     RootEpochExpired,
     #[error("revision_conflict")]
     RevisionConflict,
+    #[error("validation_failed:{0}")]
+    ValidationFailed(String),
+    #[error("workflow_cycle:{0}")]
+    WorkflowCycle(String),
+    #[error("unknown_dependency:{0}")]
+    UnknownDependency(String),
     #[error("resource_not_found")]
     ResourceNotFound,
     #[error("target_store_mismatch")]
@@ -458,6 +485,9 @@ impl CommandProblem {
             Self::ControllerLeaseExpired => "controller_lease_expired",
             Self::RootEpochExpired => "root_epoch_expired",
             Self::RevisionConflict => "revision_conflict",
+            Self::ValidationFailed(_) => "validation_failed",
+            Self::WorkflowCycle(_) => "workflow_cycle",
+            Self::UnknownDependency(_) => "unknown_dependency",
             Self::ResourceNotFound => "resource_not_found",
             Self::TargetStoreMismatch => "internal_error",
             Self::PreviousCommandFailed => "internal_error",
@@ -698,15 +728,15 @@ impl CommandCoordinator {
                     let output = effect(tx)?;
                     let sensitive_output = value_has_sensitive_field(&output.result_revisions)
                         || output
-                            .projection
-                            .as_ref()
-                            .is_some_and(value_has_sensitive_field);
+                            .projections
+                            .iter()
+                            .any(|projection| value_has_sensitive_field(&projection.payload));
                     let plaintext_output = envelope.secret_plaintext().is_some_and(|secret| {
                         value_contains(&output.result_revisions, secret)
                             || output
-                                .projection
-                                .as_ref()
-                                .is_some_and(|projection| value_contains(projection, secret))
+                                .projections
+                                .iter()
+                                .any(|projection| value_contains(&projection.payload, secret))
                     });
                     if sensitive_output || plaintext_output {
                         return Err(CommandProblem::InvalidEnvelope(
@@ -729,17 +759,22 @@ impl CommandCoordinator {
                         ],
                     )
                     .map_err(internal)?;
-                    // 显式 None 表示命令已线性化但无投影变化
-                    // (如同名 rename no-op):receipt 照写,outbox 不产生事件。
-                    if let Some(projection) = output.projection {
+                    for projection in output.projections {
+                        let aggregate = projection
+                            .aggregate
+                            .unwrap_or_else(|| envelope.target.aggregate.clone());
+                        let event_type = projection
+                            .event_type
+                            .unwrap_or_else(|| envelope.command_type.as_str().to_string());
                         let event = canonical_json(&serde_json::json!({
-                            "type": format!("{}.applied", envelope.command_type.as_str()),
+                            "type": format!("{event_type}.applied"),
                             "aggregate": {
-                                "kind": envelope.target.aggregate.kind.as_str(),
-                                "handle": envelope.target.aggregate.handle,
+                                "kind": aggregate.kind.as_str(),
+                                "handle": aggregate.handle,
                             },
                             "caused_by_command_id": envelope.command_id.as_str(),
-                            "projection": projection,
+                            "projection_critical": projection.projection_critical,
+                            "projection": projection.payload,
                         }))?;
                         tx.execute(
                             "INSERT INTO projection_outbox(event_json, published_at)

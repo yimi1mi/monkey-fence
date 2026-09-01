@@ -1180,9 +1180,9 @@ impl OperationCoordinator {
                     let output = effect.take().expect("effect 只消费一次")(tx)?;
                     if value_has_sensitive_field(&output.result_revisions)
                         || output
-                            .projection
-                            .as_ref()
-                            .is_some_and(value_has_sensitive_field)
+                            .projections
+                            .iter()
+                            .any(|projection| value_has_sensitive_field(&projection.payload))
                     {
                         return Err(CommandProblem::InvalidEnvelope(
                             "Secret 明文或可复用引用进入 step result/event".into(),
@@ -1203,12 +1203,18 @@ impl OperationCoordinator {
                         ],
                     )
                     .map_err(internal_command)?;
-                    if let Some(projection) = output.projection {
+                    for projection in output.projections {
+                        let aggregate = projection
+                            .aggregate
+                            .unwrap_or_else(|| step.target.aggregate.clone());
+                        let event_type = projection
+                            .event_type
+                            .unwrap_or_else(|| step.command_type.as_str().to_string());
                         let event = canonical_json(&serde_json::json!({
-                            "type": format!("{}.applied", step.command_type.as_str()),
+                            "type": format!("{event_type}.applied"),
                             "aggregate": {
-                                "kind": step.target.aggregate.kind.as_str(),
-                                "handle": step.target.aggregate.handle,
+                                "kind": aggregate.kind.as_str(),
+                                "handle": aggregate.handle,
                             },
                             "caused_by_command_id": operation.command_id,
                             "operation": {
@@ -1217,7 +1223,8 @@ impl OperationCoordinator {
                                 "step_id": step.step_id.as_str(),
                                 "role": step.role.as_str(),
                             },
-                            "projection": projection,
+                            "projection_critical": projection.projection_critical,
+                            "projection": projection.payload,
                         }))?;
                         tx.execute(
                             "INSERT INTO projection_outbox(event_json, published_at)

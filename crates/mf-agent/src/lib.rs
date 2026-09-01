@@ -29,6 +29,8 @@ pub mod secrets;
 pub mod store;
 pub mod workflow;
 pub mod workflow_compiler;
+pub mod workflow_mutation;
+pub mod workflow_validation;
 
 /// 适配器构造 Handoff 时使用的别名:规范类型是 `handoff::Handoff`。
 pub use crate::handoff::Handoff as HandoffDraft;
@@ -68,5 +70,12 @@ pub use schema::{
     CATALOG_V2_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION,
 };
 pub use store::Store;
-pub use workflow::{ProjectWorkflowDraft, ProjectWorkflowRecord};
+pub use workflow::{ProjectWorkflowDraft, ProjectWorkflowRecord, WorkflowNodeDraft};
 pub use workflow_compiler::{CompileError, CompileInput, WorkflowCompiler};
+pub use workflow_mutation::{
+    ProjectWorkflowMutation, WorkflowMutationError, WorkflowMutationResult,
+};
+pub use workflow_validation::{
+    validate_workflow, WorkflowValidationCode, WorkflowValidationError, WorkflowValidationErrors,
+    WorkflowValidationInput,
+};

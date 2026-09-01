@@ -202,18 +202,27 @@ fn run_project_workflow_creates_task_revision_and_starts_scheduling() {
 
 #[test]
 fn compile_failure_leaves_no_new_task() {
-    // T1b 起,结构非法(未知依赖/重复键)在保存时即 fail-closed;
-    // 这里用「循环」:结构校验通过、编译期仍必须失败。
-    let (ctx, project) = setup_with_workflow(vec![node("a", &["b"]), node("b", &["a"])]);
-    let orch = ctx.orchestrator_of(project.path()).unwrap();
+    // T2c 起循环也在 authoritative 保存边界 fail-closed，根本不能进入运行编译。
+    let ctx = AppCtx::with_catalog_for_tests(mf_agent::CatalogStore::memory().unwrap());
+    let project = tempfile::tempdir().unwrap();
+    let orch = ctx.open_project(project.path().to_path_buf()).unwrap();
     let before = orch.store.list_tasks(false).unwrap().len();
-    let err = ctx
-        .run_project_workflow(project.path(), "wf-e2e", "运行一个坏掉的工作流")
-        .err()
-        .expect("循环依赖必须编译失败");
+    let mut nodes = vec![node("a", &["b"]), node("b", &["a"])];
+    for node in &mut nodes {
+        node.agent_instance_id = "inst".into();
+    }
+    let err = orch
+        .store
+        .save_project_workflow(&ProjectWorkflowDraft {
+            key: "wf-e2e".into(),
+            name: "坏工作流".into(),
+            nodes,
+            allow_unsafe_parallel: false,
+        })
+        .unwrap_err();
     assert!(
-        format!("{err:#}").contains("编译失败"),
-        "错误必须来自编译: {err:#}"
+        format!("{err:#}").contains("依赖环"),
+        "错误必须来自权威 DAG 校验: {err:#}"
     );
     assert_eq!(
         orch.store.list_tasks(false).unwrap().len(),

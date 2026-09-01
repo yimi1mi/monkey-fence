@@ -108,14 +108,40 @@ pub enum SnapshotQuery {
 }
 
 /// Snapshot data:Store 权威状态的只读投影(不缓存、不推演)。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkflowSnapshotData {
     pub workflow: WorkflowHandle,
     pub name: String,
+    pub allow_unsafe_parallel: bool,
     pub revisions: RevisionVector,
+    pub nodes: Vec<WorkflowSnapshotNode>,
+    pub edges: Vec<WorkflowSnapshotEdge>,
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    pub workflow_collection_revision: u64,
+    pub viewport: Option<Value>,
+    pub collapse: Option<Value>,
+    pub layout: Option<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkflowSnapshotNode {
+    pub handle: String,
+    pub key: String,
+    pub title: String,
+    pub instructions: String,
+    pub agent_instance_id: String,
+    pub deps: Vec<String>,
+    pub position: Option<(f64, f64)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkflowSnapshotEdge {
+    pub handle: String,
+    pub upstream_node_handle: String,
+    pub downstream_node_handle: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum SnapshotData {
     Workflow(WorkflowSnapshotData),
 }
@@ -348,7 +374,19 @@ fn validate_projection(
             }
             // T2b 的封闭白名单先含首条 tracer；后续 T2c/T2d 每新增命令
             // 必须在同一提交显式扩表并补 projection contract。
-            if !matches!(delta_type, "workflow.rename") {
+            if !matches!(
+                delta_type,
+                "workflow.rename"
+                    | "workflow.add_node"
+                    | "workflow.update_node"
+                    | "workflow.remove_node"
+                    | "workflow.connect"
+                    | "workflow.disconnect"
+                    | "workflow.node_position_set"
+                    | "workflow.viewport_set"
+                    | "workflow.set_unsafe_parallel"
+                    | "project.workflow_collection_changed"
+            ) {
                 let critical = if projection_critical {
                     "critical"
                 } else {
@@ -371,6 +409,8 @@ fn validate_projection(
                 if decoded.name.trim().is_empty() {
                     return Err("workflow.rename name 不能为空".into());
                 }
+            } else if !data.is_object() {
+                return Err(format!("{delta_type} data 必须是 object"));
             }
             if !is_single_step(base, aggregate) {
                 return Err("typed_delta revision 不连续".into());

@@ -50,7 +50,17 @@ fn canvas_edits_project_workflows_without_any_task(cx: &mut gpui::TestAppContext
         // 从 Agent 库添加节点(保存实例引用)→ 自动保存
         c.editor.drag_from_library(&instance_id);
         c.save_after_edit();
-        assert!(c.save_error.is_none(), "自动保存必须成功");
+        assert!(
+            c.save_error.is_none(),
+            "自动保存必须成功: {:?}; {}",
+            c.save_error,
+            c.status
+        );
+        assert!(
+            c.workflows.iter().any(|(key, _)| key == "wf-1"),
+            "画布 reload 未看到创建结果: {}",
+            c.status
+        );
     });
     let record = orch
         .store
@@ -418,7 +428,7 @@ fn rename_routes_through_kernel_and_previous_bundle_remains_compatible(
                 .map_err(anyhow::Error::from)
         })
         .unwrap();
-    assert_eq!(receipts, 1, "重命名必须经 dispatch 权威链(有 receipt)");
+    assert_eq!(receipts, 2, "创建与重命名都必须经 dispatch 权威链");
 
     // 回滚开关:tracer 关闭后同一画布回退旧 rename 入口(整稿保存)。
     ctx.disable_kernel_tracer_for_tests();
@@ -440,7 +450,7 @@ fn rename_routes_through_kernel_and_previous_bundle_remains_compatible(
                 .map_err(anyhow::Error::from)
         })
         .unwrap();
-    assert_eq!(receipts, 1, "旧入口不产生新 command receipt");
+    assert_eq!(receipts, 2, "旧入口不产生新 command receipt");
 
     orch.stop();
     ctx.close_project(&project.path().to_path_buf());

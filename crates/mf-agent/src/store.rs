@@ -2530,10 +2530,21 @@ impl Store {
     fn validate_project_workflow_draft(
         draft: &crate::workflow::ProjectWorkflowDraft,
     ) -> Result<()> {
-        anyhow::ensure!(!draft.key.trim().is_empty(), "项目工作流 key 不能为空");
-        anyhow::ensure!(!draft.name.trim().is_empty(), "项目工作流名称不能为空");
-        anyhow::ensure!(!draft.nodes.is_empty(), "项目工作流至少需要一个节点");
-        crate::workflow::validate_graph_structure(&draft.nodes)?;
+        if draft.key.trim().is_empty() {
+            return Err(crate::workflow_mutation::WorkflowMutationError::Validation(
+                "项目工作流 key 不能为空".into(),
+            )
+            .into());
+        }
+        if draft.name.trim().is_empty() {
+            return Err(crate::workflow_mutation::WorkflowMutationError::Validation(
+                "项目工作流名称不能为空".into(),
+            )
+            .into());
+        }
+        crate::workflow_validation::validate_workflow(
+            crate::workflow_validation::WorkflowValidationInput::new(&draft.nodes),
+        )?;
         Ok(())
     }
 
@@ -2747,6 +2758,299 @@ impl Store {
             stats.edges_deleted,
             presentation_removed
         );
+    }
+
+    /// mf-kernel transaction-scoped seam：调用方已持有 L-CMD target
+    /// transaction；本函数不得 commit/rollback 或打开嵌套事务。
+    pub fn apply_project_workflow_mutation_tx(
+        c: &Connection,
+        mutation: crate::workflow_mutation::ProjectWorkflowMutation,
+    ) -> Result<crate::workflow_mutation::WorkflowMutationResult> {
+        use crate::workflow_mutation::{ProjectWorkflowMutation, WorkflowMutationResult};
+        match mutation {
+            ProjectWorkflowMutation::Create {
+                draft,
+                expected_collection_revision,
+            } => {
+                Self::validate_project_workflow_draft(&draft)?;
+                let collection = Self::collection_revision_tx(c)?;
+                Self::ensure_revision(
+                    expected_collection_revision,
+                    collection,
+                    RevisionAxis::Collection,
+                )?;
+                anyhow::ensure!(
+                    Self::workflow_handle_of(c, &draft.key)?.is_none(),
+                    "项目工作流 `{}` 已存在,创建命令冲突",
+                    draft.key
+                );
+                let graph_json = serde_json::to_string(&draft.nodes)?;
+                let digest = crate::workflow::workflow_content_digest(
+                    &draft.nodes,
+                    draft.allow_unsafe_parallel,
+                );
+                Self::insert_project_workflow_tx(c, &draft, &graph_json, &digest, &now())?;
+                let after = Self::project_workflow_row(c, &draft.key)?
+                    .ok_or_else(|| anyhow::anyhow!("项目工作流创建后读取失败"))?;
+                Ok(WorkflowMutationResult {
+                    before: None,
+                    after: Some(after),
+                    collection_revision: Self::collection_revision_tx(c)?,
+                    no_op: false,
+                    affected_node_handle: None,
+                })
+            }
+            ProjectWorkflowMutation::ReplaceSemantic {
+                draft,
+                expected_semantic_revision,
+            } => {
+                Self::validate_project_workflow_draft(&draft)?;
+                let before = Self::project_workflow_row(c, &draft.key)?
+                    .ok_or_else(|| anyhow::anyhow!("项目工作流 `{}` 不存在", draft.key))?;
+                let graph_json = serde_json::to_string(&draft.nodes)?;
+                let digest = crate::workflow::workflow_content_digest(
+                    &draft.nodes,
+                    draft.allow_unsafe_parallel,
+                );
+                let (after, _, _) = Self::save_project_workflow_semantic_tx(
+                    c,
+                    &draft,
+                    &graph_json,
+                    &digest,
+                    &now(),
+                    Some(expected_semantic_revision),
+                )?;
+                Ok(WorkflowMutationResult {
+                    no_op: before.semantic_revision == after.semantic_revision,
+                    before: Some(before),
+                    after: Some(after),
+                    collection_revision: Self::collection_revision_tx(c)?,
+                    affected_node_handle: None,
+                })
+            }
+            ProjectWorkflowMutation::Delete {
+                workflow_handle,
+                expected_collection_revision,
+                expected_semantic_revision,
+                expected_presentation_revision,
+            } => {
+                let before = Self::project_workflow_by_handle_tx(c, &workflow_handle)?
+                    .ok_or_else(|| anyhow::anyhow!("项目工作流 handle 不存在"))?;
+                Self::ensure_revision(
+                    expected_collection_revision,
+                    Self::collection_revision_tx(c)?,
+                    RevisionAxis::Collection,
+                )?;
+                Self::ensure_revision(
+                    expected_semantic_revision,
+                    before.semantic_revision,
+                    RevisionAxis::Semantic,
+                )?;
+                Self::ensure_revision(
+                    expected_presentation_revision,
+                    before.presentation_revision,
+                    RevisionAxis::Presentation,
+                )?;
+                let (deleted, _) = Self::delete_project_workflow_tx(c, &before.key)?;
+                anyhow::ensure!(deleted, "工作流删除 CAS 未命中");
+                Ok(WorkflowMutationResult {
+                    before: Some(before),
+                    after: None,
+                    collection_revision: Self::collection_revision_tx(c)?,
+                    no_op: false,
+                    affected_node_handle: None,
+                })
+            }
+            ProjectWorkflowMutation::SetPresentation {
+                workflow_handle,
+                expected_presentation_revision,
+                viewport_json,
+                collapse_json,
+                layout_json,
+            } => {
+                let before = Self::project_workflow_by_handle_tx(c, &workflow_handle)?
+                    .ok_or_else(|| anyhow::anyhow!("项目工作流 handle 不存在"))?;
+                Self::ensure_revision(
+                    expected_presentation_revision,
+                    before.presentation_revision,
+                    RevisionAxis::Presentation,
+                )?;
+                for value in [&viewport_json, &collapse_json, &layout_json]
+                    .into_iter()
+                    .flatten()
+                {
+                    serde_json::from_str::<serde_json::Value>(value)?;
+                }
+                let current: Option<(Option<String>, Option<String>, Option<String>)> = c
+                    .query_row(
+                        "SELECT viewport_json, collapse_json, layout_json
+                         FROM workflow_presentation WHERE workflow_handle=?1",
+                        [&workflow_handle],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                let current = current.unwrap_or((None, None, None));
+                let no_op = viewport_json
+                    .as_ref()
+                    .is_none_or(|v| Some(v) == current.0.as_ref())
+                    && collapse_json
+                        .as_ref()
+                        .is_none_or(|v| Some(v) == current.1.as_ref())
+                    && layout_json
+                        .as_ref()
+                        .is_none_or(|v| Some(v) == current.2.as_ref());
+                if !no_op {
+                    c.execute(
+                        "INSERT OR IGNORE INTO workflow_presentation
+                         (workflow_handle, viewport_json, collapse_json, layout_json)
+                         VALUES (?1,NULL,NULL,NULL)",
+                        [&workflow_handle],
+                    )?;
+                    if let Some(value) = viewport_json {
+                        c.execute("UPDATE workflow_presentation SET viewport_json=?2 WHERE workflow_handle=?1", params![workflow_handle, value])?;
+                    }
+                    if let Some(value) = collapse_json {
+                        c.execute("UPDATE workflow_presentation SET collapse_json=?2 WHERE workflow_handle=?1", params![workflow_handle, value])?;
+                    }
+                    if let Some(value) = layout_json {
+                        c.execute("UPDATE workflow_presentation SET layout_json=?2 WHERE workflow_handle=?1", params![workflow_handle, value])?;
+                    }
+                    c.execute(
+                        "UPDATE project_workflows SET presentation_revision=presentation_revision+1 WHERE public_handle=?1",
+                        [&workflow_handle],
+                    )?;
+                }
+                let after = Self::project_workflow_by_handle_tx(c, &workflow_handle)?
+                    .ok_or_else(|| anyhow::anyhow!("presentation 写入后工作流消失"))?;
+                Ok(WorkflowMutationResult {
+                    before: Some(before),
+                    after: Some(after),
+                    collection_revision: Self::collection_revision_tx(c)?,
+                    no_op,
+                    affected_node_handle: None,
+                })
+            }
+            ProjectWorkflowMutation::SetNodePosition {
+                workflow_handle: expected_workflow_handle,
+                node_handle,
+                expected_presentation_revision,
+                x,
+                y,
+            } => {
+                if !x.is_finite() || !y.is_finite() {
+                    return Err(crate::workflow_mutation::WorkflowMutationError::Validation(
+                        "节点坐标必须有限".into(),
+                    )
+                    .into());
+                }
+                let workflow_handle: String = c
+                    .query_row(
+                        "SELECT workflow_handle FROM workflow_node_identity WHERE node_handle=?1",
+                        [&node_handle],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or(crate::workflow_mutation::WorkflowMutationError::ScopeMismatch)?;
+                if workflow_handle != expected_workflow_handle {
+                    return Err(
+                        crate::workflow_mutation::WorkflowMutationError::ScopeMismatch.into(),
+                    );
+                }
+                let before = Self::project_workflow_by_handle_tx(c, &workflow_handle)?
+                    .ok_or_else(|| anyhow::anyhow!("节点所属工作流不存在"))?;
+                Self::ensure_revision(
+                    expected_presentation_revision,
+                    before.presentation_revision,
+                    RevisionAxis::Presentation,
+                )?;
+                let current: Option<(f64, f64)> = c
+                    .query_row(
+                        "SELECT x,y FROM node_position WHERE node_handle=?1",
+                        [&node_handle],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()?;
+                let no_op = current == Some((x, y));
+                if !no_op {
+                    c.execute(
+                        "INSERT INTO node_position(node_handle,x,y) VALUES(?1,?2,?3)
+                         ON CONFLICT(node_handle) DO UPDATE SET x=excluded.x,y=excluded.y",
+                        params![node_handle, x, y],
+                    )?;
+                    c.execute(
+                        "UPDATE project_workflows SET presentation_revision=presentation_revision+1 WHERE public_handle=?1",
+                        [&workflow_handle],
+                    )?;
+                }
+                let after = Self::project_workflow_by_handle_tx(c, &workflow_handle)?
+                    .ok_or_else(|| anyhow::anyhow!("position 写入后工作流消失"))?;
+                Ok(WorkflowMutationResult {
+                    before: Some(before),
+                    after: Some(after),
+                    collection_revision: Self::collection_revision_tx(c)?,
+                    no_op,
+                    affected_node_handle: Some(node_handle),
+                })
+            }
+        }
+    }
+
+    pub fn project_workflow_by_handle_tx(
+        c: &Connection,
+        workflow_handle: &str,
+    ) -> Result<Option<crate::workflow::ProjectWorkflowRecord>> {
+        let key: Option<String> = c
+            .query_row(
+                "SELECT workflow_key FROM project_workflows WHERE public_handle=?1",
+                [workflow_handle],
+                |row| row.get(0),
+            )
+            .optional()?;
+        key.map(|key| Self::project_workflow_row(c, &key))
+            .transpose()
+            .map(|value| value.flatten())
+    }
+
+    pub fn workflow_node_identities_tx(
+        c: &Connection,
+        workflow_handle: &str,
+    ) -> Result<Vec<WorkflowNodeIdentityRow>> {
+        let mut stmt = c.prepare(
+            "SELECT workflow_handle,node_key,node_handle
+             FROM workflow_node_identity WHERE workflow_handle=?1 ORDER BY node_key",
+        )?;
+        let rows = stmt
+            .query_map([workflow_handle], |row| {
+                Ok(WorkflowNodeIdentityRow {
+                    workflow_handle: row.get(0)?,
+                    node_key: row.get(1)?,
+                    node_handle: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn workflow_edge_identities_tx(
+        c: &Connection,
+        workflow_handle: &str,
+    ) -> Result<Vec<WorkflowEdgeIdentityRow>> {
+        let mut stmt = c.prepare(
+            "SELECT workflow_handle,upstream_node_key,downstream_node_key,edge_handle
+             FROM workflow_edge_identity WHERE workflow_handle=?1
+             ORDER BY upstream_node_key,downstream_node_key",
+        )?;
+        let rows = stmt
+            .query_map([workflow_handle], |row| {
+                Ok(WorkflowEdgeIdentityRow {
+                    workflow_handle: row.get(0)?,
+                    upstream_node_key: row.get(1)?,
+                    downstream_node_key: row.get(2)?,
+                    edge_handle: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// CAS 创建项目工作流(L-CMD):新持久 handle + node/edge identity

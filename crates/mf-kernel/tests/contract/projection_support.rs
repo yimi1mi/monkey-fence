@@ -129,6 +129,19 @@ impl ProjectionFixture {
         )
     }
 
+    pub(crate) fn dispatch_command(
+        &self,
+        command: KernelCommand,
+    ) -> Result<KernelOutcome, KernelProblem> {
+        self.kernel.dispatch(KernelCommandRequest::new(
+            CommandId::new(),
+            self.client.clone(),
+            self.principal.clone(),
+            self.epoch,
+            command,
+        ))
+    }
+
     pub(crate) fn add_project(&self, key: &str) -> AdditionalProject {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(&tmp.path().join("project-v7.db")).unwrap();

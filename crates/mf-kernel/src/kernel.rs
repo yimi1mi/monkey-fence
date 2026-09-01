@@ -17,7 +17,7 @@
 use crate::command::ReconcileOutcome;
 use crate::command::{
     CommandCoordinator, CommandEnvelope, CommandOutcome, CommandPayload, CommandProblem,
-    CommandType, EffectOutput, FaultPoint, ServiceIdempotencyKey, TargetDatabase,
+    CommandType, EffectOutput, FaultPoint, ProjectionEffect, ServiceIdempotencyKey, TargetDatabase,
 };
 use crate::handles::{
     AggregateKind, AggregateRef, ClientId, CommandId, CommandTarget, ExpectedRevision, Principal,
@@ -55,6 +55,77 @@ pub enum KernelCommand {
     /// semantic/collection revision 不动。同名重命名是幂等 no-op
     /// (有 receipt、无事件)。
     WorkflowRename(WorkflowRenameCommand),
+    ProjectWorkflow(ProjectWorkflowCommand),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ProjectWorkflowCommand {
+    Create {
+        project: ProjectStoreHandle,
+        draft: mf_agent::ProjectWorkflowDraft,
+        expected_collection_revision: u64,
+    },
+    Delete {
+        project: ProjectStoreHandle,
+        workflow: WorkflowHandle,
+        expected_collection_revision: u64,
+        expected_semantic_revision: u64,
+        expected_presentation_revision: u64,
+    },
+    AddNode {
+        project: ProjectStoreHandle,
+        workflow: WorkflowHandle,
+        node: mf_agent::WorkflowNodeDraft,
+        expected_semantic_revision: u64,
+    },
+    UpdateNode {
+        project: ProjectStoreHandle,
+        workflow: WorkflowHandle,
+        node_handle: String,
+        title: String,
+        instructions: String,
+        agent_instance_id: String,
+        expected_semantic_revision: u64,
+    },
+    RemoveNode {
+        project: ProjectStoreHandle,
+        workflow: WorkflowHandle,
+        node_handle: String,
+        expected_semantic_revision: u64,
+    },
+    MoveNode {
+        project: ProjectStoreHandle,
+        workflow: WorkflowHandle,
+        node_handle: String,
+        x: f64,
+        y: f64,
+        expected_presentation_revision: u64,
+    },
+    Connect {
+        project: ProjectStoreHandle,
+        workflow: WorkflowHandle,
+        upstream_node_handle: String,
+        downstream_node_handle: String,
+        expected_semantic_revision: u64,
+    },
+    Disconnect {
+        project: ProjectStoreHandle,
+        workflow: WorkflowHandle,
+        edge_handle: String,
+        expected_semantic_revision: u64,
+    },
+    SetViewport {
+        project: ProjectStoreHandle,
+        workflow: WorkflowHandle,
+        viewport: Value,
+        expected_presentation_revision: u64,
+    },
+    SetUnsafeParallel {
+        project: ProjectStoreHandle,
+        workflow: WorkflowHandle,
+        allow: bool,
+        expected_semantic_revision: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +155,24 @@ impl KernelCommand {
     pub const fn command_type(&self) -> CommandType {
         match self {
             Self::WorkflowRename(_) => CommandType::WorkflowRename,
+            Self::ProjectWorkflow(command) => command.command_type(),
+        }
+    }
+}
+
+impl ProjectWorkflowCommand {
+    pub const fn command_type(&self) -> CommandType {
+        match self {
+            Self::Create { .. } => CommandType::WorkflowCreate,
+            Self::Delete { .. } => CommandType::WorkflowDelete,
+            Self::AddNode { .. } => CommandType::WorkflowAddNode,
+            Self::UpdateNode { .. } => CommandType::WorkflowUpdateNode,
+            Self::RemoveNode { .. } => CommandType::WorkflowRemoveNode,
+            Self::MoveNode { .. } => CommandType::WorkflowMoveNode,
+            Self::Connect { .. } => CommandType::WorkflowConnect,
+            Self::Disconnect { .. } => CommandType::WorkflowDisconnect,
+            Self::SetViewport { .. } => CommandType::WorkflowSetViewport,
+            Self::SetUnsafeParallel { .. } => CommandType::WorkflowSetUnsafeParallel,
         }
     }
 }
@@ -137,6 +226,12 @@ pub enum KernelProblem {
     InvalidEnvelope(String),
     #[error("revision_conflict")]
     RevisionConflict,
+    #[error("validation_failed:{0}")]
+    ValidationFailed(String),
+    #[error("workflow_cycle:{0}")]
+    WorkflowCycle(String),
+    #[error("unknown_dependency:{0}")]
+    UnknownDependency(String),
     #[error("command_id_reused")]
     CommandIdReused,
     #[error("command_in_progress")]
@@ -159,6 +254,9 @@ impl KernelProblem {
             Self::ResourceNotFound => "resource_not_found",
             Self::InvalidEnvelope(_) => "invalid_envelope",
             Self::RevisionConflict => "revision_conflict",
+            Self::ValidationFailed(_) => "validation_failed",
+            Self::WorkflowCycle(_) => "workflow_cycle",
+            Self::UnknownDependency(_) => "unknown_dependency",
             Self::CommandIdReused => "command_id_reused",
             Self::CommandInProgress => "command_in_progress",
             Self::ControllerLeaseExpired => "controller_lease_expired",
@@ -179,6 +277,9 @@ impl From<CommandProblem> for KernelProblem {
             CommandProblem::ControllerLeaseExpired => Self::ControllerLeaseExpired,
             CommandProblem::RootEpochExpired => Self::RootEpochExpired,
             CommandProblem::RevisionConflict => Self::RevisionConflict,
+            CommandProblem::ValidationFailed(message) => Self::ValidationFailed(message),
+            CommandProblem::WorkflowCycle(message) => Self::WorkflowCycle(message),
+            CommandProblem::UnknownDependency(message) => Self::UnknownDependency(message),
             CommandProblem::ResourceNotFound => Self::ResourceNotFound,
             other => Self::Internal(other.to_string()),
         }
@@ -278,35 +379,61 @@ impl CommandPermit for InProcessPermit<'_> {
         check: &LeaseCheck<'_>,
     ) -> Result<(), CommandProblem> {
         for expected in check.expected {
-            if expected.aggregate.kind != AggregateKind::ProjectWorkflow {
-                return Err(CommandProblem::InvalidEnvelope(
-                    "T2a tracer 只支持 project_workflow expected revision".into(),
-                ));
-            }
-            let row = tx
-                .query_row(
-                    "SELECT semantic_revision, presentation_revision
-                     FROM project_workflows WHERE public_handle = ?1",
-                    [expected.aggregate.handle.as_str()],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .optional()
-                .map_err(|error| CommandProblem::Internal(error.to_string()))?;
-            let Some((semantic, presentation)) = row else {
-                return Err(CommandProblem::ResourceNotFound);
-            };
-            for (axis, expected_revision) in &expected.revisions {
-                let actual = match axis.as_str() {
-                    "semantic_revision" => semantic,
-                    "presentation_revision" => presentation,
-                    other => {
-                        return Err(CommandProblem::InvalidEnvelope(format!(
-                            "未知 revision 轴:{other}"
-                        )))
+            match expected.aggregate.kind {
+                AggregateKind::ProjectWorkflow => {
+                    let row = tx
+                        .query_row(
+                            "SELECT semantic_revision, presentation_revision
+                             FROM project_workflows WHERE public_handle = ?1",
+                            [expected.aggregate.handle.as_str()],
+                            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                        )
+                        .optional()
+                        .map_err(|error| CommandProblem::Internal(error.to_string()))?;
+                    let Some((semantic, presentation)) = row else {
+                        return Err(CommandProblem::ResourceNotFound);
+                    };
+                    for (axis, expected_revision) in &expected.revisions {
+                        let actual = match axis.as_str() {
+                            "semantic_revision" => semantic,
+                            "presentation_revision" => presentation,
+                            other => {
+                                return Err(CommandProblem::InvalidEnvelope(format!(
+                                    "未知 Workflow revision 轴:{other}"
+                                )))
+                            }
+                        };
+                        if actual != *expected_revision as i64 {
+                            return Err(CommandProblem::RevisionConflict);
+                        }
                     }
-                };
-                if actual != *expected_revision as i64 {
-                    return Err(CommandProblem::RevisionConflict);
+                }
+                AggregateKind::Project => {
+                    if expected.aggregate.handle != check.target.store_handle {
+                        return Err(CommandProblem::TargetStoreMismatch);
+                    }
+                    let collection = tx
+                        .query_row(
+                            "SELECT workflow_collection_revision FROM project_meta WHERE id=1",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .map_err(|error| CommandProblem::Internal(error.to_string()))?;
+                    for (axis, expected_revision) in &expected.revisions {
+                        if axis != "workflow_collection_revision" {
+                            return Err(CommandProblem::InvalidEnvelope(format!(
+                                "未知 Project revision 轴:{axis}"
+                            )));
+                        }
+                        if collection != *expected_revision as i64 {
+                            return Err(CommandProblem::RevisionConflict);
+                        }
+                    }
+                }
+                _ => {
+                    return Err(CommandProblem::InvalidEnvelope(
+                        "Project Workflow 命令只接受 project/project_workflow expected".into(),
+                    ))
                 }
             }
         }
@@ -571,6 +698,9 @@ impl InProcessCoreKernel {
             KernelCommand::WorkflowRename(_) => {
                 self.dispatch_workflow_rename(request, fault, || {})
             }
+            KernelCommand::ProjectWorkflow(_) => Err(KernelProblem::InvalidEnvelope(
+                "fault seam 仅支持 workflow.rename".into(),
+            )),
         }
     }
 
@@ -640,7 +770,11 @@ impl InProcessCoreKernel {
         fault: Option<FaultPoint>,
         before_barrier: impl FnOnce(),
     ) -> Result<KernelOutcome, KernelProblem> {
-        let KernelCommand::WorkflowRename(command) = &request.command;
+        let KernelCommand::WorkflowRename(command) = &request.command else {
+            return Err(KernelProblem::InvalidEnvelope(
+                "rename dispatcher 收到其它命令".into(),
+            ));
+        };
         let project = &command.project;
         let workflow = &command.workflow;
         let name = &command.name;
@@ -745,42 +879,89 @@ impl InProcessCoreKernel {
             registration
                 .store
                 .with_conn(|conn| {
-                    conn.query_row(
-                        "SELECT public_handle, name, semantic_revision, presentation_revision
-                         FROM project_workflows WHERE public_handle=?1",
-                        [workflow.as_str()],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, i64>(2)?,
-                                row.get::<_, i64>(3)?,
-                            ))
-                        },
-                    )
-                    .optional()
-                    .map_err(anyhow::Error::from)
+                    let record = Store::project_workflow_by_handle_tx(conn, workflow.as_str())?;
+                    let nodes = Store::workflow_node_identities_tx(conn, workflow.as_str())?;
+                    let edges = Store::workflow_edge_identities_tx(conn, workflow.as_str())?;
+                    let collection: i64 = conn.query_row(
+                        "SELECT workflow_collection_revision FROM project_meta WHERE id=1",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    let mut positions_stmt=conn.prepare("SELECT node_handle,x,y FROM node_position")?;
+                    let positions=positions_stmt.query_map([],|row|Ok((row.get::<_,String>(0)?,(row.get::<_,f64>(1)?,row.get::<_,f64>(2)?))))?.collect::<Result<std::collections::HashMap<_,_>,_>>()?;
+                    let presentation=conn.query_row("SELECT viewport_json,collapse_json,layout_json FROM workflow_presentation WHERE workflow_handle=?1",[workflow.as_str()],|row|Ok((row.get::<_,Option<String>>(0)?,row.get::<_,Option<String>>(1)?,row.get::<_,Option<String>>(2)?))).optional()?;
+                    Ok((record, nodes, edges, collection,positions,presentation))
                 })
                 .map_err(|error| KernelProblem::Internal(format!("{error:#}")))
         })?;
-        let Some((workflow_handle, name, semantic, presentation)) = row else {
+        let (record, nodes, edges, collection, positions, presentation) = row;
+        let Some(record) = record else {
             return Err(KernelProblem::ResourceNotFound);
         };
         let revisions = RevisionVector {
-            semantic_revision: u64::try_from(semantic)
+            semantic_revision: u64::try_from(record.semantic_revision)
                 .map_err(|_| KernelProblem::Internal("semantic_revision 溢出".into()))?,
-            presentation_revision: u64::try_from(presentation)
+            presentation_revision: u64::try_from(record.presentation_revision)
                 .map_err(|_| KernelProblem::Internal("presentation_revision 溢出".into()))?,
         };
+        let node_handle_map: std::collections::HashMap<_, _> = nodes
+            .iter()
+            .map(|row| (row.node_key.clone(), row.node_handle.clone()))
+            .collect();
+        let snapshot_nodes = nodes
+            .into_iter()
+            .filter_map(|identity| {
+                record
+                    .nodes
+                    .iter()
+                    .find(|node| node.key == identity.node_key)
+                    .map(|node| crate::projection::WorkflowSnapshotNode {
+                        handle: identity.node_handle.clone(),
+                        key: node.key.clone(),
+                        title: node.title.clone(),
+                        instructions: node.instructions.clone(),
+                        agent_instance_id: node.agent_instance_id.clone(),
+                        deps: node.deps.clone(),
+                        position: positions.get(&identity.node_handle).copied(),
+                    })
+            })
+            .collect();
+        let snapshot_edges = edges
+            .into_iter()
+            .filter_map(|edge| {
+                Some(crate::projection::WorkflowSnapshotEdge {
+                    handle: edge.edge_handle,
+                    upstream_node_handle: node_handle_map.get(&edge.upstream_node_key)?.clone(),
+                    downstream_node_handle: node_handle_map.get(&edge.downstream_node_key)?.clone(),
+                })
+            })
+            .collect();
         Ok(SnapshotEnvelope {
             schema: SNAPSHOT_SCHEMA,
             server_instance_id: self.projections.server_instance_id().clone(),
             cursor,
             data: SnapshotData::Workflow(WorkflowSnapshotData {
-                workflow: WorkflowHandle::parse(workflow_handle)
+                workflow: WorkflowHandle::parse(record.public_handle.clone())
                     .map_err(|error| KernelProblem::Internal(error.to_string()))?,
-                name,
+                name: record.name.clone(),
+                allow_unsafe_parallel: record.allow_unsafe_parallel,
                 revisions,
+                nodes: snapshot_nodes,
+                edges: snapshot_edges,
+                workflow_collection_revision: u64::try_from(collection)
+                    .map_err(|_| KernelProblem::Internal("collection revision 溢出".into()))?,
+                viewport: presentation
+                    .as_ref()
+                    .and_then(|value| value.0.as_ref())
+                    .and_then(|raw| serde_json::from_str(raw).ok()),
+                collapse: presentation
+                    .as_ref()
+                    .and_then(|value| value.1.as_ref())
+                    .and_then(|raw| serde_json::from_str(raw).ok()),
+                layout: presentation
+                    .as_ref()
+                    .and_then(|value| value.2.as_ref())
+                    .and_then(|raw| serde_json::from_str(raw).ok()),
             }),
         })
     }
@@ -872,6 +1053,7 @@ impl CoreKernel for InProcessCoreKernel {
     fn dispatch(&self, request: KernelCommandRequest) -> Result<KernelOutcome, KernelProblem> {
         match &request.command {
             KernelCommand::WorkflowRename(_) => self.dispatch_workflow_rename(request, None, || {}),
+            KernelCommand::ProjectWorkflow(_) => self.dispatch_project_workflow(request),
         }
     }
 
@@ -899,6 +1081,577 @@ impl CoreKernel for InProcessCoreKernel {
     fn shutdown(&self, intent: ShutdownIntent) -> ShutdownAssessment {
         self.assess_shutdown(intent)
     }
+}
+
+impl InProcessCoreKernel {
+    fn dispatch_project_workflow(
+        &self,
+        request: KernelCommandRequest,
+    ) -> Result<KernelOutcome, KernelProblem> {
+        let KernelCommand::ProjectWorkflow(command) = request.command.clone() else {
+            return Err(KernelProblem::InvalidEnvelope(
+                "workflow dispatcher 收到其它命令".into(),
+            ));
+        };
+        let project = project_of(&command).clone();
+        let target_aggregate = match workflow_of(&command) {
+            Some(workflow) => {
+                AggregateRef::new(AggregateKind::ProjectWorkflow, workflow.as_str().to_owned())
+            }
+            None => AggregateRef::new(AggregateKind::Project, project.as_str().to_owned()),
+        }
+        .map_err(|error| KernelProblem::Internal(error.to_string()))?;
+        let expected = expected_revisions(&command, &project, &target_aggregate)?;
+        let payload = project_workflow_payload(&command)?;
+        let command_type = command.command_type();
+        let envelope = CommandEnvelope::new(
+            request.command_id.clone(),
+            request.client_id.clone(),
+            request.principal.clone(),
+            request.controller_epoch,
+            None,
+            CommandTarget {
+                store: TargetStoreKind::Project,
+                store_handle: project.as_str().to_owned(),
+                aggregate: target_aggregate,
+            },
+            expected,
+            command_type,
+            CommandPayload::Plain(payload),
+        )?;
+        let targets = self.registered_targets();
+        self.projections.linearize(&targets, |hub| {
+            let registration = self.project_registration(&project)?;
+            let outcome = self.coordinator.dispatch_internal(
+                &envelope, &registration.target, &self.authorizer,
+                |tx| project_workflow_effect(tx, &project, &command), None, || {},
+            );
+            let outcome = match outcome {
+                Ok(value) => value,
+                Err(error) => {
+                    let committed = registration.target.with_conn(|conn| conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM command_receipt WHERE command_id=?1 AND state='applied' AND finalized_at IS NOT NULL)",
+                        [request.command_id.as_str()], |row| row.get::<_, bool>(0),
+                    ).map_err(|e| CommandProblem::Internal(e.to_string())));
+                    if !matches!(committed, Ok(false)) { hub.abort_publication(&registration.target)?; }
+                    return Err(KernelProblem::from(error));
+                }
+            };
+            hub.publish_pending(&registration.target)?;
+            let CommandOutcome::Applied { result_revisions, replayed } = outcome;
+            Ok(KernelOutcome::Applied { revisions: revision_vector_of(&result_revisions)?, replayed })
+        })
+    }
+}
+
+fn project_of(command: &ProjectWorkflowCommand) -> &ProjectStoreHandle {
+    match command {
+        ProjectWorkflowCommand::Create { project, .. }
+        | ProjectWorkflowCommand::Delete { project, .. }
+        | ProjectWorkflowCommand::AddNode { project, .. }
+        | ProjectWorkflowCommand::UpdateNode { project, .. }
+        | ProjectWorkflowCommand::RemoveNode { project, .. }
+        | ProjectWorkflowCommand::MoveNode { project, .. }
+        | ProjectWorkflowCommand::Connect { project, .. }
+        | ProjectWorkflowCommand::Disconnect { project, .. }
+        | ProjectWorkflowCommand::SetViewport { project, .. }
+        | ProjectWorkflowCommand::SetUnsafeParallel { project, .. } => project,
+    }
+}
+
+fn workflow_of(command: &ProjectWorkflowCommand) -> Option<&WorkflowHandle> {
+    match command {
+        ProjectWorkflowCommand::Create { .. } => None,
+        ProjectWorkflowCommand::Delete { workflow, .. }
+        | ProjectWorkflowCommand::AddNode { workflow, .. }
+        | ProjectWorkflowCommand::UpdateNode { workflow, .. }
+        | ProjectWorkflowCommand::RemoveNode { workflow, .. }
+        | ProjectWorkflowCommand::MoveNode { workflow, .. }
+        | ProjectWorkflowCommand::Connect { workflow, .. }
+        | ProjectWorkflowCommand::Disconnect { workflow, .. }
+        | ProjectWorkflowCommand::SetViewport { workflow, .. }
+        | ProjectWorkflowCommand::SetUnsafeParallel { workflow, .. } => Some(workflow),
+    }
+}
+
+fn expected_revisions(
+    command: &ProjectWorkflowCommand,
+    project: &ProjectStoreHandle,
+    target: &AggregateRef,
+) -> Result<Vec<ExpectedRevision>, KernelProblem> {
+    let expected = |aggregate: AggregateRef, pairs: &[(&str, u64)]| ExpectedRevision {
+        aggregate,
+        revisions: pairs.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect(),
+    };
+    Ok(match command {
+        ProjectWorkflowCommand::Create {
+            expected_collection_revision,
+            ..
+        } => vec![expected(
+            target.clone(),
+            &[(
+                "workflow_collection_revision",
+                *expected_collection_revision,
+            )],
+        )],
+        ProjectWorkflowCommand::Delete {
+            expected_collection_revision,
+            expected_semantic_revision,
+            expected_presentation_revision,
+            ..
+        } => vec![
+            expected(
+                AggregateRef::new(AggregateKind::Project, project.as_str().to_owned())
+                    .map_err(|e| KernelProblem::Internal(e.to_string()))?,
+                &[(
+                    "workflow_collection_revision",
+                    *expected_collection_revision,
+                )],
+            ),
+            expected(
+                target.clone(),
+                &[
+                    ("semantic_revision", *expected_semantic_revision),
+                    ("presentation_revision", *expected_presentation_revision),
+                ],
+            ),
+        ],
+        ProjectWorkflowCommand::MoveNode {
+            expected_presentation_revision,
+            ..
+        }
+        | ProjectWorkflowCommand::SetViewport {
+            expected_presentation_revision,
+            ..
+        } => vec![expected(
+            target.clone(),
+            &[("presentation_revision", *expected_presentation_revision)],
+        )],
+        ProjectWorkflowCommand::AddNode {
+            expected_semantic_revision,
+            ..
+        }
+        | ProjectWorkflowCommand::UpdateNode {
+            expected_semantic_revision,
+            ..
+        }
+        | ProjectWorkflowCommand::RemoveNode {
+            expected_semantic_revision,
+            ..
+        }
+        | ProjectWorkflowCommand::Connect {
+            expected_semantic_revision,
+            ..
+        }
+        | ProjectWorkflowCommand::Disconnect {
+            expected_semantic_revision,
+            ..
+        }
+        | ProjectWorkflowCommand::SetUnsafeParallel {
+            expected_semantic_revision,
+            ..
+        } => vec![expected(
+            target.clone(),
+            &[("semantic_revision", *expected_semantic_revision)],
+        )],
+    })
+}
+
+fn project_workflow_payload(command: &ProjectWorkflowCommand) -> Result<Value, KernelProblem> {
+    serde_json::to_value(match command {
+        ProjectWorkflowCommand::Create { draft, .. } => serde_json::json!({"draft": draft}),
+        ProjectWorkflowCommand::Delete { workflow, .. } => serde_json::json!({"workflow": workflow.as_str()}),
+        ProjectWorkflowCommand::AddNode { workflow, node, .. } => serde_json::json!({"workflow": workflow.as_str(), "node": node}),
+        ProjectWorkflowCommand::UpdateNode { workflow, node_handle, title, instructions, agent_instance_id, .. } => serde_json::json!({"workflow":workflow.as_str(),"node_handle":node_handle,"title":title,"instructions":instructions,"agent_instance_id":agent_instance_id}),
+        ProjectWorkflowCommand::RemoveNode { workflow, node_handle, .. } => serde_json::json!({"workflow":workflow.as_str(),"node_handle":node_handle}),
+        ProjectWorkflowCommand::MoveNode { workflow, node_handle, x, y, .. } => serde_json::json!({"workflow":workflow.as_str(),"node_handle":node_handle,"x":x,"y":y}),
+        ProjectWorkflowCommand::Connect { workflow, upstream_node_handle, downstream_node_handle, .. } => serde_json::json!({"workflow":workflow.as_str(),"upstream_node_handle":upstream_node_handle,"downstream_node_handle":downstream_node_handle}),
+        ProjectWorkflowCommand::Disconnect { workflow, edge_handle, .. } => serde_json::json!({"workflow":workflow.as_str(),"edge_handle":edge_handle}),
+        ProjectWorkflowCommand::SetViewport { workflow, viewport, .. } => serde_json::json!({"workflow":workflow.as_str(),"viewport":viewport}),
+        ProjectWorkflowCommand::SetUnsafeParallel { workflow, allow, .. } => serde_json::json!({"workflow":workflow.as_str(),"allow":allow}),
+    }).map_err(|e| KernelProblem::InvalidEnvelope(e.to_string()))
+}
+
+fn project_workflow_effect(
+    tx: &Transaction<'_>,
+    project: &ProjectStoreHandle,
+    command: &ProjectWorkflowCommand,
+) -> Result<EffectOutput, CommandProblem> {
+    use mf_agent::{ProjectWorkflowMutation as M, Store};
+    let internal = workflow_domain_problem;
+    let workflow_record = |handle: &WorkflowHandle| {
+        Store::project_workflow_by_handle_tx(tx, handle.as_str())
+            .map_err(internal)?
+            .ok_or(CommandProblem::ResourceNotFound)
+    };
+    let (mutation, delta_type, delta_data) = match command {
+        ProjectWorkflowCommand::Create {
+            draft,
+            expected_collection_revision,
+            ..
+        } => (
+            M::Create {
+                draft: draft.clone(),
+                expected_collection_revision: *expected_collection_revision as i64,
+            },
+            "workflow.replace",
+            serde_json::json!({"draft": draft}),
+        ),
+        ProjectWorkflowCommand::Delete {
+            workflow,
+            expected_collection_revision,
+            expected_semantic_revision,
+            expected_presentation_revision,
+            ..
+        } => (
+            M::Delete {
+                workflow_handle: workflow.as_str().to_owned(),
+                expected_collection_revision: *expected_collection_revision as i64,
+                expected_semantic_revision: *expected_semantic_revision as i64,
+                expected_presentation_revision: *expected_presentation_revision as i64,
+            },
+            "workflow.delete",
+            Value::Null,
+        ),
+        ProjectWorkflowCommand::MoveNode {
+            workflow,
+            node_handle,
+            x,
+            y,
+            expected_presentation_revision,
+            ..
+        } => (
+            M::SetNodePosition {
+                workflow_handle: workflow.as_str().to_owned(),
+                node_handle: node_handle.clone(),
+                expected_presentation_revision: *expected_presentation_revision as i64,
+                x: *x,
+                y: *y,
+            },
+            "workflow.node_position_set",
+            serde_json::json!({"node_handle":node_handle,"x":x,"y":y}),
+        ),
+        ProjectWorkflowCommand::SetViewport {
+            workflow,
+            viewport,
+            expected_presentation_revision,
+            ..
+        } => (
+            M::SetPresentation {
+                workflow_handle: workflow.as_str().to_owned(),
+                expected_presentation_revision: *expected_presentation_revision as i64,
+                viewport_json: Some(
+                    serde_json::to_string(viewport)
+                        .map_err(|e| CommandProblem::InvalidEnvelope(e.to_string()))?,
+                ),
+                collapse_json: None,
+                layout_json: None,
+            },
+            "workflow.viewport_set",
+            serde_json::json!({"viewport":viewport}),
+        ),
+        semantic => {
+            let workflow = workflow_of(semantic).ok_or_else(|| {
+                CommandProblem::InvalidEnvelope("semantic workflow handle 缺失".into())
+            })?;
+            let before = workflow_record(workflow)?;
+            let mut draft = mf_agent::ProjectWorkflowDraft {
+                key: before.key.clone(),
+                name: before.name.clone(),
+                nodes: before.nodes.clone(),
+                allow_unsafe_parallel: before.allow_unsafe_parallel,
+            };
+            let identities =
+                Store::workflow_node_identities_tx(tx, workflow.as_str()).map_err(internal)?;
+            let key_of = |handle: &str| {
+                identities
+                    .iter()
+                    .find(|row| row.node_handle == handle)
+                    .map(|row| row.node_key.clone())
+                    .ok_or(CommandProblem::ResourceNotFound)
+            };
+            let (delta_type, data, expected) = match semantic {
+                ProjectWorkflowCommand::AddNode {
+                    node,
+                    expected_semantic_revision,
+                    ..
+                } => {
+                    draft.nodes.push(node.clone());
+                    (
+                        "workflow.add_node",
+                        serde_json::json!({"node":node}),
+                        *expected_semantic_revision,
+                    )
+                }
+                ProjectWorkflowCommand::UpdateNode {
+                    node_handle,
+                    title,
+                    instructions,
+                    agent_instance_id,
+                    expected_semantic_revision,
+                    ..
+                } => {
+                    let key = key_of(node_handle)?;
+                    let node = draft
+                        .nodes
+                        .iter_mut()
+                        .find(|n| n.key == key)
+                        .ok_or(CommandProblem::ResourceNotFound)?;
+                    node.title = title.clone();
+                    node.instructions = instructions.clone();
+                    node.agent_instance_id = agent_instance_id.clone();
+                    (
+                        "workflow.update_node",
+                        serde_json::json!({"node_handle":node_handle,"title":title,"instructions":instructions,"agent_instance_id":agent_instance_id}),
+                        *expected_semantic_revision,
+                    )
+                }
+                ProjectWorkflowCommand::RemoveNode {
+                    node_handle,
+                    expected_semantic_revision,
+                    ..
+                } => {
+                    let key = key_of(node_handle)?;
+                    let incident: Vec<String> =
+                        Store::workflow_edge_identities_tx(tx, workflow.as_str())
+                            .map_err(internal)?
+                            .into_iter()
+                            .filter(|edge| {
+                                edge.upstream_node_key == key || edge.downstream_node_key == key
+                            })
+                            .map(|edge| edge.edge_handle)
+                            .collect();
+                    if draft.nodes.len() <= 1 {
+                        return Err(CommandProblem::InvalidEnvelope(
+                            "工作流至少保留一个节点".into(),
+                        ));
+                    }
+                    draft.nodes.retain(|n| n.key != key);
+                    for node in &mut draft.nodes {
+                        node.deps.retain(|dep| dep != &key);
+                    }
+                    (
+                        "workflow.remove_node",
+                        serde_json::json!({"node_handle":node_handle,"incident_edge_handles":incident}),
+                        *expected_semantic_revision,
+                    )
+                }
+                ProjectWorkflowCommand::Connect {
+                    upstream_node_handle,
+                    downstream_node_handle,
+                    expected_semantic_revision,
+                    ..
+                } => {
+                    let up = key_of(upstream_node_handle)?;
+                    let down = key_of(downstream_node_handle)?;
+                    let node = draft
+                        .nodes
+                        .iter_mut()
+                        .find(|n| n.key == down)
+                        .ok_or(CommandProblem::ResourceNotFound)?;
+                    if !node.deps.contains(&up) {
+                        node.deps.push(up);
+                    }
+                    (
+                        "workflow.connect",
+                        serde_json::json!({"upstream_node_handle":upstream_node_handle,"downstream_node_handle":downstream_node_handle}),
+                        *expected_semantic_revision,
+                    )
+                }
+                ProjectWorkflowCommand::Disconnect {
+                    edge_handle,
+                    expected_semantic_revision,
+                    ..
+                } => {
+                    let edges = Store::workflow_edge_identities_tx(tx, workflow.as_str())
+                        .map_err(internal)?;
+                    let edge = edges
+                        .iter()
+                        .find(|e| e.edge_handle == *edge_handle)
+                        .ok_or(CommandProblem::ResourceNotFound)?;
+                    let node = draft
+                        .nodes
+                        .iter_mut()
+                        .find(|n| n.key == edge.downstream_node_key)
+                        .ok_or(CommandProblem::ResourceNotFound)?;
+                    node.deps.retain(|dep| dep != &edge.upstream_node_key);
+                    (
+                        "workflow.disconnect",
+                        serde_json::json!({"edge_handle":edge_handle}),
+                        *expected_semantic_revision,
+                    )
+                }
+                ProjectWorkflowCommand::SetUnsafeParallel {
+                    allow,
+                    expected_semantic_revision,
+                    ..
+                } => {
+                    draft.allow_unsafe_parallel = *allow;
+                    (
+                        "workflow.set_unsafe_parallel",
+                        serde_json::json!({"allow":allow}),
+                        *expected_semantic_revision,
+                    )
+                }
+                _ => return Err(CommandProblem::InvalidEnvelope("命令轴错误".into())),
+            };
+            (
+                M::ReplaceSemantic {
+                    draft,
+                    expected_semantic_revision: expected as i64,
+                },
+                delta_type,
+                data,
+            )
+        }
+    };
+    let result = Store::apply_project_workflow_mutation_tx(tx, mutation).map_err(internal)?;
+    let delta_data = match command {
+        ProjectWorkflowCommand::Create { .. } => {
+            let record = result
+                .after
+                .as_ref()
+                .ok_or_else(|| CommandProblem::Internal("create result 缺失".into()))?;
+            let nodes =
+                Store::workflow_node_identities_tx(tx, &record.public_handle).map_err(internal)?;
+            let edges =
+                Store::workflow_edge_identities_tx(tx, &record.public_handle).map_err(internal)?;
+            serde_json::json!({"workflow":record,"node_identities":nodes,"edge_identities":edges})
+        }
+        ProjectWorkflowCommand::AddNode { workflow, node, .. } => {
+            let identity = Store::workflow_node_identities_tx(tx, workflow.as_str())
+                .map_err(internal)?
+                .into_iter()
+                .find(|row| row.node_key == node.key)
+                .ok_or(CommandProblem::ResourceNotFound)?;
+            serde_json::json!({"node_handle":identity.node_handle,"node":node})
+        }
+        ProjectWorkflowCommand::Connect {
+            workflow,
+            upstream_node_handle,
+            downstream_node_handle,
+            ..
+        } => {
+            let nodes =
+                Store::workflow_node_identities_tx(tx, workflow.as_str()).map_err(internal)?;
+            let up = nodes
+                .iter()
+                .find(|row| row.node_handle == *upstream_node_handle)
+                .ok_or(CommandProblem::ResourceNotFound)?;
+            let down = nodes
+                .iter()
+                .find(|row| row.node_handle == *downstream_node_handle)
+                .ok_or(CommandProblem::ResourceNotFound)?;
+            let edge = Store::workflow_edge_identities_tx(tx, workflow.as_str())
+                .map_err(internal)?
+                .into_iter()
+                .find(|edge| {
+                    edge.upstream_node_key == up.node_key
+                        && edge.downstream_node_key == down.node_key
+                })
+                .ok_or(CommandProblem::ResourceNotFound)?;
+            serde_json::json!({"edge_handle":edge.edge_handle,"upstream_node_handle":upstream_node_handle,"downstream_node_handle":downstream_node_handle})
+        }
+        _ => delta_data,
+    };
+    workflow_mutation_output(project, command, result, delta_type, delta_data)
+}
+
+fn workflow_domain_problem(error: anyhow::Error) -> CommandProblem {
+    if error
+        .downcast_ref::<mf_agent::model::RevisionConflict>()
+        .is_some()
+    {
+        return CommandProblem::RevisionConflict;
+    }
+    if let Some(validation) = error.downcast_ref::<mf_agent::WorkflowValidationErrors>() {
+        let message = validation.to_string();
+        if validation
+            .iter()
+            .any(|error| error.code() == mf_agent::WorkflowValidationCode::Cycle)
+        {
+            return CommandProblem::WorkflowCycle(message);
+        }
+        if validation
+            .iter()
+            .any(|error| error.code() == mf_agent::WorkflowValidationCode::UnknownDependency)
+        {
+            return CommandProblem::UnknownDependency(message);
+        }
+        return CommandProblem::ValidationFailed(message);
+    }
+    if let Some(mutation) = error.downcast_ref::<mf_agent::WorkflowMutationError>() {
+        return match mutation {
+            mf_agent::WorkflowMutationError::ScopeMismatch => CommandProblem::ResourceNotFound,
+            mf_agent::WorkflowMutationError::Validation(message) => {
+                CommandProblem::ValidationFailed(message.clone())
+            }
+        };
+    }
+    CommandProblem::Internal(format!("{error:#}"))
+}
+
+fn workflow_mutation_output(
+    project: &ProjectStoreHandle,
+    command: &ProjectWorkflowCommand,
+    result: mf_agent::WorkflowMutationResult,
+    delta_type: &str,
+    delta_data: Value,
+) -> Result<EffectOutput, CommandProblem> {
+    let record = result
+        .after
+        .as_ref()
+        .or(result.before.as_ref())
+        .ok_or_else(|| CommandProblem::Internal("mutation 无 revision 记录".into()))?;
+    let revisions = serde_json::json!({"semantic_revision":record.semantic_revision,"presentation_revision":record.presentation_revision,"workflow_collection_revision":result.collection_revision});
+    if result.no_op {
+        return Ok(EffectOutput {
+            result_revisions: revisions,
+            projections: Vec::new(),
+        });
+    }
+    let workflow_handle = record.public_handle.clone();
+    let base = result
+        .before
+        .as_ref()
+        .map(|r| (r.semantic_revision, r.presentation_revision))
+        .unwrap_or((0, 0));
+    let aggregate = result
+        .after
+        .as_ref()
+        .map(|r| (r.semantic_revision, r.presentation_revision))
+        .unwrap_or(base);
+    let mode = match command {
+        ProjectWorkflowCommand::Create { .. } => "replace",
+        ProjectWorkflowCommand::Delete { .. } => "tombstone",
+        _ => "typed_delta",
+    };
+    let delta = if mode == "replace" {
+        serde_json::json!({"mode":"replace","data":delta_data})
+    } else if mode == "tombstone" {
+        serde_json::json!({"mode":"tombstone"})
+    } else {
+        serde_json::json!({"mode":"typed_delta","delta_type":delta_type,"data":delta_data})
+    };
+    let mut projections = vec![ProjectionEffect {
+        aggregate: Some(
+            AggregateRef::new(AggregateKind::ProjectWorkflow, workflow_handle.clone())
+                .map_err(|e| CommandProblem::Internal(e.to_string()))?,
+        ),
+        event_type: Some(delta_type.to_string()),
+        projection_critical: true,
+        payload: serde_json::json!({"base_revision":{"semantic_revision":base.0,"presentation_revision":base.1},"aggregate_revision":{"semantic_revision":aggregate.0,"presentation_revision":aggregate.1},"delta":delta}),
+    }];
+    if matches!(
+        command,
+        ProjectWorkflowCommand::Create { .. } | ProjectWorkflowCommand::Delete { .. }
+    ) {
+        projections.push(ProjectionEffect { aggregate: Some(AggregateRef::new(AggregateKind::Project,project.as_str().to_owned()).map_err(|e|CommandProblem::Internal(e.to_string()))?), event_type: Some("project.workflow_collection_changed".into()), projection_critical:true, payload:serde_json::json!({"base_revision":{"revision":result.collection_revision-1},"aggregate_revision":{"revision":result.collection_revision},"delta":{"mode":"typed_delta","delta_type":"project.workflow_collection_changed","data":{"workflow_handle":workflow_handle}}}) });
+    }
+    Ok(EffectOutput {
+        result_revisions: revisions,
+        projections,
+    })
 }
 
 /// 封闭命令 → L-CMD 目标事务内的业务效果段。任意 SQL 只存在于
@@ -939,7 +1692,7 @@ fn workflow_rename_effect(
                 "semantic_revision": semantic,
                 "presentation_revision": presentation,
             }),
-            projection: None,
+            projections: Vec::new(),
         });
     }
     let changed = tx
@@ -976,7 +1729,7 @@ fn workflow_rename_effect(
     });
     Ok(EffectOutput {
         result_revisions: revisions,
-        projection: Some(projection),
+        projections: vec![crate::command::ProjectionEffect::primary(projection)],
     })
 }
 
@@ -1166,5 +1919,30 @@ impl LegacyKernelClient {
                 expected_presentation_revision,
             ),
         ))
+    }
+
+    pub fn dispatch_project_workflow(
+        &self,
+        command: ProjectWorkflowCommand,
+    ) -> Result<KernelOutcome, KernelProblem> {
+        self.kernel.dispatch(KernelCommandRequest::new(
+            CommandId::new(),
+            self.client_id.clone(),
+            self.principal.clone(),
+            self.controller_epoch(),
+            KernelCommand::ProjectWorkflow(command),
+        ))
+    }
+
+    pub fn workflow_snapshot(
+        &self,
+        project: &ProjectStoreHandle,
+        workflow_key: &str,
+    ) -> Result<SnapshotEnvelope, KernelProblem> {
+        let (workflow, _) = self.kernel.legacy_workflow_locator(project, workflow_key)?;
+        self.kernel.snapshot(SnapshotQuery::Workflow {
+            project: project.clone(),
+            workflow,
+        })
     }
 }

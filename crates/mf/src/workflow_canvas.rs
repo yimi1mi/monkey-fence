@@ -122,6 +122,10 @@ pub struct WorkflowCanvas {
     pub workflows: Vec<(String, String)>,
     /// 当前编辑的项目工作流 key(None = 未选择)。
     pub current_key: Option<String>,
+    current_record: Option<mf_agent::ProjectWorkflowRecord>,
+    collection_revision: u64,
+    node_handles: std::collections::HashMap<String, String>,
+    edge_handles: std::collections::HashMap<(String, String), String>,
     /// 当前工作流名称(重命名入口编辑)。
     pub workflow_name: String,
     /// 保存状态:None = 干净;Some(错误) = dirty 保存失败(Run 被阻止)。
@@ -158,6 +162,10 @@ impl WorkflowCanvas {
             project_root: None,
             workflows: Vec::new(),
             current_key: None,
+            current_record: None,
+            collection_revision: 1,
+            node_handles: std::collections::HashMap::new(),
+            edge_handles: std::collections::HashMap::new(),
             workflow_name: String::new(),
             save_error: None,
             templates: Vec::new(),
@@ -220,6 +228,9 @@ impl WorkflowCanvas {
         // 保持本项目的空编辑态并以 save_error 阻止写入/运行。
         self.workflows.clear();
         self.current_key = None;
+        self.current_record = None;
+        self.node_handles.clear();
+        self.edge_handles.clear();
         self.workflow_name.clear();
         self.editor.load_nodes(Vec::new());
         self.inspector = None;
@@ -244,6 +255,7 @@ impl WorkflowCanvas {
         let Some(store) = self.store() else {
             self.workflows.clear();
             self.current_key = None;
+            self.current_record = None;
             self.workflow_name.clear();
             self.editor.load_nodes(Vec::new());
             self.inspector = None;
@@ -261,6 +273,7 @@ impl WorkflowCanvas {
                 return;
             }
         };
+        self.collection_revision = store.workflow_collection_revision().unwrap_or(1) as u64;
         self.workflows = records.into_iter().map(|r| (r.key, r.name)).collect();
         if !self
             .workflows
@@ -272,6 +285,7 @@ impl WorkflowCanvas {
                 self.load_workflow(&key);
             } else {
                 self.current_key = None;
+                self.current_record = None;
                 self.workflow_name.clear();
                 self.editor.load_nodes(Vec::new());
                 self.inspector = None;
@@ -293,6 +307,84 @@ impl WorkflowCanvas {
 
     /// 选中并加载一个项目工作流(名称/节点/并行开关来自 Store)。
     pub fn load_workflow(&mut self, key: &str) {
+        if let Some(root) = self.project_root.clone() {
+            if let Some(result) = self.app.workflow_snapshot_via_kernel(&root, key) {
+                match result {
+                    Ok(snapshot) => {
+                        let mf_kernel::projection::SnapshotData::Workflow(data) = snapshot.data;
+                        let nodes: Vec<_> = data
+                            .nodes
+                            .iter()
+                            .map(|node| mf_agent::WorkflowNodeDraft {
+                                key: node.key.clone(),
+                                title: node.title.clone(),
+                                instructions: node.instructions.clone(),
+                                agent_instance_id: node.agent_instance_id.clone(),
+                                deps: node.deps.clone(),
+                            })
+                            .collect();
+                        self.current_key = Some(key.to_string());
+                        self.workflow_name = data.name.clone();
+                        self.unsafe_parallel = data.allow_unsafe_parallel;
+                        self.node_handles = data
+                            .nodes
+                            .iter()
+                            .map(|n| (n.key.clone(), n.handle.clone()))
+                            .collect();
+                        self.edge_handles = data
+                            .edges
+                            .iter()
+                            .filter_map(|e| {
+                                let up = data
+                                    .nodes
+                                    .iter()
+                                    .find(|n| n.handle == e.upstream_node_handle)?
+                                    .key
+                                    .clone();
+                                let down = data
+                                    .nodes
+                                    .iter()
+                                    .find(|n| n.handle == e.downstream_node_handle)?
+                                    .key
+                                    .clone();
+                                Some(((up, down), e.handle.clone()))
+                            })
+                            .collect();
+                        self.collection_revision = data.workflow_collection_revision;
+                        self.current_record = Some(mf_agent::ProjectWorkflowRecord {
+                            key: key.to_string(),
+                            name: data.name.clone(),
+                            nodes: nodes.clone(),
+                            allow_unsafe_parallel: self.unsafe_parallel,
+                            content_digest: String::new(),
+                            public_handle: data.workflow.as_str().to_string(),
+                            semantic_revision: data.revisions.semantic_revision as i64,
+                            presentation_revision: data.revisions.presentation_revision as i64,
+                            created_at: String::new(),
+                            updated_at: String::new(),
+                        });
+                        self.editor.load_nodes(
+                            nodes
+                                .into_iter()
+                                .map(|n| EditorNode {
+                                    key: n.key,
+                                    title: n.title,
+                                    instructions: n.instructions,
+                                    instance_id: n.agent_instance_id,
+                                    deps: n.deps,
+                                })
+                                .collect(),
+                        );
+                        self.save_error = None;
+                        return;
+                    }
+                    Err(error) => {
+                        self.save_error = Some(error.to_string());
+                        return;
+                    }
+                }
+            }
+        }
         let Some(store) = self.store() else {
             return;
         };
@@ -301,6 +393,24 @@ impl WorkflowCanvas {
                 self.current_key = Some(record.key.clone());
                 self.workflow_name = record.name.clone();
                 self.unsafe_parallel = record.allow_unsafe_parallel;
+                self.current_record = Some(record.clone());
+                self.node_handles = store
+                    .workflow_node_identities(key)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|row| (row.node_key, row.node_handle))
+                    .collect();
+                self.edge_handles = store
+                    .workflow_edge_identities(key)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|row| {
+                        (
+                            (row.upstream_node_key, row.downstream_node_key),
+                            row.edge_handle,
+                        )
+                    })
+                    .collect();
                 self.editor.load_nodes(
                     record
                         .nodes
@@ -353,6 +463,131 @@ impl WorkflowCanvas {
         })
     }
 
+    fn command_for_draft(
+        &self,
+        project: mf_kernel::handles::ProjectStoreHandle,
+        draft: &mf_agent::ProjectWorkflowDraft,
+    ) -> anyhow::Result<Option<mf_kernel::kernel::ProjectWorkflowCommand>> {
+        use mf_kernel::kernel::ProjectWorkflowCommand as C;
+        let Some(before) = &self.current_record else {
+            return Ok(Some(C::Create {
+                project,
+                draft: draft.clone(),
+                expected_collection_revision: self.collection_revision,
+            }));
+        };
+        let workflow = mf_kernel::handles::WorkflowHandle::parse(&before.public_handle)?;
+        if before.nodes == draft.nodes
+            && before.allow_unsafe_parallel == draft.allow_unsafe_parallel
+        {
+            return Ok(None);
+        }
+        let old: std::collections::HashMap<_, _> =
+            before.nodes.iter().map(|n| (n.key.as_str(), n)).collect();
+        let new: std::collections::HashMap<_, _> =
+            draft.nodes.iter().map(|n| (n.key.as_str(), n)).collect();
+        let added: Vec<_> = draft
+            .nodes
+            .iter()
+            .filter(|n| !old.contains_key(n.key.as_str()))
+            .collect();
+        let removed: Vec<_> = before
+            .nodes
+            .iter()
+            .filter(|n| !new.contains_key(n.key.as_str()))
+            .collect();
+        if added.len() == 1 && removed.is_empty() {
+            return Ok(Some(C::AddNode {
+                project,
+                workflow,
+                node: added[0].clone(),
+                expected_semantic_revision: before.semantic_revision as u64,
+            }));
+        }
+        if removed.len() == 1 && added.is_empty() {
+            let handle = self
+                .node_handles
+                .get(&removed[0].key)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("节点 handle 缺失"))?;
+            return Ok(Some(C::RemoveNode {
+                project,
+                workflow,
+                node_handle: handle,
+                expected_semantic_revision: before.semantic_revision as u64,
+            }));
+        }
+        if added.is_empty() && removed.is_empty() {
+            let changed: Vec<_> = draft
+                .nodes
+                .iter()
+                .filter(|node| old.get(node.key.as_str()).is_some_and(|old| *old != *node))
+                .collect();
+            if changed.len() == 1 {
+                let node = changed[0];
+                let old_node = old[node.key.as_str()];
+                if node.deps == old_node.deps {
+                    let handle = self
+                        .node_handles
+                        .get(&node.key)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("节点 handle 缺失"))?;
+                    return Ok(Some(C::UpdateNode {
+                        project,
+                        workflow,
+                        node_handle: handle,
+                        title: node.title.clone(),
+                        instructions: node.instructions.clone(),
+                        agent_instance_id: node.agent_instance_id.clone(),
+                        expected_semantic_revision: before.semantic_revision as u64,
+                    }));
+                }
+                let added_dep = node.deps.iter().find(|d| !old_node.deps.contains(d));
+                let removed_dep = old_node.deps.iter().find(|d| !node.deps.contains(d));
+                if let (Some(dep), None) = (added_dep, removed_dep) {
+                    return Ok(Some(C::Connect {
+                        project,
+                        workflow,
+                        upstream_node_handle: self
+                            .node_handles
+                            .get(dep)
+                            .cloned()
+                            .ok_or_else(|| anyhow::anyhow!("上游 handle 缺失"))?,
+                        downstream_node_handle: self
+                            .node_handles
+                            .get(&node.key)
+                            .cloned()
+                            .ok_or_else(|| anyhow::anyhow!("下游 handle 缺失"))?,
+                        expected_semantic_revision: before.semantic_revision as u64,
+                    }));
+                }
+                if let (None, Some(dep)) = (added_dep, removed_dep) {
+                    return Ok(Some(C::Disconnect {
+                        project,
+                        workflow,
+                        edge_handle: self
+                            .edge_handles
+                            .get(&(dep.clone(), node.key.clone()))
+                            .cloned()
+                            .ok_or_else(|| anyhow::anyhow!("边 handle 缺失"))?,
+                        expected_semantic_revision: before.semantic_revision as u64,
+                    }));
+                }
+            }
+            if before.nodes == draft.nodes
+                && before.allow_unsafe_parallel != draft.allow_unsafe_parallel
+            {
+                return Ok(Some(C::SetUnsafeParallel {
+                    project,
+                    workflow,
+                    allow: draft.allow_unsafe_parallel,
+                    expected_semantic_revision: before.semantic_revision as u64,
+                }));
+            }
+        }
+        anyhow::bail!("一次编辑包含多个 Workflow mutation，已拒绝以避免绕过 CAS")
+    }
+
     /// 保存当前项目工作流(原子编辑动作后的自动保存)。
     /// 失败保留 dirty(save_error)并显示错误;调用方据此阻止运行。
     pub fn save_current(&mut self) -> anyhow::Result<()> {
@@ -367,21 +602,66 @@ impl WorkflowCanvas {
             .iter()
             .any(|(k, _)| Some(k) == self.current_key.as_ref());
         if draft.nodes.is_empty() && !persisted {
+            self.status = "保存跳过：新工作流仍为空".into();
             return Ok(());
         }
-        let Some(store) = self.store() else {
+        let Some(root) = self.project_root.clone() else {
             let msg = "项目未打开,无法保存工作流".to_string();
             self.save_error = Some(msg.clone());
             anyhow::bail!("{msg}");
         };
-        match store.save_project_workflow(&draft) {
-            Ok(record) => {
+        let project = match self.app.kernel_project_handle(&root) {
+            Some(project) => project,
+            None => {
+                #[cfg(test)]
+                {
+                    let store = self
+                        .store()
+                        .ok_or_else(|| anyhow::anyhow!("项目 Store 不存在"))?;
+                    match store.save_project_workflow(&draft) {
+                        Ok(record) => {
+                            self.save_error = None;
+                            self.status = format!("已保存「{}」", record.name);
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            let message = format!("{error:#}");
+                            self.save_error = Some(message.clone());
+                            return Err(anyhow::anyhow!(message));
+                        }
+                    }
+                }
+                #[cfg(not(test))]
+                return Err(anyhow::anyhow!("Project Store 未完成 kernel 登记"));
+            }
+        };
+        let Some(command) = self.command_for_draft(project, &draft)? else {
+            self.status = "保存跳过：权威草案未变化".into();
+            return Ok(());
+        };
+        let result = self
+            .app
+            .dispatch_project_workflow_via_kernel(command)
+            .unwrap_or_else(|| {
+                Err(mf_kernel::kernel::KernelProblem::ServiceUnavailable(
+                    "CoreKernel runtime 未装配".into(),
+                ))
+            });
+        match result {
+            Ok(_) => {
                 self.save_error = None;
-                self.status = format!("已保存「{}」", record.name);
+                self.status = format!("已保存「{}」", draft.name);
+                self.reload_workflows();
+                if let Some(key) = self.current_key.clone() {
+                    self.load_workflow(&key);
+                }
                 Ok(())
             }
             Err(e) => {
                 let msg = format!("{e:#}");
+                if let Some(key) = self.current_key.clone() {
+                    self.load_workflow(&key);
+                }
                 self.save_error = Some(msg.clone());
                 anyhow::bail!("{msg}");
             }
@@ -411,6 +691,9 @@ impl WorkflowCanvas {
         let existing: Vec<String> = self.workflows.iter().map(|(k, _)| k.clone()).collect();
         let key = crate::workflow_editor::next_workflow_key(&existing);
         self.current_key = Some(key);
+        self.current_record = None;
+        self.node_handles.clear();
+        self.edge_handles.clear();
         self.workflow_name = format!("工作流 {}", existing.len() + 1);
         self.unsafe_parallel = false;
         self.editor.load_nodes(Vec::new());
@@ -455,7 +738,21 @@ impl WorkflowCanvas {
                 {
                     // 仅测试旧 bundle 的数据兼容；生产构建无直写 rollback。
                     self.workflow_name = name.to_string();
-                    self.save_after_edit();
+                    if let Some(draft) = self.current_draft() {
+                        match self
+                            .store()
+                            .and_then(|store| store.save_project_workflow(&draft).ok())
+                        {
+                            Some(record) => {
+                                self.save_error = None;
+                                self.status = format!("已保存「{}」", record.name);
+                                self.reload_workflows();
+                            }
+                            None => {
+                                self.save_error = Some("旧 bundle 保存失败".into());
+                            }
+                        }
+                    }
                 }
                 #[cfg(not(test))]
                 {
@@ -492,14 +789,40 @@ impl WorkflowCanvas {
         let mut copy = draft;
         copy.key = key;
         copy.name = format!("{}(副本)", self.workflow_name);
-        match store.save_project_workflow(&copy) {
-            Ok(record) => {
-                let key = record.key.clone();
+        let Some(root) = self.project_root.clone() else {
+            return;
+        };
+        let result = self.app.project_workflow_via_kernel(&root, |project| {
+            mf_kernel::kernel::ProjectWorkflowCommand::Create {
+                project,
+                draft: copy.clone(),
+                expected_collection_revision: self.collection_revision,
+            }
+        });
+        match result {
+            Some(Ok(_)) => {
+                let key = copy.key.clone();
                 self.reload_workflows();
                 self.load_workflow(&key);
-                self.status = format!("已复制为「{}」", record.name);
+                self.status = format!("已复制为「{}」", copy.name);
             }
-            Err(e) => self.status = format!("复制失败: {e:#}"),
+            Some(Err(e)) => self.status = format!("复制失败: {e:#}"),
+            None => {
+                #[cfg(test)]
+                match store.save_project_workflow(&copy) {
+                    Ok(record) => {
+                        let key = record.key.clone();
+                        self.reload_workflows();
+                        self.load_workflow(&key);
+                        self.status = format!("已复制为「{}」", record.name);
+                    }
+                    Err(error) => self.status = format!("复制失败: {error:#}"),
+                }
+                #[cfg(not(test))]
+                {
+                    self.status = "CoreKernel runtime 未装配".into();
+                }
+            }
         }
         cx.notify();
     }
@@ -512,14 +835,49 @@ impl WorkflowCanvas {
         let Some(key) = self.current_key.clone() else {
             return;
         };
-        match store.delete_project_workflow(&key) {
-            Ok(true) => {
+        let Some(root) = self.project_root.clone() else {
+            return;
+        };
+        let Some(record) = self.current_record.clone() else {
+            return;
+        };
+        let workflow = mf_kernel::handles::WorkflowHandle::parse(&record.public_handle).unwrap();
+        let result = self.app.project_workflow_via_kernel(&root, |project| {
+            mf_kernel::kernel::ProjectWorkflowCommand::Delete {
+                project,
+                workflow,
+                expected_collection_revision: self.collection_revision,
+                expected_semantic_revision: record.semantic_revision as u64,
+                expected_presentation_revision: record.presentation_revision as u64,
+            }
+        });
+        match result {
+            Some(Ok(_)) => {
                 self.current_key = None;
+                self.current_record = None;
                 self.reload_workflows();
                 self.status = format!("已删除「{key}」");
             }
-            Ok(false) => self.status = format!("项目工作流 `{key}` 不存在"),
-            Err(e) => self.status = format!("删除失败: {e:#}"),
+            Some(Err(e)) => self.status = format!("删除失败: {e:#}"),
+            None => {
+                #[cfg(test)]
+                {
+                    match store.delete_project_workflow(&key) {
+                        Ok(true) => {
+                            self.current_key = None;
+                            self.current_record = None;
+                            self.reload_workflows();
+                            self.status = format!("已删除「{key}」");
+                        }
+                        Ok(false) => self.status = format!("项目工作流 `{key}` 不存在"),
+                        Err(error) => self.status = format!("删除失败: {error:#}"),
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    self.status = "CoreKernel runtime 未装配".into();
+                }
+            }
         }
         cx.notify();
     }
@@ -558,17 +916,48 @@ impl WorkflowCanvas {
             allow_unsafe_parallel: false,
         };
         let created_key = draft.key.clone();
-        match store.save_project_workflow(&draft) {
-            Ok(record) => {
+        let Some(root) = self.project_root.clone() else {
+            return;
+        };
+        let result = self.app.project_workflow_via_kernel(&root, |project| {
+            mf_kernel::kernel::ProjectWorkflowCommand::Create {
+                project,
+                draft: draft.clone(),
+                expected_collection_revision: self.collection_revision,
+            }
+        });
+        match result {
+            Some(Ok(_)) => {
                 self.reload_workflows();
                 self.load_workflow(&created_key);
                 self.template_popover = false;
                 self.status = format!(
                     "已从模板「{template_key}」创建「{}」(副本独立,不再联动)",
-                    record.name
+                    draft.name
                 );
             }
-            Err(e) => self.status = format!("创建失败: {e:#}"),
+            Some(Err(e)) => self.status = format!("创建失败: {e:#}"),
+            None => {
+                #[cfg(test)]
+                {
+                    match store.save_project_workflow(&draft) {
+                        Ok(record) => {
+                            self.reload_workflows();
+                            self.load_workflow(&created_key);
+                            self.template_popover = false;
+                            self.status = format!(
+                                "已从模板「{template_key}」创建「{}」(副本独立,不再联动)",
+                                record.name
+                            );
+                        }
+                        Err(error) => self.status = format!("创建失败: {error:#}"),
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    self.status = "CoreKernel runtime 未装配".into();
+                }
+            }
         }
         cx.notify();
     }

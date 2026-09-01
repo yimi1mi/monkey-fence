@@ -695,6 +695,64 @@ impl AppCtx {
         )
     }
 
+    pub fn project_workflow_via_kernel(
+        &self,
+        root: &Path,
+        build: impl FnOnce(ProjectStoreHandle) -> mf_kernel::kernel::ProjectWorkflowCommand,
+    ) -> Option<Result<KernelOutcome, KernelProblem>> {
+        let tracer = match self.ensure_kernel_tracer() {
+            Ok(Some(tracer)) => tracer,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
+        };
+        let project = self
+            .projects
+            .lock()
+            .iter()
+            .find(|project| project.root == root)
+            .and_then(|project| project.kernel_project.clone());
+        let Some(project) = project else {
+            return Some(Err(KernelProblem::ServiceUnavailable(
+                "Project Store 未完成 kernel 登记".into(),
+            )));
+        };
+        Some(tracer.client.dispatch_project_workflow(build(project)))
+    }
+
+    pub fn kernel_project_handle(&self, root: &Path) -> Option<ProjectStoreHandle> {
+        self.projects
+            .lock()
+            .iter()
+            .find(|project| project.root == root)
+            .and_then(|project| project.kernel_project.clone())
+    }
+
+    pub fn dispatch_project_workflow_via_kernel(
+        &self,
+        command: mf_kernel::kernel::ProjectWorkflowCommand,
+    ) -> Option<Result<KernelOutcome, KernelProblem>> {
+        let tracer = match self.ensure_kernel_tracer() {
+            Ok(Some(tracer)) => tracer,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
+        };
+        Some(tracer.client.dispatch_project_workflow(command))
+    }
+
+    pub fn workflow_snapshot_via_kernel(
+        &self,
+        root: &Path,
+        workflow_key: &str,
+    ) -> Option<Result<mf_kernel::projection::SnapshotEnvelope, KernelProblem>> {
+        let tracer = match self.ensure_kernel_tracer() {
+            Ok(Some(value)) => value,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
+        };
+        let project = self.kernel_project_handle(root)?;
+        Some(tracer.client.workflow_snapshot(&project, workflow_key))
+    }
+
     /// 打开的项目数。
     pub fn project_count(&self) -> usize {
         self.projects.lock().len()

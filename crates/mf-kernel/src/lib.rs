@@ -63,6 +63,9 @@ mod multistore_crash_recovery;
 #[path = "../tests/contract/operation_saga.rs"]
 mod operation_saga;
 #[cfg(test)]
+#[path = "../tests/contract/project_workflow_commands.rs"]
+mod project_workflow_commands;
+#[cfg(test)]
 #[path = "../tests/contract/projection_support.rs"]
 mod projection_support;
 #[cfg(test)]
