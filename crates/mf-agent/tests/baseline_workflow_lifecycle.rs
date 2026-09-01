@@ -527,7 +527,7 @@ fn scenario_json(name: &str, actions: Vec<(&str, Value)>) -> Value {
 }
 
 fn canonical(v: &Value) -> String {
-    serde_json::to_string_pretty(v).unwrap() + "\n"
+    baseline::canonical_json(v).unwrap()
 }
 
 fn baseline_dir() -> PathBuf {
@@ -933,7 +933,8 @@ fn golden_name(scenario: &str) -> String {
 fn assert_matches_golden(scenario: &str, actual: Value) {
     let path = expected_dir().join(golden_name(scenario));
     let expected = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("读取 expected/{} 失败: {e}", golden_name(scenario)));
+        .unwrap_or_else(|e| panic!("读取 expected/{} 失败: {e}", golden_name(scenario)))
+        .replace("\r\n", "\n");
     assert_eq!(
         canonical(&actual),
         expected,

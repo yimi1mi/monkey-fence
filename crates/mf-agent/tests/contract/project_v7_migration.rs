@@ -646,9 +646,10 @@ fn migrated_fixture_business_projection_matches_committed_golden() {
             .join("expected")
             .join("project-v6.dump.json"),
     )
-    .unwrap();
+    .unwrap()
+    .replace("\r\n", "\n");
     assert_eq!(
-        serde_json::to_string_pretty(&dump).unwrap() + "\n",
+        baseline::canonical_json(&dump).unwrap(),
         expected,
         "v7 迁移后 Task/Revision/Step/Run/Settlement/Handoff/Session/project workflow \
          业务投影必须与提交 golden 等价"

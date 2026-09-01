@@ -2,8 +2,8 @@
 //!
 //! 生成器用冻结的 v6/v1 DDL 和确定性行构造迁移起点,
 //! 因此生产 Store 升级后仍不会冒充新版本。规范化 dump
-//! 只经公共读取 API 产出,键由 serde_json 排序
-//!   (BTreeMap),行序由 SQL `ORDER BY` 决定,不受插入顺序漂移影响。
+//! 只经公共读取 API 产出,对象键由显式 canonicalizer 排序,
+//! 行序由 SQL `ORDER BY` 决定,不受 workspace feature 统一或插入顺序影响。
 //!
 //! fixture 不含任何真实用户数据、Secret 引用或运行令牌。
 
@@ -31,6 +31,34 @@ pub const FROZEN_CATALOG_SCHEMA_VERSION: i64 = 1;
 pub const PROJECT_FIXTURE: &str = "project-v6.db";
 pub const CATALOG_FIXTURE: &str = "catalog-v1.db";
 pub const SESSION_FIXTURE: &str = "session.json";
+
+/// `serde_json/preserve_order` 可能被 workspace 其他 crate 统一启用。
+/// 显式递归排序，保证单包测试与 `--workspace` 生成完全同字节。
+fn sorted_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut keys: Vec<_> = object.keys().collect();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for key in keys {
+                out.insert(key.clone(), sorted_json(&object[key]));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(sorted_json).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+pub fn canonical_json(value: &serde_json::Value) -> Result<String> {
+    Ok(serde_json::to_string_pretty(&sorted_json(value))? + "\n")
+}
+
+fn canonical_compact_json(value: &serde_json::Value) -> Result<String> {
+    Ok(serde_json::to_string(&sorted_json(value))?)
+}
 
 /// 确定性时间戳常量(ISO-8601,带 +00:00 偏移)。
 const T_CREATED: &str = "2026-01-01T00:00:00+00:00";
@@ -251,7 +279,7 @@ fn build_project_data(conn: &mut Connection) -> Result<()> {
     tx.execute(
         "INSERT INTO handoffs (id, task_id, step_id, run_id, handoff_json, created_at)
          VALUES (1, 1, 1, 1, ?1, ?2)",
-        params![serde_json::to_string(&handoff)?, T_CREATED],
+        params![canonical_compact_json(&handoff)?, T_CREATED],
     )?;
     tx.execute(
         "INSERT INTO events (id, kind, payload, created_at)
@@ -341,7 +369,7 @@ fn build_catalog_data(conn: &mut Connection) -> Result<()> {
                 id,
                 instance_id,
                 version,
-                serde_json::to_string(&version_payload(name, argv))?,
+                canonical_compact_json(&version_payload(name, argv))?,
                 T_CREATED
             ],
         )?;
@@ -386,7 +414,7 @@ fn build_catalog_data(conn: &mut Connection) -> Result<()> {
 /// 确定性 session.json:固定假路径(不以真实用户目录为前缀),
 /// 含一个不存在路径(迁移后保留为 missing 状态)。
 pub fn generate_session_json() -> String {
-    serde_json::to_string_pretty(&serde_json::json!({
+    canonical_json(&serde_json::json!({
         "projects": [
             SESSION_PROJECT_ALPHA,
             "/mf-fixture/baseline-beta",
@@ -409,6 +437,8 @@ pub fn generate_session_json() -> String {
         ],
     }))
     .unwrap()
+    .trim_end_matches('\n')
+    .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -773,10 +803,7 @@ fn write_manifest(dir: &Path) -> Result<()> {
         "generator_version": GENERATOR_VERSION,
         "files": files,
     });
-    fs::write(
-        dir.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest)? + "\n",
-    )?;
+    fs::write(dir.join("manifest.json"), canonical_json(&manifest)?)?;
     Ok(())
 }
 
@@ -806,18 +833,18 @@ fn write_baseline_contents(dir: &Path) -> Result<()> {
         let store = Store::open(&dump_db)?;
         fs::write(
             dir.join("expected/project-v6.dump.json"),
-            serde_json::to_string_pretty(&dump_project(&store)?)? + "\n",
+            canonical_json(&dump_project(&store)?)?,
         )?;
     }
     let catalog = CatalogStore::open(&dir.join(CATALOG_FIXTURE))?;
     fs::write(
         dir.join("expected/catalog-v1.dump.json"),
-        serde_json::to_string_pretty(&dump_catalog(&catalog)?)? + "\n",
+        canonical_json(&dump_catalog(&catalog)?)?,
     )?;
     drop(catalog);
     fs::write(
         dir.join("expected/session.dump.json"),
-        serde_json::to_string_pretty(&dump_session(&session)?)? + "\n",
+        canonical_json(&dump_session(&session)?)?,
     )?;
 
     Ok(())

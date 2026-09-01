@@ -36,11 +36,26 @@ fn copy_to_temp(file: &str) -> (tempfile::TempDir, std::path::PathBuf) {
 
 fn expected_dump(name: &str) -> String {
     let path = fixtures_dir().join("expected").join(name);
-    fs::read_to_string(&path).unwrap_or_else(|e| panic!("读取 expected/{name} 失败: {e}"))
+    String::from_utf8(normalized_fixture_bytes(&path))
+        .unwrap_or_else(|e| panic!("读取 expected/{name} 失败: {e}"))
+}
+
+/// Git 的 Windows checkout 可能把 JSON 转成 CRLF；manifest/golden 的
+/// 规范字节始终是 LF。DB 等二进制文件保持原样。
+fn normalized_fixture_bytes(path: &Path) -> Vec<u8> {
+    let bytes = fs::read(path).unwrap_or_else(|e| panic!("读取 {} 失败: {e}", path.display()));
+    if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+        String::from_utf8(bytes)
+            .expect("baseline JSON 必须是 UTF-8")
+            .replace("\r\n", "\n")
+            .into_bytes()
+    } else {
+        bytes
+    }
 }
 
 fn canonical(v: &Value) -> String {
-    serde_json::to_string_pretty(v).unwrap() + "\n"
+    baseline::canonical_json(v).unwrap()
 }
 
 /// Project v6 fixture 能被当前 Store 原样打开,且核心实体齐全:
@@ -241,7 +256,7 @@ fn regeneration_is_deterministic() {
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
             (name.starts_with("workflow-") && name.ends_with(".json"))
-                .then(|| (name, fs::read(entry.path()).unwrap()))
+                .then(|| (name, normalized_fixture_bytes(&entry.path())))
         })
         .collect();
     for dir in [&baseline1, &baseline2] {
@@ -256,7 +271,7 @@ fn regeneration_is_deterministic() {
         assert_eq!(a, b, "{} 两轮生成不一致", name.display());
         assert_eq!(
             a,
-            fs::read(fixtures_dir().join(&name)).unwrap(),
+            normalized_fixture_bytes(&fixtures_dir().join(&name)),
             "{} 与提交的基线不一致",
             name.display()
         );
@@ -300,7 +315,7 @@ fn manifest_matches_fixture_files() {
     for entry in files {
         let rel = entry["path"].as_str().unwrap();
         let path = fixtures_dir().join(rel);
-        let bytes = fs::read(&path).unwrap_or_else(|e| panic!("读取 {rel} 失败: {e}"));
+        let bytes = normalized_fixture_bytes(&path);
         assert_eq!(
             entry["bytes"].as_u64().unwrap(),
             bytes.len() as u64,

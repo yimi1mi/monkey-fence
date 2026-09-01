@@ -12,6 +12,7 @@
 
 pub mod agent_adapter;
 pub mod agent_instance;
+pub mod catalog_migration;
 pub mod catalog_store;
 pub mod config;
 pub mod execution_directory;
@@ -39,7 +40,8 @@ pub use agent_instance::{
     AgentInstance, AgentInstanceDraft, AgentInstanceOverrides, AgentInstanceSnapshot,
     AgentInstanceVersion,
 };
-pub use catalog_store::{CatalogStore, PluginPinRecord};
+pub use catalog_migration::{CatalogImportCounts, CatalogV1ImportReport};
+pub use catalog_store::{CatalogStore, CatalogV2Store, PluginPinRecord};
 pub use config::{
     Config, EditorConfig, EngineConfig, ProviderConfig, ProviderKind, TerminalConfig,
 };
@@ -62,7 +64,8 @@ pub use runtime::{
     RuntimeHost, RuntimeKind,
 };
 pub use schema::{
-    catalog_db_path, project_db_path, CATALOG_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION,
+    catalog_db_path, catalog_v2_db_path, project_db_path, CATALOG_SCHEMA_VERSION,
+    CATALOG_V2_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION,
 };
 pub use store::Store;
 pub use workflow::{ProjectWorkflowDraft, ProjectWorkflowRecord};

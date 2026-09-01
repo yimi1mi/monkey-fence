@@ -10,17 +10,44 @@ use crate::agent_instance::{
 };
 use crate::model::InstanceScope;
 use crate::schema::{
-    catalog_db_path, schema_version_of, table_names_of, CATALOG_SCHEMA_V1, CATALOG_SCHEMA_VERSION,
+    catalog_db_path, catalog_v2_db_path, schema_version_of, table_names_of, CATALOG_SCHEMA_V1,
+    CATALOG_SCHEMA_VERSION, CATALOG_V2_SCHEMA_V1, CATALOG_V2_SCHEMA_VERSION,
 };
 use anyhow::{Context as _, Result};
 use parking_lot::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
-use std::path::Path;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub struct CatalogStore {
     conn: Mutex<Connection>,
 }
+
+/// 新 Catalog 的独立文件/版本链。T1c 阶段它是 dark data，legacy
+/// `CatalogStore` 仍只指向 v1；二者绝不双写。
+pub struct CatalogV2Store {
+    conn: Mutex<Connection>,
+    path: Option<PathBuf>,
+}
+
+pub const CATALOG_V2_REQUIRED_TABLES: &[&str] = &[
+    "agent_type_catalog",
+    "cli_installations",
+    "installation_receipts",
+    "installation_jobs",
+    "provider_profiles",
+    "provider_model_cache",
+    "agent_instances",
+    "agent_instance_versions",
+    "workflow_templates",
+    "workflow_template_versions",
+    "secret_refs",
+    "plugin_pins",
+    "command_receipt",
+    "projection_outbox",
+    "migration_marker",
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginPinRecord {
@@ -59,11 +86,12 @@ impl CatalogStore {
             crate::migration::StoreKind::Catalog,
             CATALOG_SCHEMA_VERSION,
         )?;
+        let current = schema_version_of(&conn)?;
+        reject_catalog_v2_layout(&conn)?;
         crate::migration::restrict_active_database_to_current_user(&conn)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
-        let current = schema_version_of(&conn)?;
         if current == 0 {
             // 全新库无旧数据可备份,但 DDL 仍在 writer lock 内完成并复验版本。
             crate::migration::upgrade_with_barrier(
@@ -117,6 +145,22 @@ impl CatalogStore {
         Ok(CatalogStore {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// 导入器在 SQLite 一致内存快照上补齐受支持的早期残缺 v1。
+    /// 调用方持有的真实 v1 文件始终只读，不执行 repair/DDL。
+    pub(crate) fn repair_import_snapshot(conn: &mut Connection) -> Result<()> {
+        anyhow::ensure!(
+            schema_version_of(conn)? == CATALOG_SCHEMA_VERSION,
+            "catalog_v1_schema_mismatch:导入快照版本不是 v{}",
+            CATALOG_SCHEMA_VERSION
+        );
+        reject_catalog_v2_layout(conn)?;
+        let tx = conn.transaction()?;
+        tx.execute_batch(CATALOG_SCHEMA_V1)?;
+        ensure_agent_instances_columns(&tx)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -579,6 +623,287 @@ impl CatalogStore {
     }
 }
 
+impl CatalogV2Store {
+    pub fn open(path: &Path) -> Result<Arc<Self>> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("创建 Catalog v2 目录失败: {}", parent.display()))?;
+        }
+        let conn = Connection::open(path)
+            .with_context(|| format!("打开 Catalog v2 失败: {}", path.display()))?;
+        Self::init(conn, Some(path.to_path_buf())).map(Arc::new)
+    }
+
+    pub fn open_default() -> Result<Arc<Self>> {
+        Self::open(&catalog_v2_db_path())
+    }
+
+    /// T1c 一次性启动入口：创建/打开 v2 后只读导入默认 v1。
+    /// 此方法不替换 legacy `CatalogStore::open_default`，因此在 Bridge
+    /// 切换前不会形成生产双写。
+    pub fn open_default_migrating_v1() -> Result<(
+        Arc<Self>,
+        Option<crate::catalog_migration::CatalogV1ImportReport>,
+    )> {
+        Self::open_migrating_v1(&catalog_v2_db_path(), &catalog_db_path())
+    }
+
+    /// 显式路径入口供 bootstrap 与契约测试使用。fresh profile 没有 v1
+    /// 是正常状态：创建空 v2 并返回 `None`，不伪造迁移 marker。
+    pub fn open_migrating_v1(
+        v2_path: &Path,
+        v1_path: &Path,
+    ) -> Result<(
+        Arc<Self>,
+        Option<crate::catalog_migration::CatalogV1ImportReport>,
+    )> {
+        let store = Self::open(v2_path)?;
+        let report = if let Some(report) = store.completed_catalog_v1_import()? {
+            Some(report)
+        } else if v1_path.is_file() {
+            Some(store.import_catalog_v1(v1_path)?)
+        } else {
+            None
+        };
+        Ok((store, report))
+    }
+
+    pub fn memory() -> Result<Arc<Self>> {
+        Self::init(Connection::open_in_memory()?, None).map(Arc::new)
+    }
+
+    fn init(mut conn: Connection, path: Option<PathBuf>) -> Result<Self> {
+        crate::migration::guard_future_version(
+            &conn,
+            crate::migration::StoreKind::Catalog,
+            CATALOG_V2_SCHEMA_VERSION,
+        )?;
+        let current = schema_version_of(&conn)?;
+        if current == CATALOG_V2_SCHEMA_VERSION && !catalog_v2_schema_ready(&conn)? {
+            anyhow::bail!(
+                "catalog_v2_schema_mismatch:文件标记为 Catalog v2 schema v{}，但缺少 v2 指纹；拒绝把 catalog-v1.db 当作 v2 打开",
+                CATALOG_V2_SCHEMA_VERSION
+            );
+        }
+
+        crate::migration::restrict_active_database_to_current_user(&conn)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        if current == 0 {
+            crate::migration::upgrade_with_barrier(
+                &mut conn,
+                crate::migration::StoreKind::Catalog,
+                CATALOG_V2_SCHEMA_VERSION,
+                &|tx, _, _| {
+                    tx.execute_batch(CATALOG_V2_SCHEMA_V1)?;
+                    Ok(())
+                },
+            )?;
+        }
+        anyhow::ensure!(
+            catalog_v2_schema_ready(&conn)?,
+            "catalog_v2_schema_mismatch:Catalog v2 初始化后 schema 指纹不完整"
+        );
+
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        crate::migration::restrict_active_database_to_current_user(&conn)?;
+        let outbox_depth: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM projection_outbox WHERE published_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let metric_key =
+            crate::observability::store_metric_key(&conn, crate::migration::StoreKind::Catalog);
+        crate::observability::record_store_open(
+            &metric_key,
+            crate::migration::StoreKind::Catalog,
+            CATALOG_V2_SCHEMA_VERSION,
+            outbox_depth,
+        );
+        log::info!(
+            "store_open store=catalog-v2 schema_version={} outbox_depth={}",
+            CATALOG_V2_SCHEMA_VERSION,
+            outbox_depth
+        );
+        Ok(Self {
+            conn: Mutex::new(conn),
+            path,
+        })
+    }
+
+    pub fn schema_version(&self) -> Result<i64> {
+        self.with_conn(schema_version_of)
+    }
+
+    pub fn table_names(&self) -> Result<Vec<String>> {
+        self.with_conn(table_names_of)
+    }
+
+    pub fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let conn = self.conn.lock();
+        f(&conn)
+    }
+
+    pub(crate) fn with_tx<T>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction) -> Result<T>,
+    ) -> Result<T> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let out = f(&tx)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    pub(crate) fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+}
+
+fn catalog_v2_schema_ready(conn: &Connection) -> Result<bool> {
+    let tables: BTreeSet<String> = table_names_of(conn)?.into_iter().collect();
+    if CATALOG_V2_REQUIRED_TABLES
+        .iter()
+        .any(|table| !tables.contains(*table))
+    {
+        return Ok(false);
+    }
+    for (table, required_columns) in [
+        (
+            "cli_installations",
+            &[
+                "installation_handle",
+                "agent_type_id",
+                "executable_path",
+                "canonical_path",
+                "actual_version",
+                "source",
+                "scope",
+                "health",
+                "receipt_handle",
+                "detected_at",
+            ][..],
+        ),
+        (
+            "provider_profiles",
+            &[
+                "profile_handle",
+                "provider_type_id",
+                "name",
+                "base_url",
+                "secret_ref",
+                "config_json",
+                "revision",
+                "created_at",
+                "updated_at",
+            ][..],
+        ),
+        (
+            "command_receipt",
+            &[
+                "command_id",
+                "semantic_digest",
+                "aggregate_handle",
+                "result_revisions",
+                "state",
+                "created_at",
+                "finalized_at",
+            ][..],
+        ),
+        (
+            "projection_outbox",
+            &["outbox_id", "event_json", "published_at"][..],
+        ),
+        (
+            "migration_marker",
+            &[
+                "marker",
+                "source_schema_version",
+                "source_digest",
+                "imported_counts_json",
+                "completed_at",
+            ][..],
+        ),
+        (
+            "agent_instances",
+            &[
+                "instance_key",
+                "name",
+                "agent_type",
+                "scope",
+                "project_key",
+                "current_version",
+                "enabled",
+                "created_at",
+                "updated_at",
+            ][..],
+        ),
+        (
+            "agent_instance_versions",
+            &["instance_key", "version", "config_json", "created_at"][..],
+        ),
+        (
+            "workflow_templates",
+            &[
+                "template_key",
+                "name",
+                "current_version",
+                "task_local",
+                "created_at",
+                "updated_at",
+            ][..],
+        ),
+        (
+            "workflow_template_versions",
+            &["template_key", "version", "graph_json", "created_at"][..],
+        ),
+        (
+            "secret_refs",
+            &["secret_key", "store_id", "created_at", "updated_at"][..],
+        ),
+        (
+            "plugin_pins",
+            &[
+                "run_key",
+                "full_id",
+                "version",
+                "content_hash",
+                "created_at",
+            ][..],
+        ),
+    ] {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns: BTreeSet<String> = stmt
+            .query_map([], |row| row.get(1))?
+            .collect::<std::result::Result<_, _>>()?;
+        let expected: BTreeSet<String> = required_columns
+            .iter()
+            .map(|column| (*column).to_string())
+            .collect();
+        if columns != expected {
+            return Ok(false);
+        }
+    }
+    for object in [
+        "idx_cli_installations_agent_type",
+        "idx_catalog_v2_plugin_pins_hash",
+        "installation_receipts_immutable_update",
+        "installation_receipts_immutable_delete",
+        "installation_receipts_immutable_reinsert",
+    ] {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name = ?1)",
+            params![object],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 const CATALOG_REQUIRED_TABLES: &[&str] = &[
     "agent_instances",
     "agent_instance_versions",
@@ -603,6 +928,23 @@ const CATALOG_COLUMN_REPAIRS: &[(&str, &str)] = &[
         "ALTER TABLE workflow_templates ADD COLUMN task_local INTEGER NOT NULL DEFAULT 0",
     ),
 ];
+
+/// v1/v2 当前都从 user_version=1 起步，因此必须用 v2 独有地基表区分
+/// 两条版本链。检查发生在 ACL、pragma 与任何 repair DDL 之前。
+fn reject_catalog_v2_layout(conn: &Connection) -> Result<()> {
+    const V2_DISCRIMINATORS: &[&str] = &[
+        "agent_type_catalog",
+        "cli_installations",
+        "provider_profiles",
+        "migration_marker",
+    ];
+    let tables: BTreeSet<String> = table_names_of(conn)?.into_iter().collect();
+    anyhow::ensure!(
+        !V2_DISCRIMINATORS.iter().all(|name| tables.contains(*name)),
+        "catalog_schema_kind_mismatch:拒绝把 Catalog v2 当作 v1 打开"
+    );
+    Ok(())
+}
 
 fn catalog_schema_needs_repair(conn: &Connection) -> Result<bool> {
     for (kind, names) in [

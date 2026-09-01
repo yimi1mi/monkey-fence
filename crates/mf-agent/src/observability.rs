@@ -18,6 +18,7 @@ pub struct StoreStorageMetrics {
     pub aggregate_handles_backfilled: u64,
     pub identity_nodes_backfilled: u64,
     pub identity_edges_backfilled: u64,
+    pub migration_rows_imported: u64,
     pub outbox_depth: i64,
     pub identity_nodes_gc: u64,
     pub identity_edges_gc: u64,
@@ -110,6 +111,15 @@ pub(crate) fn record_identity_gc(store_key: &str, nodes: usize, edges: usize) {
     });
 }
 
+pub(crate) fn record_catalog_import(store_key: &str, duration_ms: u128, rows: usize) {
+    with_store(store_key, StoreKind::Catalog, |metrics| {
+        metrics.migration_count = metrics.migration_count.saturating_add(1);
+        metrics.last_migration_duration_ms = duration_ms.min(u64::MAX as u128) as u64;
+        metrics.migration_rows_imported =
+            metrics.migration_rows_imported.saturating_add(rows as u64);
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,11 +138,17 @@ mod tests {
         record_identity_gc(key, 2, 1);
         let other_key = "project:test-observability-other";
         record_store_open(other_key, StoreKind::Project, 7, 9);
+        let catalog_key = "catalog:test-observability";
+        record_catalog_import(catalog_key, 12, 6);
         let after = storage_metrics_snapshot().stores.get(key).cloned().unwrap();
 
         assert_eq!(after.store_kind, "project");
         assert_eq!(after.schema_version, 7);
         assert_eq!(after.outbox_depth, 3);
+        assert_eq!(
+            storage_metrics_snapshot().stores[catalog_key].migration_rows_imported,
+            6
+        );
         assert!(after.migration_count >= before.migration_count + 1);
         assert!(after.aggregate_handles_backfilled >= before.aggregate_handles_backfilled + 5);
         assert!(after.identity_nodes_backfilled >= before.identity_nodes_backfilled + 4);

@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 
 pub const PROJECT_SCHEMA_VERSION: i64 = 7;
 pub const CATALOG_SCHEMA_VERSION: i64 = 1;
+/// Catalog v2 使用独立文件与独立版本链，不能复用 v1 的 user_version
+/// 含义，否则 pre-Bridge 旧程序可能把新库当作 v1 打开。
+pub const CATALOG_V2_SCHEMA_VERSION: i64 = 1;
 
 /// 项目库路径:`<project>/.mf-agent/workflow-v1.db`。
 pub fn project_db_path(project_root: &Path) -> PathBuf {
@@ -27,6 +30,18 @@ pub fn catalog_db_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".monkeyfence")
         .join("catalog-v1.db")
+}
+
+/// 新目录库路径：`~/.monkeyfence/catalog-v2.db`。
+/// 测试可用 `MF_CATALOG_V2_DB` 重定向，禁止回退到 v1 路径。
+pub fn catalog_v2_db_path() -> PathBuf {
+    if let Some(path) = std::env::var_os("MF_CATALOG_V2_DB") {
+        return PathBuf::from(path);
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".monkeyfence")
+        .join("catalog-v2.db")
 }
 
 /// 应用 DDL 并把版本写入 `user_version`。DDL 必须幂等(IF NOT EXISTS)。
@@ -552,6 +567,156 @@ CREATE TABLE IF NOT EXISTS plugin_pins (
     PRIMARY KEY (run_key, full_id, version, content_hash)
 );
 CREATE INDEX IF NOT EXISTS idx_plugin_pins_hash ON plugin_pins(content_hash);
+";
+
+/// Catalog v2 新文件的 v1 schema。legacy Agent Instance/Template 使用
+/// 已有稳定业务 key 作为关系键；Secret 只迁移引用，绝不复制 ciphertext。
+pub const CATALOG_V2_SCHEMA_V1: &str = "
+CREATE TABLE agent_type_catalog (
+    agent_type_id TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    plugin_full_id TEXT,
+    manifest_version INTEGER NOT NULL DEFAULT 3,
+    capabilities_json TEXT NOT NULL DEFAULT '{}',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN (0, 1)),
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE cli_installations (
+    installation_handle TEXT PRIMARY KEY,
+    agent_type_id TEXT NOT NULL,
+    executable_path TEXT NOT NULL,
+    canonical_path TEXT NOT NULL UNIQUE,
+    actual_version TEXT,
+    source TEXT NOT NULL CHECK(source IN ('external', 'managed')),
+    scope TEXT NOT NULL CHECK(scope IN ('user', 'machine')),
+    health TEXT NOT NULL CHECK(health IN ('detected', 'healthy', 'unhealthy', 'repair-needed', 'missing')),
+    receipt_handle TEXT,
+    detected_at TEXT NOT NULL
+);
+CREATE INDEX idx_cli_installations_agent_type ON cli_installations(agent_type_id);
+CREATE TABLE installation_receipts (
+    receipt_handle TEXT PRIMARY KEY,
+    installation_handle TEXT,
+    agent_type_id TEXT NOT NULL,
+    operation TEXT NOT NULL CHECK(operation IN ('install', 'update', 'repair', 'uninstall', 'adopt')),
+    source TEXT NOT NULL CHECK(source IN ('external', 'managed')),
+    scope TEXT NOT NULL CHECK(scope IN ('user', 'machine')),
+    requesting_principal TEXT NOT NULL,
+    target_owner TEXT NOT NULL,
+    provenance_json TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TRIGGER installation_receipts_immutable_update
+BEFORE UPDATE ON installation_receipts
+BEGIN SELECT RAISE(ABORT, 'installation_receipt_immutable'); END;
+CREATE TRIGGER installation_receipts_immutable_delete
+BEFORE DELETE ON installation_receipts
+BEGIN SELECT RAISE(ABORT, 'installation_receipt_immutable'); END;
+CREATE TRIGGER installation_receipts_immutable_reinsert
+BEFORE INSERT ON installation_receipts
+WHEN EXISTS(SELECT 1 FROM installation_receipts WHERE receipt_handle = NEW.receipt_handle)
+BEGIN SELECT RAISE(ABORT, 'installation_receipt_immutable'); END;
+CREATE TABLE installation_jobs (
+    job_handle TEXT PRIMARY KEY,
+    agent_type_id TEXT NOT NULL,
+    target_version TEXT,
+    state TEXT NOT NULL CHECK(state IN ('planned', 'running', 'succeeded', 'failed', 'cancelled', 'repair-needed')),
+    progress_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE provider_profiles (
+    profile_handle TEXT PRIMARY KEY,
+    provider_type_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    base_url TEXT,
+    secret_ref TEXT,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    revision INTEGER NOT NULL DEFAULT 1 CHECK(revision >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE provider_model_cache (
+    profile_handle TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    capabilities_json TEXT NOT NULL DEFAULT '{}',
+    fetched_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    PRIMARY KEY(profile_handle, model_id)
+);
+CREATE TABLE agent_instances (
+    instance_key TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    agent_type TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    project_key TEXT,
+    current_version INTEGER NOT NULL,
+    enabled INTEGER NOT NULL CHECK(enabled IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE agent_instance_versions (
+    instance_key TEXT NOT NULL REFERENCES agent_instances(instance_key) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    config_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(instance_key, version)
+);
+CREATE TABLE workflow_templates (
+    template_key TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    current_version INTEGER NOT NULL,
+    task_local INTEGER NOT NULL CHECK(task_local IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE workflow_template_versions (
+    template_key TEXT NOT NULL REFERENCES workflow_templates(template_key) ON DELETE CASCADE,
+    version INTEGER NOT NULL,
+    graph_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(template_key, version)
+);
+CREATE TABLE secret_refs (
+    secret_key TEXT NOT NULL,
+    store_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(secret_key, store_id)
+);
+CREATE TABLE plugin_pins (
+    run_key TEXT NOT NULL,
+    full_id TEXT NOT NULL,
+    version TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(run_key, full_id, version, content_hash)
+);
+CREATE INDEX idx_catalog_v2_plugin_pins_hash ON plugin_pins(content_hash);
+CREATE TABLE command_receipt (
+    command_id TEXT PRIMARY KEY,
+    semantic_digest TEXT NOT NULL,
+    aggregate_handle TEXT NOT NULL,
+    result_revisions TEXT NOT NULL,
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    finalized_at TEXT
+);
+CREATE TABLE projection_outbox (
+    outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_json TEXT NOT NULL,
+    published_at TEXT
+);
+CREATE TABLE migration_marker (
+    marker TEXT PRIMARY KEY,
+    source_schema_version INTEGER NOT NULL,
+    source_digest TEXT NOT NULL,
+    imported_counts_json TEXT NOT NULL,
+    completed_at TEXT NOT NULL
+);
 ";
 
 /// v6 增量(ADR 0004):独立的项目工作流存储。项目工作流是项目内
