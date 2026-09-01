@@ -1,0 +1,8 @@
+{
+  "foreground": "/mf-fixture/baseline-alpha",
+  "projects": [
+    "/mf-fixture/baseline-alpha",
+    "/mf-fixture/baseline-beta",
+    "/mf-fixture/__missing_project__"
+  ]
+}

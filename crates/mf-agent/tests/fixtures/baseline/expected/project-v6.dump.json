@@ -1,0 +1,280 @@
+{
+  "events": [
+    {
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "id": 1,
+      "kind": "baseline",
+      "payload": "{\"note\":\"fixture\"}"
+    }
+  ],
+  "project_workflows": [
+    {
+      "allow_unsafe_parallel": false,
+      "content_digest": "521827fe2068b4aa03fb49bdd7a6e5722f52b323b07ee390de37e52e5dfb87c3",
+      "key": "baseline-flow",
+      "name": "基线工作流",
+      "nodes": [
+        {
+          "agent_instance_id": "fixture-inst-user",
+          "deps": [],
+          "instructions": "固定指令",
+          "key": "n1",
+          "title": "节点一"
+        },
+        {
+          "agent_instance_id": "fixture-inst-user",
+          "deps": [
+            "n1"
+          ],
+          "instructions": "固定指令",
+          "key": "n2",
+          "title": "节点二"
+        }
+      ]
+    }
+  ],
+  "sessions": [
+    {
+      "agent_profile": "codex",
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "id": 1,
+      "last_instruction": null,
+      "last_reply": null,
+      "runtime": "generic-command",
+      "session_key": "shared",
+      "status": "Starting",
+      "title": "基线会话",
+      "unread": false,
+      "updated_at": "2026-01-02T00:00:00+00:00"
+    }
+  ],
+  "tasks": [
+    {
+      "active_revision": null,
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "goal": "草稿对照",
+      "handoffs": [],
+      "id": 2,
+      "paused": false,
+      "revision_count": 1,
+      "revisions": [
+        {
+          "content_digest": null,
+          "id": 2,
+          "revision": 1,
+          "snapshot": null,
+          "status": "draft"
+        }
+      ],
+      "runs": [],
+      "status": "Draft",
+      "steps": [
+        {
+          "agent_profile": "generic-command",
+          "attempts": 0,
+          "auto_retry": 0,
+          "deps": [],
+          "ended_at": null,
+          "id": 3,
+          "instructions": "",
+          "result": null,
+          "revision_id": 2,
+          "session_policy": "fresh",
+          "started_at": null,
+          "status": "Pending",
+          "step_key": "only",
+          "task_id": 2,
+          "title": "唯一节点"
+        }
+      ],
+      "title": "基线任务B",
+      "unread": false,
+      "updated_at": "2026-01-02T00:00:00+00:00"
+    },
+    {
+      "active_revision": 1,
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "goal": "冻结 v6 基线:结算与交接终态",
+      "handoffs": [
+        {
+          "handoff": {
+            "artifacts": [],
+            "blockers": [],
+            "changed_files": [],
+            "output": {
+              "count": 3,
+              "report_path": "artifacts/deps.json"
+            },
+            "raw_log_ref": "agent-run:1",
+            "recommendations": [],
+            "status": "complete",
+            "summary": "依赖清单已生成",
+            "verification": null
+          },
+          "id": 1,
+          "run_id": 1,
+          "step_id": 1
+        }
+      ],
+      "id": 1,
+      "paused": false,
+      "revision_count": 1,
+      "revisions": [
+        {
+          "content_digest": "40341831cdb7d623bdf038a90d7858af508014ce7ab93f890c68214a326304e8",
+          "id": 1,
+          "revision": 1,
+          "snapshot": {
+            "directory_provider": {
+              "content_hash": "8b17b4997776956a812f8c72e6da416f5346c7f2ac3b0cc4936cf346f9d5e079",
+              "contribution_id": "monkeyfence.builtin/project-dir",
+              "full_id": "monkeyfence.builtin/project-dir",
+              "version": "1.0.0"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": {
+                  "agent_type": "generic-command",
+                  "argv": [
+                    "--baseline-v2"
+                  ],
+                  "config": {
+                    "fixture": true
+                  },
+                  "enabled": true,
+                  "env": [
+                    [
+                      "MF_FIXTURE_ENV",
+                      "1"
+                    ]
+                  ],
+                  "executable": "agent.exe",
+                  "execution_contract": {
+                    "completion": "process-exit"
+                  },
+                  "external_config": false,
+                  "id": "fixture-inst-user",
+                  "name": "基线用户实例",
+                  "run_mode": "OneShot",
+                  "sealed_secret_ids": [],
+                  "version": 2
+                },
+                "instructions": "固定指令:拉取依赖清单",
+                "key": "fetch",
+                "plugin": {
+                  "content_hash": "4b02bd01b432f7400f5288902dc6b44dc49d5b7cd863c678f46d87dd40c41797",
+                  "contribution_id": "",
+                  "full_id": "monkeyfence.builtin/generic-command",
+                  "version": "1.0.0"
+                },
+                "title": "拉取依赖"
+              },
+              {
+                "deps": [
+                  "fetch"
+                ],
+                "instance": {
+                  "agent_type": "generic-command",
+                  "argv": [
+                    "--baseline-v2"
+                  ],
+                  "config": {
+                    "fixture": true
+                  },
+                  "enabled": true,
+                  "env": [
+                    [
+                      "MF_FIXTURE_ENV",
+                      "1"
+                    ]
+                  ],
+                  "executable": "agent.exe",
+                  "execution_contract": {
+                    "completion": "process-exit"
+                  },
+                  "external_config": false,
+                  "id": "fixture-inst-user",
+                  "name": "基线用户实例",
+                  "run_mode": "OneShot",
+                  "sealed_secret_ids": [],
+                  "version": 2
+                },
+                "instructions": "固定指令:构建产物",
+                "key": "build",
+                "plugin": {
+                  "content_hash": "4b02bd01b432f7400f5288902dc6b44dc49d5b7cd863c678f46d87dd40c41797",
+                  "contribution_id": "",
+                  "full_id": "monkeyfence.builtin/generic-command",
+                  "version": "1.0.0"
+                },
+                "title": "构建"
+              }
+            ],
+            "template_key": "tpl-baseline",
+            "template_version": 1
+          },
+          "status": "active"
+        }
+      ],
+      "runs": [
+        {
+          "agent_state": "Working",
+          "capability_token": "mft_fixture_0001",
+          "ended_at": "2026-01-01T02:00:00+00:00",
+          "id": 1,
+          "outcome": "complete",
+          "outcome_payload": "依赖清单已生成",
+          "revision_id": 1,
+          "session_id": 1,
+          "started_at": "2026-01-01T01:00:00+00:00",
+          "status": "Succeeded",
+          "step_id": 1,
+          "task_id": 1
+        }
+      ],
+      "status": "Ready",
+      "steps": [
+        {
+          "agent_profile": "generic-command",
+          "attempts": 0,
+          "auto_retry": 0,
+          "deps": [],
+          "ended_at": "2026-01-01T02:00:00+00:00",
+          "id": 1,
+          "instructions": "固定指令:拉取依赖清单",
+          "result": "依赖清单已生成",
+          "revision_id": 1,
+          "session_policy": "fresh",
+          "started_at": "2026-01-01T01:00:00+00:00",
+          "status": "Succeeded",
+          "step_key": "fetch",
+          "task_id": 1,
+          "title": "拉取依赖"
+        },
+        {
+          "agent_profile": "generic-command",
+          "attempts": 0,
+          "auto_retry": 0,
+          "deps": [
+            1
+          ],
+          "ended_at": null,
+          "id": 2,
+          "instructions": "固定指令:构建产物",
+          "result": null,
+          "revision_id": 1,
+          "session_policy": "fresh",
+          "started_at": null,
+          "status": "Pending",
+          "step_key": "build",
+          "task_id": 1,
+          "title": "构建"
+        }
+      ],
+      "title": "基线任务A",
+      "unread": false,
+      "updated_at": "2026-01-02T00:00:00+00:00"
+    }
+  ]
+}

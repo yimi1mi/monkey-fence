@@ -1,0 +1,125 @@
+{
+  "agent_instance_versions": [
+    {
+      "agent_type": "generic-command",
+      "argv": [
+        "--baseline"
+      ],
+      "config": {
+        "fixture": true
+      },
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "env": [
+        [
+          "MF_FIXTURE_ENV",
+          "1"
+        ]
+      ],
+      "executable": "agent.exe",
+      "execution_contract": {
+        "completion": "process-exit"
+      },
+      "external_config": false,
+      "instance_id": "fixture-inst-project",
+      "name": "基线项目实例",
+      "run_mode": "OneShot",
+      "sealed_secret_ids": [],
+      "version": 1
+    },
+    {
+      "agent_type": "generic-command",
+      "argv": [
+        "--baseline"
+      ],
+      "config": {
+        "fixture": true
+      },
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "env": [
+        [
+          "MF_FIXTURE_ENV",
+          "1"
+        ]
+      ],
+      "executable": "agent.exe",
+      "execution_contract": {
+        "completion": "process-exit"
+      },
+      "external_config": false,
+      "instance_id": "fixture-inst-user",
+      "name": "基线用户实例",
+      "run_mode": "OneShot",
+      "sealed_secret_ids": [],
+      "version": 1
+    },
+    {
+      "agent_type": "generic-command",
+      "argv": [
+        "--baseline-v2"
+      ],
+      "config": {
+        "fixture": true
+      },
+      "created_at": "2026-01-01T00:00:00+00:00",
+      "env": [
+        [
+          "MF_FIXTURE_ENV",
+          "1"
+        ]
+      ],
+      "executable": "agent.exe",
+      "execution_contract": {
+        "completion": "process-exit"
+      },
+      "external_config": false,
+      "instance_id": "fixture-inst-user",
+      "name": "基线用户实例",
+      "run_mode": "OneShot",
+      "sealed_secret_ids": [],
+      "version": 2
+    }
+  ],
+  "agent_instances": [
+    {
+      "agent_type": "generic-command",
+      "current_version": 1,
+      "enabled": true,
+      "id": "fixture-inst-project",
+      "name": "基线项目实例",
+      "project_key": "fixture-project",
+      "scope": "project"
+    },
+    {
+      "agent_type": "generic-command",
+      "current_version": 2,
+      "enabled": true,
+      "id": "fixture-inst-user",
+      "name": "基线用户实例",
+      "project_key": null,
+      "scope": "user"
+    }
+  ],
+  "plugin_pins": [
+    {
+      "content_hash": "4b02bd01b432f7400f5288902dc6b44dc49d5b7cd863c678f46d87dd40c41797",
+      "full_id": "monkeyfence.builtin/generic-command",
+      "run_key": "wf//mf-fixture/baseline-alpha/task-1/rev-1",
+      "version": "1.0.0"
+    },
+    {
+      "content_hash": "8b17b4997776956a812f8c72e6da416f5346c7f2ac3b0cc4936cf346f9d5e079",
+      "full_id": "monkeyfence.builtin/project-dir",
+      "run_key": "wf//mf-fixture/baseline-alpha/task-1/rev-1",
+      "version": "1.0.0"
+    }
+  ],
+  "sealed_secret_count": 0,
+  "templates": [
+    {
+      "current_version": 1,
+      "key": "tpl-baseline",
+      "name": "基线模板",
+      "task_local": false
+    }
+  ]
+}

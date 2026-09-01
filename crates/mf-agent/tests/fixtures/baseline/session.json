@@ -1,0 +1,24 @@
+{
+  "foreground": "/mf-fixture/baseline-alpha",
+  "project_states": [
+    {
+      "active_file": "/mf-fixture/baseline-alpha/src/main.rs",
+      "open_files": [
+        "/mf-fixture/baseline-alpha/src/main.rs"
+      ],
+      "root": "/mf-fixture/baseline-alpha",
+      "selected_task_id": 1
+    },
+    {
+      "active_file": null,
+      "open_files": [],
+      "root": "/mf-fixture/baseline-beta",
+      "selected_task_id": null
+    }
+  ],
+  "projects": [
+    "/mf-fixture/baseline-alpha",
+    "/mf-fixture/baseline-beta",
+    "/mf-fixture/__missing_project__"
+  ]
+}

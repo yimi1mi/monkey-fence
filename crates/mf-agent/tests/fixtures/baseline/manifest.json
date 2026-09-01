@@ -1,0 +1,35 @@
+{
+  "files": [
+    {
+      "bytes": 73728,
+      "path": "catalog-v1.db",
+      "sha256": "ee86a337bd2c2f054dc89c6f816f9b7f9d3e7270adf83f07789f6197e7af7d8e"
+    },
+    {
+      "bytes": 2966,
+      "path": "expected/catalog-v1.dump.json",
+      "sha256": "3f9ffed3e34333628704cd7e5822a66ce9e62e638d2eae93ad55f297a70ea473"
+    },
+    {
+      "bytes": 8157,
+      "path": "expected/project-v6.dump.json",
+      "sha256": "955291d7ff52e30d49ba98d3879e8287ab90f23e33784cd250996ee883f2a41a"
+    },
+    {
+      "bytes": 175,
+      "path": "expected/session.dump.json",
+      "sha256": "f453bb5228ec821b6c449ded12f0fec49e976deb7cac084afb7e1895fbd2a42a"
+    },
+    {
+      "bytes": 188416,
+      "path": "project-v6.db",
+      "sha256": "4327a99f1c66666b7abd96fd57593addbedb265086659c241dae0f1d2b58fdb3"
+    },
+    {
+      "bytes": 566,
+      "path": "session.json",
+      "sha256": "addcbacec24e35e82b2358ee828c258d6081c5612d46181c8df981cf0c18434d"
+    }
+  ],
+  "generator_version": "1"
+}
