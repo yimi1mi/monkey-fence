@@ -263,6 +263,17 @@ impl SessionRegistry {
         }
     }
 
+    /// T0c 原始 PTY 输出契约的测试 seam:返回已经过生产
+    /// StreamingRedactor、但尚未被 Screen 解释的字节。仅测试编译,
+    /// 不固化 256 KiB 容量或作为新协议。
+    #[cfg(test)]
+    pub(crate) fn pty_output_bytes(&self, project: &str, session_id: i64) -> Option<Vec<u8>> {
+        match self.get_inner(&session_key(project, session_id))? {
+            SessionInner::Pty(session) => Some(session.output_tail.lock().clone()),
+            SessionInner::Http(_) => None,
+        }
+    }
+
     pub fn send_prompt(&self, project: &str, session_id: i64, text: &str) -> Result<()> {
         let key = session_key(project, session_id);
         self.send_prompt_at(&key, session_id, text)

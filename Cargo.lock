@@ -2532,7 +2532,10 @@ name = "mfctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "crossbeam-channel",
+ "log",
  "mf-agent",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",

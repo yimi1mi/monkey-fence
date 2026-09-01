@@ -545,13 +545,12 @@ workers = 3
 
 #[cfg(test)]
 mod v2_tests {
-    use crate::pipe_server::{pipe_name_for_current_process, PipeServer};
+    use crate::pipe_server::pipe_name_for_current_process;
     use crate::runtime_host::{RuntimeHostImpl, SessionRegistry};
     use mf_agent::model::*;
     use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
     use mf_agent::pipeline::{PipelineDraft, ProfileIndex, SessionPolicy, StepDraft};
-    use mf_agent::{RuntimeHost, Store};
-    use parking_lot::Mutex;
+    use mf_agent::Store;
     use std::sync::Arc;
 
     fn test_catalog() -> Arc<parking_lot::RwLock<ProfileCatalog>> {
@@ -637,10 +636,11 @@ mod v2_tests {
         };
         let token = run.capability_token.clone();
 
-        let orchestrators: Arc<Mutex<Vec<Arc<Orchestrator>>>> =
-            Arc::new(Mutex::new(vec![orch.clone()]));
-        let mut server = PipeServer::start(orchestrators).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // 管道名全进程唯一(FIRST_PIPE_INSTANCE):与 pipe_server 契约测试
+        // 共享同一服务端实例,串行使用,避免两组测试抢注同名管道。
+        let _serial = crate::pipe_server::contract_tests::serial_guard();
+        let orchestrators = crate::pipe_server::contract_tests::shared_pipe_server();
+        orchestrators.lock().push(orch.clone());
 
         // 错误令牌
         let resp = pipe_request(
@@ -691,7 +691,7 @@ mod v2_tests {
         .unwrap();
         assert!(resp.get("ok").is_some(), "协议响应缺失: {resp}");
 
-        server.stop();
+        orchestrators.lock().retain(|o| !Arc::ptr_eq(o, &orch));
         orch.stop();
     }
 
