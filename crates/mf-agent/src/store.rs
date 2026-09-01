@@ -310,12 +310,19 @@ impl Store {
 
     fn init(conn: Connection) -> Result<Store> {
         let mut conn = conn;
+        // T1a:future guard 必须先于任何 DDL 与 journal 模式改写,
+        // 拒绝路径才可能保持数据库字节不动
+        crate::migration::guard_future_version(
+            &conn,
+            crate::migration::StoreKind::Project,
+            PROJECT_SCHEMA_VERSION,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        crate::schema::upgrade_project(&mut conn, PROJECT_SCHEMA_VERSION)?;
+        // 持久 journal 模式只在 backup→migration 屏障成功之后改写。
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        crate::schema::upgrade_project(&mut conn, PROJECT_SCHEMA_VERSION)
-            .context("项目库 schema 迁移失败")?;
         Ok(Store {
             conn: Mutex::new(conn),
         })

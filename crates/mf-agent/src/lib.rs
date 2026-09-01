@@ -16,6 +16,7 @@ pub mod catalog_store;
 pub mod config;
 pub mod execution_directory;
 pub mod handoff;
+pub mod migration;
 pub mod model;
 pub mod orchestrator;
 pub mod pipeline;
@@ -42,6 +43,7 @@ pub use config::{
     Config, EditorConfig, EngineConfig, ProviderConfig, ProviderKind, TerminalConfig,
 };
 pub use handoff::Handoff;
+pub use migration::{error_code, BackupManifest, MigrationError, StoreKind};
 pub use model::{
     AdHocSessionView, AgentState, InstanceScope, RevisionStatus, RunMode, RunStatus,
     SchedulerEvent, SessionStatus, SettleError, SettleOutcome, Settlement, StepQuestionView,

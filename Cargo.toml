@@ -40,7 +40,8 @@ gpui_platform = { path = "vendor/gpui_platform" }
 anyhow = "1"
 log = "0.4"
 ropey = "1.6"
-rusqlite = { version = "0.32", features = ["bundled"] }
+# backup feature:T1a 升级前用 SQLite Backup API 生成一致备份
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 notify = "6"
 ignore = "0.4"
 nucleo-matcher = "0.3"

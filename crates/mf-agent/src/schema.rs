@@ -30,46 +30,53 @@ pub fn catalog_db_path() -> PathBuf {
 }
 
 /// 应用 DDL 并把版本写入 `user_version`。DDL 必须幂等(IF NOT EXISTS)。
+/// 防御性 future guard:高于 `version` 的库禁止经此入口降级
+/// (生产打开路径走 `migration::upgrade_with_barrier`)。
 pub fn initialize_schema(conn: &Connection, ddl: &str, version: i64) -> Result<()> {
+    let current = schema_version_of(conn)?;
+    anyhow::ensure!(
+        current <= version,
+        "数据库 schema 版本 v{current} 高于目标 v{version},拒绝初始化降级"
+    );
     conn.execute_batch(ddl)?;
     conn.pragma_update(None, "user_version", version)?;
     Ok(())
 }
 
-/// 项目库按 `user_version` 链式迁移到 `target`(每步单事务;
-/// `user_version = 0` 视为全新库,从 v1 DDL 起完整应用)。
-/// 版本高于程序支持时拒绝打开(禁止隐式降级)。
+/// 项目库按 `user_version` 链式迁移到 `target`。
+/// T1a:经 `migration::upgrade_with_barrier` 统一执行 future guard 与
+/// Backup 前置屏障(0 < user_version < target 的真实升级先备份再迁移);
+/// `user_version = 0` 视为全新库,从 v1 DDL 起完整应用,不触发备份。
 pub fn upgrade_project(conn: &mut Connection, target: i64) -> Result<()> {
-    let current = schema_version_of(conn)?;
-    anyhow::ensure!(
-        current <= target,
-        "数据库 schema 版本 v{current} 高于程序支持的 v{target}:请升级程序后再打开"
-    );
-    if current == target {
-        return Ok(());
-    }
-    let tx = conn.transaction()?;
-    if current < 1 && target >= 1 {
+    crate::migration::upgrade_with_barrier(
+        conn,
+        crate::migration::StoreKind::Project,
+        target,
+        &apply_project_chain,
+    )
+}
+
+/// `(from, to]` 区间的 v1–v6 DDL/回填链(在迁移事务内执行)。
+fn apply_project_chain(tx: &rusqlite::Transaction, from: i64, to: i64) -> Result<()> {
+    if from < 1 && to >= 1 {
         tx.execute_batch(PROJECT_SCHEMA_V1)?;
     }
-    if current < 2 && target >= 2 {
+    if from < 2 && to >= 2 {
         tx.execute_batch(PROJECT_SCHEMA_V2_DELTA)?;
-        backfill_early_dev_columns(&tx)?;
+        backfill_early_dev_columns(tx)?;
     }
-    if current < 3 && target >= 3 {
-        backfill_digest_columns(&tx)?;
+    if from < 3 && to >= 3 {
+        backfill_digest_columns(tx)?;
     }
-    if current < 4 && target >= 4 {
-        backfill_merge_batch_columns(&tx)?;
+    if from < 4 && to >= 4 {
+        backfill_merge_batch_columns(tx)?;
     }
-    if current < 5 && target >= 5 {
-        backfill_merge_owner_columns(&tx)?;
+    if from < 5 && to >= 5 {
+        backfill_merge_owner_columns(tx)?;
     }
-    if current < 6 && target >= 6 {
+    if from < 6 && to >= 6 {
         tx.execute_batch(PROJECT_SCHEMA_V6_DELTA)?;
     }
-    tx.pragma_update(None, "user_version", target)?;
-    tx.commit()?;
     Ok(())
 }
 

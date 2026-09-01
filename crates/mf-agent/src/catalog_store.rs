@@ -10,8 +10,7 @@ use crate::agent_instance::{
 };
 use crate::model::InstanceScope;
 use crate::schema::{
-    catalog_db_path, initialize_schema, schema_version_of, table_names_of, CATALOG_SCHEMA_V1,
-    CATALOG_SCHEMA_VERSION,
+    catalog_db_path, schema_version_of, table_names_of, CATALOG_SCHEMA_V1, CATALOG_SCHEMA_VERSION,
 };
 use anyhow::{Context as _, Result};
 use parking_lot::Mutex;
@@ -52,15 +51,55 @@ impl CatalogStore {
         Self::init(Connection::open_in_memory()?).map(Arc::new)
     }
 
-    fn init(conn: Connection) -> Result<CatalogStore> {
+    fn init(mut conn: Connection) -> Result<CatalogStore> {
+        // T1a:future guard 先于任何 DDL/pragma(高版本目录库 fail-closed;
+        // 现状缺陷是 initialize_schema 会无条件把 user_version 写回 v1)
+        crate::migration::guard_future_version(
+            &conn,
+            crate::migration::StoreKind::Catalog,
+            CATALOG_SCHEMA_VERSION,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+
+        let current = schema_version_of(&conn)?;
+        if current == 0 {
+            // 全新库无旧数据可备份,但 DDL 仍在 writer lock 内完成并复验版本。
+            crate::migration::upgrade_with_barrier(
+                &mut conn,
+                crate::migration::StoreKind::Catalog,
+                CATALOG_SCHEMA_VERSION,
+                &|tx, _, _| {
+                    tx.execute_batch(CATALOG_SCHEMA_V1)?;
+                    ensure_agent_instances_columns(tx)
+                },
+            )?;
+        } else if catalog_schema_needs_repair(&conn)? {
+            // 早期 v1 开发库可能缺表/索引/后续列。它们虽然版本号已经是
+            // current,实际 ALTER/CREATE 仍属于 schema repair,必须先备份。
+            crate::migration::repair_current_with_barrier(
+                &mut conn,
+                crate::migration::StoreKind::Catalog,
+                CATALOG_SCHEMA_VERSION,
+                &catalog_schema_needs_repair,
+                &|tx| {
+                    tx.execute_batch(CATALOG_SCHEMA_V1)?;
+                    ensure_agent_instances_columns(tx)
+                },
+            )?;
+        } else {
+            // 健康 v1 不再执行任何 DDL;仅在 lock 内重申版本,保持 T0
+            // Catalog fixture 的既有 header 字节语义。
+            crate::migration::reaffirm_current_version_locked(
+                &mut conn,
+                crate::migration::StoreKind::Catalog,
+                CATALOG_SCHEMA_VERSION,
+            )?;
+        }
+
+        // 持久 WAL 模式只在初始化/repair/current-version lock 成功后启用。
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        initialize_schema(&conn, CATALOG_SCHEMA_V1, CATALOG_SCHEMA_VERSION)
-            .context("初始化目录库 v1 schema 失败")?;
-        // 早期开发库缺少后续列(CREATE IF NOT EXISTS 不会补列),幂等补齐
-        ensure_agent_instances_columns(&conn)?;
         Ok(CatalogStore {
             conn: Mutex::new(conn),
         })
@@ -526,32 +565,53 @@ impl CatalogStore {
     }
 }
 
-/// 补齐旧开发库缺失的列(CREATE IF NOT EXISTS 不会补列;幂等)。
-fn ensure_agent_instances_columns(conn: &Connection) -> Result<()> {
-    ensure_table_columns(
-        conn,
-        "agent_instances",
-        &[
-            (
-                "enabled",
-                "ALTER TABLE agent_instances ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
-            ),
-            (
-                "project_key",
-                "ALTER TABLE agent_instances ADD COLUMN project_key TEXT",
-            ),
-            (
-                "task_local",
-                "ALTER TABLE workflow_templates ADD COLUMN task_local INTEGER NOT NULL DEFAULT 0",
-            ),
-        ],
-    )
+const CATALOG_REQUIRED_TABLES: &[&str] = &[
+    "agent_instances",
+    "agent_instance_versions",
+    "workflow_templates",
+    "workflow_template_versions",
+    "sealed_secrets",
+    "plugin_packages",
+    "plugin_pins",
+];
+const CATALOG_REQUIRED_INDEXES: &[&str] = &["idx_plugin_pins_hash"];
+const CATALOG_COLUMN_REPAIRS: &[(&str, &str)] = &[
+    (
+        "enabled",
+        "ALTER TABLE agent_instances ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1",
+    ),
+    (
+        "project_key",
+        "ALTER TABLE agent_instances ADD COLUMN project_key TEXT",
+    ),
+    (
+        "task_local",
+        "ALTER TABLE workflow_templates ADD COLUMN task_local INTEGER NOT NULL DEFAULT 0",
+    ),
+];
+
+fn catalog_schema_needs_repair(conn: &Connection) -> Result<bool> {
+    for (kind, names) in [
+        ("table", CATALOG_REQUIRED_TABLES),
+        ("index", CATALOG_REQUIRED_INDEXES),
+    ] {
+        for name in names {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2)",
+                params![kind, name],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(!missing_catalog_column_repairs(conn)?.is_empty())
 }
 
-/// 幂等补列:`checks` 是 (列名, 该列所在表的 ALTER 语句) 集合。
-fn ensure_table_columns(conn: &Connection, _table: &str, checks: &[(&str, &str)]) -> Result<()> {
-    // 逐条探测对应表的列;探测失败(表/列不存在)时执行 ALTER
-    for (column, alter) in checks {
+fn missing_catalog_column_repairs(conn: &Connection) -> Result<Vec<&'static str>> {
+    let mut missing = Vec::new();
+    for (column, alter) in CATALOG_COLUMN_REPAIRS {
         let table = alter
             .split_whitespace()
             .nth(2)
@@ -566,9 +626,17 @@ fn ensure_table_columns(conn: &Connection, _table: &str, checks: &[(&str, &str)]
             cols
         };
         if !existing.iter().any(|c| c == column) {
-            conn.execute(alter, [])
-                .with_context(|| format!("补齐 {table}.{column} 列失败"))?;
+            missing.push(*alter);
         }
+    }
+    Ok(missing)
+}
+
+/// 补齐旧开发库缺失的列(CREATE IF NOT EXISTS 不会补列;幂等)。
+fn ensure_agent_instances_columns(conn: &Connection) -> Result<()> {
+    for alter in missing_catalog_column_repairs(conn)? {
+        conn.execute(alter, [])
+            .with_context(|| format!("补齐目录库列失败:{alter}"))?;
     }
     Ok(())
 }

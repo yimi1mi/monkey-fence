@@ -26,6 +26,9 @@ zeroize.workspace = true
 sha2.workspace = true
 mf-skills = { path = "../mf-skills" }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 git2 = { workspace = true }
 tempfile = "3"
