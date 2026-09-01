@@ -2,14 +2,30 @@
 //!
 //! T1d(Issue #19)交付 service-v1.db schema 与 Project Registry /
 //! session.json 幂等导入;T1e(Issue #20)交付 CoreOwnerLock/owner epoch/
-//! stale discovery fencing(§11.1,L-OWNER)与附录 A7 生命周期参数。
-//! kernel/command/operation/projection 等模块随后续 ticket 落位;本 crate
+//! stale discovery fencing(§11.1,L-OWNER)与附录 A7 生命周期参数；
+//! T1f(Issue #21)交付 command intent→target receipt/outbox 原子链。
+//! kernel facade/operation/projection 等模块随后续 ticket 落位;本 crate
 //! 当前是 dark data——不接管 `crates/mf` AppCtx 的任何权威状态,也不提供
 //! standalone Core bin(`owner_lock_probe` 是跨进程契约测试的探针工具,
 //! 不是 Core)。
 
+pub mod command;
+pub mod handles;
+pub mod lease;
 pub mod limits;
 mod platform_acl;
 pub mod project_registry;
 pub mod service_schema;
 pub mod singleton;
+
+// Command contracts 需要 crate-private target effect seam；源文件仍位于
+// `tests/contract/`，作为 lib unit module 编译，release test 同样覆盖。
+#[cfg(test)]
+#[path = "../tests/contract/command_idempotency.rs"]
+mod command_idempotency;
+#[cfg(test)]
+#[path = "../tests/contract/command_support.rs"]
+mod command_support;
+#[cfg(test)]
+#[path = "../tests/contract/intent_recovery.rs"]
+mod intent_recovery;

@@ -48,6 +48,7 @@ const COMPLETE_MARKER: &[u8] = b"mf.backup.complete.v1\n";
 pub enum StoreKind {
     Project,
     Catalog,
+    Service,
 }
 
 impl StoreKind {
@@ -55,6 +56,7 @@ impl StoreKind {
         match self {
             Self::Project => "project",
             Self::Catalog => "catalog",
+            Self::Service => "service",
         }
     }
 }

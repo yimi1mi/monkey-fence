@@ -8,8 +8,8 @@
 use crate::platform_acl::restrict_service_database_to_current_user;
 use crate::service_schema::{
     guard_future_version, schema_version_of, seed_singletons, service_db_path,
-    service_schema_ready, table_names_of, validate_singletons, SERVICE_SCHEMA_V1,
-    SERVICE_SCHEMA_VERSION,
+    service_schema_ready, service_schema_v1_ready, table_names_of, validate_singletons,
+    SERVICE_SCHEMA_V1, SERVICE_SCHEMA_V2_DELTA, SERVICE_SCHEMA_VERSION,
 };
 use anyhow::{Context as _, Result};
 use parking_lot::Mutex;
@@ -76,6 +76,9 @@ pub enum SessionImportStatus {
 /// service 库访问入口。
 pub struct ServiceStore {
     conn: Mutex<Connection>,
+    /// 同一 Core 内跨 CommandCoordinator 串行 reserve→L-CMD→finalize 与
+    /// startup reconcile；跨进程唯一性由 #20 CoreOwnerLock 保证。
+    command_gate: Mutex<()>,
 }
 
 /// session.json 中与本迁移相关的字段;`open_files`、active file、
@@ -112,23 +115,39 @@ impl ServiceStore {
         if current == SERVICE_SCHEMA_VERSION && !service_schema_ready(&conn)? {
             anyhow::bail!("service_schema_mismatch:文件标记为 service-v1，但 schema 指纹不完整");
         }
+        if current == 1 && !service_schema_v1_ready(&conn)? {
+            anyhow::bail!("service_schema_mismatch:文件标记为旧 service v1，但 schema 指纹不完整");
+        }
         restrict_service_database_to_current_user(&conn)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
-        if current == 0 {
-            // 全新库初始化:DDL + singleton 种子 + user_version 单事务完成,
-            // 中断不留半初始化库(重跑从 user_version=0 重新开始)。
-            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            tx.execute_batch(SERVICE_SCHEMA_V1)?;
-            seed_singletons(&tx)?;
-            anyhow::ensure!(
-                service_schema_ready(&tx)?,
-                "service_schema_mismatch:初始化后的 schema 指纹不完整"
-            );
-            validate_singletons(&tx)?;
-            tx.pragma_update(None, "user_version", SERVICE_SCHEMA_VERSION)?;
-            tx.commit()?;
+        if current < SERVICE_SCHEMA_VERSION {
+            // v0 全新初始化无需备份；v1→v2 必须先走统一 SQLite Backup
+            // 屏障，再在单事务加 problem_code 并更新 meta/user_version。
+            mf_agent::migration::upgrade_with_barrier(
+                &mut conn,
+                mf_agent::migration::StoreKind::Service,
+                SERVICE_SCHEMA_VERSION,
+                &|tx, from, to| {
+                    if from < 1 && to >= 1 {
+                        tx.execute_batch(SERVICE_SCHEMA_V1)?;
+                        seed_singletons(tx)?;
+                    }
+                    if from < 2 && to >= 2 {
+                        tx.execute_batch(SERVICE_SCHEMA_V2_DELTA)?;
+                    }
+                    tx.execute(
+                        "UPDATE meta SET schema_version=?1 WHERE id=1",
+                        [SERVICE_SCHEMA_VERSION],
+                    )?;
+                    anyhow::ensure!(
+                        service_schema_ready(tx)?,
+                        "service_schema_mismatch:迁移后的 schema 指纹不完整"
+                    );
+                    validate_singletons(tx)
+                },
+            )?;
         }
 
         anyhow::ensure!(
@@ -148,6 +167,7 @@ impl ServiceStore {
         );
         Ok(ServiceStore {
             conn: Mutex::new(conn),
+            command_gate: Mutex::new(()),
         })
     }
 
@@ -155,7 +175,14 @@ impl ServiceStore {
         schema_version_of(&self.conn.lock())
     }
 
-    /// CoreOwnerLock 在 L-OWNER 内原子推进 service.meta.owner_epoch。
+    #[allow(dead_code)] // T1 command recovery reader; wired by T2 facade.
+    pub(crate) fn with_conn<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        let conn = self.conn.lock();
+        f(&conn)
+    }
+
+    /// CoreOwnerLock/CommandCoordinator 在 service DB 内推进 owner epoch、
+    /// intent 与 terminal problem 的原子事务缝隙。
     pub(crate) fn with_tx<T>(
         &self,
         f: impl FnOnce(&rusqlite::Transaction) -> Result<T>,
@@ -165,6 +192,10 @@ impl ServiceStore {
         let value = f(&tx)?;
         tx.commit()?;
         Ok(value)
+    }
+
+    pub(crate) fn command_gate(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.command_gate.lock()
     }
 
     /// 全部已登记 Project(按 canonical_root 排序,确定性读序)。

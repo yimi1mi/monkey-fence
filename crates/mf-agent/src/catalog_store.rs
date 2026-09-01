@@ -745,10 +745,9 @@ impl CatalogV2Store {
         f(&conn)
     }
 
-    pub(crate) fn with_tx<T>(
-        &self,
-        f: impl FnOnce(&rusqlite::Transaction) -> Result<T>,
-    ) -> Result<T> {
+    /// 在 Catalog v2 写事务中执行。CoreKernel 的单目标 command adapter
+    /// 通过此深缝隙把业务效果、receipt 与 outbox 原子提交。
+    pub fn with_tx<T>(&self, f: impl FnOnce(&rusqlite::Transaction) -> Result<T>) -> Result<T> {
         let mut conn = self.conn.lock();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let out = f(&tx)?;

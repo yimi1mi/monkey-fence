@@ -17,7 +17,7 @@ use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 /// service 库 schema 版本(新库新版本链,从 v1 起)。
-pub const SERVICE_SCHEMA_VERSION: i64 = 1;
+pub const SERVICE_SCHEMA_VERSION: i64 = 2;
 
 /// 稳定错误码:与主规格 §7.5 problem code `schema_future_version` 对齐。
 pub const CODE_SCHEMA_FUTURE_VERSION: &str = "schema_future_version";
@@ -164,6 +164,12 @@ CREATE TABLE IF NOT EXISTS migration_marker (
 );
 ";
 
+/// T1f 增量：保留 terminal command 的稳定 problem code，使相同
+/// command id + digest 跨重启仍返回原错误，而不是 generic internal。
+pub const SERVICE_SCHEMA_V2_DELTA: &str = "
+ALTER TABLE command_intent ADD COLUMN problem_code TEXT;
+";
+
 /// 与 DDL 配套的 singleton 种子行(初始化事务内与 DDL 同事务执行)。
 /// `meta.instance_id` 是该 service 库的持久实例身份(建库时生成一次,
 /// 重开不变);`root_state` 建库即 `mode=off`(§3.4:Core 启动强制 off)。
@@ -184,6 +190,13 @@ pub(crate) fn seed_singletons(conn: &Connection) -> Result<()> {
 /// 同为 `user_version=1` 的其他 SQLite 文件不得被误当成 service-v1。
 /// 精确列指纹也防止中断/手工损坏的 current-version 库被静默接受。
 pub(crate) fn service_schema_ready(conn: &Connection) -> Result<bool> {
+    let expected = Connection::open_in_memory()?;
+    expected.execute_batch(SERVICE_SCHEMA_V1)?;
+    expected.execute_batch(SERVICE_SCHEMA_V2_DELTA)?;
+    Ok(schema_fingerprint(conn)? == schema_fingerprint(&expected)?)
+}
+
+pub(crate) fn service_schema_v1_ready(conn: &Connection) -> Result<bool> {
     let expected = Connection::open_in_memory()?;
     expected.execute_batch(SERVICE_SCHEMA_V1)?;
     Ok(schema_fingerprint(conn)? == schema_fingerprint(&expected)?)

@@ -10,7 +10,8 @@ use crate::support::{
 };
 use mf_kernel::project_registry::{ProjectStatus, ServiceStore};
 use mf_kernel::service_schema::{
-    error_code, ServiceSchemaError, CODE_SCHEMA_FUTURE_VERSION, SERVICE_SCHEMA_VERSION,
+    error_code, ServiceSchemaError, CODE_SCHEMA_FUTURE_VERSION, SERVICE_SCHEMA_V1,
+    SERVICE_SCHEMA_VERSION,
 };
 use rusqlite::{params, Connection};
 
@@ -99,6 +100,63 @@ fn meta_and_root_state_singletons_with_stable_identity() {
     assert_eq!(reopened, instance_id);
 }
 
+#[test]
+fn service_v1_upgrades_to_v2_after_verified_backup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = service_db(&tmp);
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(SERVICE_SCHEMA_V1).unwrap();
+        conn.execute(
+            "INSERT INTO meta(id, instance_id, schema_version, owner_epoch)
+             VALUES(1, '018f0000-0000-7000-8000-000000000001', 1, 9)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO root_state(id, mode, root_epoch) VALUES(1, 'off', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_registry
+             (project_handle, public_id, canonical_root, display_path, registered_at, status)
+             VALUES('proj_keep', 'pub_keep', '/keep', '/keep', '2026-09-01', 'registered')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+    }
+    let backup_dir = mf_agent::migration::backup_dir_for(&db);
+    let store = ServiceStore::open(&db).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 2);
+    assert_eq!(
+        store.list_projects().unwrap()[0].project_handle,
+        "proj_keep"
+    );
+    assert!(column_names_of(&db, "command_intent").contains(&"problem_code".to_string()));
+    let meta_version: i64 = read_only(&db)
+        .query_row("SELECT schema_version FROM meta WHERE id=1", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(meta_version, 2);
+
+    let artifacts = mf_agent::migration::published_artifact_dirs(&backup_dir).unwrap();
+    assert_eq!(artifacts.len(), 1, "v1→v2 必须先发布一个完整备份");
+    let backup = artifacts[0].join("backup.db");
+    assert_eq!(user_version_of(&backup), 1);
+    assert!(!column_names_of(&backup, "command_intent")
+        .iter()
+        .any(|column| column == "problem_code"));
+    let old_project: String = read_only(&backup)
+        .query_row("SELECT project_handle FROM project_registry", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(old_project, "proj_keep");
+}
+
 /// `project_registry` 列形状(§3.4 逐列)与唯一约束。
 #[test]
 fn project_registry_shape_matches_spec() {
@@ -153,6 +211,7 @@ fn command_intent_and_operation_shape_and_constraints() {
             "state",
             "created_at",
             "resolved_at",
+            "problem_code",
         ]
     );
     let root_epoch = columns_of(&db, "command_intent")
@@ -309,7 +368,7 @@ fn project_registry_status_check_rejects_unknown_values() {
     assert!(insert("bogus").is_err(), "status CHECK 必须拒绝未知值");
 }
 
-/// future guard:`user_version = 2`(> 1)打开拒绝,稳定错误码,库不动
+/// future guard:`user_version = 3`(> 2)打开拒绝,稳定错误码,库不动
 /// (字节不变、无 DDL、无 journal 模式改写、无 sidecar)。
 #[test]
 fn future_version_fails_closed_without_side_effects() {
@@ -320,7 +379,7 @@ fn future_version_fails_closed_without_side_effects() {
         conn.execute_batch(
             "CREATE TABLE future_marker (id INTEGER PRIMARY KEY, note TEXT NOT NULL);
              INSERT INTO future_marker (id, note) VALUES (1, 'v2-data');
-             PRAGMA user_version = 2;",
+             PRAGMA user_version = 3;",
         )
         .unwrap();
     }
@@ -329,7 +388,7 @@ fn future_version_fails_closed_without_side_effects() {
     assert_eq!(journal_mode_of(&db), "delete");
 
     let err = match ServiceStore::open(&db) {
-        Ok(_) => panic!("v2 service 库必须 fail-closed"),
+        Ok(_) => panic!("future service 库必须 fail-closed"),
         Err(err) => err,
     };
     assert_eq!(
@@ -339,7 +398,7 @@ fn future_version_fails_closed_without_side_effects() {
     );
     match err.downcast_ref::<ServiceSchemaError>() {
         Some(ServiceSchemaError::FutureVersion { found, known }) => {
-            assert_eq!(*found, 2);
+            assert_eq!(*found, 3);
             assert_eq!(*known, SERVICE_SCHEMA_VERSION);
         }
         other => panic!("必须是 FutureVersion 判别值: {other:?}"),
@@ -350,7 +409,7 @@ fn future_version_fails_closed_without_side_effects() {
         hash_before,
         "拒绝路径不得改写数据库文件字节"
     );
-    assert_eq!(user_version_of(&db), 2, "user_version 不变");
+    assert_eq!(user_version_of(&db), 3, "user_version 不变");
     assert_eq!(
         journal_mode_of(&db),
         "delete",

@@ -15,6 +15,12 @@ parking_lot.workspace = true
 dirs.workspace = true
 thiserror = "2"
 uuid.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+zeroize.workspace = true
+mf-agent.workspace = true
+keyring.workspace = true
+rand.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # Win32_System_Threading:T1e CoreOwnerLock 命名 mutex 与进程存活探针
@@ -28,8 +34,6 @@ libc = "0.2"
 tempfile = "3"
 # 契约测试断言 handle 是真实 UUIDv7
 uuid = { workspace = true }
-# 契约测试的文件字节不变断言
-sha2.workspace = true
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }
