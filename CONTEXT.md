@@ -62,6 +62,14 @@ _避免_: Plugin Package、Agent Instance、Provider Profile
 核心服务对一次受管 CLI 安装保存的不可变来源记录,包含插件/recipe 摘要、目标、实际版本、可执行身份、校验与回滚信息;用于更新、修复、卸载和 Revision 冻结检查。
 _避免_: 插件锁文件、运行日志、Provider 配置
 
+**后台操作（Operation）**:
+核心服务接受长耗时命令后返回的持久异步句柄,投影进度与最终结果并支持崩溃恢复;可承载安装、模型探测或工作流启动,但不是新的业务运行状态机。
+_避免_: Task、Workflow Run、Agent Run、通用 Job
+
+**安装任务（Installation Job）**:
+一次冻结安装计划的实际执行,属于一个 Operation,拥有排队、执行、验证、修复或失败状态;它不等同于 CLI Installation 本身。
+_避免_: CLI Installation、Plugin Package、Agent Run
+
 **智能体实例（Agent Instance）**:
 用户保存的一套独立 Agent Type 配置,包含命令、参数、加密 Secret 与执行契约;编辑实例不改变真实 CLI 的全局配置或已运行会话。
 _避免_: Agent Type、Agent Session、Agent Profile
