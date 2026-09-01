@@ -9,6 +9,8 @@ use mf_agent::Settlement;
 fn run(status: RunStatus, outcome: Option<&str>) -> RunView {
     RunView {
         id: 1,
+        public_handle: "run-1".into(),
+        revision: 1,
         task_id: 1,
         step_id: 1,
         revision_id: 1,
@@ -138,7 +140,7 @@ fn cancel_action_stops_process_and_releases_lease() {
     use std::collections::HashMap;
 
     struct StopHost {
-        stopped: Mutex<Vec<i64>>,
+        stopped: Mutex<Vec<String>>,
     }
     impl RuntimeHost for StopHost {
         fn launch_workflow(
@@ -157,14 +159,16 @@ fn cancel_action_stops_process_and_releases_lease() {
         fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) -> anyhow::Result<()> {
             Ok(())
         }
-        fn send_prompt(&self, _: &str, _: i64, _: i64, _: &str) {}
-        fn stop_run(&self, _: &str, run_id: i64) -> anyhow::Result<()> {
-            self.stopped.lock().push(run_id);
+        fn send_prompt(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
             Ok(())
         }
-        fn kill_session(&self, _: &str, _: i64) {}
-        fn kill_ad_hoc(&self, _: &str, _: i64) {}
-        fn answer_question(&self, _: &str, _: i64, _: &str) {}
+        fn stop_run(&self, run_handle: &str) -> anyhow::Result<()> {
+            self.stopped.lock().push(run_handle.to_string());
+            Ok(())
+        }
+        fn kill_session(&self, _: &str) {}
+        fn kill_ad_hoc(&self, _: &str) {}
+        fn answer_question(&self, _: &str, _: &str) {}
     }
 
     let dir = tempfile::tempdir().unwrap();
@@ -243,7 +247,7 @@ fn cancel_action_stops_process_and_releases_lease() {
     let msg = execute_action(&orch, &details, &crate::run_monitor::RunAction::Cancel, "").unwrap();
     assert!(msg.contains("已取消"), "{msg}");
     // 完整链:进程停止已请求(不是只改 DB)
-    assert!(host.stopped.lock().contains(&run.id));
+    assert!(host.stopped.lock().contains(&run.public_handle));
     let after = orch.store.run_view(run.id).unwrap().unwrap();
     assert_eq!(after.status, mf_agent::model::RunStatus::Cancelled);
     orch.stop();
@@ -276,13 +280,15 @@ fn snapshot_collects_sessions_handoffs_leases_and_conflicts() {
         fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) -> anyhow::Result<()> {
             Ok(())
         }
-        fn send_prompt(&self, _: &str, _: i64, _: i64, _: &str) {}
-        fn stop_run(&self, _: &str, _: i64) -> anyhow::Result<()> {
+        fn send_prompt(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
             Ok(())
         }
-        fn kill_session(&self, _: &str, _: i64) {}
-        fn kill_ad_hoc(&self, _: &str, _: i64) {}
-        fn answer_question(&self, _: &str, _: i64, _: &str) {}
+        fn stop_run(&self, _: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn kill_session(&self, _: &str) {}
+        fn kill_ad_hoc(&self, _: &str) {}
+        fn answer_question(&self, _: &str, _: &str) {}
     }
 
     let dir = tempfile::tempdir().unwrap();
@@ -494,6 +500,8 @@ fn monitor_nodes_surface_artifacts_blockers_recommendations_and_output() {
     }];
     snapshot.sessions = vec![SessionView {
         id: 1,
+        public_handle: "session-1".into(),
+        revision: 1,
         session_key: None,
         runtime: "pty".into(),
         agent_profile: "inst".into(),
@@ -624,6 +632,8 @@ fn workflow_node_exposes_its_latest_session_interaction_target() {
         crate::run_monitor::RunMonitorSnapshot::from_parts(vec![step.clone()], vec![older, latest]);
     snapshot.sessions = vec![mf_agent::model::SessionView {
         id: 11,
+        public_handle: "session-11".into(),
+        revision: 1,
         session_key: None,
         runtime: "http".into(),
         agent_profile: "agent".into(),

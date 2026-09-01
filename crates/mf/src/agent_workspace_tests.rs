@@ -13,6 +13,8 @@ fn card(bucket: AttentionBucket) -> AgentCardOverview {
         project_name: "proj".into(),
         session: mf_agent::model::SessionView {
             id: 1,
+            public_handle: "session-1".into(),
+            revision: 1,
             session_key: None,
             runtime: "pty".into(),
             agent_profile: "claude".into(),
@@ -282,8 +284,9 @@ fn run_requested_opens_composer_and_submit_activates_task(cx: &mut gpui::TestApp
     // 清理真实进程
     for r in orch.store.list_runs_of_task(tasks[0].id).unwrap() {
         if let Some(sid) = r.session_id {
-            ctx.registry
-                .kill_session(&project.path().to_string_lossy(), sid);
+            if let Some(session) = orch.store.session_view(sid).unwrap() {
+                ctx.registry.kill_session(&session.public_handle);
+            }
         }
     }
     orch.stop();

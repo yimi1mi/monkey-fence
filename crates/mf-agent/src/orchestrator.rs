@@ -317,10 +317,9 @@ impl Orchestrator {
     ) -> Result<Arc<Orchestrator>> {
         // 异常退出恢复(设计 §13):宿主确认存活的会话重连;
         // 未知状态 → interrupted + awaiting-outcome(不判失败)
-        let root_str_for_probe = root.to_string_lossy().to_string();
         let host_for_probe = host.clone();
-        let recovered = store.recover_interrupted_with(&|session_id| {
-            host_for_probe.is_session_alive(&root_str_for_probe, session_id)
+        let recovered = store.recover_interrupted_with(&|session_handle| {
+            host_for_probe.is_session_alive(session_handle)
         })?;
         let orphan_steps = store.repair_orphan_steps()?;
         if !orphan_steps.is_empty() {
@@ -495,7 +494,7 @@ impl Orchestrator {
         // 停止未确认只记录(关闭路径不因个别进程阻塞而失败)
         if let Ok(runs) = self.store.running_runs() {
             for run in runs {
-                if let Err(e) = self.host.stop_run(&self.root_str, run.id) {
+                if let Err(e) = self.host.stop_run(&run.public_handle) {
                     log::warn!("关闭时停止 run {} 未确认: {e:#}", run.id);
                 }
             }
@@ -859,7 +858,7 @@ impl Orchestrator {
             if run.task_id != task_id {
                 continue;
             }
-            if let Err(e) = self.host.stop_run(&self.root_str, run.id) {
+            if let Err(e) = self.host.stop_run(&run.public_handle) {
                 stop_failures.push(format!("run {}: {e:#}", run.id));
                 if let Some(r) = self.store.set_run_status(run.id, RunStatus::Interrupted)? {
                     self.release_slot(run.id);
@@ -1853,7 +1852,7 @@ impl Orchestrator {
             return Ok(run); // 终态幂等
         }
         // stop_run 真终止进程并等待停止确认;确认后才结算/释放租约
-        if let Err(stop_err) = self.host.stop_run(&self.root_str, run.id) {
+        if let Err(stop_err) = self.host.stop_run(&run.public_handle) {
             // 未确认终止:不标 Cancelled、不释放租约/不动会话状态 ——
             // 进程可能仍在运行;转入 Interrupted 等待人工处理
             self.release_slot(run.id);
@@ -2680,8 +2679,12 @@ impl Orchestrator {
             anyhow::bail!("Run 已终结,不能再发送提示");
         }
         if let Some(session_id) = run.session_id {
+            let session = self
+                .store
+                .session_view(session_id)?
+                .ok_or_else(|| anyhow::anyhow!("Run {run_id} 的会话 {session_id} 不存在"))?;
             self.host
-                .send_prompt(&self.root_str, run_id, session_id, text);
+                .send_prompt(&run.public_handle, &session.public_handle, text)?;
         }
         if run.status == RunStatus::AwaitingOutcome {
             if let Some(r) = self.store.set_run_status(run_id, RunStatus::Running)? {
@@ -2747,8 +2750,8 @@ impl Orchestrator {
             .answer_question(question_id, answer)?
             .ok_or_else(|| anyhow::anyhow!("回答失败"))?;
         if let Some(run_id) = q.run_id {
-            self.host.answer_question(&self.root_str, run_id, answer);
             if let Some(run) = self.store.run_view(run_id)? {
+                self.host.answer_question(&run.public_handle, answer);
                 self.emit(SchedulerEvent::RunUpdated(run));
             }
         }
@@ -2808,6 +2811,7 @@ impl Orchestrator {
             task_id,
             session_id: view.id,
             display_session_id: display.id,
+            display_session_handle: display.public_handle.clone(),
             title: view.title.clone(),
             run_mode: launch_mode,
             plan,
@@ -2833,7 +2837,7 @@ impl Orchestrator {
             Ok(None) => anyhow::bail!("离散会话 {} 启动后读取失败", view.id),
             Err(db_error) => {
                 // 进程注册在展示会话键下 —— 补偿 kill 必须用 display ID
-                self.host.kill_ad_hoc(&self.root_str, display.id);
+                self.host.kill_ad_hoc(&display.public_handle);
                 // 二次状态写入失败不遮蔽主错误(kill 已执行,必须如实上报)
                 match self.store.set_ad_hoc_status(view.id, SessionStatus::Dead) {
                     Ok(Some(dead)) => {
@@ -3285,9 +3289,11 @@ impl Orchestrator {
             let spec = WorkflowLaunchSpec {
                 project_root: self.root.clone(),
                 run_id: run.id,
+                run_handle: run.public_handle.clone(),
                 step_id: step.id,
                 task_id: task.id,
                 session_id: session.id,
+                session_handle: session.public_handle.clone(),
                 session_key: policy.session_key().map(str::to_string),
                 attach_existing_session: attach_existing,
                 node_key: node.key.clone(),
@@ -3315,9 +3321,11 @@ impl Orchestrator {
         let spec = LaunchSpec {
             project_root: self.root.clone(),
             run_id: run.id,
+            run_handle: run.public_handle.clone(),
             step_id: step.id,
             task_id: task.id,
             session_id: session.id,
+            session_handle: session.public_handle.clone(),
             session_key: policy.session_key().map(str::to_string),
             attach_existing_session: attach_existing,
             profile: spec_profile,

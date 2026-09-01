@@ -34,6 +34,8 @@ fn step(id: i64, key: &str, status: StepStatus) -> mf_agent::StepView {
 fn run(id: i64, step_id: i64, status: RunStatus) -> RunView {
     RunView {
         id,
+        public_handle: format!("run-{id}"),
+        revision: 1,
         task_id: 1,
         step_id,
         revision_id: 1,

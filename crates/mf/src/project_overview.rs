@@ -456,7 +456,6 @@ impl ProjectOverviewHub {
                     .iter()
                     .map(|session| (session.id, session))
                     .collect();
-                let project_key = root.to_string_lossy().to_string();
                 let unavailable_session_steps: HashSet<i64> = latest_run_by_step
                     .iter()
                     .filter_map(|(step_id, run)| {
@@ -470,10 +469,7 @@ impl ProjectOverviewHub {
                                 session.status == SessionStatus::Dead
                                     || (session.status == SessionStatus::Idle
                                         && session.runtime != "http"
-                                        && !self
-                                            .ctx
-                                            .registry
-                                            .session_alive(&project_key, session_id))
+                                        && !self.ctx.registry.session_alive(&session.public_handle))
                             }
                         };
                         unavailable.then_some(*step_id)
@@ -581,13 +577,12 @@ impl ProjectOverviewHub {
                         .unwrap_or_else(|| session.agent_profile.clone())
                 };
                 let is_http = session.runtime == "http";
-                let project_str = root.to_string_lossy().to_string();
                 let tail = if is_http {
                     Vec::new()
                 } else {
-                    self.ctx.registry.pty_tail(&project_str, session.id, 4)
+                    self.ctx.registry.pty_tail(&session.public_handle, 4)
                 };
-                let alive = self.ctx.registry.session_alive(&project_str, session.id) || is_http;
+                let alive = self.ctx.registry.session_alive(&session.public_handle) || is_http;
                 let bucket = bucket_of(session, &run, alive);
                 agent_cards.push(AgentCardOverview {
                     project_root: root.clone(),

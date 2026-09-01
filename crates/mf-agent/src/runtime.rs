@@ -87,13 +87,14 @@ pub struct AgentTypeDescriptor {
 /// 一次 Agent Run 的启动规格。
 #[derive(Debug, Clone)]
 pub struct LaunchSpec {
-    /// 项目根(注册表路由键:run/session id 是项目内行号,跨项目会碰撞;
-    /// 与进程 cwd 无关 —— cwd 是 `workdir`/租约路径)。
+    /// 项目根只描述项目归属；运行时注册表不得用路径寻址。
     pub project_root: PathBuf,
     pub run_id: i64,
+    pub run_handle: String,
     pub step_id: i64,
     pub task_id: i64,
     pub session_id: i64,
+    pub session_handle: String,
     pub session_key: Option<String>,
     /// 复用已存在(存活)的会话则不再拉起进程。
     pub attach_existing_session: bool,
@@ -126,6 +127,8 @@ pub struct AdHocLaunchSpec {
     /// 展示会话行号(agent_sessions):进程注册、卡片与终端交互用;
     /// 与 session_id(ad_hoc_sessions 行)分属两个表,互不挤占命名空间。
     pub display_session_id: i64,
+    /// `agent_sessions.public_handle`，是展示终端的唯一运行时路由身份。
+    pub display_session_handle: String,
     /// 退出事件通道(tag 为 session_id):进程结束时宿主上报
     /// `RuntimeEvent::AdHocExited`,由 Orchestrator 做完成分类。
     pub events: crossbeam_channel::Sender<TaggedRuntimeEvent>,
@@ -136,13 +139,14 @@ pub struct AdHocLaunchSpec {
 /// 后启动。宿主不得改写 `run_temp`(可信物化根由调度器提供)。
 #[derive(Debug, Clone)]
 pub struct WorkflowLaunchSpec {
-    /// 项目根(注册表路由键;worktree 租约路径只作进程 cwd —— 用租约
-    /// 路径注册会让 stop_run/恢复探测按项目根寻址时找不到绑定)。
+    /// 项目根只描述归属；worktree 租约路径只作进程 cwd。
     pub project_root: PathBuf,
     pub run_id: i64,
+    pub run_handle: String,
     pub step_id: i64,
     pub task_id: i64,
     pub session_id: i64,
+    pub session_handle: String,
     pub session_key: Option<String>,
     /// 复用已存在(存活)的会话则不再拉起进程。
     pub attach_existing_session: bool,
@@ -216,28 +220,27 @@ pub trait RuntimeHost: Send + Sync {
     /// 不得发明 Step / Agent Run,也不得触碰 Task 状态。
     fn launch_ad_hoc(&self, spec: AdHocLaunchSpec) -> Result<()>;
     /// 向运行中的 Agent 追加提示。
-    /// `project`:项目根路径 —— run/session id 是各项目数据库的行号,
-    /// 跨项目会碰撞,宿主必须以 (project, id) 定位真实会话。
-    fn send_prompt(&self, project: &str, run_id: i64, session_id: i64, text: &str);
+    /// 运行时只接受 Store 持久化的 opaque handle；数据库行号不得参与寻址。
+    fn send_prompt(&self, run_handle: &str, session_handle: &str, text: &str) -> Result<()>;
     /// 停止一次运行:真终止 run 绑定的会话进程,并**等待真实终止确认**
     /// (child 已被 wait/reap、生命周期已收口)后才返回 Ok。
     /// Err = 停止未在时限内确认(进程可能仍在运行):调用方不得标记
     /// Cancelled / 释放执行租约,应转入 Interrupted 等人工处理。
     /// 无绑定会话(已退出/未知 run)时 Ok(无进程可停)。
-    fn stop_run(&self, project: &str, run_id: i64) -> Result<()>;
+    fn stop_run(&self, run_handle: &str) -> Result<()>;
     /// 强制终止整个会话(进程)。
-    fn kill_session(&self, project: &str, session_id: i64);
+    fn kill_session(&self, session_handle: &str);
     /// 强制终止离散 CLI 会话(补偿路径:启动后 DB 写失败等场景,
     /// 必须杀掉进程,不留孤儿)。`session_id` 是展示会话行
     /// (agent_sessions)的编号 —— 进程注册在展示会话键下;
     /// ad_hoc_sessions 行号只作为事件 tag,不用于进程路由。
-    fn kill_ad_hoc(&self, project: &str, display_session_id: i64);
+    fn kill_ad_hoc(&self, display_session_handle: &str);
     /// 回答 Agent 的提问(阻塞等待中的 HTTP Runtime)。
-    fn answer_question(&self, project: &str, run_id: i64, answer: &str);
+    fn answer_question(&self, run_handle: &str, answer: &str);
     /// 宿主是否能确认会话仍存活(重启恢复用)。
     /// 默认 false(无法确认 = 未知状态,绝不推断为失败)。
-    fn is_session_alive(&self, project: &str, session_id: i64) -> bool {
-        let _ = (project, session_id);
+    fn is_session_alive(&self, session_handle: &str) -> bool {
+        let _ = session_handle;
         false
     }
 }

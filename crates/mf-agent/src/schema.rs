@@ -5,11 +5,11 @@
 //!
 //! 旧库文件(`orchestration.db` 等)既不读取也不删除;版本号写入 `user_version` pragma。
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-pub const PROJECT_SCHEMA_VERSION: i64 = 6;
+pub const PROJECT_SCHEMA_VERSION: i64 = 7;
 pub const CATALOG_SCHEMA_VERSION: i64 = 1;
 
 /// 项目库路径:`<project>/.mf-agent/workflow-v1.db`。
@@ -48,36 +48,75 @@ pub fn initialize_schema(conn: &Connection, ddl: &str, version: i64) -> Result<(
 /// Backup 前置屏障(0 < user_version < target 的真实升级先备份再迁移);
 /// `user_version = 0` 视为全新库,从 v1 DDL 起完整应用,不触发备份。
 pub fn upgrade_project(conn: &mut Connection, target: i64) -> Result<()> {
+    let metric_key =
+        crate::observability::store_metric_key(conn, crate::migration::StoreKind::Project);
+    let pending = std::cell::RefCell::new(None);
     crate::migration::upgrade_with_barrier(
         conn,
         crate::migration::StoreKind::Project,
         target,
-        &apply_project_chain,
-    )
+        &|tx, from, to| {
+            *pending.borrow_mut() = apply_project_chain(tx, from, to)?;
+            Ok(())
+        },
+    )?;
+    if let Some(stats) = pending.into_inner() {
+        let outbox_depth: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM projection_outbox WHERE published_at IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        log::info!(
+            "migration_identity_backfill store=project schema_version=7 aggregate_handles={} workflows={} nodes_created={} edges_created={} nodes_removed={} edges_removed={} outbox_depth={}",
+            stats.aggregate_handles,
+            stats.identity.workflows,
+            stats.identity.identity.nodes_created,
+            stats.identity.identity.edges_created,
+            stats.identity.identity.nodes_deleted,
+            stats.identity.identity.edges_deleted,
+            outbox_depth
+        );
+        crate::observability::record_identity_backfill(
+            &metric_key,
+            stats.aggregate_handles,
+            stats.identity.identity.nodes_created,
+            stats.identity.identity.edges_created,
+        );
+    }
+    Ok(())
 }
 
 /// `(from, to]` 区间的 v1–v6 DDL/回填链(在迁移事务内执行)。
-fn apply_project_chain(tx: &rusqlite::Transaction, from: i64, to: i64) -> Result<()> {
-    if from < 1 && to >= 1 {
+fn apply_project_chain(
+    tx: &rusqlite::Transaction,
+    from: i64,
+    to: i64,
+) -> Result<Option<ProjectMigrationStats>> {
+    // 每次真实升级都重放幂等地基/repair 探针:早期开发库可能已标 v1–v6
+    // 却缺表/列。必须先补齐完整历史 schema,不能把残缺库标成 v7。
+    if to >= 1 {
         tx.execute_batch(PROJECT_SCHEMA_V1)?;
     }
-    if from < 2 && to >= 2 {
+    if to >= 2 {
         tx.execute_batch(PROJECT_SCHEMA_V2_DELTA)?;
         backfill_early_dev_columns(tx)?;
     }
-    if from < 3 && to >= 3 {
+    if to >= 3 {
         backfill_digest_columns(tx)?;
     }
-    if from < 4 && to >= 4 {
+    if to >= 4 {
         backfill_merge_batch_columns(tx)?;
     }
-    if from < 5 && to >= 5 {
+    if to >= 5 {
         backfill_merge_owner_columns(tx)?;
     }
-    if from < 6 && to >= 6 {
+    if to >= 6 {
         tx.execute_batch(PROJECT_SCHEMA_V6_DELTA)?;
     }
-    Ok(())
+    if from < 7 && to >= 7 {
+        return Ok(Some(backfill_project_v7(tx)?));
+    }
+    Ok(None)
 }
 
 /// 早期开发库(v1 期间缺列/缺表的库,user_version 已是 1)的幂等补齐:
@@ -529,3 +568,311 @@ CREATE TABLE IF NOT EXISTS project_workflows (
     updated_at TEXT NOT NULL
 );
 ";
+
+// ---------------------------------------------------------------------------
+// v7 增量(T1b,canonical spec §3.2):expand-only——持久 opaque identity、
+// 语义/展示双 revision、T1 本地持久表。
+//
+// 持久 aggregate 审计清单(逐一决定,不凭模糊规则):
+//   加 public_handle:agent_tasks(Task;Workflow Run 由 Task 承载)、
+//     pipeline_revisions(Pipeline Revision;已有 per-task `revision` 列,
+//     语义保持不变,不另加)、steps、agent_sessions(SessionRegistry 改用
+//     持久 handle)、agent_runs、ad_hoc_sessions、project_workflows。
+//   另补 revision(DEFAULT 1):agent_tasks、steps、agent_sessions、
+//     agent_runs、ad_hoc_sessions。
+//   不加 handle:step_deps(纯 join)、events(事件日志)、step_questions
+//     (依附 Task/Step/Run 的交互记录)、handoffs(Agent Run 的不可变负载,
+//     经所属 run 定位)、execution_leases / pending_merges /
+//     join_deferrals / merge_batches(内部编排状态机,自有租约键)、
+//     task_workflows(Task 聚合的本地草稿投影,经 task 定位)。
+//
+// SQLite 限制:ALTER ADD COLUMN 不允许 UNIQUE/PRIMARY KEY;NOT NULL 列
+// 必须带非 NULL 默认。因此 handle 列先以 `DEFAULT ''` 加入,同事务回填
+// 真实 UUIDv7 后再建唯一索引(空串默认迁移后失效:全部写入都经 Store
+// 深模块生成 handle,唯一索引最多再容忍一行 '' 即拒绝)。
+// ---------------------------------------------------------------------------
+
+/// v7 新表:project_meta singleton、node/edge identity、presentation、
+/// position、command receipt、outbox、terminal transcript。
+/// identity/presentation 经 FK 随所属工作流级联清理(显式清理在
+/// Store 事务 API 中同事务执行,两者互为兜底)。
+pub const PROJECT_SCHEMA_V7_DELTA: &str = "
+CREATE TABLE IF NOT EXISTS project_meta (
+    id INTEGER PRIMARY KEY CHECK(id = 1),
+    workflow_collection_revision INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS workflow_node_identity (
+    workflow_handle TEXT NOT NULL
+        REFERENCES project_workflows(public_handle) ON DELETE CASCADE,
+    node_key TEXT NOT NULL,
+    node_handle TEXT NOT NULL UNIQUE,
+    UNIQUE(workflow_handle, node_key)
+);
+CREATE TABLE IF NOT EXISTS workflow_edge_identity (
+    workflow_handle TEXT NOT NULL
+        REFERENCES project_workflows(public_handle) ON DELETE CASCADE,
+    upstream_node_key TEXT NOT NULL,
+    downstream_node_key TEXT NOT NULL,
+    edge_handle TEXT NOT NULL UNIQUE,
+    UNIQUE(workflow_handle, upstream_node_key, downstream_node_key)
+);
+CREATE TABLE IF NOT EXISTS workflow_presentation (
+    workflow_handle TEXT NOT NULL UNIQUE
+        REFERENCES project_workflows(public_handle) ON DELETE CASCADE,
+    viewport_json TEXT,
+    collapse_json TEXT,
+    layout_json TEXT
+);
+CREATE TABLE IF NOT EXISTS node_position (
+    node_handle TEXT NOT NULL UNIQUE
+        REFERENCES workflow_node_identity(node_handle) ON DELETE CASCADE,
+    x REAL NOT NULL,
+    y REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS command_receipt (
+    command_id TEXT NOT NULL UNIQUE,
+    semantic_digest TEXT NOT NULL,
+    aggregate_handle TEXT NOT NULL,
+    result_revisions TEXT NOT NULL DEFAULT '{}',
+    state TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    finalized_at TEXT
+);
+CREATE TABLE IF NOT EXISTS projection_outbox (
+    outbox_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_json TEXT NOT NULL,
+    published_at TEXT
+);
+CREATE TABLE IF NOT EXISTS terminal_transcript (
+    session_handle TEXT PRIMARY KEY NOT NULL,
+    terminal_epoch INTEGER NOT NULL,
+    final_state TEXT NOT NULL
+        CHECK(final_state IN ('live', 'complete', 'crash_incomplete', 'lost')),
+    durable_through_seq INTEGER NOT NULL,
+    exit_code INTEGER,
+    exit_signal INTEGER,
+    as_of_seq INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS terminal_transcript_segment (
+    session_handle TEXT NOT NULL
+        REFERENCES terminal_transcript(session_handle) ON DELETE CASCADE,
+    seq_start INTEGER NOT NULL,
+    seq_end INTEGER NOT NULL,
+    bytes BLOB NOT NULL,
+    PRIMARY KEY (session_handle, seq_start),
+    CHECK(seq_start >= 1),
+    CHECK(seq_end >= seq_start)
+);
+CREATE INDEX IF NOT EXISTS idx_workflow_node_identity_handle
+    ON workflow_node_identity(workflow_handle);
+CREATE INDEX IF NOT EXISTS idx_workflow_edge_identity_handle
+    ON workflow_edge_identity(workflow_handle);
+";
+
+/// v7 handle 列 ALTER(经 has_column 守卫幂等;残缺库缺表跳过)。
+const V7_HANDLE_COLUMN_DDLS: &[&str] = &[
+    "ALTER TABLE agent_tasks ADD COLUMN public_handle TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE pipeline_revisions ADD COLUMN public_handle TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE steps ADD COLUMN public_handle TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE agent_sessions ADD COLUMN public_handle TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE agent_runs ADD COLUMN public_handle TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE ad_hoc_sessions ADD COLUMN public_handle TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE project_workflows ADD COLUMN public_handle TEXT NOT NULL DEFAULT ''",
+];
+
+/// v7 缺 revision 的 aggregate 补列(pipeline_revisions 已有 per-task
+/// `revision`,语义不变,不在此列)。
+const V7_REVISION_COLUMN_DDLS: &[&str] = &[
+    "ALTER TABLE agent_tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE steps ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE agent_sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE agent_runs ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE ad_hoc_sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 1",
+];
+
+/// project_workflows 双 revision 列(语义/展示分离,互不串增)。
+const V7_WORKFLOW_REVISION_DDLS: &[&str] = &[
+    "ALTER TABLE project_workflows ADD COLUMN semantic_revision INTEGER NOT NULL DEFAULT 1",
+    "ALTER TABLE project_workflows ADD COLUMN presentation_revision INTEGER NOT NULL DEFAULT 1",
+];
+
+/// handle 唯一索引:在回填消灭全部 '' 之后创建(见上文 SQLite 限制)。
+/// 残缺旧库缺表时跳过(`CREATE INDEX` 对缺表报错,与 ALTER 同口径)。
+const V7_HANDLE_INDEX_DDLS: &[(&str, &str)] = &[
+    (
+        "agent_tasks",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_tasks_public_handle
+         ON agent_tasks(public_handle)",
+    ),
+    (
+        "pipeline_revisions",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_pipeline_revisions_public_handle
+         ON pipeline_revisions(public_handle)",
+    ),
+    (
+        "steps",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_steps_public_handle
+         ON steps(public_handle)",
+    ),
+    (
+        "agent_sessions",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_sessions_public_handle
+         ON agent_sessions(public_handle)",
+    ),
+    (
+        "agent_runs",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_runs_public_handle
+         ON agent_runs(public_handle)",
+    ),
+    (
+        "ad_hoc_sessions",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_ad_hoc_sessions_public_handle
+         ON ad_hoc_sessions(public_handle)",
+    ),
+    (
+        "project_workflows",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_project_workflows_public_handle
+         ON project_workflows(public_handle)",
+    ),
+];
+
+pub(crate) fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let mut stmt =
+        conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1")?;
+    Ok(stmt.exists([table])?)
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let has = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .any(|c| c.map(|c| c == column).unwrap_or(false));
+    Ok(has)
+}
+
+/// 从 ALTER DDL 中提取 `(表名, 列名)`(仅用于幂等守卫,不执行)。
+fn table_column_of_alter(ddl: &str) -> (&str, &str) {
+    let table = ddl
+        .split_whitespace()
+        .nth(2)
+        .unwrap_or_else(|| panic!("非法 ALTER DDL: {ddl}"));
+    let column = ddl
+        .rsplit_once("ADD COLUMN ")
+        .map(|(_, rest)| rest.split_whitespace().next().unwrap_or(""))
+        .unwrap_or_else(|| panic!("非法 ALTER DDL: {ddl}"));
+    (table, column)
+}
+
+fn apply_guarded_alters(conn: &Connection, ddls: &[&str]) -> Result<()> {
+    for ddl in ddls {
+        let (table, column) = table_column_of_alter(ddl);
+        if !table_exists(conn, table)? {
+            // 残缺旧库缺表:无从 ALTER,与 v2 早期补列同一容错口径
+            continue;
+        }
+        if !column_exists(conn, table, column)? {
+            conn.execute(ddl, [])?;
+        }
+    }
+    Ok(())
+}
+
+/// 为 `table` 回填空 handle 行(每行一个新 UUIDv7,永不复用)。
+fn backfill_public_handles(conn: &Connection, table: &str) -> Result<usize> {
+    if !table_exists(conn, table)? {
+        return Ok(0);
+    }
+    let mut stmt = conn.prepare(&format!(
+        "SELECT rowid FROM {table} WHERE public_handle = '' ORDER BY rowid"
+    ))?;
+    let ids: Vec<i64> = stmt
+        .query_map([], |r| r.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    let count = ids.len();
+    for id in ids {
+        conn.execute(
+            &format!("UPDATE {table} SET public_handle = ?1 WHERE rowid = ?2"),
+            rusqlite::params![crate::store::new_public_handle(), id],
+        )?;
+    }
+    Ok(count)
+}
+
+/// v6→v7 迁移体(单一 writer-lock 事务内执行;任一步失败整体回滚):
+/// ALTER 加列 → 回填聚合/工作流 handle → handle 唯一索引 → 新表 DDL →
+/// project_meta singleton → 既有工作流图 node/edge identity 回填。
+/// graph_json 解析失败、重复 node key、未知 dependency 一律 fail-closed。
+#[derive(Debug, Default)]
+struct ProjectMigrationStats {
+    aggregate_handles: usize,
+    identity: WorkflowIdentityBackfillStats,
+}
+
+fn backfill_project_v7(tx: &rusqlite::Transaction) -> Result<ProjectMigrationStats> {
+    apply_guarded_alters(tx, V7_HANDLE_COLUMN_DDLS)?;
+    apply_guarded_alters(tx, V7_REVISION_COLUMN_DDLS)?;
+    apply_guarded_alters(tx, V7_WORKFLOW_REVISION_DDLS)?;
+    let mut aggregate_handles = 0usize;
+    for table in [
+        "agent_tasks",
+        "pipeline_revisions",
+        "steps",
+        "agent_sessions",
+        "agent_runs",
+        "ad_hoc_sessions",
+        "project_workflows",
+    ] {
+        aggregate_handles += backfill_public_handles(tx, table)?;
+    }
+    for (table, ddl) in V7_HANDLE_INDEX_DDLS {
+        if table_exists(tx, table)? {
+            tx.execute(ddl, [])?;
+        }
+    }
+    tx.execute_batch(PROJECT_SCHEMA_V7_DELTA)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO project_meta (id, workflow_collection_revision) VALUES (1, 1)",
+        [],
+    )?;
+    Ok(ProjectMigrationStats {
+        aggregate_handles,
+        identity: backfill_workflow_identity(tx)?,
+    })
+}
+
+/// 为每个现存 project_workflow 回填 node/edge identity。
+/// 既有 `(workflow_handle, node_key)` 行保留原 handle(幂等重跑不改);
+/// 节点 key 用 `WorkflowNodeDraft.key`,边按 downstream deps 键对。
+#[derive(Debug, Default)]
+struct WorkflowIdentityBackfillStats {
+    workflows: usize,
+    identity: crate::store::IdentitySyncStats,
+}
+
+fn backfill_workflow_identity(tx: &rusqlite::Transaction) -> Result<WorkflowIdentityBackfillStats> {
+    if !table_exists(tx, "project_workflows")? {
+        return Ok(WorkflowIdentityBackfillStats::default());
+    }
+    let mut stmt = tx.prepare(
+        "SELECT workflow_key, graph_json, public_handle
+         FROM project_workflows ORDER BY workflow_key",
+    )?;
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    drop(stmt);
+    let mut stats = WorkflowIdentityBackfillStats::default();
+    for (key, graph_json, handle) in rows {
+        anyhow::ensure!(
+            !handle.is_empty(),
+            "工作流 `{key}` 缺少持久 handle,identity 无法回填"
+        );
+        let nodes = crate::workflow::parse_graph_json(&graph_json)
+            .with_context(|| format!("工作流 `{key}` graph_json 损坏,拒绝回填 identity"))?;
+        stats.identity += crate::store::sync_workflow_identity_tx_with_stats(tx, &handle, &nodes)
+            .with_context(|| format!("工作流 `{key}` identity 回填失败"))?;
+        stats.workflows += 1;
+    }
+    Ok(stats)
+}

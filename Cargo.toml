@@ -60,6 +60,8 @@ aes-gcm = "0.10"
 rand = "0.8"
 zeroize = "1"
 sha2 = "0.10"
+# T1b:持久 opaque handle 一律 UUIDv7(时间有序;不把系统时间排序当业务正确性)
+uuid = { version = "1", features = ["v7"] }
 keyring = "3"
 errno = "0.3"
 

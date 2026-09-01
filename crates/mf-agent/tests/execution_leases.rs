@@ -85,7 +85,7 @@ impl ExecutionDirectoryProvider for RecordingProvider {
 struct MockHost {
     launches: Mutex<Vec<LaunchSpec>>,
     senders: Mutex<HashMap<String, Sender<(i64, RuntimeEvent)>>>,
-    stopped: Mutex<Vec<i64>>,
+    stopped: Mutex<Vec<String>>,
 }
 
 impl RuntimeHost for MockHost {
@@ -108,14 +108,21 @@ impl RuntimeHost for MockHost {
     fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) -> anyhow::Result<()> {
         Ok(())
     }
-    fn send_prompt(&self, _p: &str, _r: i64, _s: i64, _t: &str) {}
-    fn stop_run(&self, _p: &str, r: i64) -> anyhow::Result<()> {
-        self.stopped.lock().push(r);
+    fn send_prompt(
+        &self,
+        _run_handle: &str,
+        _session_handle: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
-    fn kill_session(&self, _p: &str, _s: i64) {}
-    fn kill_ad_hoc(&self, _p: &str, _s: i64) {}
-    fn answer_question(&self, _p: &str, _r: i64, _a: &str) {}
+    fn stop_run(&self, run_handle: &str) -> anyhow::Result<()> {
+        self.stopped.lock().push(run_handle.to_string());
+        Ok(())
+    }
+    fn kill_session(&self, _session_handle: &str) {}
+    fn kill_ad_hoc(&self, _display_session_handle: &str) {}
+    fn answer_question(&self, _run_handle: &str, _answer: &str) {}
 }
 
 // ---------- Fixture ----------
@@ -191,7 +198,7 @@ impl Fixture {
         assert!(ok, "等待步骤进入 running 超时");
     }
 
-    fn host_stopped(&self) -> Vec<i64> {
+    fn host_stopped(&self) -> Vec<String> {
         self.host.stopped.lock().clone()
     }
 
@@ -515,7 +522,7 @@ fn cancel_run_stops_process_and_releases_lease() {
     assert_eq!(after.status, mf_agent::model::RunStatus::Cancelled);
     // 进程已请求停止(完整 Orchestrator 动作,不是只改 DB 状态)
     assert!(
-        fx.host_stopped().contains(&run.id),
+        fx.host_stopped().contains(&run.public_handle),
         "取消必须终止进程: {:?}",
         fx.host_stopped()
     );

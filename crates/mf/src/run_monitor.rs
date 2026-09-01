@@ -171,6 +171,8 @@ impl RunMonitorSnapshot {
 fn placeholder_run() -> RunView {
     RunView {
         id: 0,
+        public_handle: String::new(),
+        revision: 0,
         task_id: 0,
         step_id: 0,
         revision_id: 0,

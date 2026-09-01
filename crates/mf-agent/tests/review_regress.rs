@@ -106,14 +106,21 @@ impl RuntimeHost for MockHost {
         }
         let _ = events.send((run_id, RuntimeEvent::Launched));
     }
-    fn send_prompt(&self, _project: &str, _run_id: i64, _session_id: i64, _text: &str) {}
-    fn stop_run(&self, _project: &str, _run_id: i64) -> anyhow::Result<()> {
+    fn send_prompt(
+        &self,
+        _run_handle: &str,
+        _session_handle: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn stop_run(&self, _run_handle: &str) -> anyhow::Result<()> {
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         Ok(())
     }
-    fn kill_session(&self, _project: &str, _session_id: i64) {}
-    fn kill_ad_hoc(&self, _project: &str, _session_id: i64) {}
-    fn answer_question(&self, _project: &str, _run_id: i64, _answer: &str) {}
+    fn kill_session(&self, _session_handle: &str) {}
+    fn kill_ad_hoc(&self, _display_session_handle: &str) {}
+    fn answer_question(&self, _run_handle: &str, _answer: &str) {}
     fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) -> anyhow::Result<()> {
         Ok(())
     }

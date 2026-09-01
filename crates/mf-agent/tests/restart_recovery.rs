@@ -20,7 +20,7 @@ struct MockHost {
     launches: Mutex<Vec<LaunchSpec>>,
     senders: Mutex<HashMap<String, Sender<(i64, RuntimeEvent)>>>,
     /// 重启后上报的会话存活状态
-    session_alive: Mutex<HashMap<i64, bool>>,
+    session_alive: Mutex<HashMap<String, bool>>,
 }
 
 impl RuntimeHost for MockHost {
@@ -43,17 +43,24 @@ impl RuntimeHost for MockHost {
     fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) -> anyhow::Result<()> {
         Ok(())
     }
-    fn send_prompt(&self, _p: &str, _r: i64, _s: i64, _t: &str) {}
-    fn stop_run(&self, _p: &str, _r: i64) -> anyhow::Result<()> {
+    fn send_prompt(
+        &self,
+        _run_handle: &str,
+        _session_handle: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
-    fn kill_session(&self, _p: &str, _s: i64) {}
-    fn kill_ad_hoc(&self, _p: &str, _s: i64) {}
-    fn answer_question(&self, _p: &str, _r: i64, _a: &str) {}
-    fn is_session_alive(&self, _project: &str, session_id: i64) -> bool {
+    fn stop_run(&self, _run_handle: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn kill_session(&self, _session_handle: &str) {}
+    fn kill_ad_hoc(&self, _display_session_handle: &str) {}
+    fn answer_question(&self, _run_handle: &str, _answer: &str) {}
+    fn is_session_alive(&self, session_handle: &str) -> bool {
         self.session_alive
             .lock()
-            .get(&session_id)
+            .get(session_handle)
             .copied()
             .unwrap_or(false)
     }
@@ -135,7 +142,14 @@ fn recover_fixture(session_alive: bool, pre_exit_code: Option<i32>) -> Recovered
     // 重启:宿主上报会话存活状态
     let store = Store::open(&db).unwrap();
     let host = Arc::new(MockHost::default());
-    host.session_alive.lock().insert(session_id, session_alive);
+    let session_handle = store
+        .session_view(session_id)
+        .unwrap()
+        .unwrap()
+        .public_handle;
+    host.session_alive
+        .lock()
+        .insert(session_handle, session_alive);
     let orch = Orchestrator::start(
         store.clone(),
         tmp.path().to_path_buf(),

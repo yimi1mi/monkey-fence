@@ -18,6 +18,7 @@ pub mod execution_directory;
 pub mod handoff;
 pub mod migration;
 pub mod model;
+pub mod observability;
 pub mod orchestrator;
 pub mod pipeline;
 pub mod provider;
@@ -45,9 +46,10 @@ pub use config::{
 pub use handoff::Handoff;
 pub use migration::{error_code, BackupManifest, MigrationError, StoreKind};
 pub use model::{
-    AdHocSessionView, AgentState, InstanceScope, RevisionStatus, RunMode, RunStatus,
-    SchedulerEvent, SessionStatus, SettleError, SettleOutcome, Settlement, StepQuestionView,
-    StepStatus, StepView, TaskStatus, TaskView,
+    AdHocSessionView, AgentState, InstanceScope, RevisionAxis, RevisionConflict, RevisionStatus,
+    RunMode, RunStatus, SchedulerEvent, SessionStatus, SettleError, SettleOutcome, Settlement,
+    StepQuestionView, StepStatus, StepView, TaskStatus, TaskView, WorkflowEdgeIdentityRow,
+    WorkflowNodeIdentityRow, WorkflowPresentationState,
 };
 pub use model::{RetryMode, RetryPolicy};
 pub use orchestrator::{

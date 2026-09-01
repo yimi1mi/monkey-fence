@@ -464,9 +464,9 @@ fn project(w: &World, wf_key: &str, task_id: Option<i64>) -> Value {
         .answers
         .lock()
         .iter()
-        .map(|(run_id, answer)| {
+        .map(|(run_handle, answer)| {
             let step_key = store
-                .run_view(*run_id)
+                .run_view_by_handle(run_handle)
                 .unwrap()
                 .map(|run| key_of(run.step_id))
                 .unwrap_or_default();

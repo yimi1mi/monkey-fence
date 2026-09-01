@@ -3,5 +3,9 @@
 //! 因此本文件聚合全部契约模块。
 
 mod backup_before_migration;
+mod identity_backfill;
+mod identity_gc;
+mod project_v7_migration;
+mod revision_cas;
 mod schema_guards;
 mod support;

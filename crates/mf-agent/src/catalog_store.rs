@@ -59,6 +59,7 @@ impl CatalogStore {
             crate::migration::StoreKind::Catalog,
             CATALOG_SCHEMA_VERSION,
         )?;
+        crate::migration::restrict_active_database_to_current_user(&conn)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
 
@@ -100,6 +101,19 @@ impl CatalogStore {
         // 持久 WAL 模式只在初始化/repair/current-version lock 成功后启用。
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        crate::migration::restrict_active_database_to_current_user(&conn)?;
+        log::info!(
+            "store_open store=catalog schema_version={} outbox_depth=0",
+            schema_version_of(&conn)?
+        );
+        let metric_key =
+            crate::observability::store_metric_key(&conn, crate::migration::StoreKind::Catalog);
+        crate::observability::record_store_open(
+            &metric_key,
+            crate::migration::StoreKind::Catalog,
+            schema_version_of(&conn)?,
+            0,
+        );
         Ok(CatalogStore {
             conn: Mutex::new(conn),
         })

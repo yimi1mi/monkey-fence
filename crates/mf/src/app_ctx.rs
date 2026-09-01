@@ -695,13 +695,14 @@ impl AppCtx {
             idx.map(|i| projects.remove(i))
         };
         if let Some(h) = handle {
-            let project_str = h.root.to_string_lossy().to_string();
             // 先快照活动 run(取消后 running_runs 会变空,先取后杀才有效)
             let active_runs = h.orchestrator.store.running_runs().unwrap_or_default();
             // 杀掉该项目 run 关联的会话(按项目作用域,不会误杀其他项目)
             for run in &active_runs {
                 if let Some(sid) = run.session_id {
-                    self.registry.kill_session(&project_str, sid);
+                    if let Ok(Some(session)) = h.orchestrator.store.session_view(sid) {
+                        self.registry.kill_session(&session.public_handle);
+                    }
                 }
             }
             // 再取消任务(终止调度)

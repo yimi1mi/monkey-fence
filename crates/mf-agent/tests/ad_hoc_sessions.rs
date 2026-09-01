@@ -64,13 +64,20 @@ impl RuntimeHost for MockHost {
     }
 
     fn launch(&self, _spec: LaunchSpec, _events: Sender<(i64, RuntimeEvent)>) {}
-    fn send_prompt(&self, _project: &str, _run_id: i64, _session_id: i64, _text: &str) {}
-    fn stop_run(&self, _project: &str, _run_id: i64) -> anyhow::Result<()> {
+    fn send_prompt(
+        &self,
+        _run_handle: &str,
+        _session_handle: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
-    fn kill_session(&self, _project: &str, _session_id: i64) {}
-    fn kill_ad_hoc(&self, _project: &str, _session_id: i64) {}
-    fn answer_question(&self, _project: &str, _run_id: i64, _answer: &str) {}
+    fn stop_run(&self, _run_handle: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn kill_session(&self, _session_handle: &str) {}
+    fn kill_ad_hoc(&self, _display_session_handle: &str) {}
+    fn answer_question(&self, _run_handle: &str, _answer: &str) {}
     fn launch_ad_hoc(&self, spec: AdHocLaunchSpec) -> anyhow::Result<()> {
         let session_id = spec.session_id;
         let events = spec.events.clone();
@@ -592,13 +599,13 @@ fn mark_launched_only_transitions_from_starting() {
     assert!(marked2.launched_at.is_some());
 }
 
-// ---------- DB 失败补偿:kill 必须用 display session ID ----------
+// ---------- DB 失败补偿:kill 必须用 display session handle ----------
 
 /// 记录 kill_ad_hoc 参数的宿主;launch 钩子里持有 IMMEDIATE 写锁,
 /// 使"启动成功之后"的状态写入(mark_ad_hoc_launched)必然失败。
 struct KillRecordingHost {
     inner: MockHost,
-    kills: Mutex<Vec<(String, i64)>>,
+    kills: Mutex<Vec<String>>,
     db_path: std::path::PathBuf,
     write_lock: Mutex<Option<rusqlite::Connection>>,
 }
@@ -612,17 +619,22 @@ impl RuntimeHost for KillRecordingHost {
         Ok(())
     }
     fn launch(&self, _spec: LaunchSpec, _events: Sender<(i64, RuntimeEvent)>) {}
-    fn send_prompt(&self, _p: &str, _r: i64, _s: i64, _t: &str) {}
-    fn stop_run(&self, _p: &str, _r: i64) -> anyhow::Result<()> {
+    fn send_prompt(
+        &self,
+        _run_handle: &str,
+        _session_handle: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
-    fn kill_session(&self, _p: &str, _s: i64) {}
-    fn kill_ad_hoc(&self, project: &str, display_session_id: i64) {
-        self.kills
-            .lock()
-            .push((project.to_string(), display_session_id));
+    fn stop_run(&self, _run_handle: &str) -> anyhow::Result<()> {
+        Ok(())
     }
-    fn answer_question(&self, _p: &str, _r: i64, _a: &str) {}
+    fn kill_session(&self, _session_handle: &str) {}
+    fn kill_ad_hoc(&self, display_session_handle: &str) {
+        self.kills.lock().push(display_session_handle.to_string());
+    }
+    fn answer_question(&self, _run_handle: &str, _answer: &str) {}
     fn launch_ad_hoc(&self, spec: AdHocLaunchSpec) -> anyhow::Result<()> {
         // 进程"启动成功"后、DB 状态写入前:锁住写库
         let conn = rusqlite::Connection::open(&self.db_path)?;
@@ -634,7 +646,7 @@ impl RuntimeHost for KillRecordingHost {
 }
 
 #[test]
-fn db_failure_after_launch_kills_process_via_display_id() {
+fn db_failure_after_launch_kills_process_via_display_handle() {
     // 文件库 + 第二连接持有 IMMEDIATE 写锁:启动后的状态写入必然失败
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("adhoc.db");
@@ -678,8 +690,7 @@ fn db_failure_after_launch_kills_process_via_display_id() {
         "启动后 DB 写失败必须补偿杀进程: {err:#}"
     );
 
-    // 补偿 kill 必须传 display session ID(agent_sessions 行),
-    // 不是 ad_hoc_sessions 行号 —— 两者分属两套自增序列。
+    // 补偿 kill 必须传 display session 的持久 opaque handle。
     let ad_hoc_row: i64 = store
         .with_conn(|c| {
             Ok(c.query_row(
@@ -691,13 +702,14 @@ fn db_failure_after_launch_kills_process_via_display_id() {
         .unwrap();
     let kills = host.kills.lock().clone();
     assert_eq!(kills.len(), 1, "必须补偿 kill 恰好一次: {kills:?}");
-    assert_ne!(kills[0].1, decoy.id, "不得误杀 decoy 会话");
-    assert_ne!(kills[0].1, ad_hoc_row, "kill 参数不得是 ad-hoc 行号");
-    // display 行确实存在且不同
-    let display_row: Option<i64> = store
+    assert_ne!(kills[0], decoy.public_handle, "不得误杀 decoy 会话");
+    let display_handle: Option<String> = store
         .with_conn(|c| {
             Ok(c.query_row(
-                "SELECT display_session_id FROM ad_hoc_sessions WHERE id = ?1",
+                "SELECT s.public_handle
+                 FROM ad_hoc_sessions a
+                 JOIN agent_sessions s ON s.id = a.display_session_id
+                 WHERE a.id = ?1",
                 rusqlite::params![ad_hoc_row],
                 |r| r.get(0),
             )
@@ -706,9 +718,9 @@ fn db_failure_after_launch_kills_process_via_display_id() {
         .unwrap()
         .flatten();
     assert_eq!(
-        kills[0].1,
-        display_row.expect("启动路径应已写 display 行"),
-        "kill 参数必须是 display session ID"
+        kills[0],
+        display_handle.expect("启动路径应已写 display 行"),
+        "kill 参数必须是 display session handle"
     );
 }
 

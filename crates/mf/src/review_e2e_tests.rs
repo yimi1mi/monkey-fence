@@ -338,8 +338,7 @@ fn default_cli_leaves_external_config_untouched() {
             s.status,
             mf_agent::SessionStatus::Dead | mf_agent::SessionStatus::Hidden
         ) {
-            ctx.registry
-                .kill_session(&project.path().to_string_lossy(), s.id);
+            ctx.registry.kill_session(&s.public_handle);
         }
     }
     orch.stop();
@@ -509,7 +508,9 @@ modes = ["oneshot", "interactive"]
     // 这里只要求进程确实被杀掉)
     for r in orch.store.list_runs_of_task(task.id).unwrap() {
         if let Some(sid) = r.session_id {
-            registry.kill_session(&project.path().to_string_lossy(), sid);
+            if let Some(session) = orch.store.session_view(sid).unwrap() {
+                registry.kill_session(&session.public_handle);
+            }
         }
     }
     assert!(
@@ -520,7 +521,10 @@ modes = ["oneshot", "interactive"]
             .iter()
             .filter_map(|r| r.session_id)
             .all(|sid| {
-                !registry.session_alive(&project.path().to_string_lossy(), sid)
+                orch.store
+                    .session_view(sid)
+                    .unwrap()
+                    .is_none_or(|session| !registry.session_alive(&session.public_handle))
             })),
         "会话进程应被终止"
     );
@@ -948,6 +952,12 @@ fn e2e_cancel_run_terminates_real_os_process_and_releases_worktree() {
         .find(|r| r.status == RunStatus::Running)
         .unwrap();
     let session_id = run.session_id.expect("工作流 run 绑定会话");
+    let session_handle = orch
+        .store
+        .session_view(session_id)
+        .unwrap()
+        .unwrap()
+        .public_handle;
     // 工作流会话注册在 run 的执行租约工作目录(worktree)键下
     // (租约行在 run 行之后写入:轮询等待)
     let mut lease_path = None;
@@ -966,17 +976,15 @@ fn e2e_cancel_run_terminates_real_os_process_and_releases_worktree() {
         orch.store.list_execution_leases(task.id).unwrap()
     );
     let lease_path = lease_path.unwrap();
-    // 会话注册键 = 项目根(进程 cwd 是租约路径,但路由按项目根)
-    let workdir_key = project.to_string_lossy().to_string();
     // OS PID 可观测且进程真实存活
     assert!(
         wait_until(Duration::from_secs(10), || ctx
             .registry
-            .session_pid(&workdir_key, session_id)
+            .session_pid(&session_handle)
             .is_some()),
         "会话应有可观测 OS PID"
     );
-    let pid = ctx.registry.session_pid(&workdir_key, session_id).unwrap();
+    let pid = ctx.registry.session_pid(&session_handle).unwrap();
     assert!(tasklist_has_pid(pid), "前置:PID {pid} 应存活");
 
     // 取消:确认真实 OS 进程终止(不是 kill 后立刻谎报)

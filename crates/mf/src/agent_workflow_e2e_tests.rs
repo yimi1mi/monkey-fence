@@ -443,10 +443,15 @@ fn fake_ad_hoc_spec(
     display_id: i64,
 ) -> AdHocLaunchSpec {
     use mf_agent::InputInjection;
+    static NEXT_HANDLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     AdHocLaunchSpec {
         task_id: 1,
         session_id: display_id + 100, // ad-hoc 行号(事件 tag),与 display 分离
         display_session_id: display_id,
+        display_session_handle: format!(
+            "session-preview-{display_id}-{}",
+            NEXT_HANDLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
         title: "预览会话".into(),
         run_mode: mf_agent::RunMode::Interactive,
         plan: mf_agent::LaunchPlan {
@@ -471,15 +476,10 @@ fn fake_ad_hoc_spec(
     }
 }
 
-fn wait_alive(
-    registry: &SessionRegistry,
-    project: &str,
-    session_id: i64,
-    timeout: Duration,
-) -> bool {
+fn wait_alive(registry: &SessionRegistry, session_handle: &str, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if registry.session_alive(project, session_id) {
+        if registry.session_alive(session_handle) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(30));
@@ -491,14 +491,13 @@ fn wait_alive(
 /// 避免孤儿进程锁住构建产物导致后续测试的 fixture 重建失败。
 struct SessionGuard<'a> {
     registry: &'a SessionRegistry,
-    project: String,
-    session: i64,
+    session_handle: String,
 }
 
 impl Drop for SessionGuard<'_> {
     fn drop(&mut self) {
-        let pid = self.registry.session_pid(&self.project, self.session);
-        self.registry.kill_session(&self.project, self.session);
+        let pid = self.registry.session_pid(&self.session_handle);
+        self.registry.kill_session(&self.session_handle);
         if let Some(pid) = pid {
             let deadline = Instant::now() + Duration::from_secs(5);
             while fake_agent::process_alive(pid) && Instant::now() < deadline {
@@ -517,20 +516,19 @@ fn preview_ad_hoc_session_launches_fake_agent_without_settlement_token() {
     let registry = SessionRegistry::new(mf_agent::Config::default());
     let host = RuntimeHostImpl::new(registry.clone());
     let (events, _rx) = crossbeam_channel::bounded(16);
-    host.launch_ad_hoc(fake_ad_hoc_spec(
+    let spec = fake_ad_hoc_spec(
         events,
         &fake_agent::exe(),
         record.path(),
         workdir.path(),
         800,
-    ))
-    .expect("离散会话启动失败");
+    );
+    let session_handle = spec.display_session_handle.clone();
+    host.launch_ad_hoc(spec).expect("离散会话启动失败");
 
-    let project = workdir.path().to_string_lossy().to_string();
     let _guard = SessionGuard {
         registry: &registry,
-        project: project.clone(),
-        session: 800,
+        session_handle: session_handle.clone(),
     };
     let launch = fake_agent::wait_for_record(record.path(), Duration::from_secs(15), |_| true);
     // argv 原样(--record 与尾随参数均在,顺序保留)
@@ -560,10 +558,10 @@ fn preview_ad_hoc_session_launches_fake_agent_without_settlement_token() {
     );
     // 会话以 display id 注册存活
     assert!(
-        wait_alive(&registry, &project, 800, Duration::from_secs(10)),
-        "会话必须以 display id 注册存活"
+        wait_alive(&registry, &session_handle, Duration::from_secs(10)),
+        "会话必须以 display handle 注册存活"
     );
-    assert!(!registry.session_alive(&project, 900), "无关注联的其他 id");
+    assert!(!registry.session_alive("unrelated-session-handle"));
 }
 
 /// 契约:Preview 会话的原始输入/输出不被 MonkeyFence 解释或改写 ——
@@ -576,22 +574,21 @@ fn preview_session_passes_raw_bytes_without_interpretation() {
     let registry = SessionRegistry::new(mf_agent::Config::default());
     let host = RuntimeHostImpl::new(registry.clone());
     let (events, _rx) = crossbeam_channel::bounded(16);
-    host.launch_ad_hoc(fake_ad_hoc_spec(
+    let spec = fake_ad_hoc_spec(
         events,
         &fake_agent::exe(),
         record.path(),
         workdir.path(),
         801,
-    ))
-    .unwrap();
-    let project = workdir.path().to_string_lossy().to_string();
+    );
+    let session_handle = spec.display_session_handle.clone();
+    host.launch_ad_hoc(spec).unwrap();
     let _guard = SessionGuard {
         registry: &registry,
-        project: project.clone(),
-        session: 801,
+        session_handle: session_handle.clone(),
     };
     assert!(
-        wait_alive(&registry, &project, 801, Duration::from_secs(10)),
+        wait_alive(&registry, &session_handle, Duration::from_secs(10)),
         "前置:会话应存活"
     );
 
@@ -599,10 +596,10 @@ fn preview_session_passes_raw_bytes_without_interpretation() {
     //    (MonkeyFence send_prompt_raw 是字节透传;PTY 行规程会把行尾 \r
     //    规范为 \r\n —— 子序列断言不受影响)
     registry
-        .send_prompt_raw(&project, 801, b"/model gpt-5\r")
+        .send_prompt_raw(&session_handle, b"/model gpt-5\r")
         .expect("写入 PTY 失败");
     registry
-        .send_prompt_raw(&project, 801, "/skills 你好-技能-Ω\r".as_bytes())
+        .send_prompt_raw(&session_handle, "/skills 你好-技能-Ω\r".as_bytes())
         .expect("写入 PTY 失败");
     fake_agent::wait_recorded_bytes(
         record.path(),
@@ -627,7 +624,7 @@ fn preview_session_passes_raw_bytes_without_interpretation() {
     emitted.extend(std::iter::repeat_n(b'.', 256));
     let command = format!("!out {}\r", fake_agent::b64(&emitted));
     registry
-        .send_prompt_raw(&project, 801, command.as_bytes())
+        .send_prompt_raw(&session_handle, command.as_bytes())
         .expect("写入 PTY 失败");
     fake_agent::wait_recorded_bytes(
         record.path(),
@@ -640,7 +637,7 @@ fn preview_session_passes_raw_bytes_without_interpretation() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut raw_saw = false;
     while Instant::now() < deadline {
-        if let Some(bytes) = registry.pty_output_bytes(&project, 801) {
+        if let Some(bytes) = registry.pty_output_bytes(&session_handle) {
             if fake_agent::contains_subsequence(&bytes, &payload) {
                 raw_saw = true;
                 break;
@@ -662,22 +659,21 @@ fn preview_tui_input_sequences_reach_cli_unchanged() {
     let registry = SessionRegistry::new(mf_agent::Config::default());
     let host = RuntimeHostImpl::new(registry.clone());
     let (events, _rx) = crossbeam_channel::bounded(16);
-    host.launch_ad_hoc(fake_ad_hoc_spec(
+    let spec = fake_ad_hoc_spec(
         events,
         &fake_agent::exe(),
         record.path(),
         workdir.path(),
         802,
-    ))
-    .unwrap();
-    let project = workdir.path().to_string_lossy().to_string();
+    );
+    let session_handle = spec.display_session_handle.clone();
+    host.launch_ad_hoc(spec).unwrap();
     let _guard = SessionGuard {
         registry: &registry,
-        project: project.clone(),
-        session: 802,
+        session_handle: session_handle.clone(),
     };
     assert!(
-        wait_alive(&registry, &project, 802, Duration::from_secs(10)),
+        wait_alive(&registry, &session_handle, Duration::from_secs(10)),
         "前置:会话应存活"
     );
     fake_agent::wait_for_record(record.path(), Duration::from_secs(10), |_| true);
@@ -687,7 +683,7 @@ fn preview_tui_input_sequences_reach_cli_unchanged() {
     raw.extend_from_slice("终端-Ω".as_bytes());
     raw.push(b'\r');
     registry
-        .send_prompt_raw(&project, 802, &raw)
+        .send_prompt_raw(&session_handle, &raw)
         .expect("写入 PTY 失败");
     let expected = &raw[..raw.len() - 1];
     fake_agent::wait_recorded_bytes(
@@ -712,26 +708,25 @@ fn preview_session_exit_reports_code_and_detaches() {
     let registry = SessionRegistry::new(mf_agent::Config::default());
     let host = RuntimeHostImpl::new(registry.clone());
     let (events, rx) = crossbeam_channel::bounded(16);
-    host.launch_ad_hoc(fake_ad_hoc_spec(
+    let spec = fake_ad_hoc_spec(
         events,
         &fake_agent::exe(),
         record.path(),
         workdir.path(),
         803,
-    ))
-    .unwrap();
-    let project = workdir.path().to_string_lossy().to_string();
+    );
+    let session_handle = spec.display_session_handle.clone();
+    host.launch_ad_hoc(spec).unwrap();
     let _guard = SessionGuard {
         registry: &registry,
-        project: project.clone(),
-        session: 803,
+        session_handle: session_handle.clone(),
     };
     assert!(
-        wait_alive(&registry, &project, 803, Duration::from_secs(10)),
+        wait_alive(&registry, &session_handle, Duration::from_secs(10)),
         "前置:会话应存活"
     );
     registry
-        .send_prompt_raw(&project, 803, b"!exit 7\r")
+        .send_prompt_raw(&session_handle, b"!exit 7\r")
         .expect("写入 PTY 失败");
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut exit_event = None;
@@ -750,7 +745,7 @@ fn preview_session_exit_reports_code_and_detaches() {
     assert_eq!(exit_event, Some(7), "退出事件必须携带真实退出码");
     let removed = (0..150).any(|_| {
         std::thread::sleep(Duration::from_millis(20));
-        !registry.session_alive(&project, 803)
+        !registry.session_alive(&session_handle)
     });
     assert!(removed, "退出后注册表条目必须摘除");
 }
@@ -762,38 +757,30 @@ fn preview_termination_isolates_target_session_only() {
     let registry = SessionRegistry::new(mf_agent::Config::default());
     let host = RuntimeHostImpl::new(registry.clone());
     let project_dir = tempfile::tempdir().unwrap();
-    let project = project_dir.path().to_string_lossy().to_string();
 
     // 同项目两个会话 + 另一项目的同编号会话
     let mut records = Vec::new();
     let mut launch = |display: i64, workdir: &std::path::Path| {
         let record = tempfile::tempdir().unwrap();
         let (events, _rx) = crossbeam_channel::bounded(16);
-        host.launch_ad_hoc(fake_ad_hoc_spec(
-            events,
-            &fake_agent::exe(),
-            record.path(),
-            workdir,
-            display,
-        ))
-        .unwrap();
-        records.push(record);
+        let spec = fake_ad_hoc_spec(events, &fake_agent::exe(), record.path(), workdir, display);
+        let handle = spec.display_session_handle.clone();
+        host.launch_ad_hoc(spec).unwrap();
+        records.push((record, handle));
     };
     launch(810, project_dir.path());
     launch(811, project_dir.path());
     let other_project = tempfile::tempdir().unwrap();
     launch(810, other_project.path()); // 跨项目同 display id
-    let other = other_project.path().to_string_lossy().to_string();
-
-    for (proj, id) in [(&project, 810), (&project, 811), (&other, 810)] {
+    for (_, handle) in &records {
         assert!(
-            wait_alive(&registry, proj, id, Duration::from_secs(10)),
-            "前置:会话 ({proj}, {id}) 应存活"
+            wait_alive(&registry, handle, Duration::from_secs(10)),
+            "前置:会话 {handle} 应存活"
         );
     }
     let pids: Vec<u32> = records
         .iter()
-        .map(|record| {
+        .map(|(record, _)| {
             fake_agent::wait_for_record(record.path(), Duration::from_secs(10), |_| true)["pid"]
                 .as_u64()
                 .and_then(|pid| u32::try_from(pid).ok())
@@ -803,22 +790,20 @@ fn preview_termination_isolates_target_session_only() {
     assert!(pids.iter().all(|pid| fake_agent::process_alive(*pid)));
     let _guard_main = SessionGuard {
         registry: &registry,
-        project: project.clone(),
-        session: 811,
+        session_handle: records[1].1.clone(),
     };
     let _guard_other = SessionGuard {
         registry: &registry,
-        project: other.clone(),
-        session: 810,
+        session_handle: records[2].1.clone(),
     };
 
-    // 终止 (project, 810):同项目 811 与跨项目 810 都必须继续
-    registry.kill_session(&project, 810);
+    // 终止第一个 handle：其余会话（即便行号同为 810）都必须继续。
+    registry.kill_session(&records[0].1);
     let deadline = Instant::now() + Duration::from_secs(10);
-    while registry.session_alive(&project, 810) && Instant::now() < deadline {
+    while registry.session_alive(&records[0].1) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(!registry.session_alive(&project, 810), "目标会话必须终止");
+    assert!(!registry.session_alive(&records[0].1), "目标会话必须终止");
     let target_exited = (0..200).any(|_| {
         if !fake_agent::process_alive(pids[0]) {
             return true;
@@ -828,12 +813,12 @@ fn preview_termination_isolates_target_session_only() {
     });
     assert!(target_exited, "目标 fake-agent OS 进程必须真正退出");
     assert!(
-        registry.session_alive(&project, 811),
+        registry.session_alive(&records[1].1),
         "同项目其他会话必须继续存活"
     );
     assert!(
-        registry.session_alive(&other, 810),
-        "跨项目同编号会话必须不受影响(注册表按 project#id 路由)"
+        registry.session_alive(&records[2].1),
+        "跨项目同编号会话必须不受影响(注册表按 opaque handle 路由)"
     );
     assert!(
         fake_agent::process_alive(pids[1]) && fake_agent::process_alive(pids[2]),
@@ -844,9 +829,9 @@ fn preview_termination_isolates_target_session_only() {
     let probe = "隔离探针-仍然存活".as_bytes();
     let command = format!("!out {}\r", fake_agent::b64(probe));
     registry
-        .send_prompt_raw(&project, 811, command.as_bytes())
+        .send_prompt_raw(&records[1].1, command.as_bytes())
         .expect("写入 PTY 失败");
-    let probe_record = records[1].path();
+    let probe_record = records[1].0.path();
     fake_agent::wait_recorded_bytes(probe_record, "output.hex", probe, Duration::from_secs(10));
 }
 
@@ -863,7 +848,6 @@ struct NodeChain {
     orch: Arc<Orchestrator>,
     registry: Arc<SessionRegistry>,
     record: tempfile::TempDir,
-    root: std::path::PathBuf,
     task_id: i64,
     pipe_name: String,
     _plugins_root: tempfile::TempDir,
@@ -1005,16 +989,11 @@ modes = ["oneshot", "interactive"]
             orch,
             registry,
             record,
-            root,
             task_id: task.id,
             pipe_name,
             _plugins_root: plugins_root,
             _project: project,
         }
-    }
-
-    fn project_str(&self) -> String {
-        self.root.to_string_lossy().into_owned()
     }
 
     fn wait_run(&self) -> mf_agent::model::RunView {
@@ -1033,15 +1012,16 @@ modes = ["oneshot", "interactive"]
 
 impl Drop for NodeChain {
     fn drop(&mut self) {
-        let project = self.project_str();
         let mut pids = Vec::new();
         if let Ok(runs) = self.orch.store.list_runs_of_task(self.task_id) {
             for run in runs {
                 if let Some(sid) = run.session_id {
-                    if let Some(pid) = self.registry.session_pid(&project, sid) {
-                        pids.push(pid);
+                    if let Ok(Some(session)) = self.orch.store.session_view(sid) {
+                        if let Some(pid) = self.registry.session_pid(&session.public_handle) {
+                            pids.push(pid);
+                        }
+                        self.registry.kill_session(&session.public_handle);
                     }
-                    self.registry.kill_session(&project, sid);
                 }
             }
         }
@@ -1110,11 +1090,17 @@ fn node_session_injects_capability_token_and_pipe_into_cli_env() {
     );
     // 原始输入直达节点会话
     let session_id = run.session_id.expect("节点 run 必须绑定会话");
-    let project = chain.project_str();
-    assert!(chain.registry.session_alive(&project, session_id));
+    let session_handle = chain
+        .orch
+        .store
+        .session_view(session_id)
+        .unwrap()
+        .unwrap()
+        .public_handle;
+    assert!(chain.registry.session_alive(&session_handle));
     chain
         .registry
-        .send_prompt_raw(&project, session_id, b"/model node-42\r")
+        .send_prompt_raw(&session_handle, b"/model node-42\r")
         .expect("写入 PTY 失败");
     fake_agent::wait_recorded_bytes(
         chain.record.path(),
@@ -1132,21 +1118,22 @@ fn node_cli_exit_awaits_explicit_settlement() {
     let chain = NodeChain::spawn(r"\\.\pipe\monkeyfence-mfctl-node-b");
     let run = chain.wait_run();
     let session_id = run.session_id.expect("节点 run 必须绑定会话");
-    let project = chain.project_str();
+    let session_handle = chain
+        .orch
+        .store
+        .session_view(session_id)
+        .unwrap()
+        .unwrap()
+        .public_handle;
     assert!(
-        wait_alive(
-            &chain.registry,
-            &project,
-            session_id,
-            Duration::from_secs(15)
-        ),
+        wait_alive(&chain.registry, &session_handle, Duration::from_secs(15)),
         "前置:节点会话应注册存活"
     );
 
     // CLI 以退出码 0 结束
     chain
         .registry
-        .send_prompt_raw(&project, session_id, b"!exit 0\r")
+        .send_prompt_raw(&session_handle, b"!exit 0\r")
         .expect("写入 PTY 失败");
     let awaiting = Instant::now() + Duration::from_secs(15);
     while Instant::now() < awaiting {
@@ -1274,11 +1261,13 @@ fn node_capability_token_is_scoped_to_its_own_project() {
             .is_some_and(|r| r.outcome.is_some()),
         "本项目的令牌结算必须生效"
     );
-    let _ = run_a;
-    chain_a.registry.kill_session(
-        &chain_a.project_str(),
-        run_a.session_id.expect("A run 绑定会话"),
-    );
+    let session_a = chain_a
+        .orch
+        .store
+        .session_view(run_a.session_id.expect("A run 绑定会话"))
+        .unwrap()
+        .unwrap();
+    chain_a.registry.kill_session(&session_a.public_handle);
 }
 
 // ---------- 工作流优先主路径端到端(ADR 0004 / Task 8) ----------
@@ -1603,8 +1592,9 @@ fn project_workflow_first_run_loop_e2e(cx: &mut gpui::TestAppContext) {
     // 清理真实进程并完全关闭第一套 AppCtx/Orchestrator。
     for r in orch.store.list_runs_of_task(task_id).unwrap() {
         if let Some(sid) = r.session_id {
-            ctx.registry
-                .kill_session(&project.path().to_string_lossy(), sid);
+            if let Some(session) = orch.store.session_view(sid).unwrap() {
+                ctx.registry.kill_session(&session.public_handle);
+            }
         }
     }
     let restart_config = ctx.config.lock().clone();

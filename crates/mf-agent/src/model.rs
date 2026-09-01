@@ -189,6 +189,10 @@ pub struct StepView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionView {
     pub id: i64,
+    /// 持久、不透明的会话身份。运行时注册表只允许用它寻址；`id` 仅为
+    /// Project Store 内部关系与旧 UI 展示保留。
+    pub public_handle: String,
+    pub revision: i64,
     pub session_key: Option<String>,
     pub runtime: String,
     pub agent_profile: String,
@@ -204,6 +208,9 @@ pub struct SessionView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunView {
     pub id: i64,
+    /// 持久、不透明的运行身份；不得由项目路径或数据库行号派生。
+    pub public_handle: String,
+    pub revision: i64,
     pub task_id: i64,
     pub step_id: i64,
     pub revision_id: i64,
@@ -445,4 +452,70 @@ pub enum SchedulerEvent {
         text: String,
     },
     Error(String),
+}
+
+// ---------------------------------------------------------------------------
+// T1b:项目工作流 CAS 三轴与 opaque identity 投影
+// ---------------------------------------------------------------------------
+
+/// CAS 轴:工作流集合(collection)、单个工作流语义(semantic)、
+/// 展示状态(presentation)。三轴互不串增。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RevisionAxis {
+    Collection,
+    Semantic,
+    Presentation,
+}
+
+impl RevisionAxis {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Collection => "collection",
+            Self::Semantic => "semantic",
+            Self::Presentation => "presentation",
+        }
+    }
+}
+
+impl std::fmt::Display for RevisionAxis {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// CAS 冲突的稳定判别错误:期望 revision 与库内实际不符。
+/// 任何一半状态都不会被写入(整个 Store 事务回滚)。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("revision_conflict:{axis} 期望 v{expected},实际 v{actual};命令未写入任何状态")]
+pub struct RevisionConflict {
+    pub axis: RevisionAxis,
+    pub expected: i64,
+    pub actual: i64,
+}
+
+/// `workflow_node_identity` 行:`graph_json` 内嵌节点的持久 opaque 身份。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowNodeIdentityRow {
+    pub workflow_handle: String,
+    pub node_key: String,
+    pub node_handle: String,
+}
+
+/// `workflow_edge_identity` 行:downstream deps 中一个键对的持久 opaque 身份。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowEdgeIdentityRow {
+    pub workflow_handle: String,
+    pub upstream_node_key: String,
+    pub downstream_node_key: String,
+    pub edge_handle: String,
+}
+
+/// `workflow_presentation` 行:viewport/折叠/布局元数据(可为空的 JSON 文本,
+/// 迁移不伪造旧值,由 Web 首次打开后写入)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowPresentationState {
+    pub workflow_handle: String,
+    pub viewport_json: Option<String>,
+    pub collapse_json: Option<String>,
+    pub layout_json: Option<String>,
 }

@@ -12,7 +12,7 @@ use mf_agent::store::Store;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -60,7 +60,8 @@ struct MockHost {
     senders: Mutex<HashMap<String, Sender<(i64, RuntimeEvent)>>>,
     max_concurrent: AtomicUsize,
     in_flight: AtomicUsize,
-    stopped: Mutex<Vec<i64>>,
+    stopped: Mutex<Vec<String>>,
+    send_prompt_fails: AtomicBool,
 }
 
 impl MockHost {
@@ -120,15 +121,25 @@ impl RuntimeHost for MockHost {
         }
         let _ = events.send((run_id, RuntimeEvent::Launched));
     }
-    fn send_prompt(&self, _project: &str, _run_id: i64, _session_id: i64, _text: &str) {}
-    fn stop_run(&self, _project: &str, run_id: i64) -> anyhow::Result<()> {
-        self.stopped.lock().push(run_id);
+    fn send_prompt(
+        &self,
+        _run_handle: &str,
+        _session_handle: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        if self.send_prompt_fails.load(Ordering::SeqCst) {
+            anyhow::bail!("prompt delivery failed")
+        }
+        Ok(())
+    }
+    fn stop_run(&self, run_handle: &str) -> anyhow::Result<()> {
+        self.stopped.lock().push(run_handle.to_string());
         self.in_flight.fetch_sub(1, Ordering::SeqCst);
         Ok(())
     }
-    fn kill_session(&self, _project: &str, _session_id: i64) {}
-    fn kill_ad_hoc(&self, _project: &str, _session_id: i64) {}
-    fn answer_question(&self, _project: &str, _run_id: i64, _answer: &str) {}
+    fn kill_session(&self, _session_handle: &str) {}
+    fn kill_ad_hoc(&self, _display_session_handle: &str) {}
+    fn answer_question(&self, _run_handle: &str, _answer: &str) {}
     fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) -> anyhow::Result<()> {
         Ok(())
     }
@@ -798,6 +809,35 @@ fn exited_without_settlement_needs_you() {
     assert_eq!(
         orch.store.run_view(run_id).unwrap().unwrap().status,
         RunStatus::Running
+    );
+    orch.stop();
+}
+
+#[test]
+fn failed_prompt_delivery_keeps_awaiting_outcome_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host: Arc<MockHost> = Arc::new(Default::default());
+    let (orch, _) = start_orch(tmp.path(), host.clone());
+    let task = orch.create_task("发送失败", "").unwrap();
+    orch.save_pipeline(task.id, &draft(vec![step("a", &[])]))
+        .unwrap();
+    orch.confirm_and_run(task.id).unwrap();
+    assert!(wait_until(Duration::from_secs(5), || host.launch_count() == 1));
+    let run_id = host.run_id_of(0);
+    host.emit(run_id, RuntimeEvent::Exited { code: Some(0) });
+    assert!(wait_until(Duration::from_secs(5), || {
+        orch.store
+            .run_view(run_id)
+            .unwrap()
+            .is_some_and(|run| run.status == RunStatus::AwaitingOutcome)
+    }));
+
+    host.send_prompt_fails.store(true, Ordering::SeqCst);
+    assert!(orch.send_prompt(run_id, "继续修改").is_err());
+    assert_eq!(
+        orch.store.run_view(run_id).unwrap().unwrap().status,
+        RunStatus::AwaitingOutcome,
+        "提示未送达时不得推进 Run 状态"
     );
     orch.stop();
 }

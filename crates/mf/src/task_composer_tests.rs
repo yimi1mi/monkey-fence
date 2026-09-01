@@ -25,13 +25,20 @@ impl RuntimeHost for NoopHost {
     fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) -> anyhow::Result<()> {
         Ok(())
     }
-    fn send_prompt(&self, _p: &str, _r: i64, _s: i64, _t: &str) {}
-    fn stop_run(&self, _p: &str, _r: i64) -> anyhow::Result<()> {
+    fn send_prompt(
+        &self,
+        _run_handle: &str,
+        _session_handle: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
-    fn kill_session(&self, _p: &str, _s: i64) {}
-    fn kill_ad_hoc(&self, _p: &str, _s: i64) {}
-    fn answer_question(&self, _p: &str, _r: i64, _a: &str) {}
+    fn stop_run(&self, _run_handle: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn kill_session(&self, _session_handle: &str) {}
+    fn kill_ad_hoc(&self, _display_session_handle: &str) {}
+    fn answer_question(&self, _run_handle: &str, _answer: &str) {}
 }
 
 fn start_orch(dir: &std::path::Path) -> Arc<Orchestrator> {

@@ -299,13 +299,20 @@ pub(crate) mod contract_tests {
         fn launch_ad_hoc(&self, _spec: mf_agent::runtime::AdHocLaunchSpec) -> anyhow::Result<()> {
             Ok(())
         }
-        fn send_prompt(&self, _project: &str, _run_id: i64, _session_id: i64, _text: &str) {}
-        fn stop_run(&self, _project: &str, _run_id: i64) -> anyhow::Result<()> {
+        fn send_prompt(
+            &self,
+            _run_handle: &str,
+            _session_handle: &str,
+            _text: &str,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
-        fn kill_session(&self, _project: &str, _session_id: i64) {}
-        fn kill_ad_hoc(&self, _project: &str, _display_session_id: i64) {}
-        fn answer_question(&self, _project: &str, _run_id: i64, _answer: &str) {}
+        fn stop_run(&self, _run_handle: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn kill_session(&self, _session_handle: &str) {}
+        fn kill_ad_hoc(&self, _display_session_handle: &str) {}
+        fn answer_question(&self, _run_handle: &str, _answer: &str) {}
     }
 
     /// 进程内唯一的 PipeServer(管道名含本进程 pid,

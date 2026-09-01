@@ -314,7 +314,7 @@ impl ExecutionDirectoryProvider for ScriptedDirectory {
 pub struct RecordingHost {
     pub workflow: Mutex<Vec<(WorkflowLaunchSpec, mf_agent::LaunchPlan)>>,
     pub senders: Mutex<HashMap<String, Sender<(i64, RuntimeEvent)>>>,
-    pub answers: Mutex<Vec<(i64, String)>>,
+    pub answers: Mutex<Vec<(String, String)>>,
     pub stop_fails: AtomicBool,
 }
 
@@ -338,17 +338,26 @@ impl RuntimeHost for RecordingHost {
         let _ = events.send((run_id, RuntimeEvent::Launched));
         Ok(())
     }
-    fn send_prompt(&self, _project: &str, _run_id: i64, _session_id: i64, _text: &str) {}
-    fn stop_run(&self, _project: &str, _run_id: i64) -> anyhow::Result<()> {
+    fn send_prompt(
+        &self,
+        _run_handle: &str,
+        _session_handle: &str,
+        _text: &str,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn stop_run(&self, _run_handle: &str) -> anyhow::Result<()> {
         if self.stop_fails.load(Ordering::SeqCst) {
             anyhow::bail!("会话进程停止未在时限内确认(脚本注入)")
         }
         Ok(())
     }
-    fn kill_session(&self, _project: &str, _session_id: i64) {}
-    fn kill_ad_hoc(&self, _project: &str, _display_session_id: i64) {}
-    fn answer_question(&self, _project: &str, run_id: i64, answer: &str) {
-        self.answers.lock().push((run_id, answer.to_string()));
+    fn kill_session(&self, _session_handle: &str) {}
+    fn kill_ad_hoc(&self, _display_session_handle: &str) {}
+    fn answer_question(&self, run_handle: &str, answer: &str) {
+        self.answers
+            .lock()
+            .push((run_handle.to_string(), answer.to_string()));
     }
     fn launch_ad_hoc(&self, _spec: mf_agent::AdHocLaunchSpec) -> anyhow::Result<()> {
         Ok(())

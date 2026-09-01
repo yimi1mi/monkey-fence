@@ -24,6 +24,7 @@ dirs.workspace = true
 thiserror = "2"
 zeroize.workspace = true
 sha2.workspace = true
+uuid.workspace = true
 mf-skills = { path = "../mf-skills" }
 
 [target.'cfg(windows)'.dependencies]
@@ -32,5 +33,7 @@ windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Securit
 [dev-dependencies]
 git2 = { workspace = true }
 tempfile = "3"
+# 契约测试断言 handle 是真实 UUIDv7
+uuid = { workspace = true }
 # 集成测试用真实内置适配器验证 Adapter → LaunchPlan 编译链
 mf-plugins = { path = "../mf-plugins" }

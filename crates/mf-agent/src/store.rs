@@ -293,6 +293,136 @@ fn ad_hoc_status_terminal(status: SessionStatus) -> bool {
     )
 }
 
+/// 生成持久 opaque handle(真实 UUIDv7)。全部 handle 生成集中于此与
+/// Store 事务 API;UUIDv7 时间有序仅作索引局部性,业务正确性不依赖
+/// 系统时间排序。handle 永不复用、不得由 rowid/路径派生。
+pub(crate) fn new_public_handle() -> String {
+    uuid::Uuid::now_v7().to_string()
+}
+
+/// 将工作流图的 node/edge identity 与 `nodes` 对齐(同事务):
+/// - 既有 `(workflow_handle, node_key)` 保留原 handle(稳定);
+/// - 新节点/新连线生成新 UUIDv7 handle;
+/// - 消失的节点连同 node_position、消失的连线删除 identity
+///   (删除的 handle 永不回到可复用池,重连必然是新 handle)。
+/// 图结构非法(重复键/未知依赖)在写任何行之前 fail-closed。
+pub(crate) fn sync_workflow_identity_tx(
+    c: &Connection,
+    workflow_handle: &str,
+    nodes: &[crate::workflow::WorkflowNodeDraft],
+) -> Result<IdentitySyncStats> {
+    sync_workflow_identity_tx_with_stats(c, workflow_handle, nodes)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct IdentitySyncStats {
+    pub nodes_created: usize,
+    pub nodes_deleted: usize,
+    pub edges_created: usize,
+    pub edges_deleted: usize,
+}
+
+impl std::ops::AddAssign for IdentitySyncStats {
+    fn add_assign(&mut self, rhs: Self) {
+        self.nodes_created += rhs.nodes_created;
+        self.nodes_deleted += rhs.nodes_deleted;
+        self.edges_created += rhs.edges_created;
+        self.edges_deleted += rhs.edges_deleted;
+    }
+}
+
+pub(crate) fn sync_workflow_identity_tx_with_stats(
+    c: &Connection,
+    workflow_handle: &str,
+    nodes: &[crate::workflow::WorkflowNodeDraft],
+) -> Result<IdentitySyncStats> {
+    crate::workflow::validate_graph_structure(nodes)?;
+    let mut stats = IdentitySyncStats::default();
+    let existing_nodes: Vec<(String, String)> = {
+        let mut stmt = c.prepare(
+            "SELECT node_key, node_handle FROM workflow_node_identity
+             WHERE workflow_handle = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![workflow_handle], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    let desired_keys: std::collections::HashSet<&str> =
+        nodes.iter().map(|n| n.key.as_str()).collect();
+    for (key, node_handle) in &existing_nodes {
+        if desired_keys.contains(key.as_str()) {
+            continue;
+        }
+        // 显式清理:position 先于 identity(FK 级联同为兜底)
+        c.execute(
+            "DELETE FROM node_position WHERE node_handle = ?1",
+            params![node_handle],
+        )?;
+        stats.nodes_deleted += c.execute(
+            "DELETE FROM workflow_node_identity
+             WHERE workflow_handle = ?1 AND node_key = ?2",
+            params![workflow_handle, key],
+        )?;
+    }
+    let existing_keys: std::collections::HashSet<&str> =
+        existing_nodes.iter().map(|(k, _)| k.as_str()).collect();
+    for node in nodes {
+        if existing_keys.contains(node.key.as_str()) {
+            continue;
+        }
+        stats.nodes_created += c.execute(
+            "INSERT INTO workflow_node_identity (workflow_handle, node_key, node_handle)
+             VALUES (?1, ?2, ?3)",
+            params![workflow_handle, node.key, new_public_handle()],
+        )?;
+    }
+
+    let existing_edges: Vec<(String, String)> = {
+        let mut stmt = c.prepare(
+            "SELECT upstream_node_key, downstream_node_key FROM workflow_edge_identity
+             WHERE workflow_handle = ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![workflow_handle], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    let mut desired_edges: std::collections::BTreeSet<(&str, &str)> =
+        std::collections::BTreeSet::new();
+    for node in nodes {
+        for dep in &node.deps {
+            desired_edges.insert((dep.as_str(), node.key.as_str()));
+        }
+    }
+    for (upstream, downstream) in &existing_edges {
+        if desired_edges.contains(&(upstream.as_str(), downstream.as_str())) {
+            continue;
+        }
+        stats.edges_deleted += c.execute(
+            "DELETE FROM workflow_edge_identity
+             WHERE workflow_handle = ?1 AND upstream_node_key = ?2 AND downstream_node_key = ?3",
+            params![workflow_handle, upstream, downstream],
+        )?;
+    }
+    let existing_set: std::collections::HashSet<(&str, &str)> = existing_edges
+        .iter()
+        .map(|(u, d)| (u.as_str(), d.as_str()))
+        .collect();
+    for &(upstream, downstream) in &desired_edges {
+        if existing_set.contains(&(upstream, downstream)) {
+            continue;
+        }
+        stats.edges_created += c.execute(
+            "INSERT INTO workflow_edge_identity
+                 (workflow_handle, upstream_node_key, downstream_node_key, edge_handle)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![workflow_handle, upstream, downstream, new_public_handle()],
+        )?;
+    }
+    Ok(stats)
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Arc<Store>> {
         if let Some(parent) = path.parent() {
@@ -317,12 +447,37 @@ impl Store {
             crate::migration::StoreKind::Project,
             PROJECT_SCHEMA_VERSION,
         )?;
+        crate::migration::restrict_active_database_to_current_user(&conn)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         crate::schema::upgrade_project(&mut conn, PROJECT_SCHEMA_VERSION)?;
         // 持久 journal 模式只在 backup→migration 屏障成功之后改写。
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
+        crate::migration::restrict_active_database_to_current_user(&conn)?;
+        let schema_version = schema_version_of(&conn)?;
+        let outbox_depth = if crate::schema::table_exists(&conn, "projection_outbox")? {
+            conn.query_row(
+                "SELECT COUNT(*) FROM projection_outbox WHERE published_at IS NULL",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?
+        } else {
+            0
+        };
+        log::info!(
+            "store_open store=project schema_version={} outbox_depth={}",
+            schema_version,
+            outbox_depth
+        );
+        let metric_key =
+            crate::observability::store_metric_key(&conn, crate::migration::StoreKind::Project);
+        crate::observability::record_store_open(
+            &metric_key,
+            crate::migration::StoreKind::Project,
+            schema_version,
+            outbox_depth,
+        );
         Ok(Store {
             conn: Mutex::new(conn),
         })
@@ -362,8 +517,10 @@ impl Store {
         let ts = now();
         self.with_conn(|c| {
             c.execute(
-                "INSERT INTO agent_tasks (title, goal, status, created_at, updated_at) VALUES (?1, ?2, 'draft', ?3, ?3)",
-                params![title, goal, ts],
+                "INSERT INTO agent_tasks
+                     (title, goal, status, public_handle, created_at, updated_at)
+                 VALUES (?1, ?2, 'draft', ?3, ?4, ?4)",
+                params![title, goal, new_public_handle(), ts],
             )?;
             Self::task_view_by_id(c, c.last_insert_rowid())
                 .transpose()
@@ -470,8 +627,9 @@ impl Store {
         for node in &snapshot.nodes {
             c.execute(
                 "INSERT INTO steps (revision_id, task_id, step_key, title, instructions,
-                    agent_profile, session_policy, status, attempts, result, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'fresh', 'pending', 0, NULL, ?7, ?7)",
+                    agent_profile, session_policy, status, attempts, result,
+                    public_handle, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'fresh', 'pending', 0, NULL, ?7, ?8, ?8)",
                 params![
                     rev_id,
                     task_id,
@@ -479,6 +637,7 @@ impl Store {
                     node.title,
                     node.instructions,
                     node.instance.agent_type,
+                    new_public_handle(),
                     ts,
                 ],
             )?;
@@ -512,8 +671,9 @@ impl Store {
             let (status, attempts, result) = status_of(&s.key, &s.session_policy, 0);
             c.execute(
                 "INSERT INTO steps (revision_id, task_id, step_key, title, instructions,
-                    agent_profile, session_policy, status, attempts, result, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11)",
+                    agent_profile, session_policy, status, attempts, result,
+                    public_handle, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
                 params![
                     rev_id,
                     task_id,
@@ -525,6 +685,7 @@ impl Store {
                     status,
                     attempts,
                     result,
+                    new_public_handle(),
                     ts,
                 ],
             )?;
@@ -559,8 +720,10 @@ impl Store {
                 |r| r.get(0),
             )?;
             c.execute(
-                "INSERT INTO pipeline_revisions (task_id, revision, status, created_at) VALUES (?1, ?2, 'draft', ?3)",
-                params![task_id, next, ts],
+                "INSERT INTO pipeline_revisions
+                     (task_id, revision, status, public_handle, created_at)
+                 VALUES (?1, ?2, 'draft', ?3, ?4)",
+                params![task_id, next, new_public_handle(), ts],
             )?;
             let rev_id = c.last_insert_rowid();
             Self::insert_revision_steps(c, task_id, rev_id, draft, |_, _, _| {
@@ -570,7 +733,13 @@ impl Store {
                 "UPDATE agent_tasks SET updated_at = ?2 WHERE id = ?1",
                 params![task_id, ts],
             )?;
-            Ok(RevisionView { id: rev_id, task_id, revision: next, status: RevisionStatus::Draft, created_at: ts })
+            Ok(RevisionView {
+                id: rev_id,
+                task_id,
+                revision: next,
+                status: RevisionStatus::Draft,
+                created_at: ts,
+            })
         })
     }
 
@@ -621,8 +790,10 @@ impl Store {
                 |r| r.get(0),
             )?;
             c.execute(
-                "INSERT INTO pipeline_revisions (task_id, revision, status, created_at) VALUES (?1, ?2, 'draft', ?3)",
-                params![task_id, next, ts],
+                "INSERT INTO pipeline_revisions
+                     (task_id, revision, status, public_handle, created_at)
+                 VALUES (?1, ?2, 'draft', ?3, ?4)",
+                params![task_id, next, new_public_handle(), ts],
             )?;
             let rev_id = c.last_insert_rowid();
             Self::insert_revision_steps(c, task_id, rev_id, draft, |key, _, _| {
@@ -978,16 +1149,18 @@ impl Store {
     fn session_view_row(r: &rusqlite::Row) -> rusqlite::Result<SessionView> {
         Ok(SessionView {
             id: r.get(0)?,
-            session_key: r.get(1)?,
-            runtime: r.get(2)?,
-            agent_profile: r.get(3)?,
-            title: r.get(4)?,
-            status: SessionStatus::parse(&r.get::<_, String>(5)?).unwrap_or(SessionStatus::Idle),
-            last_instruction: r.get(6)?,
-            last_reply: r.get(7)?,
-            unread: r.get::<_, i64>(8)? != 0,
-            created_at: r.get(9)?,
-            updated_at: r.get(10)?,
+            public_handle: r.get(1)?,
+            revision: r.get(2)?,
+            session_key: r.get(3)?,
+            runtime: r.get(4)?,
+            agent_profile: r.get(5)?,
+            title: r.get(6)?,
+            status: SessionStatus::parse(&r.get::<_, String>(7)?).unwrap_or(SessionStatus::Idle),
+            last_instruction: r.get(8)?,
+            last_reply: r.get(9)?,
+            unread: r.get::<_, i64>(10)? != 0,
+            created_at: r.get(11)?,
+            updated_at: r.get(12)?,
         })
     }
 
@@ -1001,9 +1174,18 @@ impl Store {
         self.with_conn(|c| {
             let ts = now();
             c.execute(
-                "INSERT INTO agent_sessions (session_key, runtime, agent_profile, title, status, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, 'starting', ?5, ?5)",
-                params![session_key, runtime, agent_profile, title, ts],
+                "INSERT INTO agent_sessions
+                     (session_key, runtime, agent_profile, title, status,
+                      public_handle, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 'starting', ?5, ?6, ?6)",
+                params![
+                    session_key,
+                    runtime,
+                    agent_profile,
+                    title,
+                    new_public_handle(),
+                    ts
+                ],
             )?;
             Self::session_view_by_id(c, c.last_insert_rowid())
                 .transpose()
@@ -1013,8 +1195,8 @@ impl Store {
 
     fn session_view_by_id(c: &Connection, id: i64) -> Result<Option<SessionView>> {
         c.query_row(
-            "SELECT id, session_key, runtime, agent_profile, title, status, last_instruction,
-                    last_reply, unread, created_at, updated_at
+            "SELECT id, public_handle, revision, session_key, runtime, agent_profile, title,
+                    status, last_instruction, last_reply, unread, created_at, updated_at
              FROM agent_sessions WHERE id = ?1",
             params![id],
             Self::session_view_row,
@@ -1034,8 +1216,8 @@ impl Store {
     ) -> Result<Option<SessionView>> {
         self.with_conn(|c| {
             c.query_row(
-                "SELECT id, session_key, runtime, agent_profile, title, status, last_instruction,
-                        last_reply, unread, created_at, updated_at
+                "SELECT id, public_handle, revision, session_key, runtime, agent_profile, title,
+                        status, last_instruction, last_reply, unread, created_at, updated_at
                  FROM agent_sessions
                  WHERE session_key = ?1 AND agent_profile = ?2 AND status NOT IN ('dead', 'hidden')
                  ORDER BY id DESC LIMIT 1",
@@ -1050,8 +1232,8 @@ impl Store {
     pub fn list_sessions(&self) -> Result<Vec<SessionView>> {
         self.with_conn(|c| {
             let mut stmt = c.prepare(
-                "SELECT id, session_key, runtime, agent_profile, title, status, last_instruction,
-                        last_reply, unread, created_at, updated_at
+                "SELECT id, public_handle, revision, session_key, runtime, agent_profile, title,
+                        status, last_instruction, last_reply, unread, created_at, updated_at
                  FROM agent_sessions ORDER BY id DESC LIMIT 500",
             )?;
             let rows = stmt
@@ -1103,21 +1285,23 @@ impl Store {
     fn run_view_row(r: &rusqlite::Row) -> rusqlite::Result<RunView> {
         Ok(RunView {
             id: r.get(0)?,
-            task_id: r.get(1)?,
-            step_id: r.get(2)?,
-            revision_id: r.get(3)?,
-            session_id: r.get(4)?,
-            status: RunStatus::parse(&r.get::<_, String>(5)?).unwrap_or(RunStatus::Running),
-            agent_state: AgentState::parse(&r.get::<_, String>(6)?).unwrap_or(AgentState::Working),
-            capability_token: r.get(7)?,
-            outcome: r.get(8)?,
-            outcome_payload: r.get(9)?,
-            started_at: r.get(10)?,
-            ended_at: r.get(11)?,
+            public_handle: r.get(1)?,
+            revision: r.get(2)?,
+            task_id: r.get(3)?,
+            step_id: r.get(4)?,
+            revision_id: r.get(5)?,
+            session_id: r.get(6)?,
+            status: RunStatus::parse(&r.get::<_, String>(7)?).unwrap_or(RunStatus::Running),
+            agent_state: AgentState::parse(&r.get::<_, String>(8)?).unwrap_or(AgentState::Working),
+            capability_token: r.get(9)?,
+            outcome: r.get(10)?,
+            outcome_payload: r.get(11)?,
+            started_at: r.get(12)?,
+            ended_at: r.get(13)?,
         })
     }
 
-    const RUN_COLS: &'static str = "id, task_id, step_id, revision_id, session_id, status, agent_state, capability_token, outcome, outcome_payload, started_at, ended_at";
+    const RUN_COLS: &'static str = "id, public_handle, revision, task_id, step_id, revision_id, session_id, status, agent_state, capability_token, outcome, outcome_payload, started_at, ended_at";
 
     pub fn create_run(
         &self,
@@ -1130,14 +1314,15 @@ impl Store {
             let ts = now();
             c.execute(
                 "INSERT INTO agent_runs (task_id, step_id, revision_id, session_id, status,
-                    capability_token, agent_state, started_at)
-                 VALUES (?1, ?2, ?3, ?4, 'running', ?5, 'working', ?6)",
+                    capability_token, agent_state, public_handle, started_at)
+                 VALUES (?1, ?2, ?3, ?4, 'running', ?5, 'working', ?6, ?7)",
                 params![
                     task_id,
                     step_id,
                     revision_id,
                     session_id,
                     gen_capability_token(),
+                    new_public_handle(),
                     ts
                 ],
             )?;
@@ -1169,6 +1354,21 @@ impl Store {
 
     pub fn run_view(&self, id: i64) -> Result<Option<RunView>> {
         self.with_conn(|c| Self::run_view_by_id(c, id))
+    }
+
+    pub fn run_view_by_handle(&self, public_handle: &str) -> Result<Option<RunView>> {
+        self.with_conn(|c| {
+            c.query_row(
+                &format!(
+                    "SELECT {} FROM agent_runs WHERE public_handle = ?1",
+                    Self::RUN_COLS
+                ),
+                params![public_handle],
+                Self::run_view_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
     }
 
     pub fn run_by_token(&self, token: &str) -> Result<Option<RunView>> {
@@ -1286,14 +1486,15 @@ impl Store {
             )?;
             tx.execute(
                 "INSERT INTO agent_runs (task_id, step_id, revision_id, session_id, status,
-                    capability_token, agent_state, started_at)
-                 VALUES (?1, ?2, ?3, ?4, 'running', ?5, 'working', ?6)",
+                    capability_token, agent_state, public_handle, started_at)
+                 VALUES (?1, ?2, ?3, ?4, 'running', ?5, 'working', ?6, ?7)",
                 params![
                     task_id,
                     step_id,
                     revision_id,
                     session_id,
                     gen_capability_token(),
+                    new_public_handle(),
                     ts
                 ],
             )?;
@@ -1506,7 +1707,7 @@ impl Store {
     /// 正常启动(非崩溃)时没有 running 记录,本方法为 no-op。
     /// done/idle 会话是合法终态,不判死(否则 reuse 策略重启后无法复用)。
     pub fn recover_interrupted(&self) -> Result<Vec<RunView>> {
-        self.recover_interrupted_with(&|_session_id| false)
+        self.recover_interrupted_with(&|_session_handle| false)
     }
 
     /// 重启恢复(设计 §13):
@@ -1517,17 +1718,19 @@ impl Store {
     /// 返回受影响(未重连)的 run 列表。
     pub fn recover_interrupted_with(
         &self,
-        session_alive: &dyn Fn(i64) -> bool,
+        session_alive: &dyn Fn(&str) -> bool,
     ) -> Result<Vec<RunView>> {
         let ts = now();
         self.with_tx(|tx| {
-            let rows: Vec<(i64, Option<i64>, String)> = {
+            let rows: Vec<(i64, Option<i64>, Option<String>, String)> = {
                 let mut stmt = tx.prepare(
-                    "SELECT id, session_id, status FROM agent_runs
-                     WHERE status IN ('running','awaiting-outcome')",
+                    "SELECT r.id, r.session_id, s.public_handle, r.status
+                     FROM agent_runs r
+                     LEFT JOIN agent_sessions s ON s.id = r.session_id
+                     WHERE r.status IN ('running','awaiting-outcome')",
                 )?;
                 let ids = stmt
-                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
                     .collect::<std::result::Result<_, _>>()?;
                 drop(stmt);
                 ids
@@ -1537,9 +1740,9 @@ impl Store {
             }
             let mut interrupted_ids = Vec::new();
             let mut reattached_sessions: Vec<i64> = Vec::new();
-            for (id, session_id, status) in &rows {
-                let reattach = match session_id {
-                    Some(sid) if status == "running" => session_alive(*sid),
+            for (id, session_id, session_handle, status) in &rows {
+                let reattach = match session_handle {
+                    Some(handle) if status == "running" => session_alive(handle),
                     _ => false,
                 };
                 if reattach {
@@ -1753,9 +1956,16 @@ impl Store {
         self.with_conn(|c| {
             let ts = now();
             c.execute(
-                "INSERT INTO ad_hoc_sessions (task_id, title, status, snapshot_json, created_at)
-                 VALUES (?1, ?2, 'starting', ?3, ?4)",
-                params![task_id, snapshot.name, serde_json::to_string(snapshot)?, ts],
+                "INSERT INTO ad_hoc_sessions
+                     (task_id, title, status, snapshot_json, public_handle, created_at)
+                 VALUES (?1, ?2, 'starting', ?3, ?4, ?5)",
+                params![
+                    task_id,
+                    snapshot.name,
+                    serde_json::to_string(snapshot)?,
+                    new_public_handle(),
+                    ts
+                ],
             )?;
             Self::ad_hoc_view_by_id(c, c.last_insert_rowid())?
                 .ok_or_else(|| anyhow::anyhow!("ad_hoc 插入后读取失败"))
@@ -1879,12 +2089,14 @@ impl Store {
             )?;
             c.execute(
                 "INSERT INTO pipeline_revisions
-                     (task_id, revision, status, snapshot_json, created_at, content_digest)
-                 VALUES (?1, ?2, 'draft', ?3, ?4, ?5)",
+                     (task_id, revision, status, snapshot_json, public_handle, created_at,
+                      content_digest)
+                 VALUES (?1, ?2, 'draft', ?3, ?4, ?5, ?6)",
                 params![
                     task_id,
                     next,
                     serde_json::to_string(snapshot)?,
+                    new_public_handle(),
                     ts,
                     content_digest
                 ],
@@ -2310,63 +2522,318 @@ impl Store {
         })
     }
 
-    // ---------- Project Workflow(ADR 0004) ----------
+    // ---------- Project Workflow(ADR 0004 + T1b identity/revision 深模块) ----------
 
-    /// 保存/覆盖项目工作流。校验 key/name 非空、nodes 非空;DAG 完整
-    /// 校验(环/未知依赖)仍由 Workflow Compiler 在运行前负责。
-    /// 同内容保存按内容摘要幂等,不刷新 `updated_at`(与任务本地草稿
-    /// 的 I8 语义一致)。返回保存后的记录。
-    pub fn save_project_workflow(
-        &self,
+    /// 校验草案并做图结构校验(节点键唯一、依赖已知);完整 DAG 校验
+    /// (环/变量/实例)仍由 Workflow Compiler 在运行前负责。
+    /// 结构非法在写任何行之前 fail-closed(identity 无法同步)。
+    fn validate_project_workflow_draft(
         draft: &crate::workflow::ProjectWorkflowDraft,
-    ) -> Result<crate::workflow::ProjectWorkflowRecord> {
+    ) -> Result<()> {
         anyhow::ensure!(!draft.key.trim().is_empty(), "项目工作流 key 不能为空");
         anyhow::ensure!(!draft.name.trim().is_empty(), "项目工作流名称不能为空");
         anyhow::ensure!(!draft.nodes.is_empty(), "项目工作流至少需要一个节点");
+        crate::workflow::validate_graph_structure(&draft.nodes)?;
+        Ok(())
+    }
+
+    /// 读取(必要时种入)project_meta singleton 的 collection revision。
+    fn collection_revision_tx(c: &Connection) -> Result<i64> {
+        c.execute(
+            "INSERT OR IGNORE INTO project_meta (id, workflow_collection_revision)
+             VALUES (1, 1)",
+            [],
+        )?;
+        Ok(c.query_row(
+            "SELECT workflow_collection_revision FROM project_meta WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// collection 轴 +1(工作流 create/delete 与目标行同一事务)。
+    fn bump_collection_tx(c: &Connection) -> Result<i64> {
+        let updated = c.execute(
+            "UPDATE project_meta
+             SET workflow_collection_revision = workflow_collection_revision + 1
+             WHERE id = 1",
+            [],
+        )?;
+        anyhow::ensure!(updated == 1, "project_meta singleton 行缺失");
+        Self::collection_revision_tx(c)
+    }
+
+    /// CAS 前置检查:期望 revision 不匹配即返回稳定判别冲突,
+    /// 整个事务不写入任何一半状态。
+    fn ensure_revision(expected: i64, actual: i64, axis: RevisionAxis) -> Result<()> {
+        if expected != actual {
+            return Err(RevisionConflict {
+                axis,
+                expected,
+                actual,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    /// 工作流 key → 持久 handle(无此工作流为 None)。
+    fn workflow_handle_of(c: &Connection, key: &str) -> Result<Option<String>> {
+        Ok(c.query_row(
+            "SELECT public_handle FROM project_workflows WHERE workflow_key = ?1",
+            params![key],
+            |r| r.get(0),
+        )
+        .optional()?)
+    }
+
+    /// 同事务显式清理工作流的全部 identity/presentation/position 行
+    /// (FK CASCADE 是兜底;删除的 handle 永不回到可复用池)。
+    fn cleanup_workflow_dependents_tx(
+        c: &Connection,
+        workflow_handle: &str,
+    ) -> Result<(IdentitySyncStats, usize)> {
+        c.execute(
+            "DELETE FROM node_position WHERE node_handle IN
+                 (SELECT node_handle FROM workflow_node_identity WHERE workflow_handle = ?1)",
+            params![workflow_handle],
+        )?;
+        let nodes_removed = c.execute(
+            "DELETE FROM workflow_node_identity WHERE workflow_handle = ?1",
+            params![workflow_handle],
+        )?;
+        let edges_removed = c.execute(
+            "DELETE FROM workflow_edge_identity WHERE workflow_handle = ?1",
+            params![workflow_handle],
+        )?;
+        let presentation_removed = c.execute(
+            "DELETE FROM workflow_presentation WHERE workflow_handle = ?1",
+            params![workflow_handle],
+        )?;
+        Ok((
+            IdentitySyncStats {
+                nodes_deleted: nodes_removed,
+                edges_deleted: edges_removed,
+                ..IdentitySyncStats::default()
+            },
+            presentation_removed,
+        ))
+    }
+
+    fn insert_project_workflow_tx(
+        c: &Connection,
+        draft: &crate::workflow::ProjectWorkflowDraft,
+        graph_json: &str,
+        digest: &str,
+        ts: &str,
+    ) -> Result<(String, IdentitySyncStats)> {
+        let handle = new_public_handle();
+        c.execute(
+            "INSERT INTO project_workflows
+                 (workflow_key, name, graph_json, allow_unsafe_parallel, content_digest,
+                  public_handle, semantic_revision, presentation_revision,
+                  created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, 1, ?7, ?7)",
+            params![
+                draft.key,
+                draft.name,
+                graph_json,
+                draft.allow_unsafe_parallel as i64,
+                digest,
+                handle,
+                ts
+            ],
+        )?;
+        let stats = sync_workflow_identity_tx(c, &handle, &draft.nodes)?;
+        Self::bump_collection_tx(c)?;
+        Ok((handle, stats))
+    }
+
+    fn save_project_workflow_semantic_tx(
+        c: &Connection,
+        draft: &crate::workflow::ProjectWorkflowDraft,
+        graph_json: &str,
+        digest: &str,
+        ts: &str,
+        expected_semantic_revision: Option<i64>,
+    ) -> Result<(
+        crate::workflow::ProjectWorkflowRecord,
+        String,
+        IdentitySyncStats,
+    )> {
+        let current: Option<(String, String, i64, String, i64)> = c
+            .query_row(
+                "SELECT public_handle, name, allow_unsafe_parallel, content_digest,
+                        semantic_revision
+                 FROM project_workflows WHERE workflow_key = ?1",
+                params![draft.key],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let Some((handle, name, flag, current_digest, semantic)) = current else {
+            anyhow::bail!("项目工作流 `{}` 不存在,语义编辑必须先创建", draft.key);
+        };
+        if let Some(expected) = expected_semantic_revision {
+            Self::ensure_revision(expected, semantic, RevisionAxis::Semantic)?;
+        }
+        let content_changed = current_digest != digest
+            || name != draft.name
+            || flag != draft.allow_unsafe_parallel as i64;
+        let mut stats = IdentitySyncStats::default();
+        if content_changed {
+            c.execute(
+                "UPDATE project_workflows SET
+                     name = ?2, graph_json = ?3, allow_unsafe_parallel = ?4,
+                     content_digest = ?5, semantic_revision = semantic_revision + 1,
+                     updated_at = ?6
+                 WHERE workflow_key = ?1",
+                params![
+                    draft.key,
+                    draft.name,
+                    graph_json,
+                    draft.allow_unsafe_parallel as i64,
+                    digest,
+                    ts
+                ],
+            )?;
+            if current_digest != digest {
+                stats = sync_workflow_identity_tx(c, &handle, &draft.nodes)?;
+            }
+        }
+        let record = Self::project_workflow_row(c, &draft.key)
+            .transpose()
+            .unwrap_or_else(|| Err(anyhow::anyhow!("项目工作流保存后读取失败")))?;
+        Ok((record, handle, stats))
+    }
+
+    fn delete_project_workflow_tx(
+        c: &Connection,
+        key: &str,
+    ) -> Result<(bool, Option<(String, IdentitySyncStats, usize)>)> {
+        let Some(handle) = Self::workflow_handle_of(c, key)? else {
+            return Ok((false, None));
+        };
+        let (stats, presentation_removed) = Self::cleanup_workflow_dependents_tx(c, &handle)?;
+        c.execute(
+            "DELETE FROM project_workflows WHERE workflow_key = ?1",
+            params![key],
+        )?;
+        Self::bump_collection_tx(c)?;
+        Ok((true, Some((handle, stats, presentation_removed))))
+    }
+
+    fn record_committed_identity_gc(
+        &self,
+        workflow_handle: &str,
+        stats: IdentitySyncStats,
+        presentation_removed: usize,
+    ) {
+        if stats.nodes_deleted == 0 && stats.edges_deleted == 0 && presentation_removed == 0 {
+            return;
+        }
+        let metric_key = {
+            let conn = self.conn.lock();
+            crate::observability::store_metric_key(&conn, crate::migration::StoreKind::Project)
+        };
+        crate::observability::record_identity_gc(
+            &metric_key,
+            stats.nodes_deleted,
+            stats.edges_deleted,
+        );
+        log::info!(
+            "identity_gc workflow_handle={} nodes_removed={} edges_removed={} presentation_removed={}",
+            workflow_handle,
+            stats.nodes_deleted,
+            stats.edges_deleted,
+            presentation_removed
+        );
+    }
+
+    /// CAS 创建项目工作流(L-CMD):新持久 handle + node/edge identity
+    /// 同事务落库,collection revision +1。持有旧集合快照的命令冲突。
+    pub fn create_project_workflow_cas(
+        &self,
+        draft: &crate::workflow::ProjectWorkflowDraft,
+        expected_collection_revision: i64,
+    ) -> Result<crate::workflow::ProjectWorkflowRecord> {
+        Self::validate_project_workflow_draft(draft)?;
         let graph_json = serde_json::to_string(&draft.nodes)?;
         let digest =
             crate::workflow::workflow_content_digest(&draft.nodes, draft.allow_unsafe_parallel);
         let ts = now();
-        self.with_conn(|c| {
-            let existing: Option<String> = c
-                .query_row(
-                    "SELECT content_digest FROM project_workflows WHERE workflow_key = ?1",
-                    params![draft.key],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if existing.as_deref() != Some(digest.as_str()) {
-                c.execute(
-                    "INSERT INTO project_workflows
-                        (workflow_key, name, graph_json, allow_unsafe_parallel,
-                         content_digest, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)
-                     ON CONFLICT(workflow_key) DO UPDATE SET
-                        name = excluded.name,
-                        graph_json = excluded.graph_json,
-                        allow_unsafe_parallel = excluded.allow_unsafe_parallel,
-                        content_digest = excluded.content_digest,
-                        updated_at = excluded.updated_at",
-                    params![
-                        draft.key,
-                        draft.name,
-                        graph_json,
-                        draft.allow_unsafe_parallel as i64,
-                        digest,
-                        ts
-                    ],
-                )?;
-            } else if existing.is_some() {
-                // 内容相同但名称可能变化:名称参与用户可见列表,单独刷新
-                c.execute(
-                    "UPDATE project_workflows SET name = ?2 WHERE workflow_key = ?1 AND name <> ?2",
-                    params![draft.key, draft.name],
-                )?;
-            }
+        self.with_tx(|c| {
+            let collection = Self::collection_revision_tx(c)?;
+            Self::ensure_revision(
+                expected_collection_revision,
+                collection,
+                RevisionAxis::Collection,
+            )?;
+            anyhow::ensure!(
+                Self::workflow_handle_of(c, &draft.key)?.is_none(),
+                "项目工作流 `{}` 已存在,创建命令冲突",
+                draft.key
+            );
+            let _identity = Self::insert_project_workflow_tx(c, draft, &graph_json, &digest, &ts)?;
             Self::project_workflow_row(c, &draft.key)
                 .transpose()
                 .unwrap_or_else(|| Err(anyhow::anyhow!("项目工作流保存后读取失败")))
         })
+    }
+
+    /// CAS 语义编辑(图/名称/unsafe 开关):identity 同步 + semantic
+    /// revision +1;collection/presentation 不动。内容与名称均未变化时
+    /// 为 no-op(不增 revision、handle 稳定)。
+    pub fn save_project_workflow_semantic_cas(
+        &self,
+        draft: &crate::workflow::ProjectWorkflowDraft,
+        expected_semantic_revision: i64,
+    ) -> Result<crate::workflow::ProjectWorkflowRecord> {
+        Self::validate_project_workflow_draft(draft)?;
+        let graph_json = serde_json::to_string(&draft.nodes)?;
+        let digest =
+            crate::workflow::workflow_content_digest(&draft.nodes, draft.allow_unsafe_parallel);
+        let ts = now();
+        let (record, handle, stats) = self.with_tx(|c| {
+            Self::save_project_workflow_semantic_tx(
+                c,
+                draft,
+                &graph_json,
+                &digest,
+                &ts,
+                Some(expected_semantic_revision),
+            )
+        })?;
+        self.record_committed_identity_gc(&handle, stats, 0);
+        Ok(record)
+    }
+
+    /// 保存/覆盖项目工作流(GPUI 旧写路径,无 CAS):新建走 collection 轴,
+    /// 编辑走 semantic 轴;同内容(含名称)保存为幂等 no-op。
+    /// T2 移除 GPUI mutation bypass 后由 CAS 命令取代。
+    pub fn save_project_workflow(
+        &self,
+        draft: &crate::workflow::ProjectWorkflowDraft,
+    ) -> Result<crate::workflow::ProjectWorkflowRecord> {
+        Self::validate_project_workflow_draft(draft)?;
+        let graph_json = serde_json::to_string(&draft.nodes)?;
+        let digest =
+            crate::workflow::workflow_content_digest(&draft.nodes, draft.allow_unsafe_parallel);
+        let ts = now();
+        let (record, handle, stats) = self.with_tx(|c| {
+            let existing = Self::workflow_handle_of(c, &draft.key)?;
+            if existing.is_some() {
+                Self::save_project_workflow_semantic_tx(c, draft, &graph_json, &digest, &ts, None)
+            } else {
+                let (handle, stats) =
+                    Self::insert_project_workflow_tx(c, draft, &graph_json, &digest, &ts)?;
+                let record = Self::project_workflow_row(c, &draft.key)
+                    .transpose()
+                    .unwrap_or_else(|| Err(anyhow::anyhow!("项目工作流保存后读取失败")))?;
+                Ok((record, handle, stats))
+            }
+        })?;
+        self.record_committed_identity_gc(&handle, stats, 0);
+        Ok(record)
     }
 
     /// 读取项目工作流(无记录为 None;graph_json 损坏时报错而非静默空)。
@@ -2398,14 +2865,287 @@ impl Store {
         })
     }
 
-    /// 删除项目工作流;返回是否确实删除了一行。
+    /// 当前 workflow collection revision(project_meta singleton)。
+    pub fn workflow_collection_revision(&self) -> Result<i64> {
+        self.with_conn(Self::collection_revision_tx)
+    }
+
+    /// CAS 删除项目工作流:identity/presentation/position 同事务清理,
+    /// collection revision +1。行不存在时返回 false(不递增)。
+    pub fn delete_project_workflow_cas(
+        &self,
+        key: &str,
+        expected_collection_revision: i64,
+    ) -> Result<bool> {
+        let (deleted, gc) = self.with_tx(|c| {
+            let collection = Self::collection_revision_tx(c)?;
+            Self::ensure_revision(
+                expected_collection_revision,
+                collection,
+                RevisionAxis::Collection,
+            )?;
+            Self::delete_project_workflow_tx(c, key)
+        })?;
+        if let Some((handle, stats, presentation_removed)) = gc {
+            self.record_committed_identity_gc(&handle, stats, presentation_removed);
+        }
+        Ok(deleted)
+    }
+
+    /// 删除项目工作流(GPUI 旧写路径,无 CAS);返回是否确实删除了一行。
+    /// identity/presentation/position 同事务清理,collection revision +1。
     /// 不影响 `task_workflows` 与已冻结的 Pipeline Revision。
     pub fn delete_project_workflow(&self, key: &str) -> Result<bool> {
+        let (deleted, gc) = self.with_tx(|c| Self::delete_project_workflow_tx(c, key))?;
+        if let Some((handle, stats, presentation_removed)) = gc {
+            self.record_committed_identity_gc(&handle, stats, presentation_removed);
+        }
+        Ok(deleted)
+    }
+
+    /// CAS 写入展示状态(viewport/折叠/布局 JSON)。`None` 表示不修改
+    /// 对应字段;提供的值必须是合法 JSON。写入成功 presentation +1。
+    pub fn set_workflow_presentation_cas(
+        &self,
+        workflow_key: &str,
+        expected_presentation_revision: i64,
+        viewport_json: Option<&str>,
+        collapse_json: Option<&str>,
+        layout_json: Option<&str>,
+    ) -> Result<i64> {
+        for (field, value) in [
+            ("viewport", viewport_json),
+            ("collapse", collapse_json),
+            ("layout", layout_json),
+        ] {
+            if let Some(value) = value {
+                anyhow::ensure!(
+                    serde_json::from_str::<serde_json::Value>(value).is_ok(),
+                    "presentation {field} 必须是合法 JSON"
+                );
+            }
+        }
+        self.with_tx(|c| {
+            let row: Option<(String, i64)> = c
+                .query_row(
+                    "SELECT public_handle, presentation_revision
+                     FROM project_workflows WHERE workflow_key = ?1",
+                    params![workflow_key],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((handle, presentation)) = row else {
+                anyhow::bail!("项目工作流 `{workflow_key}` 不存在,presentation 无法写入");
+            };
+            Self::ensure_revision(
+                expected_presentation_revision,
+                presentation,
+                RevisionAxis::Presentation,
+            )?;
+            if viewport_json.is_none() && collapse_json.is_none() && layout_json.is_none() {
+                return Ok(presentation);
+            }
+            c.execute(
+                "INSERT OR IGNORE INTO workflow_presentation
+                     (workflow_handle, viewport_json, collapse_json, layout_json)
+                 VALUES (?1, NULL, NULL, NULL)",
+                params![handle],
+            )?;
+            if let Some(value) = viewport_json {
+                c.execute(
+                    "UPDATE workflow_presentation SET viewport_json = ?2
+                     WHERE workflow_handle = ?1",
+                    params![handle, value],
+                )?;
+            }
+            if let Some(value) = collapse_json {
+                c.execute(
+                    "UPDATE workflow_presentation SET collapse_json = ?2
+                     WHERE workflow_handle = ?1",
+                    params![handle, value],
+                )?;
+            }
+            if let Some(value) = layout_json {
+                c.execute(
+                    "UPDATE workflow_presentation SET layout_json = ?2
+                     WHERE workflow_handle = ?1",
+                    params![handle, value],
+                )?;
+            }
+            c.execute(
+                "UPDATE project_workflows
+                 SET presentation_revision = presentation_revision + 1
+                 WHERE workflow_key = ?1",
+                params![workflow_key],
+            )?;
+            Ok(presentation + 1)
+        })
+    }
+
+    /// CAS 写入节点位置(presentation 命令):node_handle 必须已有 identity;
+    /// 同节点重复写是 upsert。成功后所属工作流 presentation +1。
+    pub fn set_node_position_cas(
+        &self,
+        node_handle: &str,
+        x: f64,
+        y: f64,
+        expected_presentation_revision: i64,
+    ) -> Result<i64> {
+        self.with_tx(|c| {
+            let workflow_handle: String = c
+                .query_row(
+                    "SELECT workflow_handle FROM workflow_node_identity WHERE node_handle = ?1",
+                    params![node_handle],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("node_handle `{node_handle}` 不存在,position 无法写入")
+                })?;
+            let presentation: i64 = c.query_row(
+                "SELECT presentation_revision FROM project_workflows WHERE public_handle = ?1",
+                params![workflow_handle],
+                |r| r.get(0),
+            )?;
+            Self::ensure_revision(
+                expected_presentation_revision,
+                presentation,
+                RevisionAxis::Presentation,
+            )?;
+            c.execute(
+                "INSERT INTO node_position (node_handle, x, y) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(node_handle) DO UPDATE SET x = excluded.x, y = excluded.y",
+                params![node_handle, x, y],
+            )?;
+            c.execute(
+                "UPDATE project_workflows
+                 SET presentation_revision = presentation_revision + 1
+                 WHERE public_handle = ?1",
+                params![workflow_handle],
+            )?;
+            Ok(presentation + 1)
+        })
+    }
+
+    /// 读取工作流展示状态(未写过为 None;迁移不伪造旧值)。
+    pub fn workflow_presentation(
+        &self,
+        workflow_key: &str,
+    ) -> Result<Option<WorkflowPresentationState>> {
         self.with_conn(|c| {
-            Ok(c.execute(
-                "DELETE FROM project_workflows WHERE workflow_key = ?1",
-                params![key],
-            )? > 0)
+            let row: Option<(String, Option<String>, Option<String>, Option<String>)> = c
+                .query_row(
+                    "SELECT p.workflow_handle, p.viewport_json, p.collapse_json, p.layout_json
+                     FROM workflow_presentation p
+                     JOIN project_workflows w ON w.public_handle = p.workflow_handle
+                     WHERE w.workflow_key = ?1",
+                    params![workflow_key],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            Ok(row.map(
+                |(workflow_handle, viewport_json, collapse_json, layout_json)| {
+                    WorkflowPresentationState {
+                        workflow_handle,
+                        viewport_json,
+                        collapse_json,
+                        layout_json,
+                    }
+                },
+            ))
+        })
+    }
+
+    /// 节点位置(node_handle 精确查询;无位置为 None)。
+    pub fn node_position(&self, node_handle: &str) -> Result<Option<(f64, f64)>> {
+        self.with_conn(|c| {
+            Ok(c.query_row(
+                "SELECT x, y FROM node_position WHERE node_handle = ?1",
+                params![node_handle],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+        })
+    }
+
+    /// 工作流全部节点位置 `(node_handle, x, y)`,按 node_handle 稳定排序。
+    pub fn node_positions_of_workflow(
+        &self,
+        workflow_key: &str,
+    ) -> Result<Vec<(String, f64, f64)>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT p.node_handle, p.x, p.y
+                 FROM node_position p
+                 JOIN workflow_node_identity i ON i.node_handle = p.node_handle
+                 JOIN project_workflows w ON w.public_handle = i.workflow_handle
+                 WHERE w.workflow_key = ?1
+                 ORDER BY p.node_handle",
+            )?;
+            let rows = stmt
+                .query_map(params![workflow_key], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, f64>(1)?,
+                        r.get::<_, f64>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// 工作流的节点 identity(按 node_key 排序;工作流不存在为空)。
+    pub fn workflow_node_identities(
+        &self,
+        workflow_key: &str,
+    ) -> Result<Vec<WorkflowNodeIdentityRow>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT i.workflow_handle, i.node_key, i.node_handle
+                 FROM workflow_node_identity i
+                 JOIN project_workflows w ON w.public_handle = i.workflow_handle
+                 WHERE w.workflow_key = ?1
+                 ORDER BY i.node_key",
+            )?;
+            let rows = stmt
+                .query_map(params![workflow_key], |r| {
+                    Ok(WorkflowNodeIdentityRow {
+                        workflow_handle: r.get(0)?,
+                        node_key: r.get(1)?,
+                        node_handle: r.get(2)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// 工作流的边 identity(按 upstream/downstream 排序)。
+    pub fn workflow_edge_identities(
+        &self,
+        workflow_key: &str,
+    ) -> Result<Vec<WorkflowEdgeIdentityRow>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT e.workflow_handle, e.upstream_node_key, e.downstream_node_key,
+                        e.edge_handle
+                 FROM workflow_edge_identity e
+                 JOIN project_workflows w ON w.public_handle = e.workflow_handle
+                 WHERE w.workflow_key = ?1
+                 ORDER BY e.upstream_node_key, e.downstream_node_key",
+            )?;
+            let rows = stmt
+                .query_map(params![workflow_key], |r| {
+                    Ok(WorkflowEdgeIdentityRow {
+                        workflow_handle: r.get(0)?,
+                        upstream_node_key: r.get(1)?,
+                        downstream_node_key: r.get(2)?,
+                        edge_handle: r.get(3)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
         })
     }
 
@@ -2413,9 +3153,20 @@ impl Store {
         c: &Connection,
         key: &str,
     ) -> Result<Option<crate::workflow::ProjectWorkflowRecord>> {
-        let row: Option<(String, String, i64, String, String, String)> = c
+        let row: Option<(
+            String,
+            String,
+            i64,
+            String,
+            String,
+            i64,
+            i64,
+            String,
+            String,
+        )> = c
             .query_row(
                 "SELECT name, graph_json, allow_unsafe_parallel, content_digest,
+                        public_handle, semantic_revision, presentation_revision,
                         created_at, updated_at
                  FROM project_workflows WHERE workflow_key = ?1",
                 params![key],
@@ -2427,11 +3178,25 @@ impl Store {
                         r.get(3)?,
                         r.get(4)?,
                         r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                        r.get(8)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((name, graph_json, flag, digest, created_at, updated_at)) = row else {
+        let Some((
+            name,
+            graph_json,
+            flag,
+            digest,
+            public_handle,
+            semantic_revision,
+            presentation_revision,
+            created_at,
+            updated_at,
+        )) = row
+        else {
             return Ok(None);
         };
         let nodes: Vec<crate::workflow::WorkflowNodeDraft> = serde_json::from_str(&graph_json)
@@ -2442,6 +3207,9 @@ impl Store {
             nodes,
             allow_unsafe_parallel: flag != 0,
             content_digest: digest,
+            public_handle,
+            semantic_revision,
+            presentation_revision,
             created_at,
             updated_at,
         }))

@@ -196,7 +196,16 @@ pub fn upgrade_with_barrier(
     target: i64,
     migrate: &dyn Fn(&Transaction, i64, i64) -> Result<()>,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
+    let metric_key = crate::observability::store_metric_key(conn, store);
     let current = schema_version_of(conn)?;
+    log::info!(
+        "schema_migration_check store={} current_version={} target_version={} migration_required={}",
+        store,
+        current,
+        target,
+        current != target
+    );
     if current > target {
         return Err(MigrationError::FutureVersion {
             store,
@@ -217,6 +226,14 @@ pub fn upgrade_with_barrier(
         migrate(&tx, locked_current, target)?;
         tx.pragma_update(None, "user_version", target)?;
         tx.commit()?;
+        log::info!(
+            "schema_migration_complete store={} from_version={} to_version={} duration_ms={} persistent=false",
+            store,
+            locked_current,
+            target,
+            started.elapsed().as_millis()
+        );
+        crate::observability::record_migration(&metric_key, store, started.elapsed().as_millis());
         return Ok(());
     }
 
@@ -247,6 +264,49 @@ pub fn upgrade_with_barrier(
     migrate(&tx, locked_current, target)?;
     tx.pragma_update(None, "user_version", target)?;
     tx.commit()?;
+    log::info!(
+        "schema_migration_complete store={} from_version={} to_version={} duration_ms={} persistent=true",
+        store,
+        locked_current,
+        target,
+        started.elapsed().as_millis()
+    );
+    crate::observability::record_migration(&metric_key, store, started.elapsed().as_millis());
+    Ok(())
+}
+
+/// 收紧活动 SQLite 文件及其专用父目录为当前用户独占。
+///
+/// 必须在 future-version guard 成功之后调用，保证拒绝未来版本的路径
+/// 不修改文件元数据。相对裸文件名没有“专用目录”，因此只收紧文件本体，
+/// 不会误改进程当前工作目录 ACL。WAL/SHM 已存在时同步收紧。
+pub(crate) fn restrict_active_database_to_current_user(conn: &Connection) -> Result<()> {
+    let Some(raw_path) = conn.path().filter(|path| !path.is_empty()) else {
+        return Ok(());
+    };
+    let path = PathBuf::from(raw_path);
+    if let Some(parent) = path.parent().filter(|parent| {
+        matches!(
+            parent.file_name().and_then(|name| name.to_str()),
+            Some(".mf-agent" | ".monkeyfence")
+        )
+    }) {
+        restrict_current_user_only(parent).map_err(|error| {
+            anyhow::anyhow!("收紧活动数据库目录 ACL {} 失败:{error}", parent.display())
+        })?;
+    }
+    restrict_current_user_only(&path)
+        .map_err(|error| anyhow::anyhow!("收紧活动数据库 ACL {} 失败:{error}", path.display()))?;
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        if sidecar.exists() {
+            restrict_current_user_only(&sidecar).map_err(|error| {
+                anyhow::anyhow!("收紧 SQLite sidecar ACL {} 失败:{error}", sidecar.display())
+            })?;
+        }
+    }
     Ok(())
 }
 
@@ -956,6 +1016,51 @@ mod tests {
             #[cfg(windows)]
             {
                 let sddl = dacl_sddl(&path);
+                assert!(
+                    sddl.contains(";;;OW)"),
+                    "{} 必须只授权 object owner:{sddl}",
+                    path.display()
+                );
+                for broad in [";;;WD)", ";;;AU)", ";;;BU)", ";;;BG)"] {
+                    assert!(
+                        !sddl.contains(broad),
+                        "{} 不得授权宽泛主体 {broad}:{sddl}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn active_project_database_is_restricted_to_current_user() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_dir = tmp.path().join("project").join(".mf-agent");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&db_dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        let db = db_dir.join("workflow-v1.db");
+        let store = crate::Store::open(&db).unwrap();
+        store.create_task("acl", "acl").unwrap();
+
+        for path in [&db_dir, &db] {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let expected = if path.is_dir() { 0o700 } else { 0o600 };
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    expected,
+                    "{} 必须仅当前用户可访问",
+                    path.display()
+                );
+            }
+            #[cfg(windows)]
+            {
+                let sddl = dacl_sddl(path);
                 assert!(
                     sddl.contains(";;;OW)"),
                     "{} 必须只授权 object owner:{sddl}",

@@ -8,7 +8,7 @@
 
 use crate::agent_instance::AgentInstanceSnapshot;
 use crate::catalog_store::CatalogStore;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 /// 内容身份摘要(I12/F13):规范化节点(按 key 排序,deps 排序)以
@@ -59,6 +59,36 @@ pub struct WorkflowNodeDraft {
     pub deps: Vec<String>,
 }
 
+/// 图结构校验(T1b 深模块缝隙):节点键唯一、依赖必须指向已知节点。
+/// 迁移回填与项目工作流保存共用;完整 DAG 校验(循环/变量/实例)仍属
+/// WorkflowCompiler。结构非法即 Err(fail-closed),绝不跳过 identity。
+pub(crate) fn validate_graph_structure(nodes: &[WorkflowNodeDraft]) -> Result<()> {
+    use std::collections::HashSet;
+    let mut keys = HashSet::with_capacity(nodes.len());
+    for node in nodes {
+        if !keys.insert(node.key.as_str()) {
+            anyhow::bail!("节点键 `{}` 重复,图结构非法", node.key);
+        }
+    }
+    for node in nodes {
+        for dep in &node.deps {
+            if !keys.contains(dep.as_str()) {
+                anyhow::bail!("节点 `{}` 依赖未知节点 `{}`,图结构非法", node.key, dep);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 解析持久化的 `graph_json` 并做结构校验(解析失败即 Err,
+/// 不静默返回空图)。
+pub(crate) fn parse_graph_json(graph_json: &str) -> Result<Vec<WorkflowNodeDraft>> {
+    let nodes: Vec<WorkflowNodeDraft> =
+        serde_json::from_str(graph_json).context("graph_json 解析失败")?;
+    validate_graph_structure(&nodes)?;
+    Ok(nodes)
+}
+
 /// 模板草案;`task_local` 为真的模板只属于单个任务,不进全局列表。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowTemplateDraft {
@@ -91,6 +121,8 @@ pub struct ProjectWorkflowDraft {
 
 /// 项目库 `project_workflows` 行:只保存当前版本(无版本链);
 /// 运行时投影为临时模板版本并冻结成 Pipeline Revision。
+/// `public_handle` 是持久 aggregate handle(UUIDv7,永不复用);
+/// `semantic_revision`/`presentation_revision` 是两条互不串增的 CAS 轴。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectWorkflowRecord {
     pub key: String,
@@ -98,6 +130,9 @@ pub struct ProjectWorkflowRecord {
     pub nodes: Vec<WorkflowNodeDraft>,
     pub allow_unsafe_parallel: bool,
     pub content_digest: String,
+    pub public_handle: String,
+    pub semantic_revision: i64,
+    pub presentation_revision: i64,
     pub created_at: String,
     pub updated_at: String,
 }

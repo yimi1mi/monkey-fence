@@ -711,9 +711,10 @@ impl AgentWorkspace {
     }
 
     fn kill_session_by(&mut self, project: &PathBuf, session_id: i64, cx: &mut Context<Self>) {
-        let project_str = project.to_string_lossy().to_string();
-        self.app.registry.kill_session(&project_str, session_id);
         if let Some(orch) = self.app.orchestrator_of(project) {
+            if let Ok(Some(session)) = orch.store.session_view(session_id) {
+                self.app.registry.kill_session(&session.public_handle);
+            }
             if let Err(e) = orch.set_session_status(session_id, SessionStatus::Dead) {
                 log::warn!("更新会话状态失败: {e:#}");
             }
@@ -2036,8 +2037,14 @@ impl AgentWorkspace {
                 run_id,
             } => (project.clone(), *session_id, Some(*run_id), false),
         };
-        let project_str = project.to_string_lossy().to_string();
-        let snapshot = self.app.registry.snapshot(&project_str, session_id);
+        let session_handle = self
+            .app
+            .orchestrator_of(&project)
+            .and_then(|orch| orch.store.session_view(session_id).ok().flatten())
+            .map(|session| session.public_handle);
+        let snapshot = session_handle
+            .as_deref()
+            .and_then(|handle| self.app.registry.snapshot(handle, session_id));
         let title = snapshot
             .as_ref()
             .map(|s| s.title.clone())
@@ -2441,8 +2448,16 @@ impl Render for AgentWorkspace {
                                 ..
                             }) = ws.overlay.clone()
                             {
-                                let p = project.to_string_lossy().to_string();
-                                let _ = ws.app.registry.send_prompt_raw(&p, session_id, &[0x1b]);
+                                if let Some(handle) = ws
+                                    .app
+                                    .orchestrator_of(&project)
+                                    .and_then(|orch| {
+                                        orch.store.session_view(session_id).ok().flatten()
+                                    })
+                                    .map(|session| session.public_handle)
+                                {
+                                    let _ = ws.app.registry.send_prompt_raw(&handle, &[0x1b]);
+                                }
                             }
                             cx.stop_propagation();
                             return;
@@ -2521,8 +2536,16 @@ impl Render for AgentWorkspace {
                     {
                         if focused && ws.active_field == Field::None {
                             if let Some(seq) = terminal_key_bytes(ev) {
-                                let p = project.to_string_lossy().to_string();
-                                let _ = ws.app.registry.send_prompt_raw(&p, session_id, &seq);
+                                if let Some(handle) = ws
+                                    .app
+                                    .orchestrator_of(&project)
+                                    .and_then(|orch| {
+                                        orch.store.session_view(session_id).ok().flatten()
+                                    })
+                                    .map(|session| session.public_handle)
+                                {
+                                    let _ = ws.app.registry.send_prompt_raw(&handle, &seq);
+                                }
                             }
                             cx.stop_propagation();
                             return;

@@ -783,18 +783,32 @@ fn write_manifest(dir: &Path) -> Result<()> {
 fn write_baseline_contents(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir.join("expected"))?;
     generate_project_db(&dir.join(PROJECT_FIXTURE))?;
+    // 与提交基线逐字节一致所需的头部归一:旧 harness 用 Store::open 原位
+    // 打开 fixture,持久化为 WAL 模式并 +1 change counter。v7 起原位打开会
+    // 触发迁移,改用等价的裸 journal_mode 切换保持字节稳定(无任何 DDL)。
+    {
+        let conn = Connection::open(dir.join(PROJECT_FIXTURE))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "wal_checkpoint", "TRUNCATE")?;
+    }
     generate_catalog_db(&dir.join(CATALOG_FIXTURE))?;
     let session = generate_session_json();
     fs::write(dir.join(SESSION_FIXTURE), &session)?;
 
     // expected dump 从刚写出的 fixture 读取(而非生成过程内存态),
     // 保证「打开 fixture → dump」这一被测路径自身就是期望来源。
-    let store = Store::open(&dir.join(PROJECT_FIXTURE))?;
-    fs::write(
-        dir.join("expected/project-v6.dump.json"),
-        serde_json::to_string_pretty(&dump_project(&store)?)? + "\n",
-    )?;
-    drop(store);
+    // 读取用副本:T1b 起 Store 打开会把 v6 fixture 升级到 v7 并生成备份,
+    // 不得改写冻结的 v6 基线本体、也不得把备份目录带进 manifest。
+    {
+        let dump_tmp = tempfile::tempdir()?;
+        let dump_db = dump_tmp.path().join(PROJECT_FIXTURE);
+        fs::copy(&dir.join(PROJECT_FIXTURE), &dump_db)?;
+        let store = Store::open(&dump_db)?;
+        fs::write(
+            dir.join("expected/project-v6.dump.json"),
+            serde_json::to_string_pretty(&dump_project(&store)?)? + "\n",
+        )?;
+    }
     let catalog = CatalogStore::open(&dir.join(CATALOG_FIXTURE))?;
     fs::write(
         dir.join("expected/catalog-v1.dump.json"),

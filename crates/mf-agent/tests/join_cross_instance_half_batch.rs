@@ -32,23 +32,28 @@ impl RuntimeHost for SharedHost {
     ) -> anyhow::Result<()> {
         self.0.launch_workflow(spec, events)
     }
-    fn send_prompt(&self, project: &str, run_id: i64, session_id: i64, text: &str) {
-        self.0.send_prompt(project, run_id, session_id, text)
+    fn send_prompt(
+        &self,
+        run_handle: &str,
+        session_handle: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        self.0.send_prompt(run_handle, session_handle, text)
     }
-    fn stop_run(&self, project: &str, run_id: i64) -> anyhow::Result<()> {
-        self.0.stop_run(project, run_id)
+    fn stop_run(&self, run_handle: &str) -> anyhow::Result<()> {
+        self.0.stop_run(run_handle)
     }
-    fn is_session_alive(&self, _project: &str, _session_id: i64) -> bool {
+    fn is_session_alive(&self, _session_handle: &str) -> bool {
         true
     }
-    fn kill_session(&self, project: &str, session_id: i64) {
-        self.0.kill_session(project, session_id)
+    fn kill_session(&self, session_handle: &str) {
+        self.0.kill_session(session_handle)
     }
-    fn kill_ad_hoc(&self, project: &str, display_session_id: i64) {
-        self.0.kill_ad_hoc(project, display_session_id)
+    fn kill_ad_hoc(&self, display_session_handle: &str) {
+        self.0.kill_ad_hoc(display_session_handle)
     }
-    fn answer_question(&self, project: &str, run_id: i64, answer: &str) {
-        self.0.answer_question(project, run_id, answer)
+    fn answer_question(&self, run_handle: &str, answer: &str) {
+        self.0.answer_question(run_handle, answer)
     }
     fn launch_ad_hoc(&self, spec: mf_agent::AdHocLaunchSpec) -> anyhow::Result<()> {
         self.0.launch_ad_hoc(spec)

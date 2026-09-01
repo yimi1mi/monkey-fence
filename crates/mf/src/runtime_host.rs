@@ -172,17 +172,11 @@ fn push_capped(list: &mut Vec<(String, String)>, item: (String, String)) {
     list.push(item);
 }
 
-/// 全局唯一会话键:run/session id 是各项目数据库的行号,跨项目会碰撞,
-/// 注册表一律以 `{project}#{id}` 定位。
-/// 离散 CLI 会话的进程也注册在展示会话行(agent_sessions)键下 ——
-/// Registry/PtySession/kill/detach/snapshot 一律使用 display session ID;
-/// ad_hoc_sessions 行号只作为 `AdHocExited` 事件 tag,不参与进程路由。
-pub fn session_key(project: &str, id: i64) -> String {
-    format!("{}#{}", project.replace('#', "_"), id)
-}
-
 pub struct SessionRegistry {
+    /// 唯一主键是 `agent_sessions.public_handle`。项目路径和 SQLite rowid
+    /// 都不得进入注册表身份，避免目录移动/导入后路由漂移。
     sessions: Mutex<HashMap<String, SessionInner>>,
+    /// `agent_runs.public_handle -> agent_sessions.public_handle`。
     run_sessions: Mutex<HashMap<String, String>>,
     config: Mutex<mf_agent::Config>,
     /// stop 等待真实终止确认的时限(生产 10s;测试可调短)。
@@ -214,9 +208,8 @@ impl SessionRegistry {
     }
 
     /// UI 终端视图重新挂载时恢复当前屏幕。
-    pub fn snapshot(&self, project: &str, session_id: i64) -> Option<SessionSnapshot> {
-        let key = session_key(project, session_id);
-        self.snapshot_at(&key, session_id)
+    pub fn snapshot(&self, session_handle: &str, session_id: i64) -> Option<SessionSnapshot> {
+        self.snapshot_at(session_handle, session_id)
     }
 
     fn snapshot_at(&self, key: &str, session_id: i64) -> Option<SessionSnapshot> {
@@ -251,10 +244,9 @@ impl SessionRegistry {
     }
 
     /// 终端输出尾部(卡片"最后回复"用)。
-    pub fn pty_tail(&self, project: &str, session_id: i64, lines: usize) -> Vec<String> {
-        let key = session_key(project, session_id);
+    pub fn pty_tail(&self, session_handle: &str, lines: usize) -> Vec<String> {
         let sessions = self.sessions.lock();
-        match sessions.get(&key) {
+        match sessions.get(session_handle) {
             Some(SessionInner::Pty(p)) => {
                 let screen = p.screen.lock();
                 screen.tail_lines(lines)
@@ -267,20 +259,19 @@ impl SessionRegistry {
     /// StreamingRedactor、但尚未被 Screen 解释的字节。仅测试编译,
     /// 不固化 256 KiB 容量或作为新协议。
     #[cfg(test)]
-    pub(crate) fn pty_output_bytes(&self, project: &str, session_id: i64) -> Option<Vec<u8>> {
-        match self.get_inner(&session_key(project, session_id))? {
+    pub(crate) fn pty_output_bytes(&self, session_handle: &str) -> Option<Vec<u8>> {
+        match self.get_inner(session_handle)? {
             SessionInner::Pty(session) => Some(session.output_tail.lock().clone()),
             SessionInner::Http(_) => None,
         }
     }
 
-    pub fn send_prompt(&self, project: &str, session_id: i64, text: &str) -> Result<()> {
-        let key = session_key(project, session_id);
-        self.send_prompt_at(&key, session_id, text)
+    pub fn send_prompt(&self, session_handle: &str, text: &str) -> Result<()> {
+        self.send_prompt_at(session_handle, text)
     }
 
     /// 锁外做阻塞 I/O(ConPTY 输入缓冲满时 write 会阻塞,不能拿着注册表锁)。
-    fn send_prompt_at(&self, key: &str, session_id: i64, text: &str) -> Result<()> {
+    fn send_prompt_at(&self, key: &str, text: &str) -> Result<()> {
         let sess = self.get_inner(key);
         match sess {
             Some(SessionInner::Pty(p)) => {
@@ -296,16 +287,15 @@ impl SessionRegistry {
                 push_capped(&mut h.transcript.lock(), ("user".into(), text.to_string()));
                 Ok(())
             }
-            None => Err(anyhow!("会话 {session_id} 不存在")),
+            None => Err(anyhow!("会话 handle `{key}` 不存在")),
         }
     }
 
     /// 终端键盘直通:原始字节写入 PTY(不追加回车)。
-    pub fn send_prompt_raw(&self, project: &str, session_id: i64, bytes: &[u8]) -> Result<()> {
-        let key = session_key(project, session_id);
+    pub fn send_prompt_raw(&self, session_handle: &str, bytes: &[u8]) -> Result<()> {
         let sess = {
             let sessions = self.sessions.lock();
-            sessions.get(&key).cloned()
+            sessions.get(session_handle).cloned()
         };
         match sess {
             Some(SessionInner::Pty(p)) => {
@@ -322,31 +312,30 @@ impl SessionRegistry {
         }
     }
 
-    pub fn kill_session(&self, project: &str, session_id: i64) {
-        let key = session_key(project, session_id);
-        Self::kill_at(&self.sessions, &key);
+    pub fn kill_session(&self, session_handle: &str) {
+        if let Some(session) = self.remove_session_and_bindings(session_handle) {
+            Self::terminate_session(session);
+        }
     }
 
     /// 停止 run 绑定的会话进程并等待**真实终止确认**(child 已被
     /// reader/waiter 线程 wait/reap、生命周期已收口)。
     /// Ok = 已确认停止(或本无绑定会话);Err = 时限内未确认
     /// (进程可能仍在运行,调用方不得标记 Cancelled/释放租约)。
-    pub fn stop_run(&self, project: &str, run_id: i64) -> Result<()> {
-        let run_key = session_key(project, run_id);
+    pub fn stop_run(&self, run_handle: &str) -> Result<()> {
         // I10:只查找、不预先移除 —— 未确认终止前 binding/session 保留
         // (超时后可重试停止);确认 terminated 并回收线程后才移除。
-        let bound = self.run_sessions.lock().get(&run_key).cloned();
+        let bound = self.run_sessions.lock().get(run_handle).cloned();
         let Some(session_key_of_run) = bound else {
             return Ok(()); // 无绑定:无进程可停,视为已停止
         };
         let inner = self.sessions.lock().get(&session_key_of_run).cloned();
         let Some(inner) = inner else {
-            self.run_sessions.lock().remove(&run_key);
+            self.remove_session_and_bindings(&session_key_of_run);
             return Ok(()); // 绑定指向的会话已摘除(自然退出/已清理)
         };
         let confirm_removed = |me: &SessionRegistry| {
-            me.sessions.lock().remove(&session_key_of_run);
-            me.run_sessions.lock().remove(&run_key);
+            me.remove_session_and_bindings(&session_key_of_run);
         };
         match &inner {
             SessionInner::Http(h) => {
@@ -364,7 +353,7 @@ impl SessionRegistry {
                 } else {
                     // 超时:保留 binding/session(stopping 可重试状态)
                     Err(anyhow!(
-                        "run {run_id} HTTP 工具循环未在时限内真正结束(可能仍在处理请求;会话保留,可重试停止)"
+                        "run {run_handle} HTTP 工具循环未在时限内真正结束(可能仍在处理请求;会话保留,可重试停止)"
                     ))
                 }
             }
@@ -383,14 +372,16 @@ impl SessionRegistry {
                     .transpose()?
                 {
                     if let Err(e) = job.terminate() {
-                        log::warn!("run {run_id} 进程树 terminate 请求失败: {e}");
+                        log::warn!("run {run_handle} 进程树 terminate 请求失败: {e}");
                     }
                     let empty = job.wait_empty(std::time::Duration::from_secs(10));
                     drop(job);
                     if !empty {
                         // 树未清空:进程可能仍在写执行目录 → 不确认、不释放、
                         // 不消费守卫(会话保留,重试仍能整组终止)
-                        return Err(anyhow!("run {run_id} 进程树未在 10s 内清空(孙进程仍存活)"));
+                        return Err(anyhow!(
+                            "run {run_handle} 进程树未在 10s 内清空(孙进程仍存活)"
+                        ));
                     }
                 }
                 // 停止输入;请求直接子进程终止(树 terminate 的兜底)。
@@ -399,7 +390,7 @@ impl SessionRegistry {
                 p.writer.lock().take();
                 if let Some(killer) = p.killer.lock().take() {
                     if let Err(e) = killer.kill() {
-                        log::warn!("run {run_id} 会话进程 kill 请求失败: {e}");
+                        log::warn!("run {run_handle} 会话进程 kill 请求失败: {e}");
                     }
                 }
                 if let Some(child) = p.child.lock().take() {
@@ -418,7 +409,7 @@ impl SessionRegistry {
                     // 超时:保留 binding/session 与进程树守卫
                     //(可重试;重试路径由 reader/waiter 线程的收口确认终止)
                     Err(anyhow!(
-                        "run {run_id} 会话进程停止未在 10s 内确认(可能被外部阻塞;会话保留,可重试停止)"
+                        "run {run_handle} 会话进程停止未在 10s 内确认(可能被外部阻塞;会话保留,可重试停止)"
                     ))
                 }
             }
@@ -426,47 +417,69 @@ impl SessionRegistry {
     }
 
     /// PTY 会话的 OS 进程 PID(终止验证/诊断;HTTP 或无进程时 None)。
-    pub fn session_pid(&self, project: &str, session_id: i64) -> Option<u32> {
-        match self
-            .sessions
-            .lock()
-            .get(&session_key(project, session_id))?
-        {
+    pub fn session_pid(&self, session_handle: &str) -> Option<u32> {
+        match self.sessions.lock().get(session_handle)? {
             SessionInner::Pty(p) => p.pid,
             SessionInner::Http(_) => None,
         }
     }
 
-    fn kill_at(sessions: &Mutex<HashMap<String, SessionInner>>, key: &str) {
-        if let Some(s) = sessions.lock().remove(key) {
-            match &s {
-                SessionInner::Pty(p) => {
-                    p.writer.lock().take();
-                    // 进程树终止(尽力而为;不等待,此处绝不伪造"进程已死")
-                    if let Some(job) = p.job.lock().take() {
-                        if let Err(e) = job.terminate() {
-                            log::warn!("进程树 terminate 请求失败: {e}");
-                        }
-                    }
-                    if let Some(killer) = p.killer.lock().take() {
-                        let _ = killer.kill();
-                    }
-                    if let Some(child) = p.child.lock().take() {
-                        // reader/waiter 未接管 child:直接终止并同步 reap,
-                        // 终止已确认
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        p.master.lock().take();
-                        p.mark_terminated();
+    fn remove_session_and_bindings(&self, session_handle: &str) -> Option<SessionInner> {
+        // 与 stop_run 相同的锁顺序(run bindings → sessions)，并在一个
+        // 临界区清掉所有历史 Run→Session 反向引用。
+        let mut bindings = self.run_sessions.lock();
+        let session = self.sessions.lock().remove(session_handle);
+        bindings.retain(|_, bound_session| bound_session != session_handle);
+        session
+    }
+
+    fn terminate_session(session: SessionInner) {
+        match &session {
+            SessionInner::Pty(p) => {
+                p.writer.lock().take();
+                // 进程树终止(尽力而为;不等待,此处绝不伪造"进程已死")
+                if let Some(job) = p.job.lock().take() {
+                    if let Err(e) = job.terminate() {
+                        log::warn!("进程树 terminate 请求失败: {e}");
                     }
                 }
-                SessionInner::Http(h) => {
-                    h.cancel.store(true, Ordering::SeqCst);
-                    h.alive.store(false, Ordering::SeqCst);
-                    h.answer_tx.lock().take(); // 唤醒阻塞中的 ask_human
+                if let Some(killer) = p.killer.lock().take() {
+                    let _ = killer.kill();
+                }
+                if let Some(child) = p.child.lock().take() {
+                    // reader/waiter 未接管 child:直接终止并同步 reap,
+                    // 终止已确认
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    p.master.lock().take();
+                    p.mark_terminated();
                 }
             }
+            SessionInner::Http(h) => {
+                h.cancel.store(true, Ordering::SeqCst);
+                h.alive.store(false, Ordering::SeqCst);
+                h.answer_tx.lock().take(); // 唤醒阻塞中的 ask_human
+            }
         }
+    }
+
+    fn send_prompt_for_run(
+        &self,
+        run_handle: &str,
+        session_handle: &str,
+        text: &str,
+    ) -> Result<()> {
+        let bound = self.run_sessions.lock().get(run_handle).cloned();
+        anyhow::ensure!(
+            bound.as_deref() == Some(session_handle),
+            "run handle `{run_handle}` 未绑定到 session handle `{session_handle}`"
+        );
+        self.send_prompt(session_handle, text)
+    }
+
+    #[cfg(test)]
+    fn binding_count(&self) -> usize {
+        self.run_sessions.lock().len()
     }
 
     #[allow(dead_code)]
@@ -481,10 +494,10 @@ impl SessionRegistry {
             .count()
     }
 
-    pub fn session_alive(&self, project: &str, session_id: i64) -> bool {
+    pub fn session_alive(&self, session_handle: &str) -> bool {
         self.sessions
             .lock()
-            .get(&session_key(project, session_id))
+            .get(session_handle)
             .map(|s| match s {
                 SessionInner::Pty(p) => p.alive.load(Ordering::SeqCst),
                 SessionInner::Http(h) => h.alive.load(Ordering::SeqCst),
@@ -492,32 +505,29 @@ impl SessionRegistry {
             .unwrap_or(false)
     }
 
-    fn register(&self, project: &str, session_id: i64, inner: SessionInner) {
+    fn register(&self, session_handle: &str, inner: SessionInner) {
         self.sessions
             .lock()
-            .insert(session_key(project, session_id), inner);
+            .insert(session_handle.to_string(), inner);
     }
 
-    fn bind_run(&self, project: &str, run_id: i64, session_id: i64) {
-        self.run_sessions.lock().insert(
-            session_key(project, run_id),
-            session_key(project, session_id),
-        );
-    }
-
-    pub fn session_of_run(&self, project: &str, run_id: i64) -> Option<i64> {
-        let key = self
-            .run_sessions
+    fn bind_run(&self, run_handle: &str, session_handle: &str) {
+        self.run_sessions
             .lock()
-            .get(&session_key(project, run_id))?
-            .clone();
-        key.rsplit('#').next()?.parse().ok()
+            .insert(run_handle.to_string(), session_handle.to_string());
     }
 
-    fn http_answer(&self, project: &str, session_id: i64, answer: &str) {
-        let key = session_key(project, session_id);
+    fn unbind_run(&self, run_handle: &str) {
+        self.run_sessions.lock().remove(run_handle);
+    }
+
+    pub fn session_of_run(&self, run_handle: &str) -> Option<String> {
+        self.run_sessions.lock().get(run_handle).cloned()
+    }
+
+    fn http_answer(&self, session_handle: &str, answer: &str) {
         let sessions = self.sessions.lock();
-        if let Some(SessionInner::Http(h)) = sessions.get(&key) {
+        if let Some(SessionInner::Http(h)) = sessions.get(session_handle) {
             if let Some(tx) = h.answer_tx.lock().take() {
                 let _ = tx.send(answer.to_string());
             }
@@ -541,18 +551,24 @@ fn launch_pty(
     spec: &LaunchSpec,
     events: Sender<(i64, RuntimeEvent)>,
 ) {
-    // 注册表按项目根路由(跨项目 id 碰撞隔离);workdir 只是进程 cwd
-    let project = spec.project_root.to_string_lossy().to_string();
-    if spec.attach_existing_session && registry.session_alive(&project, spec.session_id) {
+    if spec.attach_existing_session && registry.session_alive(&spec.session_handle) {
+        registry.bind_run(&spec.run_handle, &spec.session_handle);
         // 复用存活会话:直接发送提示
-        let _ = registry.send_prompt(&project, spec.session_id, &spec.prompt);
+        if let Err(error) = registry.send_prompt(&spec.session_handle, &spec.prompt) {
+            registry.unbind_run(&spec.run_handle);
+            let _ = events.send((
+                spec.run_id,
+                RuntimeEvent::SpawnError(format!("复用会话提示发送失败: {error:#}")),
+            ));
+            return;
+        }
         let _ = events.send((
             spec.run_id,
             RuntimeEvent::AgentState(mf_agent::AgentState::Working),
         ));
         return;
     }
-    registry.kill_session(&project, spec.session_id); // 同键旧会话清理
+    registry.kill_session(&spec.session_handle); // 同 handle 旧会话清理
 
     let mut pair = match pty::openpty(pty::PtySize {
         rows: TERM_ROWS as u16,
@@ -663,12 +679,8 @@ fn launch_pty(
         pid: Some(pid),
         term: TermSignal::new(),
     });
-    registry.register(
-        &project,
-        spec.session_id,
-        SessionInner::Pty(session.clone()),
-    );
-    registry.bind_run(&project, spec.run_id, spec.session_id);
+    registry.register(&spec.session_handle, SessionInner::Pty(session.clone()));
+    registry.bind_run(&spec.run_handle, &spec.session_handle);
 
     // ConPTY 在 master 存续期间不给 reader EOF(自然退出的短命 CLI 会把
     // reader 永远挂在 ReadFile 上):waiter 持有 child,wait 返回后记录
@@ -708,7 +720,7 @@ fn launch_pty(
     let run_id = spec.run_id;
     let events_out = events.clone();
     let reader_registry = registry.clone();
-    let reader_project = project.clone();
+    let reader_session_handle = spec.session_handle.clone();
     let reader_session = session.clone();
     let exit_code_slot_reader = exit_code_slot.clone();
     let reader_done_flag = reader_done.clone();
@@ -751,7 +763,7 @@ fn launch_pty(
             let _ = events_out.send((run_id, RuntimeEvent::Exited { code }));
             let _ = events_out.send((run_id, RuntimeEvent::AgentState(mf_agent::AgentState::Dead)));
             // 进程已结束并 wait:摘除注册表条目(不 kill)
-            reader_registry.kill_session(&reader_project, reader_session.session_id);
+            reader_registry.kill_session(&reader_session_handle);
             // 事件已发出:唤醒 waiter 的终止确认握手(见上)
             reader_done_flag.mark();
         });
@@ -777,7 +789,7 @@ fn launch_pty(
         session.writer.lock().take();
         session.master.lock().take();
         session.mark_terminated(); // child 已同步 reap:终止已确认
-        registry.kill_session(&project, spec.session_id);
+        registry.kill_session(&spec.session_handle);
         let _ = events.send((
             spec.run_id,
             RuntimeEvent::SpawnError(format!("启动 PTY waiter 线程失败: {error}")),
@@ -790,7 +802,7 @@ fn launch_pty(
             let _ = killer.kill();
         }
         session.master.lock().take(); // reader 不存在,直接解除阻塞语义
-        registry.kill_session(&project, spec.session_id);
+        registry.kill_session(&spec.session_handle);
         let _ = events.send((
             spec.run_id,
             RuntimeEvent::SpawnError(format!("启动 PTY reader 线程失败: {error}")),
@@ -808,7 +820,7 @@ fn launch_pty(
 // ---------------- Ad-hoc CLI 会话 ----------------
 
 /// 离散 CLI 会话启动(设计 §4.7 / §10):挂在 Task 下,
-/// 无 Step / Agent Run / 结算事件流;注册表仍以 (project, session_id)
+/// 无 Step / Agent Run / 结算事件流;注册表仍以持久 session handle
 /// 路由,UI 终端视图、send_prompt、kill 与普通会话一致。
 
 /// 拒绝符号链接/接合点/junction 逃逸:从 run_temp 到 target 的
@@ -875,16 +887,15 @@ fn materialize_temp_files(run_temp: &Path, files: &[TempFileSpec]) -> Result<()>
 /// 注册表条目位于展示会话键下 —— kill/detach 都用 display ID。
 struct AdHocReapGuard<'a> {
     registry: &'a SessionRegistry,
-    project: &'a str,
-    /// 进程注册键(展示会话行;与 ad_hoc_sessions 行号不同)。
-    display_id: i64,
+    /// 进程注册键(agent_sessions.public_handle)。
+    display_session_handle: &'a str,
     session: Option<Arc<PtySession>>,
 }
 
 impl Drop for AdHocReapGuard<'_> {
     fn drop(&mut self) {
         if let Some(session) = self.session.take() {
-            self.registry.kill_session(self.project, self.display_id);
+            self.registry.kill_session(self.display_session_handle);
             if let Some(mut killer) = session.killer.lock().take() {
                 let _ = killer.kill();
             }
@@ -899,10 +910,9 @@ impl Drop for AdHocReapGuard<'_> {
 /// `StreamingRedactor` 跨块脱敏;进程退出时向 Orchestrator 上报
 /// `AdHocExited`(tag 为 session_id)并从注册表摘除会话。
 fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) -> Result<()> {
-    let project = spec.workdir.to_string_lossy().to_string();
-    // 进程注册键 = 展示会话行:Agents 卡片与终端交互复用既有通道
+    // 进程注册键 = 展示会话的持久 handle；行号只作事件/UI tag。
     let display_id = spec.display_session_id;
-    registry.kill_session(&project, display_id); // 同键旧会话清理
+    registry.kill_session(&spec.display_session_handle);
 
     if spec.plan.uses_shell {
         anyhow::bail!("离散 CLI Runtime 尚不支持 Shell 启动计划");
@@ -979,13 +989,15 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
         pid: Some(pid),
         term: TermSignal::new(),
     });
-    registry.register(&project, display_id, SessionInner::Pty(session.clone()));
+    registry.register(
+        &spec.display_session_handle,
+        SessionInner::Pty(session.clone()),
+    );
     // 看护 armed:下方任何失败路径(初始 stdin 写入、线程启动)
     // 都会 kill 并摘除注册表条目
     let mut reap = AdHocReapGuard {
         registry,
-        project: &project,
-        display_id,
+        display_session_handle: &spec.display_session_handle,
         session: Some(session.clone()),
     };
 
@@ -1017,10 +1029,9 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
 
     let completion = spec.plan.completion.clone();
     let events = spec.events.clone();
-    let reader_project = project.clone();
+    let reader_display_handle = spec.display_session_handle.clone();
     let reader_session = session.clone();
     let reader_registry = registry.clone();
-    let reader_display_id = display_id;
     let exit_code_slot_reader = exit_code_slot.clone();
     let build = std::thread::Builder::new()
         .name(format!("ad-hoc-pty-reader-{}", display_id))
@@ -1089,7 +1100,7 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
             // 退出后从注册表摘除(不 kill:进程已自然结束并 wait)。
             // 注册键是展示会话行 —— 必须用 display ID 摘除,
             // ad_hoc 行号(事件 tag)与它分属两套自增序列,互不相等。
-            reader_registry.kill_session(&reader_project, reader_display_id);
+            reader_registry.kill_session(&reader_display_handle);
             // 终止确认由 waiter 负责(child.wait 完成即置位)
         });
     if let Err(error) = build {
@@ -1121,24 +1132,27 @@ fn apply_prompt_file_argv(argv: &mut Vec<String>, input: &InputInjection) -> Res
 
 /// 工作流 Step 启动:冻结 Agent Instance 经真实 Adapter 编译出的
 /// LaunchPlan 直启 PTY。事件以 run_id 回流(Launched/Output/Exited/Dead);
-/// 进程注册在 (project, session_id) 键下,reader 线程完全接管后才上报 Launched。
+/// 进程注册在持久 session handle 下,reader 线程完全接管后才上报 Launched。
 fn launch_workflow_pty(
     registry: &Arc<SessionRegistry>,
     spec: &mf_agent::runtime::WorkflowLaunchSpec,
     plan: &mf_agent::LaunchPlan,
     events: Sender<(i64, RuntimeEvent)>,
 ) -> Result<()> {
-    let project = spec.project_root.to_string_lossy().to_string();
     // 复用存活会话:直接发送提示,不再拉起进程
-    if spec.attach_existing_session && registry.session_alive(&project, spec.session_id) {
-        registry.send_prompt(&project, spec.session_id, &spec.prompt)?;
+    if spec.attach_existing_session && registry.session_alive(&spec.session_handle) {
+        registry.bind_run(&spec.run_handle, &spec.session_handle);
+        if let Err(error) = registry.send_prompt(&spec.session_handle, &spec.prompt) {
+            registry.unbind_run(&spec.run_handle);
+            return Err(error).context("复用工作流会话提示发送失败");
+        }
         let _ = events.send((
             spec.run_id,
             RuntimeEvent::AgentState(mf_agent::AgentState::Working),
         ));
         return Ok(());
     }
-    registry.kill_session(&project, spec.session_id); // 同键旧会话清理
+    registry.kill_session(&spec.session_handle);
 
     if plan.uses_shell {
         anyhow::bail!("工作流 Runtime 尚不支持 Shell 启动计划");
@@ -1223,16 +1237,11 @@ fn launch_workflow_pty(
         pid: Some(pid),
         term: TermSignal::new(),
     });
-    registry.register(
-        &project,
-        spec.session_id,
-        SessionInner::Pty(session.clone()),
-    );
-    registry.bind_run(&project, spec.run_id, spec.session_id);
+    registry.register(&spec.session_handle, SessionInner::Pty(session.clone()));
+    registry.bind_run(&spec.run_handle, &spec.session_handle);
     let mut reap = AdHocReapGuard {
         registry,
-        project: &project,
-        display_id: spec.session_id,
+        display_session_handle: &spec.session_handle,
         session: Some(session.clone()),
     };
 
@@ -1268,8 +1277,7 @@ fn launch_workflow_pty(
     let run_id = spec.run_id;
     let reader_session = session.clone();
     let reader_registry = registry.clone();
-    let reader_project = project.clone();
-    let reader_session_id = spec.session_id;
+    let reader_session_handle = spec.session_handle.clone();
     let exit_code_slot_reader = exit_code_slot.clone();
     let reader_done_flag = reader_done.clone();
     let events_out = events.clone();
@@ -1319,7 +1327,7 @@ fn launch_workflow_pty(
             let _ = events_out.send((run_id, RuntimeEvent::Exited { code: exit_code }));
             let _ = events_out.send((run_id, RuntimeEvent::AgentState(mf_agent::AgentState::Dead)));
             // 进程已结束并 wait:摘除注册表条目(不 kill)
-            reader_registry.kill_session(&reader_project, reader_session_id);
+            reader_registry.kill_session(&reader_session_handle);
             // 事件已发出:唤醒 waiter 的终止确认握手(见上)
             reader_done_flag.mark();
         });
@@ -1433,13 +1441,12 @@ enum HttpOutcome {
 }
 
 fn launch_http(registry: &SessionRegistry, spec: &LaunchSpec, events: Sender<(i64, RuntimeEvent)>) {
-    let project = spec.project_root.to_string_lossy().to_string();
     // HTTP 会话复用:同键存活则续用 transcript(会话连续性)
-    if spec.attach_existing_session && registry.session_alive(&project, spec.session_id) {
-        let key = session_key(&project, spec.session_id);
+    if spec.attach_existing_session && registry.session_alive(&spec.session_handle) {
+        registry.bind_run(&spec.run_handle, &spec.session_handle);
         let existing = {
             let sessions = registry.sessions.lock();
-            sessions.get(&key).cloned()
+            sessions.get(&spec.session_handle).cloned()
         };
         if let Some(SessionInner::Http(h)) = existing {
             push_capped(
@@ -1471,12 +1478,8 @@ fn launch_http(registry: &SessionRegistry, spec: &LaunchSpec, events: Sender<(i6
         term: TermSignal::new(),
         join: Mutex::new(None),
     });
-    registry.register(
-        &project,
-        spec.session_id,
-        SessionInner::Http(session.clone()),
-    );
-    registry.bind_run(&project, spec.run_id, spec.session_id);
+    registry.register(&spec.session_handle, SessionInner::Http(session.clone()));
+    registry.bind_run(&spec.run_handle, &spec.session_handle);
     let _ = events.send((spec.run_id, RuntimeEvent::Launched));
     let _ = events.send((
         spec.run_id,
@@ -1555,7 +1558,7 @@ fn run_http_turn_async(
             // 失败结算),绝不留下"已注册但无人推进"的僵尸会话。
             log::error!("run {run_id} HTTP 工具循环线程启动失败: {error}");
             join_session.mark_terminated();
-            registry.kill_session(&spec.project_root.to_string_lossy(), spec.session_id);
+            registry.kill_session(&spec.session_handle);
             let _ = events.send((
                 run_id,
                 RuntimeEvent::SpawnError(format!("启动 HTTP 工具循环线程失败: {error}")),
@@ -1913,36 +1916,36 @@ impl RuntimeHost for RuntimeHostImpl {
         launch_ad_hoc_pty(&self.registry, &spec)
     }
 
-    fn kill_ad_hoc(&self, project: &str, display_session_id: i64) {
-        // 进程注册在展示会话键下;ad_hoc 行号只作事件 tag
-        self.registry.kill_session(project, display_session_id);
+    fn kill_ad_hoc(&self, display_session_handle: &str) {
+        self.registry.kill_session(display_session_handle);
     }
 
-    fn send_prompt(&self, project: &str, _run_id: i64, session_id: i64, text: &str) {
-        let _ = self.registry.send_prompt(project, session_id, text);
+    fn send_prompt(&self, run_handle: &str, session_handle: &str, text: &str) -> Result<()> {
+        self.registry
+            .send_prompt_for_run(run_handle, session_handle, text)
     }
 
-    fn stop_run(&self, project: &str, run_id: i64) -> Result<()> {
+    fn stop_run(&self, run_handle: &str) -> Result<()> {
         // run 级停止 = 真终止 run 绑定的会话进程并等待真实终止确认
         // (child 已 reap、生命周期已收口);Err = 未确认,调用方不得
         // 标记 Cancelled / 释放执行租约(隔离目录可能仍被写)
-        self.registry.stop_run(project, run_id)
+        self.registry.stop_run(run_handle)
     }
 
-    fn kill_session(&self, project: &str, session_id: i64) {
-        self.registry.kill_session(project, session_id);
+    fn kill_session(&self, session_handle: &str) {
+        self.registry.kill_session(session_handle);
     }
 
-    fn answer_question(&self, project: &str, run_id: i64, answer: &str) {
-        if let Some(session_id) = self.registry.session_of_run(project, run_id) {
-            self.registry.http_answer(project, session_id, answer);
+    fn answer_question(&self, run_handle: &str, answer: &str) {
+        if let Some(session_handle) = self.registry.session_of_run(run_handle) {
+            self.registry.http_answer(&session_handle, answer);
         }
     }
 
-    fn is_session_alive(&self, project: &str, session_id: i64) -> bool {
+    fn is_session_alive(&self, session_handle: &str) -> bool {
         // 重启恢复探测:注册表内仍然存活的会话(含离散 CLI 的展示会话)
         // 保持原状态,不得推断为中断
-        self.registry.session_alive(project, session_id)
+        self.registry.session_alive(session_handle)
     }
 }
 
@@ -2058,6 +2061,7 @@ mod ad_hoc_launch_tests {
             // 事件 tag 用 ad-hoc 行号(700)
             session_id: 700,
             display_session_id: 800,
+            display_session_handle: "session-display-800".into(),
             title: "测试离散会话".into(),
             run_mode: mf_agent::RunMode::OneShot,
             plan,
@@ -2078,11 +2082,15 @@ mod ad_hoc_launch_tests {
         assert!(error.to_string().contains("启动"), "{error}");
         // 失败路径不得留下注册表条目(无孤儿会话句柄)
         assert!(
-            registry.snapshot(".", 800).is_none(),
+            registry
+                .snapshot(&spec.display_session_handle, 800)
+                .is_none(),
             "失败路径不得留下注册表条目(display 键)"
         );
         assert!(
-            registry.snapshot(".", 700).is_none(),
+            registry
+                .snapshot("ad-hoc-row-is-not-a-handle", 700)
+                .is_none(),
             "ad-hoc 行号不是进程注册键"
         );
     }
@@ -2096,11 +2104,15 @@ mod ad_hoc_launch_tests {
         let spec = ad_hoc_spec(events, &cmd, &["/C", "echo bye&&exit 2"], None);
         launch_ad_hoc_pty(&registry, &spec).unwrap();
         assert!(
-            registry.snapshot(".", 800).is_some(),
+            registry
+                .snapshot(&spec.display_session_handle, 800)
+                .is_some(),
             "启动后应能以 display ID 快照"
         );
         assert!(
-            registry.snapshot(".", 700).is_none(),
+            registry
+                .snapshot("ad-hoc-row-is-not-a-handle", 700)
+                .is_none(),
             "ad-hoc 行号不是进程注册键"
         );
 
@@ -2122,7 +2134,9 @@ mod ad_hoc_launch_tests {
         // 退出后会话从注册表摘除
         let still_present = (0..150).any(|_| {
             std::thread::sleep(std::time::Duration::from_millis(20));
-            registry.snapshot(".", 800).is_some()
+            registry
+                .snapshot(&spec.display_session_handle, 800)
+                .is_some()
         });
         assert!(!still_present, "会话应在退出后从注册表移除(display 键)");
     }
@@ -2161,7 +2175,7 @@ mod ad_hoc_launch_tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut saw_output = false;
         while std::time::Instant::now() < deadline {
-            if let Some(snapshot) = registry.snapshot(".", 800) {
+            if let Some(snapshot) = registry.snapshot(&spec.display_session_handle, 800) {
                 let text = snapshot.screen_rows.concat();
                 if text.contains("***") {
                     saw_output = true;
@@ -2173,10 +2187,12 @@ mod ad_hoc_launch_tests {
         }
         assert!(saw_output, "应在会话存活期间观察到脱敏后的回显");
         assert!(
-            registry.snapshot(".", 800).is_some(),
+            registry
+                .snapshot(&spec.display_session_handle, 800)
+                .is_some(),
             "pause 会话应保持存活(display 键)"
         );
-        registry.kill_session(".", 800);
+        registry.kill_session(&spec.display_session_handle);
     }
 }
 
@@ -2244,12 +2260,112 @@ mod tests {
     #[test]
     fn ad_hoc_and_display_ids_are_distinct_namespaces() {
         // ad_hoc_sessions 与 agent_sessions 是两套自增行号:
-        // 进程路由只认 display session ID;ad-hoc 行号仅作事件 tag。
-        // 注册表只有一条命名空间:普通会话键。
+        // 进程路由只认 display session handle;ad-hoc 行号仅作事件 tag。
         let registry = SessionRegistry::new(mf_agent::Config::default());
-        assert!(registry.snapshot("proj", 7).is_none());
-        assert!(registry.send_prompt("proj", 7, "hi").is_err());
-        registry.kill_session("proj", 1); // 不存在时是 no-op
+        assert!(registry.snapshot("session-handle", 7).is_none());
+        assert!(registry.send_prompt("session-handle", "hi").is_err());
+        registry.kill_session("session-handle"); // 不存在时是 no-op
+    }
+
+    #[test]
+    fn registry_routes_same_rowid_sessions_by_persistent_handle() {
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        let session = |id| {
+            Arc::new(HttpSession {
+                session_id: id,
+                transcript: Mutex::new(Vec::new()),
+                alive: AtomicBool::new(true),
+                answer_tx: Mutex::new(None),
+                cancel: AtomicBool::new(false),
+                term: TermSignal::new(),
+                join: Mutex::new(None),
+            })
+        };
+        registry.register("019-handle-a", SessionInner::Http(session(7)));
+        registry.register("019-handle-b", SessionInner::Http(session(7)));
+        registry.bind_run("019-run-a", "019-handle-a");
+        registry.bind_run("019-run-b", "019-handle-b");
+        assert_eq!(registry.binding_count(), 2);
+
+        assert!(registry.snapshot("019-handle-a", 7).is_some());
+        assert!(registry.snapshot("019-handle-b", 7).is_some());
+        registry.kill_session("019-handle-a");
+        assert!(!registry.session_alive("019-handle-a"));
+        assert_eq!(registry.binding_count(), 1, "摘除会话必须清掉反向 Run 绑定");
+        assert!(
+            registry.session_alive("019-handle-b"),
+            "相同行号的另一持久 handle 不得被串杀"
+        );
+        registry.kill_session("019-handle-b");
+        assert_eq!(registry.binding_count(), 0);
+    }
+
+    #[test]
+    fn reused_session_binds_new_run_handle_before_returning() {
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        let mut pair = pty::openpty(pty::PtySize {
+            rows: TERM_ROWS as u16,
+            cols: TERM_COLS as u16,
+        })
+        .unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let session = Arc::new(PtySession {
+            session_id: 7,
+            master: Mutex::new(Some(pair.master)),
+            writer: Mutex::new(Some(writer)),
+            child: Mutex::new(None),
+            killer: Mutex::new(None),
+            job: Mutex::new(None),
+            screen: Mutex::new(Screen::new(TERM_ROWS, TERM_COLS)),
+            title: Mutex::new("reuse".into()),
+            output_tail: Mutex::new(Vec::new()),
+            alive: AtomicBool::new(true),
+            pid: None,
+            term: TermSignal::new(),
+        });
+        registry.register("session-reused", SessionInner::Pty(session.clone()));
+        registry.bind_run("run-old", "session-reused");
+        let spec = LaunchSpec {
+            project_root: std::env::temp_dir(),
+            run_id: 2,
+            run_handle: "run-new".into(),
+            step_id: 1,
+            task_id: 1,
+            session_id: 7,
+            session_handle: "session-reused".into(),
+            session_key: Some("reuse".into()),
+            attach_existing_session: true,
+            profile: AgentProfileSpec {
+                id: "unused".into(),
+                display_name: "unused".into(),
+                runtime: RuntimeKind::Pty,
+                command: "unused".into(),
+                args: Vec::new(),
+                env: Vec::new(),
+                permission_args: Vec::new(),
+                provider: None,
+                icon: None,
+                homepage: None,
+                hook: None,
+            },
+            step_title: "reuse".into(),
+            prompt: "continue".into(),
+            capability_token: "token".into(),
+            pipe_name: "pipe".into(),
+            mfctl_hint: None,
+            workdir: std::env::temp_dir(),
+        };
+        let (events, _rx) = crossbeam_channel::bounded(8);
+        launch_pty(&registry, &spec, events);
+        assert_eq!(
+            registry.session_of_run("run-new").as_deref(),
+            Some("session-reused")
+        );
+
+        session.mark_terminated();
+        registry.stop_run("run-new").unwrap();
+        assert!(!registry.session_alive("session-reused"));
+        assert_eq!(registry.binding_count(), 0);
     }
 
     fn workflow_spec(
@@ -2261,9 +2377,11 @@ mod tests {
         WorkflowLaunchSpec {
             project_root: std::env::temp_dir(),
             run_id,
+            run_handle: format!("run-{run_id}"),
             step_id: 1,
             task_id: 1,
             session_id: 1,
+            session_handle: format!("session-{run_id}"),
             session_key: None,
             attach_existing_session: false,
             node_key: node_key.into(),
@@ -2335,9 +2453,11 @@ mod tests {
         let spec = LaunchSpec {
             project_root: workdir.clone(),
             run_id: 77,
+            run_handle: "run-77".into(),
             step_id: 1,
             task_id: 1,
             session_id: 9,
+            session_handle: "session-9".into(),
             session_key: None,
             attach_existing_session: false,
             profile: AgentProfileSpec {
@@ -2360,22 +2480,21 @@ mod tests {
             mfctl_hint: None,
             workdir: workdir.clone(),
         };
-        let project = workdir.to_string_lossy().to_string();
         host.launch(spec, events);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
-            if registry.session_alive(&project, 9) {
+            if registry.session_alive("session-9") {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
-        assert!(registry.session_alive(&project, 9), "前置:PTY 会话应存活");
+        assert!(registry.session_alive("session-9"), "前置:PTY 会话应存活");
         let pid = registry
-            .session_pid(&project, 9)
+            .session_pid("session-9")
             .expect("PTY 会话必须可观测 OS PID(终止验证的前提)");
         assert!(tasklist_has_pid(pid), "前置:PID {pid} 应存在于 OS 进程表");
 
-        host.stop_run(&project, 77)
+        host.stop_run("run-77")
             .expect("stop_run 必须在真实终止确认后成功返回");
         // 返回即确认:退出事件已送达(不等待、不轮询)
         let mut saw_exited = false;
@@ -2393,7 +2512,7 @@ mod tests {
             "stop_run 返回后 OS 进程必须真正终止(PID {pid} 仍可见)"
         );
         // 二次停止幂等(无绑定会话 → 视为已停止)
-        host.stop_run(&project, 77).unwrap();
+        host.stop_run("run-77").unwrap();
     }
 
     #[test]
@@ -2408,9 +2527,11 @@ mod tests {
         let spec = LaunchSpec {
             project_root: workdir.clone(),
             run_id: 42,
+            run_handle: "run-42".into(),
             step_id: 1,
             task_id: 1,
             session_id: 7,
+            session_handle: "session-7".into(),
             session_key: None,
             attach_existing_session: false,
             profile: AgentProfileSpec {
@@ -2433,33 +2554,32 @@ mod tests {
             mfctl_hint: None,
             workdir: workdir.clone(),
         };
-        let project = workdir.to_string_lossy().to_string();
         host.launch(spec, events);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
-            if registry.session_alive(&project, 7) {
+            if registry.session_alive("session-7") {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(30));
         }
         assert!(
-            registry.session_alive(&project, 7),
+            registry.session_alive("session-7"),
             "前置:PTY 会话应存活等待停止"
         );
 
         let started = std::time::Instant::now();
-        host.stop_run(&project, 42).unwrap();
+        host.stop_run("run-42").unwrap();
         assert!(
             started.elapsed() < std::time::Duration::from_secs(10),
             "stop_run 应在时限内同步返回"
         );
         assert!(
-            !registry.session_alive(&project, 7),
+            !registry.session_alive("session-7"),
             "stop_run 返回后会话进程必须已停止"
         );
-        assert!(registry.snapshot(&project, 7).is_none());
+        assert!(registry.snapshot("session-7", 7).is_none());
         // 二次停止幂等
-        host.stop_run(&project, 42).unwrap();
+        host.stop_run("run-42").unwrap();
     }
 
     /// C8:stop 超时返回 Err 后**进程树守卫必须仍留在会话里** ——
@@ -2474,7 +2594,8 @@ mod tests {
         }
         let registry = SessionRegistry::new(mf_agent::Config::default());
         let host = RuntimeHostImpl::new(registry.clone());
-        let project = "proj-f8".to_string();
+        let session_handle = "session-55";
+        let run_handle = "run-4242";
         let session = Arc::new(PtySession {
             session_id: 55,
             master: Mutex::new(None),
@@ -2489,27 +2610,27 @@ mod tests {
             pid: None,
             term: TermSignal::new(),
         });
-        registry.register(&project, 55, SessionInner::Pty(session.clone()));
-        registry.bind_run(&project, 4242, 55);
+        registry.register(session_handle, SessionInner::Pty(session.clone()));
+        registry.bind_run(run_handle, session_handle);
 
         // 极短确认超时:终止确认永不置位 → stop_run 必然 Err
         registry.set_stop_confirm_timeout(std::time::Duration::from_millis(1));
-        let first = host.stop_run(&project, 4242);
+        let first = host.stop_run(run_handle);
         assert!(first.is_err(), "前置:确认超时必须返回 Err({first:?})");
         // 守卫必须在会话里保留(重试仍能整组杀);会话/绑定保留
         assert!(
             session.job.lock().is_some(),
             "stop 超时后进程树守卫必须留在会话(第二次重试仍能整组杀)"
         );
-        assert!(registry.session_alive(&project, 55), "超时后会话保留");
+        assert!(registry.session_alive(session_handle), "超时后会话保留");
 
         // 第二次重试:守卫仍在 → 仍可整组终止;确认到达后成功收口
         session.mark_terminated();
         registry.set_stop_confirm_timeout(std::time::Duration::from_secs(10));
-        host.stop_run(&project, 4242)
+        host.stop_run(run_handle)
             .expect("第二次 stop 必须用保留的守卫完成整组终止并确认");
         assert!(
-            !registry.session_alive(&project, 55),
+            !registry.session_alive(session_handle),
             "重试后会话必须真正收口"
         );
         assert!(session.job.lock().is_none(), "确认停止后守卫才被消费");
@@ -2528,9 +2649,11 @@ mod tests {
         let spec = LaunchSpec {
             project_root: workdir.clone(),
             run_id: 88,
+            run_handle: "run-88".into(),
             step_id: 1,
             task_id: 1,
             session_id: 21,
+            session_handle: "session-21".into(),
             session_key: None,
             attach_existing_session: false,
             profile: AgentProfileSpec {
@@ -2553,7 +2676,6 @@ mod tests {
             mfctl_hint: None,
             workdir: workdir.clone(),
         };
-        let project = workdir.to_string_lossy().to_string();
         host.launch(spec, events);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
         let mut exit_code = None;
@@ -2578,7 +2700,7 @@ mod tests {
         // 注册表条目移除(session_alive 由条目存在性判定)
         let removed = (0..150).any(|_| {
             std::thread::sleep(std::time::Duration::from_millis(20));
-            !registry.session_alive(&project, 21)
+            !registry.session_alive("session-21")
         });
         assert!(
             removed,
@@ -2601,8 +2723,8 @@ mod tests {
             term: TermSignal::new(),
             join: Mutex::new(None),
         });
-        registry.register("proj", 11, SessionInner::Http(session.clone()));
-        registry.bind_run("proj", 501, 11);
+        registry.register("session-11", SessionInner::Http(session.clone()));
+        registry.bind_run("run-501", "session-11");
         let started = std::time::Instant::now();
         let s2 = session.clone();
         std::thread::spawn(move || {
@@ -2610,7 +2732,7 @@ mod tests {
             s2.mark_terminated(); // 循环线程真正结束
         });
         registry
-            .stop_run("proj", 501)
+            .stop_run("run-501")
             .expect("循环线程结束后必须确认停止");
         assert!(
             started.elapsed() >= std::time::Duration::from_millis(550),
@@ -2634,9 +2756,9 @@ mod tests {
             term: TermSignal::new(),
             join: Mutex::new(None),
         });
-        registry.register("proj", 12, SessionInner::Http(session.clone()));
-        registry.bind_run("proj", 502, 12);
-        let err = registry.stop_run("proj", 502).expect_err("未确认必须 Err");
+        registry.register("session-12", SessionInner::Http(session.clone()));
+        registry.bind_run("run-502", "session-12");
+        let err = registry.stop_run("run-502").expect_err("未确认必须 Err");
         assert!(format!("{err:#}").contains("HTTP 工具循环"), "{err:#}");
         assert!(session.cancel.load(Ordering::SeqCst), "终止信号必须已发出");
     }
@@ -2656,14 +2778,14 @@ mod tests {
             term: TermSignal::new(),
             join: Mutex::new(None),
         });
-        registry.register("proj", 15, SessionInner::Http(session.clone()));
-        registry.bind_run("proj", 504, 15);
+        registry.register("session-15", SessionInner::Http(session.clone()));
+        registry.bind_run("run-504", "session-15");
 
         // 第一次:工具循环未结束 → Err
-        let err = registry.stop_run("proj", 504).expect_err("未确认必须 Err");
+        let err = registry.stop_run("run-504").expect_err("未确认必须 Err");
         assert!(format!("{err:#}").contains("HTTP 工具循环"), "{err:#}");
         assert!(
-            registry.session_alive("proj", 15),
+            registry.session_alive("session-15"),
             "超时后 session/binding 必须保留(否则永远无法重试停止)"
         );
 
@@ -2673,9 +2795,9 @@ mod tests {
         session.mark_terminated();
 
         // 第二次:确认终止 → Ok 且移除
-        registry.stop_run("proj", 504).expect("重试停止必须成功");
+        registry.stop_run("run-504").expect("重试停止必须成功");
         assert!(
-            !registry.session_alive("proj", 15),
+            !registry.session_alive("session-15"),
             "确认终止后 session 必须移除"
         );
     }
@@ -2724,9 +2846,11 @@ mod tests {
         let spec = LaunchSpec {
             project_root: workdir.clone(),
             run_id: 601,
+            run_handle: "run-601".into(),
             step_id: 1,
             task_id: 1,
             session_id: 21,
+            session_handle: "session-601".into(),
             session_key: None,
             attach_existing_session: false,
             profile: AgentProfileSpec {
@@ -2754,12 +2878,11 @@ mod tests {
             mfctl_hint: None,
             workdir: workdir.clone(),
         };
-        let project = workdir.to_string_lossy().to_string();
         host.launch(spec, events);
         // 等 Mock 轮次线程进入执行(300ms 睡眠窗口内发起 stop)
         std::thread::sleep(std::time::Duration::from_millis(50));
         let started = std::time::Instant::now();
-        host.stop_run(&project, 601)
+        host.stop_run("run-601")
             .expect("线程真正结束后必须确认停止");
         assert!(
             started.elapsed() >= std::time::Duration::from_millis(150),
@@ -2796,9 +2919,11 @@ mod tests {
         let spec = LaunchSpec {
             project_root: workdir.clone(),
             run_id: 4242,
+            run_handle: "run-4242".into(),
             step_id: 1,
             task_id: 1,
             session_id: 77,
+            session_handle: "session-77".into(),
             session_key: None,
             attach_existing_session: false,
             profile: AgentProfileSpec {
@@ -2824,11 +2949,10 @@ mod tests {
             mfctl_hint: None,
             workdir: workdir.clone(),
         };
-        let project = workdir.to_string_lossy().to_string();
         host.launch(spec, events);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline {
-            if registry.session_alive(&project, 77)
+            if registry.session_alive("session-77")
                 && growing.is_file()
                 && std::fs::metadata(&growing)
                     .map(|m| m.len() > 0)
@@ -2843,7 +2967,7 @@ mod tests {
             "前置:孙进程(ping)应已在执行目录持续写文件"
         );
         let pid = registry
-            .session_pid(&project, 77)
+            .session_pid("session-77")
             .expect("PTY 会话必须可观测 OS PID");
         // 前置:写入正在进行(文件仍在增长 → 孙进程活着)
         let size_a = std::fs::metadata(&growing).unwrap().len();
@@ -2855,7 +2979,7 @@ mod tests {
             "前置:孙进程持续写入(size {size_a}→{size_b})"
         );
 
-        host.stop_run(&project, 4242)
+        host.stop_run("run-4242")
             .expect("整棵进程树终止并确认后 stop_run 才返回 Ok");
 
         // 父进程消失

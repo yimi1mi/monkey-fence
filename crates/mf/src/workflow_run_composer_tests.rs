@@ -191,8 +191,9 @@ fn run_project_workflow_creates_task_revision_and_starts_scheduling() {
     // 清理真实进程并停止
     for r in orch.store.list_runs_of_task(target.task_id).unwrap() {
         if let Some(sid) = r.session_id {
-            ctx.registry
-                .kill_session(&project.path().to_string_lossy(), sid);
+            if let Some(session) = orch.store.session_view(sid).unwrap() {
+                ctx.registry.kill_session(&session.public_handle);
+            }
         }
     }
     orch.stop();
@@ -201,13 +202,15 @@ fn run_project_workflow_creates_task_revision_and_starts_scheduling() {
 
 #[test]
 fn compile_failure_leaves_no_new_task() {
-    let (ctx, project) = setup_with_workflow(vec![node("a", &[]), node("b", &["missing"])]);
+    // T1b 起,结构非法(未知依赖/重复键)在保存时即 fail-closed;
+    // 这里用「循环」:结构校验通过、编译期仍必须失败。
+    let (ctx, project) = setup_with_workflow(vec![node("a", &["b"]), node("b", &["a"])]);
     let orch = ctx.orchestrator_of(project.path()).unwrap();
     let before = orch.store.list_tasks(false).unwrap().len();
     let err = ctx
         .run_project_workflow(project.path(), "wf-e2e", "运行一个坏掉的工作流")
         .err()
-        .expect("未知依赖必须编译失败");
+        .expect("循环依赖必须编译失败");
     assert!(
         format!("{err:#}").contains("编译失败"),
         "错误必须来自编译: {err:#}"
@@ -239,8 +242,9 @@ fn single_and_multi_node_workflows_use_the_same_api() {
     assert_eq!(steps.len(), 2, "两个节点都投影为 Step");
     for r in orch.store.list_runs_of_task(target.task_id).unwrap() {
         if let Some(sid) = r.session_id {
-            ctx.registry
-                .kill_session(&project.path().to_string_lossy(), sid);
+            if let Some(session) = orch.store.session_view(sid).unwrap() {
+                ctx.registry.kill_session(&session.public_handle);
+            }
         }
     }
     orch.stop();
