@@ -1,0 +1,1377 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>PROTOTYPE — MonkeyFence 可视化工作流</title>
+  <!--
+    PROTOTYPE — wipe me.
+    Three variants of the visual workflow editor, switchable via ?variant=,
+    on a standalone throwaway page next to the native GPUI module.
+  -->
+  <style>
+    :root {
+      --ink: #162221;
+      --muted: #687370;
+      --paper: #f4f0e7;
+      --panel: #fffdf8;
+      --panel-2: #ebe5d8;
+      --line: #c8c1b3;
+      --accent: #e45536;
+      --accent-2: #0f766e;
+      --danger: #bb3e3e;
+      --success: #177a57;
+      --shadow: 0 18px 50px rgba(35, 41, 37, .14);
+      --radius: 14px;
+      --top-h: 74px;
+      --node-w: 220px;
+      --node-h: 112px;
+      --ui-font: "Bahnschrift", "Microsoft YaHei UI", sans-serif;
+      --display-font: "Iowan Old Style", "Noto Serif SC", Georgia, serif;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body {
+      font-family: var(--ui-font);
+      color: var(--ink);
+      background: var(--paper);
+      -webkit-font-smoothing: antialiased;
+      user-select: none;
+    }
+    button, input, textarea, select { font: inherit; }
+    button { color: inherit; }
+    input, textarea, select { user-select: text; }
+    #app { width: 100%; height: 100%; }
+
+    .topbar {
+      height: var(--top-h);
+      display: flex;
+      align-items: center;
+      gap: 18px;
+      padding: 0 22px;
+      border-bottom: 1px solid var(--line);
+      background: color-mix(in srgb, var(--panel) 92%, transparent);
+      position: relative;
+      z-index: 30;
+    }
+    .brand { display: flex; align-items: center; gap: 11px; min-width: 204px; }
+    .brand-mark {
+      width: 34px; height: 34px; border-radius: 10px;
+      display: grid; place-items: center;
+      color: white; background: var(--ink);
+      font-family: var(--display-font); font-weight: 800; font-size: 19px;
+      box-shadow: 4px 4px 0 var(--accent);
+    }
+    .brand-title { font-family: var(--display-font); font-weight: 800; font-size: 19px; line-height: 1; }
+    .brand-kicker { margin-top: 4px; color: var(--muted); font-size: 9px; letter-spacing: .12em; text-transform: uppercase; }
+    .segmented {
+      display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--line);
+      border-radius: 999px; background: var(--panel-2);
+    }
+    .segmented button {
+      border: 0; background: transparent; border-radius: 999px; padding: 7px 13px;
+      font-size: 12px; cursor: pointer;
+    }
+    .segmented button.active { background: var(--panel); color: var(--accent); box-shadow: 0 1px 5px rgba(0,0,0,.08); }
+    .workflow-identity { display: flex; align-items: center; gap: 9px; min-width: 0; }
+    .workflow-select, .project-select, .field {
+      border: 1px solid var(--line); background: var(--panel); color: var(--ink);
+      border-radius: 9px; padding: 8px 10px; outline: none;
+    }
+    .workflow-select:focus, .project-select:focus, .field:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent); }
+    .workflow-select { min-width: 176px; }
+    .project-select { width: 126px; }
+    .needs-badge { display: inline-grid; place-items: center; min-width: 17px; height: 17px; margin-left: 3px; padding: 0 4px; border-radius: 999px; color: white; background: var(--accent); font-size: 8px; }
+    .top-actions { display: flex; align-items: center; gap: 7px; margin-left: auto; }
+    .btn {
+      border: 1px solid var(--line); background: var(--panel); border-radius: 9px;
+      padding: 8px 11px; font-size: 11px; font-weight: 650; letter-spacing: .02em;
+      cursor: pointer; transition: transform .14s ease, border-color .14s ease, background .14s ease;
+    }
+    .btn:hover { transform: translateY(-1px); border-color: var(--ink); }
+    .btn.primary { color: white; background: var(--accent); border-color: var(--accent); padding-inline: 15px; }
+    .btn.primary:hover { background: color-mix(in srgb, var(--accent) 88%, black); }
+    .btn.ghost { background: transparent; }
+    .btn.danger { color: var(--danger); }
+    .save-state { font-size: 10px; color: var(--success); white-space: nowrap; }
+    .save-state::before { content: "●"; margin-right: 5px; font-size: 8px; }
+
+    .workspace-shell { height: calc(100% - var(--top-h)); position: relative; }
+    .panel {
+      background: var(--panel); border-color: var(--line); color: var(--ink);
+      overflow: hidden;
+    }
+    .panel-head {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 15px 16px 10px; border-bottom: 1px solid var(--line);
+    }
+    .panel-title { font-family: var(--display-font); font-weight: 800; font-size: 15px; }
+    .panel-note { font-size: 9px; color: var(--muted); margin-top: 3px; }
+
+    .library-panel { min-width: 0; overflow: auto; }
+    .library-scroll { padding: 14px; display: flex; flex-direction: column; gap: 8px; }
+    .library-group { margin: 8px 2px 3px; color: var(--muted); font-size: 9px; letter-spacing: .14em; text-transform: uppercase; }
+    .agent-card {
+      border: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 84%, var(--panel-2));
+      border-radius: 11px; padding: 11px; cursor: grab; position: relative;
+      transition: transform .15s ease, box-shadow .15s ease, border-color .15s ease;
+    }
+    .agent-card:hover { transform: translateX(3px); border-color: var(--accent); box-shadow: 0 7px 18px rgba(0,0,0,.07); }
+    .agent-card:active { cursor: grabbing; }
+    .agent-name { font-size: 12px; font-weight: 750; }
+    .agent-meta { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 9px; color: var(--muted); }
+    .agent-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--success); box-shadow: 0 0 0 3px color-mix(in srgb, var(--success) 14%, transparent); }
+    .drag-hint { margin-top: 12px; padding: 11px; border-radius: 10px; border: 1px dashed var(--line); color: var(--muted); font-size: 9px; line-height: 1.55; }
+    .run-list { padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .run-filter { display: flex; gap: 5px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel-2); }
+    .run-filter button { flex: 1; border: 0; border-radius: 7px; padding: 6px 4px; color: var(--muted); background: transparent; font-size: 8px; cursor: pointer; }
+    .run-filter button.active { color: var(--accent); background: var(--panel); }
+    .run-card { padding: 11px; border: 1px solid var(--line); border-radius: 11px; background: var(--panel); cursor: pointer; }
+    .run-card.active { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent); }
+    .run-card-title { font-size: 11px; font-weight: 750; }
+    .run-card-meta { margin-top: 6px; color: var(--muted); font-size: 8px; line-height: 1.45; }
+    .run-card-status { display: inline-block; width: 7px; height: 7px; margin-right: 6px; border-radius: 50%; background: var(--accent-2); }
+    .run-card-status.attention { background: var(--accent); animation: pulse 1.3s ease-in-out infinite; }
+
+    .inspector-panel { min-width: 0; overflow: auto; }
+    .inspector-body { padding: 14px 16px 88px; display: flex; flex-direction: column; gap: 14px; }
+    .empty-inspector { color: var(--muted); font-size: 11px; line-height: 1.7; padding: 26px 10px; text-align: center; }
+    .inspector-section { display: flex; flex-direction: column; gap: 7px; }
+    .label { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: .1em; }
+    textarea.field { min-height: 86px; resize: vertical; line-height: 1.5; }
+    .dep-chip-row { display: flex; flex-wrap: wrap; gap: 6px; }
+    .dep-chip { border: 1px solid var(--line); border-radius: 999px; padding: 5px 8px; font-size: 9px; background: var(--panel-2); }
+    .inspector-danger { margin-top: 8px; width: 100%; }
+
+    .canvas-panel { min-width: 0; min-height: 0; position: relative; overflow: hidden; background: var(--paper); }
+    .canvas-viewport {
+      position: absolute; inset: 0; overflow: hidden; cursor: grab;
+      background-color: var(--paper);
+      background-image: radial-gradient(circle, color-mix(in srgb, var(--ink) 20%, transparent) 1px, transparent 1.3px);
+      background-size: 24px 24px;
+    }
+    .canvas-viewport.panning { cursor: grabbing; }
+    .canvas-world { position: absolute; left: 0; top: 0; width: 2400px; height: 1400px; transform-origin: 0 0; }
+    .edge-svg { position: absolute; inset: 0; width: 2400px; height: 1400px; overflow: visible; z-index: 1; }
+    .edge-visible { fill: none; stroke: color-mix(in srgb, var(--ink) 54%, transparent); stroke-width: 2.4; vector-effect: non-scaling-stroke; transition: stroke .14s ease, stroke-width .14s ease; }
+    .edge-visible.selected { stroke: var(--accent); stroke-width: 4; }
+    .edge-visible.running { stroke: var(--accent-2); stroke-dasharray: 7 6; animation: edgeFlow .8s linear infinite; }
+    .edge-hit { fill: none; stroke: transparent; stroke-width: 16; pointer-events: stroke; cursor: pointer; vector-effect: non-scaling-stroke; }
+    .edge-preview { fill: none; stroke: var(--accent); stroke-width: 3; stroke-dasharray: 7 7; vector-effect: non-scaling-stroke; animation: edgeFlow .7s linear infinite; }
+    @keyframes edgeFlow { to { stroke-dashoffset: -26; } }
+
+    .graph-node {
+      position: absolute; width: var(--node-w); height: var(--node-h); z-index: 4;
+      background: var(--panel); border: 1px solid var(--line); border-radius: 13px;
+      box-shadow: 0 8px 20px rgba(29, 38, 34, .09); overflow: visible;
+      transition: border-color .12s ease, box-shadow .12s ease;
+    }
+    .graph-node:hover { border-color: color-mix(in srgb, var(--accent) 58%, var(--line)); box-shadow: 0 12px 28px rgba(29, 38, 34, .14); }
+    .graph-node.selected { border: 2px solid var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 13%, transparent), 0 14px 30px rgba(29,38,34,.16); }
+    .graph-node.running { border-color: var(--accent-2); box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent-2) 15%, transparent), 0 14px 30px rgba(29,38,34,.16); }
+    .graph-node.succeeded { border-color: var(--success); }
+    .graph-node.needs-input { border-color: var(--accent); box-shadow: 0 0 0 5px color-mix(in srgb, var(--accent) 15%, transparent), 0 14px 30px rgba(29,38,34,.16); }
+    .node-drag-strip { height: 31px; display: flex; align-items: center; gap: 7px; padding: 0 12px; cursor: grab; border-bottom: 1px solid var(--line); }
+    .node-drag-strip:active { cursor: grabbing; }
+    .node-index { font-size: 8px; color: var(--muted); letter-spacing: .09em; }
+    .node-status { margin-left: auto; font-size: 8px; color: var(--muted); }
+    .node-status::before { content: ""; display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--line); margin-right: 5px; }
+    .running .node-status { color: var(--accent-2); }
+    .running .node-status::before { background: var(--accent-2); animation: pulse 1s ease-in-out infinite; }
+    .succeeded .node-status { color: var(--success); }
+    .succeeded .node-status::before { background: var(--success); }
+    .needs-input .node-status { color: var(--accent); }
+    .needs-input .node-status::before { background: var(--accent); animation: pulse 1s ease-in-out infinite; }
+    @keyframes pulse { 50% { transform: scale(1.7); opacity: .55; } }
+    .node-body { padding: 10px 13px; }
+    .node-title { font-family: var(--display-font); font-size: 15px; font-weight: 800; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .node-agent { margin-top: 8px; display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 9px; }
+    .agent-badge { padding: 3px 6px; border-radius: 999px; background: var(--panel-2); border: 1px solid var(--line); color: var(--ink); }
+    .port {
+      position: absolute; top: 50%; width: 16px; height: 16px; margin-top: -8px;
+      border-radius: 50%; background: var(--panel); border: 3px solid var(--ink); z-index: 8;
+      cursor: crosshair; transition: transform .12s ease, border-color .12s ease, background .12s ease;
+    }
+    .port.input { left: -9px; }
+    .port.output { right: -9px; }
+    .port:hover, .port.valid { transform: scale(1.28); border-color: var(--accent); background: var(--accent); }
+    .port.invalid { transform: scale(1.2); border-color: var(--danger); background: var(--danger); }
+
+    .canvas-tools {
+      position: absolute; left: 16px; top: 16px; z-index: 15;
+      display: flex; gap: 5px; padding: 5px; border: 1px solid var(--line); border-radius: 11px;
+      background: color-mix(in srgb, var(--panel) 92%, transparent); box-shadow: 0 8px 24px rgba(0,0,0,.08);
+      backdrop-filter: blur(10px);
+    }
+    .canvas-tools .btn { padding: 7px 9px; }
+    .zoom-readout { min-width: 48px; display: grid; place-items: center; font-size: 9px; color: var(--muted); }
+    .canvas-tip {
+      position: absolute; left: 18px; bottom: 62px; z-index: 13; max-width: 360px;
+      padding: 9px 12px; border-radius: 10px; color: var(--muted); font-size: 9px;
+      background: color-mix(in srgb, var(--panel) 88%, transparent); border: 1px solid var(--line);
+      backdrop-filter: blur(10px);
+    }
+    .state-strip {
+      position: absolute; left: 18px; right: 18px; bottom: 16px; z-index: 14;
+      display: flex; align-items: center; gap: 8px; min-height: 34px; padding: 6px 9px;
+      border: 1px solid var(--line); border-radius: 10px; background: color-mix(in srgb, var(--panel) 94%, transparent);
+      box-shadow: 0 8px 24px rgba(0,0,0,.08); backdrop-filter: blur(10px); font-size: 9px;
+    }
+    .state-chip { padding: 4px 7px; border-radius: 999px; background: var(--panel-2); color: var(--muted); white-space: nowrap; }
+    .state-message { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
+    .state-json-toggle { margin-left: auto; cursor: pointer; color: var(--accent); white-space: nowrap; }
+    .state-json {
+      position: absolute; right: 18px; bottom: 58px; width: min(420px, calc(100% - 36px)); max-height: 280px;
+      overflow: auto; z-index: 20; padding: 14px; margin: 0; border-radius: 12px;
+      color: #d9eee9; background: #14201f; border: 1px solid #344744; font: 10px/1.45 Consolas, monospace;
+      box-shadow: var(--shadow); user-select: text;
+    }
+    .terminal-drawer { position: absolute; left: 12px; right: 12px; bottom: 12px; height: min(44%, 410px); z-index: 80; display: flex; flex-direction: column; overflow: hidden; border: 1px solid #3b4b47; border-radius: 14px; background: #101716; color: #dce9e5; box-shadow: 0 24px 80px rgba(0,0,0,.42); }
+    .terminal-head { display: flex; align-items: center; gap: 9px; padding: 9px 12px; border-bottom: 1px solid #31403d; background: #16201e; }
+    .terminal-title { font-size: 11px; font-weight: 750; }
+    .terminal-meta { color: #8fa19b; font-size: 8px; }
+    .terminal-prototype { margin-left: auto; padding: 3px 6px; border-radius: 999px; color: #ffb49f; background: rgba(228,85,54,.14); font-size: 7px; letter-spacing: .08em; }
+    .terminal-close { border: 0; color: #dce9e5; background: transparent; cursor: pointer; }
+    .terminal-output { flex: 1; overflow: auto; margin: 0; padding: 13px; color: #cfe3dd; background: #0c1211; font: 11px/1.52 Consolas, "Cascadia Mono", monospace; white-space: pre-wrap; user-select: text; }
+    .terminal-compose { display: flex; align-items: center; gap: 8px; padding: 9px 11px; border-top: 1px solid #31403d; background: #121b19; }
+    .terminal-prompt { color: #58d1b6; font: 700 12px Consolas, monospace; }
+    .terminal-input { flex: 1; border: 0; outline: none; color: #e9f4f0; background: transparent; font: 11px Consolas, monospace; }
+
+    .prototype-switcher {
+      position: fixed; left: 50%; bottom: 17px; transform: translateX(-50%); z-index: 1000;
+      display: flex; align-items: center; gap: 8px; padding: 7px;
+      border-radius: 999px; background: #101817; color: white; border: 1px solid rgba(255,255,255,.2);
+      box-shadow: 0 16px 48px rgba(0,0,0,.34);
+    }
+    .prototype-switcher button { width: 31px; height: 31px; border-radius: 50%; border: 0; color: white; background: rgba(255,255,255,.1); cursor: pointer; }
+    .prototype-switcher button:hover { background: var(--accent); }
+    .variant-label { min-width: 208px; text-align: center; font-size: 10px; letter-spacing: .04em; }
+    .prototype-tag { position: fixed; top: 8px; right: 8px; z-index: 200; padding: 4px 7px; border-radius: 6px; color: white; background: var(--danger); font-size: 8px; letter-spacing: .12em; }
+
+    .toast {
+      position: fixed; top: 88px; left: 50%; z-index: 500; transform: translate(-50%, -12px);
+      padding: 10px 14px; border-radius: 10px; background: var(--ink); color: white;
+      box-shadow: var(--shadow); font-size: 10px; opacity: 0; pointer-events: none; transition: all .2s ease;
+    }
+    .toast.show { opacity: 1; transform: translate(-50%, 0); }
+    .modal-backdrop { position: fixed; inset: 0; z-index: 400; display: grid; place-items: center; background: rgba(12,20,19,.45); backdrop-filter: blur(4px); }
+    .run-modal { width: min(580px, calc(100vw - 32px)); border-radius: 18px; background: var(--panel); border: 1px solid var(--line); box-shadow: 0 28px 90px rgba(0,0,0,.34); overflow: hidden; }
+    .run-modal-head { padding: 22px 24px 16px; border-bottom: 1px solid var(--line); }
+    .run-modal-title { font: 800 24px/1.1 var(--display-font); }
+    .run-modal-sub { margin-top: 8px; color: var(--muted); font-size: 10px; }
+    .run-modal-body { padding: 20px 24px 24px; }
+    .run-goal { width: 100%; min-height: 120px; }
+    .run-summary { display: flex; gap: 8px; margin: 12px 0 18px; }
+    .run-summary .state-chip { background: var(--panel-2); }
+    .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
+    .settings-backdrop { position: fixed; inset: 0; z-index: 420; display: grid; place-items: center; padding: 18px; background: rgba(12,20,19,.48); backdrop-filter: blur(5px); }
+    .settings-modal { width: min(1040px, calc(100vw - 28px)); height: min(760px, calc(100vh - 36px)); display: grid; grid-template-columns: 270px minmax(0, 1fr); overflow: hidden; border: 1px solid var(--line); border-radius: 18px; background: var(--panel); box-shadow: 0 30px 100px rgba(0,0,0,.35); }
+    .settings-rail { min-width: 0; overflow: auto; border-right: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 84%, var(--panel-2)); }
+    .settings-rail-head { position: sticky; top: 0; z-index: 2; padding: 18px 16px 12px; border-bottom: 1px solid var(--line); background: inherit; }
+    .settings-list { padding: 10px; }
+    .settings-group { margin: 12px 7px 6px; color: var(--muted); font-size: 8px; letter-spacing: .13em; text-transform: uppercase; }
+    .settings-item { width: 100%; display: flex; align-items: center; gap: 9px; padding: 10px; border: 1px solid transparent; border-radius: 10px; background: transparent; text-align: left; cursor: pointer; }
+    .settings-item:hover { background: var(--panel); }
+    .settings-item.active { border-color: var(--accent); background: var(--panel); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 11%, transparent); }
+    .settings-item-main { min-width: 0; }
+    .settings-item-name { font-size: 11px; font-weight: 750; }
+    .settings-item-meta { margin-top: 3px; color: var(--muted); font-size: 8px; }
+    .settings-detail { min-width: 0; overflow: auto; padding: 22px 24px 86px; }
+    .settings-detail-head { display: flex; align-items: flex-start; gap: 12px; margin-bottom: 20px; }
+    .settings-detail-title { font: 800 24px/1.1 var(--display-font); }
+    .settings-close { margin-left: auto; }
+    .settings-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+    .settings-grid .wide { grid-column: 1 / -1; }
+    .settings-help { padding: 11px 13px; border: 1px dashed var(--line); border-radius: 10px; color: var(--muted); background: var(--panel-2); font-size: 9px; line-height: 1.55; }
+    .secret-field { display: flex; gap: 7px; }
+    .secret-field .field { flex: 1; }
+    .model-fetch-row { display: flex; gap: 7px; }
+    .model-fetch-row .field { flex: 1; min-width: 0; }
+    .model-fetch { white-space: nowrap; }
+    .toggle-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel); font-size: 10px; }
+    .toggle { width: 34px; height: 19px; padding: 2px; border: 0; border-radius: 999px; background: var(--line); cursor: pointer; }
+    .toggle::after { content: ""; display: block; width: 15px; height: 15px; border-radius: 50%; background: white; transition: transform .15s ease; }
+    .toggle.on { background: var(--accent-2); }
+    .toggle.on::after { transform: translateX(15px); }
+    .settings-footer { position: sticky; bottom: -86px; display: flex; justify-content: flex-end; gap: 8px; margin: 24px -24px -86px; padding: 12px 24px; border-top: 1px solid var(--line); background: color-mix(in srgb, var(--panel) 94%, transparent); backdrop-filter: blur(10px); }
+    @media (max-width: 760px) {
+      .settings-modal { grid-template-columns: 190px minmax(0, 1fr); }
+      .settings-detail { padding-inline: 16px; }
+      .settings-grid { grid-template-columns: 1fr; }
+      .settings-grid .wide { grid-column: 1; }
+    }
+
+    /* Variant A — Workbench: classic three-column, warm workshop. */
+    body[data-variant="A"] .workspace-shell {
+      display: grid; grid-template-columns: 238px minmax(480px, 1fr) 292px;
+      gap: 1px; background: var(--line);
+    }
+    body[data-variant="A"] .library-panel { grid-column: 1; border-right: 0; }
+    body[data-variant="A"] .canvas-panel { grid-column: 2; }
+    body[data-variant="A"] .inspector-panel { grid-column: 3; }
+
+    /* Variant B — Canvas First: dark mission canvas with floating glass tools. */
+    body[data-variant="B"] {
+      --ink: #e9f0ec; --muted: #91a29c; --paper: #0e1615; --panel: #172220;
+      --panel-2: #22302d; --line: #31413d; --accent: #ff6a3d; --accent-2: #55d5bd;
+      --danger: #ff6b6b; --success: #52c993; --top-h: 58px;
+    }
+    body[data-variant="B"] .topbar { background: #101918; padding-inline: 16px; }
+    body[data-variant="B"] .brand { min-width: auto; }
+    body[data-variant="B"] .brand-kicker, body[data-variant="B"] .topbar .btn.auxiliary,
+    body[data-variant="B"] .workflow-identity .btn { display: none; }
+    body[data-variant="B"] .workspace-shell { display: block; background: var(--paper); }
+    body[data-variant="B"] .canvas-panel { position: absolute; inset: 0; }
+    body[data-variant="B"] .library-panel {
+      position: absolute; z-index: 40; left: 16px; top: 74px; bottom: 86px; width: 220px;
+      border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 18px 60px rgba(0,0,0,.35);
+      background: color-mix(in srgb, var(--panel) 90%, transparent); backdrop-filter: blur(16px);
+    }
+    body[data-variant="B"] .inspector-panel {
+      position: absolute; z-index: 40; right: 16px; top: 74px; bottom: 86px; width: 286px;
+      border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 18px 60px rgba(0,0,0,.35);
+      background: color-mix(in srgb, var(--panel) 90%, transparent); backdrop-filter: blur(16px);
+    }
+    body[data-variant="B"] .canvas-tools { left: 252px; top: 16px; }
+    body[data-variant="B"] .canvas-tip { left: 252px; }
+    body[data-variant="B"] .state-strip { left: 252px; right: 318px; }
+    body[data-variant="B"] .graph-node { background: #182421; box-shadow: 0 12px 28px rgba(0,0,0,.38); }
+
+    /* Variant C — Sequence Desk: vertical editorial orchestration with bottom agent shelf. */
+    body[data-variant="C"] {
+      --ink: #202b24; --muted: #677167; --paper: #eef0e5; --panel: #fafbf4;
+      --panel-2: #e2e6d6; --line: #bcc3b3; --accent: #bc4b32; --accent-2: #316a62;
+      --top-h: 92px;
+    }
+    body[data-variant="C"] .topbar { align-items: flex-end; padding-bottom: 14px; background: var(--paper); }
+    body[data-variant="C"] .brand { align-self: center; }
+    body[data-variant="C"] .brand-title { font-size: 22px; }
+    body[data-variant="C"] .workspace-shell {
+      display: grid; grid-template-columns: minmax(520px, 1fr) 320px;
+      grid-template-rows: minmax(0, 1fr) 132px; gap: 1px; background: var(--line);
+    }
+    body[data-variant="C"] .canvas-panel { grid-column: 1; grid-row: 1; }
+    body[data-variant="C"] .inspector-panel { grid-column: 2; grid-row: 1 / 3; }
+    body[data-variant="C"] .library-panel { grid-column: 1; grid-row: 2; display: flex; overflow: hidden; }
+    body[data-variant="C"] .library-panel .panel-head { width: 160px; flex: 0 0 160px; border-right: 1px solid var(--line); border-bottom: 0; align-items: flex-start; }
+    body[data-variant="C"] .library-scroll { flex: 1; flex-direction: row; overflow-x: auto; align-items: center; padding: 12px; }
+    body[data-variant="C"] .library-group, body[data-variant="C"] .drag-hint { display: none; }
+    body[data-variant="C"] .agent-card { min-width: 175px; }
+    body[data-variant="C"] .canvas-tools { left: auto; right: 16px; }
+    body[data-variant="C"] .state-strip { bottom: 14px; }
+
+    @media (max-width: 1040px) {
+      .topbar { gap: 9px; padding-inline: 12px; }
+      .brand { min-width: 150px; }
+      .brand-kicker, .btn.auxiliary { display: none; }
+      body[data-variant="A"] .workspace-shell { grid-template-columns: 200px minmax(420px, 1fr) 260px; }
+    }
+
+    @media (max-width: 760px) {
+      .topbar { gap: 7px; }
+      .brand { min-width: 38px; width: 38px; }
+      .brand > div:last-child, .save-state { display: none; }
+      .brand-mark { width: 30px; height: 30px; font-size: 16px; }
+      .segmented button { padding: 6px 9px; }
+      .workflow-select { min-width: 0; width: 154px; padding-inline: 8px; }
+      .project-select { width: 112px; }
+      .top-actions { margin-left: 0; }
+      .btn.primary { width: 84px; padding-inline: 8px; }
+      .prototype-switcher { bottom: 10px; }
+      .variant-label { min-width: 190px; }
+
+      body[data-variant="A"] .workspace-shell {
+        display: grid;
+        grid-template-columns: 166px minmax(0, 1fr);
+        grid-template-rows: minmax(0, 1fr) 260px;
+      }
+      body[data-variant="A"] .library-panel { grid-column: 1; grid-row: 1 / 3; }
+      body[data-variant="A"] .canvas-panel { grid-column: 2; grid-row: 1; }
+      body[data-variant="A"] .inspector-panel { grid-column: 2; grid-row: 2; }
+      body[data-variant="A"] .library-scroll { padding: 9px; }
+      body[data-variant="A"] .agent-card { padding: 8px; }
+      body[data-variant="A"] .drag-hint { display: none; }
+      body[data-variant="A"] .inspector-body {
+        padding-bottom: 72px; display: grid; grid-template-columns: 1fr 1fr; align-items: start;
+      }
+      body[data-variant="A"] .inspector-body .inspector-danger { grid-column: 1 / -1; }
+
+      body[data-variant="B"] .library-panel {
+        left: 10px; right: 10px; top: auto; bottom: 68px; width: auto; height: 118px; display: flex;
+      }
+      body[data-variant="B"] .library-panel .panel-head {
+        width: 132px; flex: 0 0 132px; border-right: 1px solid var(--line); border-bottom: 0;
+      }
+      body[data-variant="B"] .library-scroll {
+        flex: 1; flex-direction: row; overflow-x: auto; padding: 8px; align-items: center;
+      }
+      body[data-variant="B"] .library-group, body[data-variant="B"] .drag-hint { display: none; }
+      body[data-variant="B"] .agent-card { min-width: 152px; padding: 8px; }
+      body[data-variant="B"] .inspector-panel { top: 68px; right: 10px; bottom: 198px; width: 226px; }
+      body[data-variant="B"] .canvas-tools { left: 10px; top: 10px; }
+      body[data-variant="B"] .canvas-tip { left: 10px; right: 244px; bottom: 198px; }
+      body[data-variant="B"] .state-strip { left: 10px; right: 244px; bottom: 156px; }
+
+      body[data-variant="C"] .workspace-shell {
+        display: grid; grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: minmax(0, 1fr) 230px 118px;
+      }
+      body[data-variant="C"] .canvas-panel { grid-column: 1; grid-row: 1; }
+      body[data-variant="C"] .inspector-panel { grid-column: 1; grid-row: 2; }
+      body[data-variant="C"] .library-panel { grid-column: 1; grid-row: 3; }
+      body[data-variant="C"] .inspector-body {
+        padding-bottom: 64px; display: grid; grid-template-columns: 1fr 1fr; align-items: start;
+      }
+      body[data-variant="C"] .inspector-body .inspector-danger { grid-column: 1 / -1; }
+      body[data-variant="C"] .library-panel .panel-head { width: 130px; flex-basis: 130px; }
+      body[data-variant="C"] .agent-card { min-width: 150px; padding: 8px; }
+    }
+  </style>
+</head>
+<body data-variant="A">
+  <div id="app"></div>
+  <div class="prototype-tag">THROWAWAY PROTOTYPE</div>
+  <div class="toast" id="toast"></div>
+  <div class="prototype-switcher" aria-label="原型方案切换">
+    <button id="prevVariant" aria-label="上一个方案">←</button>
+    <div class="variant-label" id="variantLabel"></div>
+    <button id="nextVariant" aria-label="下一个方案">→</button>
+  </div>
+
+  <script>
+    const NODE_W = 220;
+    const NODE_H = 112;
+    const WORLD_W = 2400;
+    const WORLD_H = 1400;
+    const variants = [
+      { key: 'A', name: 'Workbench · 推荐三栏工作台' },
+      { key: 'B', name: 'Canvas First · 沉浸画布' },
+      { key: 'C', name: 'Sequence Desk · 纵向编排桌' },
+    ];
+
+    const agentCatalog = [
+      { group: '检测到的默认 CLI', id: 'claude', name: 'Claude', meta: '默认 CLI · 沿用外部配置' },
+      { group: '检测到的默认 CLI', id: 'codex', name: 'Codex', meta: '默认 CLI · 沿用外部配置' },
+      { group: '保存的智能体配置', id: 'glm', name: 'GLM-5.3 Builder', meta: '保存配置 · 实现' },
+      { group: '保存的智能体配置', id: 'reviewer', name: 'Codex Reviewer', meta: '保存配置 · 审查' },
+      { group: '保存的智能体配置', id: 'qa', name: 'QA Sentinel', meta: '保存配置 · 验证' },
+    ];
+
+    const providerProfiles = [
+      { id: 'official-openai', name: 'OpenAI Official', protocol: 'OpenAI / 官方登录', baseUrl: 'https://api.openai.com/v1', keyState: '使用本机官方登录', defaultModel: 'gpt-5.6-sol', fastModel: 'gpt-5.6-luna', reasoningModel: 'gpt-5.6-sol', models: ['gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-5.5'] },
+      { id: 'official-anthropic', name: 'Anthropic Official', protocol: 'Anthropic Messages', baseUrl: 'https://api.anthropic.com', keyState: '使用本机官方登录', defaultModel: 'claude-opus-4-1', fastModel: 'claude-sonnet-4', reasoningModel: 'claude-opus-4-1', models: ['claude-opus-4-1', 'claude-sonnet-4', 'claude-haiku-3-5'] },
+      { id: 'glm-zai', name: 'Z.AI · GLM', protocol: 'Anthropic Compatible', baseUrl: 'https://api.z.ai/api/anthropic', keyState: '已保存 Secret', defaultModel: 'glm-5', fastModel: 'glm-4.7-flash', reasoningModel: 'glm-5', models: ['glm-5', 'glm-4.7', 'glm-4.7-flash', 'glm-4.6'] },
+      { id: 'deepseek', name: 'DeepSeek', protocol: 'OpenAI Compatible', baseUrl: 'https://api.deepseek.com', keyState: '已保存 Secret', defaultModel: 'deepseek-chat', fastModel: 'deepseek-chat', reasoningModel: 'deepseek-reasoner', models: ['deepseek-chat', 'deepseek-reasoner'] },
+    ];
+
+    const activeSessions = [
+      { id: 'session-build-01', name: '实现功能', agent: 'GLM-5.3 Builder', project: 'MonkeyFence', state: '等待输入' },
+      { id: 'session-review-02', name: '快速代码审查', agent: 'Codex Reviewer', project: 'Orca', state: '运行中' },
+    ];
+
+    const state = {
+      variant: new URLSearchParams(location.search).get('variant') || 'A',
+      page: 'workflows',
+      project: 'monkeyfence',
+      workflow: 'delivery',
+      runFilter: 'attention',
+      terminalNode: null,
+      nodes: [
+        { id: 'discover', title: '澄清与拆解', agent: 'claude', instructions: '读取目标并产出结构化实现清单。', x: 70, y: 210, status: 'idle' },
+        { id: 'architect', title: '接口设计', agent: 'codex', instructions: '确认模块缝隙、数据结构和验收面。', x: 375, y: 95, status: 'idle' },
+        { id: 'build', title: '实现功能', agent: 'glm', instructions: '按 tracer bullet 完成代码与定向测试。', x: 375, y: 325, status: 'idle' },
+        { id: 'verify', title: '回归验证', agent: 'qa', instructions: '执行定向与完整验证，记录结果。', x: 690, y: 95, status: 'idle' },
+        { id: 'review', title: 'Codex Review', agent: 'reviewer', instructions: '按 Standards 与 Spec 双轴审查。', x: 995, y: 210, status: 'idle' },
+      ],
+      edges: [
+        { from: 'discover', to: 'architect' },
+        { from: 'discover', to: 'build' },
+        { from: 'architect', to: 'verify' },
+        { from: 'build', to: 'review' },
+        { from: 'verify', to: 'review' },
+      ],
+      viewport: { panX: 34, panY: 44, zoom: .62 },
+      selection: { kind: 'node', id: 'build' },
+      interaction: { mode: 'idle' },
+      lastNodePointer: null,
+      message: '已自动保存 · 拖动节点或从输出端口拉线',
+      showState: false,
+      runTimer: null,
+    };
+
+    const els = {};
+
+    function h(tag, className, html) {
+      const el = document.createElement(tag);
+      if (className) el.className = className;
+      if (html !== undefined) el.innerHTML = html;
+      return el;
+    }
+
+    function agentName(id) {
+      return agentCatalog.find(a => a.id === id)?.name || id;
+    }
+
+    function makeTopbar() {
+      const top = h('header', 'topbar');
+      const onWorkflows = state.page === 'workflows';
+      top.innerHTML = `
+        <div class="brand">
+          <div class="brand-mark">M</div>
+          <div><div class="brand-title">MonkeyFence</div><div class="brand-kicker">Agent orchestration studio</div></div>
+        </div>
+        <div class="segmented"><button data-page="workflows" class="${onWorkflows ? 'active' : ''}">工作流</button><button data-page="runs" class="${!onWorkflows ? 'active' : ''}">运行 <span class="needs-badge">1</span></button></div>
+        <div class="workflow-identity">
+          <select class="project-select" aria-label="选择项目"><option value="monkeyfence" ${state.project === 'monkeyfence' ? 'selected' : ''}>MonkeyFence</option><option value="orca" ${state.project === 'orca' ? 'selected' : ''}>Orca</option><option value="zed" ${state.project === 'zed' ? 'selected' : ''}>Zed</option></select>
+          <select class="workflow-select" aria-label="选择工作流"><option value="delivery" ${state.workflow === 'delivery' ? 'selected' : ''}>产品交付流水线</option><option value="review" ${state.workflow === 'review' ? 'selected' : ''}>快速代码审查</option></select>
+          ${onWorkflows ? '<button class="btn ghost auxiliary" data-action="rename">重命名</button>' : ''}
+        </div>
+        ${onWorkflows ? '<div class="save-state">已自动保存</div>' : '<div class="save-state">实时同步</div>'}
+        <div class="top-actions">
+          <button class="btn" data-action="settings">智能体配置</button>
+          ${onWorkflows ? '<button class="btn auxiliary" data-action="duplicate">复制</button><button class="btn auxiliary" data-action="template">另存模板</button><button class="btn primary" data-action="run">运行工作流</button>' : '<button class="btn primary" data-action="attention">查看需要你</button>'}
+        </div>`;
+      top.querySelectorAll('[data-page]').forEach(button => button.addEventListener('click', () => setPage(button.dataset.page)));
+      top.querySelector('.project-select').addEventListener('change', e => {
+        state.project = e.target.value;
+        state.message = `已切换项目：${e.target.options[e.target.selectedIndex].text}`;
+        mountVariantShell();
+      });
+      top.querySelector('.workflow-select').addEventListener('change', e => {
+        state.workflow = e.target.value;
+        state.message = `已切换工作流：${e.target.options[e.target.selectedIndex].text}`;
+        mountVariantShell();
+      });
+      top.addEventListener('click', e => {
+        const action = e.target.closest('[data-action]')?.dataset.action;
+        if (action === 'run') openRunModal();
+        if (action === 'settings') openAgentSettings();
+        if (action === 'attention') { state.runFilter = 'attention'; state.message = '已定位到需要你：实现功能等待输入'; mountVariantShell(); }
+        if (action === 'duplicate') toast('已复制为「产品交付流水线（副本）」');
+        if (action === 'template') toast('已另存为全局模板（原型不持久化）');
+        if (action === 'rename') toast('正式版在这里进入就地重命名');
+      });
+      return top;
+    }
+
+    function makeLibrary() {
+      const panel = h('aside', 'panel library-panel');
+      panel.innerHTML = `<div class="panel-head"><div><div class="panel-title">Agent 库</div><div class="panel-note">拖入画布，或点击快速添加</div></div><button class="btn ghost" data-library-action="settings" title="管理智能体">⚙</button></div><div class="library-scroll"></div>`;
+      panel.querySelector('[data-library-action="settings"]').onclick = () => openAgentSettings();
+      const scroll = panel.querySelector('.library-scroll');
+      let lastGroup = '';
+      agentCatalog.forEach(agent => {
+        if (agent.group !== lastGroup) {
+          scroll.append(h('div', 'library-group', agent.group));
+          lastGroup = agent.group;
+        }
+        const card = h('div', 'agent-card', `<div class="agent-name">${agent.name}</div><div class="agent-meta"><span class="agent-dot"></span>${agent.meta}</div>`);
+        card.draggable = true;
+        card.dataset.agent = agent.id;
+        card.addEventListener('dragstart', e => {
+          e.dataTransfer.effectAllowed = 'copy';
+          e.dataTransfer.setData('text/plain', agent.id);
+          state.message = `正在拖入 ${agent.name}`;
+          renderState();
+        });
+        card.addEventListener('click', () => addAgentAtViewportCenter(agent.id));
+        scroll.append(card);
+      });
+      scroll.append(h('div', 'drag-hint', '拖拽到画布可精确放置。<br>点击卡片会在当前视口中心寻找空位。'));
+      return panel;
+    }
+
+    function makeRunList() {
+      const panel = h('aside', 'panel library-panel');
+      panel.innerHTML = `<div class="panel-head"><div><div class="panel-title">Workflow Runs</div><div class="panel-note">跨项目运行与需要你</div></div><span class="needs-badge">1</span></div><div class="run-list"><div class="run-filter"><button data-filter="attention" class="${state.runFilter === 'attention' ? 'active' : ''}">需要你</button><button data-filter="running" class="${state.runFilter === 'running' ? 'active' : ''}">运行中</button><button data-filter="recent" class="${state.runFilter === 'recent' ? 'active' : ''}">最近</button></div><div class="run-card active"><div class="run-card-title"><span class="run-card-status attention"></span>产品交付流水线</div><div class="run-card-meta">MonkeyFence · build 等待输入<br>5 节点 · 2 已完成 · 1 需要你</div></div><div class="run-card"><div class="run-card-title"><span class="run-card-status"></span>快速代码审查</div><div class="run-card-meta">Orca · 运行中<br>3 节点 · Codex Reviewer</div></div><div class="run-card"><div class="run-card-title"><span class="run-card-status" style="background:var(--success)"></span>发布验证</div><div class="run-card-meta">Zed · 14:32 完成<br>4/4 节点成功</div></div></div>`;
+      panel.querySelectorAll('[data-filter]').forEach(button => button.addEventListener('click', () => {
+        state.runFilter = button.dataset.filter;
+        state.message = `运行过滤：${button.textContent}`;
+        mountVariantShell();
+      }));
+      return panel;
+    }
+
+    function makeInspector() {
+      const panel = h('aside', 'panel inspector-panel');
+      panel.innerHTML = `<div class="panel-head"><div><div class="panel-title">${state.page === 'workflows' ? '节点检查器' : '运行节点详情'}</div><div class="panel-note">${state.page === 'workflows' ? '选择节点或连线查看详情' : '双击节点打开 Agent Session'}</div></div><span>⌘</span></div><div class="inspector-body"></div>`;
+      return panel;
+    }
+
+    function makeCanvas() {
+      const panel = h('section', 'panel canvas-panel');
+      panel.innerHTML = `
+        <div class="canvas-viewport" tabindex="0">
+          <div class="canvas-world">
+            <svg class="edge-svg" viewBox="0 0 ${WORLD_W} ${WORLD_H}" aria-label="工作流连线"></svg>
+            <div class="node-layer"></div>
+          </div>
+        </div>
+        <div class="canvas-tools">
+          <button class="btn" data-canvas-action="fit">适配视图</button>
+          ${state.page === 'workflows' ? '<button class="btn" data-canvas-action="layout">自动排列</button>' : ''}
+          <button class="btn" data-canvas-action="zoom-out">−</button>
+          <span class="zoom-readout">82%</span>
+          <button class="btn" data-canvas-action="zoom-in">＋</button>
+        </div>
+        <div class="canvas-tip">${state.page === 'workflows' ? '拖节点移动 · 输出端 → 输入端连线 · Ctrl + 滚轮缩放 · 空白拖动平移 · Delete 删除' : '单击节点查看状态 · 双击节点打开 Agent Session · Ctrl + 滚轮缩放 · 空白拖动平移'}</div>
+        <div class="state-strip">
+          <span class="state-chip state-count"></span><span class="state-chip state-zoom"></span>
+          <span class="state-message"></span><span class="state-json-toggle">查看状态 JSON</span>
+        </div>
+        <pre class="state-json" hidden></pre>`;
+      return panel;
+    }
+
+    function mountVariantShell() {
+      document.body.dataset.variant = state.variant;
+      const app = document.getElementById('app');
+      app.replaceChildren();
+      const topbar = makeTopbar();
+      const shell = h('main', 'workspace-shell');
+      const library = state.page === 'workflows' ? makeLibrary() : makeRunList();
+      const canvas = makeCanvas();
+      const inspector = makeInspector();
+
+      if (state.variant === 'A') {
+        app.append(topbar, shell);
+        shell.append(library, canvas, inspector);
+      } else if (state.variant === 'B') {
+        app.append(topbar, shell);
+        shell.append(canvas, library, inspector);
+      } else {
+        app.append(topbar, shell);
+        shell.append(canvas, inspector, library);
+      }
+
+      Object.assign(els, {
+        topbar, shell, library, canvas, inspector,
+        viewport: canvas.querySelector('.canvas-viewport'),
+        world: canvas.querySelector('.canvas-world'),
+        svg: canvas.querySelector('.edge-svg'),
+        nodeLayer: canvas.querySelector('.node-layer'),
+        inspectorBody: inspector.querySelector('.inspector-body'),
+        stateJson: canvas.querySelector('.state-json'),
+      });
+      bindCanvasEvents();
+      canvas.querySelector('.state-json-toggle').addEventListener('click', () => {
+        state.showState = !state.showState;
+        renderState();
+      });
+      canvas.addEventListener('click', e => {
+        const action = e.target.closest('[data-canvas-action]')?.dataset.canvasAction;
+        if (!action) return;
+        if (action === 'fit') fitView();
+        if (action === 'layout') autoLayout(true);
+        if (action === 'zoom-in') setZoom(state.viewport.zoom + .12, centerClientPoint());
+        if (action === 'zoom-out') setZoom(state.viewport.zoom - .12, centerClientPoint());
+      });
+      if (state.variant === 'C') autoLayout(false);
+      renderAll();
+    }
+
+    function setPage(page) {
+      state.page = page;
+      state.terminalNode = null;
+      if (page === 'runs' && !state.runTimer) {
+        const defaults = { discover: 'succeeded', architect: 'succeeded', build: 'needs-input', verify: 'idle', review: 'idle' };
+        state.nodes.forEach(node => node.status = defaults[node.id] || 'idle');
+        state.selection = { kind: 'node', id: 'build' };
+        state.message = '需要你：实现功能节点等待输入，双击进入 Agent Session';
+      } else if (page === 'workflows') {
+        state.nodes.forEach(node => node.status = 'idle');
+        state.message = '已返回工作流编辑器 · 自动保存开启';
+      }
+      mountVariantShell();
+    }
+
+    function bindCanvasEvents() {
+      const v = els.viewport;
+      v.addEventListener('dragover', e => { if (state.page !== 'workflows') return; e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; });
+      v.addEventListener('drop', e => {
+        if (state.page !== 'workflows') return;
+        e.preventDefault();
+        const agent = e.dataTransfer.getData('text/plain');
+        if (!agentCatalog.some(a => a.id === agent)) return;
+        addNode(agent, clientToWorld(e.clientX, e.clientY));
+      });
+      v.addEventListener('pointerdown', onPointerDown);
+      v.addEventListener('pointermove', onPointerMove);
+      v.addEventListener('pointerup', onPointerUp);
+      v.addEventListener('pointercancel', cancelInteraction);
+      v.addEventListener('wheel', e => {
+        if (!e.ctrlKey) return;
+        e.preventDefault();
+        setZoom(state.viewport.zoom * (e.deltaY > 0 ? .9 : 1.1), { x: e.clientX, y: e.clientY });
+      }, { passive: false });
+    }
+
+    function centerClientPoint() {
+      const r = els.viewport.getBoundingClientRect();
+      return { x: r.left + r.width / 2, y: r.top + r.height / 2 };
+    }
+
+    function clientToWorld(clientX, clientY) {
+      const r = els.viewport.getBoundingClientRect();
+      return {
+        x: (clientX - r.left - state.viewport.panX) / state.viewport.zoom,
+        y: (clientY - r.top - state.viewport.panY) / state.viewport.zoom,
+      };
+    }
+
+    function onPointerDown(e) {
+      const port = e.target.closest('.port');
+      const nodeEl = e.target.closest('.graph-node');
+      const edge = e.target.closest('.edge-hit');
+      if (nodeEl && !port && !edge && e.button === 0) {
+        const now = performance.now();
+        const previous = state.lastNodePointer;
+        const sameNode = previous?.id === nodeEl.dataset.node;
+        const closeInTime = previous && now - previous.time <= 1200;
+        const closeInSpace = previous && Math.hypot(e.clientX - previous.x, e.clientY - previous.y) <= 24;
+        if (sameNode && closeInTime && closeInSpace && !previous.moved) {
+          state.lastNodePointer = null;
+          state.interaction = { mode: 'idle' };
+          e.preventDefault();
+          e.stopPropagation();
+          openTerminal(nodeEl.dataset.node, state.page === 'runs' ? 'run' : 'preview');
+          return;
+        }
+        state.lastNodePointer = { id: nodeEl.dataset.node, time: now, x: e.clientX, y: e.clientY, moved: false };
+      } else if (!nodeEl) {
+        state.lastNodePointer = null;
+      }
+      if (state.page === 'runs' && nodeEl) {
+        state.selection = { kind: 'node', id: nodeEl.dataset.node };
+        state.message = `已选择运行节点「${nodeById(nodeEl.dataset.node)?.title}」，双击进入 Agent Session`;
+        renderAll();
+        return;
+      }
+      if (port?.classList.contains('output')) {
+        const node = state.nodes.find(n => n.id === port.dataset.node);
+        state.selection = { kind: 'node', id: node.id };
+        state.interaction = { mode: 'connect', from: node.id, pointer: clientToWorld(e.clientX, e.clientY) };
+        els.viewport.setPointerCapture(e.pointerId);
+        state.message = `从「${node.title}」拉线：请选择下游输入端`;
+        renderAll();
+        e.preventDefault();
+        return;
+      }
+      if (nodeEl && e.target.closest('.node-drag-strip')) {
+        const node = state.nodes.find(n => n.id === nodeEl.dataset.node);
+        const point = clientToWorld(e.clientX, e.clientY);
+        state.selection = { kind: 'node', id: node.id };
+        state.interaction = { mode: 'move-node', id: node.id, dx: point.x - node.x, dy: point.y - node.y, originX: node.x, originY: node.y, startClientX: e.clientX, startClientY: e.clientY, dragged: false };
+        els.viewport.setPointerCapture(e.pointerId);
+        renderAll();
+        e.preventDefault();
+        return;
+      }
+      if (edge) {
+        state.selection = { kind: 'edge', from: edge.dataset.from, to: edge.dataset.to };
+        state.message = `已选择连线 ${edge.dataset.from} → ${edge.dataset.to}，按 Delete 断开`;
+        renderAll();
+        e.stopPropagation();
+        return;
+      }
+      if (nodeEl) {
+        state.selection = { kind: 'node', id: nodeEl.dataset.node };
+        state.message = `已选择节点「${state.nodes.find(n => n.id === nodeEl.dataset.node)?.title}」`;
+        renderAll();
+        return;
+      }
+      if (e.button === 0) {
+        state.selection = null;
+        state.interaction = { mode: 'pan', startX: e.clientX, startY: e.clientY, panX: state.viewport.panX, panY: state.viewport.panY };
+        els.viewport.setPointerCapture(e.pointerId);
+        els.viewport.classList.add('panning');
+        renderAll();
+      }
+    }
+
+    function onPointerMove(e) {
+      const it = state.interaction;
+      if (it.mode === 'move-node') {
+        const distance = Math.hypot(e.clientX - it.startClientX, e.clientY - it.startClientY);
+        if (!it.dragged && distance <= 6) return;
+        it.dragged = true;
+        if (state.lastNodePointer) state.lastNodePointer.moved = true;
+        const node = state.nodes.find(n => n.id === it.id);
+        const p = clientToWorld(e.clientX, e.clientY);
+        node.x = Math.max(0, Math.min(WORLD_W - NODE_W, p.x - it.dx));
+        node.y = Math.max(0, Math.min(WORLD_H - NODE_H, p.y - it.dy));
+        renderGraph();
+      } else if (it.mode === 'connect') {
+        it.pointer = clientToWorld(e.clientX, e.clientY);
+        clearPortHighlights();
+        const targetPort = document.elementFromPoint(e.clientX, e.clientY)?.closest?.('.port.input');
+        if (targetPort) {
+          const targetId = targetPort.dataset.node;
+          const validation = validateConnection(it.from, targetId);
+          targetPort.classList.add(validation.ok ? 'valid' : 'invalid');
+          state.message = validation.ok ? `释放以连接到「${nodeById(targetId).title}」` : validation.reason;
+        }
+        renderEdges();
+        renderState();
+      } else if (it.mode === 'pan') {
+        state.viewport.panX = it.panX + (e.clientX - it.startX);
+        state.viewport.panY = it.panY + (e.clientY - it.startY);
+        renderViewport();
+        renderState();
+      }
+    }
+
+    function onPointerUp(e) {
+      const it = state.interaction;
+      if (it.mode === 'move-node') {
+        const node = nodeById(it.id);
+        if (it.dragged) {
+          node.x = Math.round(node.x / 20) * 20;
+          node.y = Math.round(node.y / 20) * 20;
+          state.lastNodePointer = null;
+          state.message = `已保存「${node.title}」的位置 (${node.x}, ${node.y})`;
+        } else {
+          node.x = it.originX;
+          node.y = it.originY;
+          state.message = `已选择节点「${node.title}」· 再点一次打开终端`;
+        }
+      } else if (it.mode === 'connect') {
+        const targetPort = document.elementFromPoint(e.clientX, e.clientY)?.closest?.('.port.input');
+        if (targetPort) {
+          const result = validateConnection(it.from, targetPort.dataset.node);
+          if (result.ok) connectNodes(it.from, targetPort.dataset.node);
+          else state.message = result.reason;
+        } else state.message = '已取消连线，工作流未改变';
+      }
+      state.interaction = { mode: 'idle' };
+      els.viewport.classList.remove('panning');
+      clearPortHighlights();
+      renderAll();
+    }
+
+    function cancelInteraction() {
+      state.interaction = { mode: 'idle' };
+      els.viewport?.classList.remove('panning');
+      clearPortHighlights();
+      state.message = '已取消当前操作';
+      renderAll();
+    }
+
+    function clearPortHighlights() {
+      document.querySelectorAll('.port.valid,.port.invalid').forEach(p => p.classList.remove('valid', 'invalid'));
+    }
+
+    function nodeById(id) { return state.nodes.find(n => n.id === id); }
+
+    function uniqueNodeId(agent) {
+      let i = 1;
+      let key = `${agent}-${i}`;
+      while (nodeById(key)) key = `${agent}-${++i}`;
+      return key;
+    }
+
+    function addNode(agent, point) {
+      const id = uniqueNodeId(agent);
+      const info = agentCatalog.find(a => a.id === agent);
+      state.nodes.push({
+        id, title: `${info.name} 步骤`, agent,
+        instructions: '点击右侧检查器补充这个节点的工作说明。',
+        x: Math.max(20, Math.min(WORLD_W - NODE_W - 20, point.x - NODE_W / 2)),
+        y: Math.max(20, Math.min(WORLD_H - NODE_H - 20, point.y - NODE_H / 2)), status: 'idle'
+      });
+      state.selection = { kind: 'node', id };
+      state.message = `已添加「${info.name} 步骤」并保存工作流`;
+      renderAll();
+    }
+
+    function addAgentAtViewportCenter(agent) {
+      const center = centerClientPoint();
+      const p = clientToWorld(center.x, center.y);
+      const offset = state.nodes.length * 18;
+      addNode(agent, { x: p.x + offset, y: p.y + offset });
+    }
+
+    function validateConnection(from, to) {
+      if (!nodeById(from) || !nodeById(to)) return { ok: false, reason: '节点不存在' };
+      if (from === to) return { ok: false, reason: '不允许节点依赖自己' };
+      if (state.edges.some(e => e.from === from && e.to === to)) return { ok: false, reason: '这条依赖已经存在' };
+      if (reachable(to, from)) return { ok: false, reason: '这条连接会形成环，已拒绝' };
+      return { ok: true };
+    }
+
+    function reachable(from, target) {
+      const seen = new Set();
+      const stack = [from];
+      while (stack.length) {
+        const current = stack.pop();
+        if (current === target) return true;
+        if (seen.has(current)) continue;
+        seen.add(current);
+        state.edges.filter(e => e.from === current).forEach(e => stack.push(e.to));
+      }
+      return false;
+    }
+
+    function connectNodes(from, to) {
+      state.edges.push({ from, to });
+      state.selection = { kind: 'edge', from, to };
+      state.message = `已连接「${nodeById(from).title}」→「${nodeById(to).title}」并自动保存`;
+    }
+
+    function removeSelection() {
+      if (state.page !== 'workflows') return;
+      const s = state.selection;
+      if (!s) return;
+      if (s.kind === 'edge') {
+        state.edges = state.edges.filter(e => !(e.from === s.from && e.to === s.to));
+        state.message = `已断开 ${s.from} → ${s.to}`;
+      } else {
+        const node = nodeById(s.id);
+        state.nodes = state.nodes.filter(n => n.id !== s.id);
+        state.edges = state.edges.filter(e => e.from !== s.id && e.to !== s.id);
+        state.message = `已删除节点「${node?.title || s.id}」及相关连线`;
+      }
+      state.selection = null;
+      renderAll();
+    }
+
+    function edgePath(fromId, toId, pointer) {
+      const from = nodeById(fromId);
+      const to = toId ? nodeById(toId) : null;
+      if (!from) return '';
+      const x1 = from.x + NODE_W, y1 = from.y + NODE_H / 2;
+      const x2 = to ? to.x : pointer.x, y2 = to ? to.y + NODE_H / 2 : pointer.y;
+      const bend = Math.max(70, Math.abs(x2 - x1) * .48);
+      return `M ${x1} ${y1} C ${x1 + bend} ${y1}, ${x2 - bend} ${y2}, ${x2} ${y2}`;
+    }
+
+    function renderGraph() {
+      renderViewport();
+      renderEdges();
+      els.nodeLayer.replaceChildren();
+      state.nodes.forEach((node, index) => {
+        const selected = state.selection?.kind === 'node' && state.selection.id === node.id;
+        const el = h('div', `graph-node ${selected ? 'selected' : ''} ${node.status}`);
+        el.dataset.node = node.id;
+        el.style.left = `${node.x}px`;
+        el.style.top = `${node.y}px`;
+        el.innerHTML = `
+          ${state.page === 'workflows' ? `<div class="port input" data-node="${node.id}" title="输入：上游依赖"></div><div class="port output" data-node="${node.id}" title="输出：拖到下游输入端"></div>` : ''}
+          <div class="node-drag-strip"><span class="node-index">${String(index + 1).padStart(2, '0')} · ${node.id}</span><span class="node-status">${nodeStatusLabel(node.status)}</span></div>
+          <div class="node-body"><div class="node-title">${escapeHtml(node.title)}</div><div class="node-agent"><span class="agent-badge">${escapeHtml(agentName(node.agent))}</span><span>${incoming(node.id).length} 个依赖</span></div></div>`;
+        el.addEventListener('dblclick', event => {
+          event.stopPropagation();
+          if (state.page === 'runs') openTerminal(node.id, 'run');
+          else openTerminal(node.id, 'preview');
+        });
+        els.nodeLayer.append(el);
+      });
+    }
+
+    function nodeStatusLabel(status) {
+      return ({ running: '运行中', succeeded: '已完成', 'needs-input': '需要你', pending: '等待中', idle: '就绪' })[status] || status;
+    }
+
+    function renderViewport() {
+      els.world.style.transform = `translate(${state.viewport.panX}px, ${state.viewport.panY}px) scale(${state.viewport.zoom})`;
+      const grid = 24 * state.viewport.zoom;
+      els.viewport.style.backgroundSize = `${grid}px ${grid}px`;
+      els.viewport.style.backgroundPosition = `${state.viewport.panX % grid}px ${state.viewport.panY % grid}px`;
+      const zr = els.canvas.querySelector('.zoom-readout');
+      if (zr) zr.textContent = `${Math.round(state.viewport.zoom * 100)}%`;
+    }
+
+    function renderEdges() {
+      const svg = els.svg;
+      svg.innerHTML = `
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="currentColor"></path></marker>
+          <marker id="arrowSelected" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"></path></marker>
+        </defs>`;
+      state.edges.forEach(edge => {
+        const selected = state.selection?.kind === 'edge' && state.selection.from === edge.from && state.selection.to === edge.to;
+        const running = nodeById(edge.from)?.status === 'succeeded' && nodeById(edge.to)?.status === 'running';
+        const d = edgePath(edge.from, edge.to);
+        const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+        group.innerHTML = `<path class="edge-visible ${selected ? 'selected' : ''} ${running ? 'running' : ''}" d="${d}" marker-end="url(#${selected ? 'arrowSelected' : 'arrow'})" style="color:${selected ? 'var(--accent)' : 'color-mix(in srgb, var(--ink) 54%, transparent)'}"></path><path class="edge-hit" data-from="${edge.from}" data-to="${edge.to}" d="${d}"></path>`;
+        svg.append(group);
+      });
+      if (state.interaction.mode === 'connect') {
+        const d = edgePath(state.interaction.from, null, state.interaction.pointer);
+        const p = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        p.setAttribute('class', 'edge-preview'); p.setAttribute('d', d);
+        svg.append(p);
+      }
+    }
+
+    function incoming(id) { return state.edges.filter(e => e.to === id).map(e => e.from); }
+
+    function renderInspector() {
+      const body = els.inspectorBody;
+      const s = state.selection;
+      if (!s) {
+        body.innerHTML = `<div class="empty-inspector">选择一个节点查看配置。<br>选择连线后可直接断开依赖。</div>`;
+        return;
+      }
+      if (state.page === 'runs') return renderRunInspector(body, s);
+      if (s.kind === 'edge') {
+        const from = nodeById(s.from), to = nodeById(s.to);
+        body.innerHTML = `
+          <div class="inspector-section"><div class="label">选中连线</div><div class="panel-title">${escapeHtml(from?.title || s.from)} → ${escapeHtml(to?.title || s.to)}</div><div class="panel-note">落库语义：${s.to}.deps 包含 ${s.from}</div></div>
+          <div class="inspector-section"><div class="label">验证</div><div class="dep-chip-row"><span class="dep-chip">✓ 无环</span><span class="dep-chip">✓ 节点存在</span></div></div>
+          <button class="btn danger inspector-danger" data-inspector-action="delete">断开这条依赖</button>`;
+        body.querySelector('[data-inspector-action="delete"]').onclick = removeSelection;
+        return;
+      }
+      const node = nodeById(s.id);
+      if (!node) { state.selection = null; return renderInspector(); }
+      body.innerHTML = `
+        <div class="inspector-section"><div class="label">节点身份</div><div class="panel-title">${escapeHtml(node.id)}</div><div class="panel-note">Project Workflow · 可执行 Step</div></div>
+        <label class="inspector-section"><span class="label">标题</span><input class="field" data-field="title" value="${escapeAttr(node.title)}"></label>
+        <label class="inspector-section"><span class="label">工作说明</span><textarea class="field" data-field="instructions">${escapeHtml(node.instructions)}</textarea></label>
+        <label class="inspector-section"><span class="label">Agent 绑定</span><select class="field" data-field="agent">${agentCatalog.map(a => `<option value="${a.id}" ${a.id === node.agent ? 'selected' : ''}>${escapeHtml(a.name)}</option>`).join('')}</select></label>
+        <div class="inspector-section"><span class="label">上游依赖</span><div class="dep-chip-row">${incoming(node.id).length ? incoming(node.id).map(id => `<span class="dep-chip">← ${escapeHtml(nodeById(id)?.title || id)}</span>`).join('') : '<span class="panel-note">无依赖，可立即运行</span>'}</div></div>
+        <button class="btn primary" data-inspector-action="preview">打开 Preview 终端（双击节点）</button>
+        <button class="btn danger inspector-danger" data-inspector-action="delete">删除节点</button>`;
+      body.querySelector('[data-field="title"]').addEventListener('input', e => { node.title = e.target.value; state.message = '标题已修改（原型内存状态）'; renderGraph(); renderState(); });
+      body.querySelector('[data-field="instructions"]').addEventListener('input', e => { node.instructions = e.target.value; state.message = '工作说明已修改（原型内存状态）'; renderState(); });
+      body.querySelector('[data-field="agent"]').addEventListener('change', e => { node.agent = e.target.value; state.message = `已改绑为 ${agentName(node.agent)}`; renderGraph(); renderState(); });
+      body.querySelector('[data-inspector-action="preview"]').onclick = () => openTerminal(node.id, 'preview');
+      body.querySelector('[data-inspector-action="delete"]').onclick = removeSelection;
+    }
+
+    function renderRunInspector(body, selection) {
+      if (selection.kind === 'edge') {
+        const from = nodeById(selection.from), to = nodeById(selection.to);
+        body.innerHTML = `<div class="inspector-section"><div class="label">运行依赖</div><div class="panel-title">${escapeHtml(from?.title || selection.from)} → ${escapeHtml(to?.title || selection.to)}</div><div class="panel-note">运行画布只读，依赖来自冻结 Pipeline Revision。</div></div>`;
+        return;
+      }
+      const node = nodeById(selection.id);
+      if (!node) return;
+      const hasSession = ['running', 'needs-input', 'succeeded'].includes(node.status);
+      body.innerHTML = `<div class="inspector-section"><div class="label">Workflow Run · Step</div><div class="panel-title">${escapeHtml(node.title)}</div><div class="panel-note">${escapeHtml(node.id)} · ${escapeHtml(agentName(node.agent))}</div></div><div class="inspector-section"><div class="label">状态</div><div class="dep-chip-row"><span class="dep-chip">${nodeStatusLabel(node.status)}</span>${node.status === 'needs-input' ? '<span class="dep-chip" style="color:var(--accent)">等待用户输入</span>' : ''}</div></div><div class="inspector-section"><div class="label">Agent Session</div><div class="panel-note">${hasSession ? '真实 CLI Session 可附着；双击节点也可打开。' : '尚未创建 Agent Session。'}</div></div>${hasSession ? '<button class="btn primary" data-run-action="terminal">打开 Agent 终端</button>' : ''}<div class="inspector-section"><div class="label">上游 Handoff</div><div class="panel-note">${incoming(node.id).length ? incoming(node.id).map(id => nodeById(id)?.title || id).join('、') : '无上游依赖'}</div></div>`;
+      body.querySelector('[data-run-action="terminal"]')?.addEventListener('click', () => openTerminal(node.id));
+    }
+
+    function renderState() {
+      if (!els.canvas) return;
+      els.canvas.querySelector('.state-count').textContent = `${state.nodes.length} 节点 · ${state.edges.length} 连线`;
+      els.canvas.querySelector('.state-zoom').textContent = `${Math.round(state.viewport.zoom * 100)}%`;
+      els.canvas.querySelector('.state-message').textContent = state.message;
+      els.stateJson.hidden = !state.showState;
+      els.stateJson.textContent = JSON.stringify({
+        page: state.page,
+        project: state.project,
+        workflow: state.workflow,
+        selection: state.selection,
+        interaction: state.interaction,
+        viewport: state.viewport,
+        nodes: state.nodes.map(({id,title,agent,x,y,status}) => ({id,title,agent,x:Math.round(x),y:Math.round(y),status})),
+        edges: state.edges,
+      }, null, 2);
+      els.canvas.querySelector('.state-json-toggle').textContent = state.showState ? '隐藏状态 JSON' : '查看状态 JSON';
+    }
+
+    function renderAll() { renderGraph(); renderInspector(); renderState(); }
+
+    function openTerminal(nodeId, mode = state.page === 'runs' ? 'run' : 'preview') {
+      const node = nodeById(nodeId);
+      const preview = mode === 'preview';
+      if (!node || (!preview && !['running', 'needs-input', 'succeeded'].includes(node.status))) {
+        toast('这个节点尚未创建 Agent Session');
+        return;
+      }
+      state.terminalNode = nodeId;
+      els.canvas.querySelector('.terminal-drawer')?.remove();
+      const drawer = h('section', 'terminal-drawer');
+      drawer.innerHTML = `<div class="terminal-head"><div><div class="terminal-title">${escapeHtml(node.title)} · ${escapeHtml(agentName(node.agent))}</div><div class="terminal-meta">${preview ? 'Preview Session · 独立于正式 Workflow Run' : `Workflow Run Agent Session · ${node.status === 'succeeded' ? '只读历史' : 'Controller 可输入'}`}</div></div><span class="terminal-prototype">${preview ? 'PREVIEW SESSION' : 'RUN SESSION'} · 正式版 RAW PTY</span><button class="terminal-close" aria-label="关闭终端">×</button></div><pre class="terminal-output">${terminalSeed(node, mode)}</pre><div class="terminal-compose"><span class="terminal-prompt">❯</span><input class="terminal-input" placeholder="输入 /skills、/model 或继续引导 Agent…" ${!preview && node.status === 'succeeded' ? 'disabled' : ''}></div>`;
+      drawer.querySelector('.terminal-close').onclick = () => { state.terminalNode = null; drawer.remove(); };
+      const input = drawer.querySelector('.terminal-input');
+      input?.addEventListener('keydown', event => {
+        if (event.key !== 'Enter' || !input.value.trim()) return;
+        const output = drawer.querySelector('.terminal-output');
+        output.textContent += `\n❯ ${input.value}\n[原型] 输入将原样发送给真实 ${agentName(node.agent)} CLI；网页不会解析命令。`;
+        output.scrollTop = output.scrollHeight;
+        input.value = '';
+      });
+      els.canvas.append(drawer);
+      drawer.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      input?.focus();
+      state.message = preview ? `已创建/恢复 ${node.title} 的 Preview Session` : `已附着 ${node.title} 的 Workflow Run Agent Session`;
+      renderState();
+    }
+
+    function terminalSeed(node, mode = 'run') {
+      const preview = mode === 'preview';
+      return `MonkeyFence Node Session Panel\n────────────────────────────────────────\nSession: ${preview ? 'preview' : 'run'}-${node.id}-01\nMode:    ${preview ? 'Preview Session（不参与正式运行）' : 'Workflow Run Agent Session'}\nAgent:   ${agentName(node.agent)}\nStep:    ${node.title}\n\n[原型说明] 正式版由 Rust 持有真实 PTY。\nSlash command、Skill、审批和 TUI 都由原生 CLI 自己处理。\n${preview ? '本会话不会产生 Settlement、Handoff 或解锁下游节点。\n' : ''}\n${node.status === 'needs-input' && !preview ? 'Agent 正在等待你的进一步引导。\n' : ''}› Try /skills or continue the conversation`;
+    }
+
+    function setZoom(next, anchorClient) {
+      const old = state.viewport.zoom;
+      next = Math.max(.35, Math.min(2, next));
+      const r = els.viewport.getBoundingClientRect();
+      const worldX = (anchorClient.x - r.left - state.viewport.panX) / old;
+      const worldY = (anchorClient.y - r.top - state.viewport.panY) / old;
+      state.viewport.zoom = next;
+      state.viewport.panX = anchorClient.x - r.left - worldX * next;
+      state.viewport.panY = anchorClient.y - r.top - worldY * next;
+      state.message = `视图缩放到 ${Math.round(next * 100)}%（不改变工作流内容）`;
+      renderViewport(); renderState();
+    }
+
+    function fitView() {
+      if (!state.nodes.length) { state.viewport = { panX: 0, panY: 0, zoom: 1 }; return renderAll(); }
+      const r = els.viewport.getBoundingClientRect();
+      const minX = Math.min(...state.nodes.map(n => n.x));
+      const minY = Math.min(...state.nodes.map(n => n.y));
+      const maxX = Math.max(...state.nodes.map(n => n.x + NODE_W));
+      const maxY = Math.max(...state.nodes.map(n => n.y + NODE_H));
+      const padding = 96;
+      const zoom = Math.max(.35, Math.min(1.25, Math.min((r.width - padding * 2) / (maxX - minX), (r.height - padding * 2) / (maxY - minY))));
+      state.viewport.zoom = zoom;
+      state.viewport.panX = (r.width - (maxX - minX) * zoom) / 2 - minX * zoom;
+      state.viewport.panY = (r.height - (maxY - minY) * zoom) / 2 - minY * zoom;
+      state.message = '已适配全部节点（仅改变当前视图）';
+      renderAll();
+    }
+
+    function autoLayout(announce) {
+      const indegree = new Map(state.nodes.map(n => [n.id, 0]));
+      state.edges.forEach(e => indegree.set(e.to, (indegree.get(e.to) || 0) + 1));
+      let frontier = state.nodes.filter(n => indegree.get(n.id) === 0).map(n => n.id).sort();
+      const layers = [];
+      const seen = new Set();
+      while (frontier.length) {
+        layers.push(frontier);
+        const next = [];
+        frontier.forEach(id => {
+          seen.add(id);
+          state.edges.filter(e => e.from === id).forEach(e => {
+            indegree.set(e.to, indegree.get(e.to) - 1);
+            if (indegree.get(e.to) === 0) next.push(e.to);
+          });
+        });
+        frontier = [...new Set(next)].sort();
+      }
+      state.nodes.filter(n => !seen.has(n.id)).forEach(n => layers.push([n.id]));
+      layers.forEach((layer, li) => layer.forEach((id, ni) => {
+        const node = nodeById(id);
+        if (state.variant === 'C') { node.x = 110 + ni * 290; node.y = 80 + li * 176; }
+        else { node.x = 90 + li * 305; node.y = 95 + ni * 180; }
+      }));
+      if (announce) state.message = '已按拓扑自动排列并保存节点坐标';
+      renderAll();
+      if (announce) requestAnimationFrame(fitView);
+    }
+
+    function openAgentSettings(initialSection = 'providers', initialId = 'glm-zai') {
+      document.querySelector('.settings-backdrop')?.remove();
+      const backdrop = h('div', 'settings-backdrop');
+      const modal = h('section', 'settings-modal');
+      modal.innerHTML = `<aside class="settings-rail"><div class="settings-rail-head"><div class="panel-title">智能体配置</div><div class="panel-note">Provider、实例与活动 Session</div><div class="run-filter" style="margin-top:12px"><button data-settings-section="providers">Provider</button><button data-settings-section="instances">实例</button><button data-settings-section="sessions">Session</button></div><button class="btn primary" data-settings-action="new" style="width:100%;margin-top:10px">＋ 新建 Provider</button></div><div class="settings-list"></div></aside><main class="settings-detail"></main>`;
+      backdrop.append(modal);
+      document.body.append(backdrop);
+      let section = initialSection;
+      let selectedId = initialId;
+      const list = modal.querySelector('.settings-list');
+      const detail = modal.querySelector('.settings-detail');
+
+      const renderList = () => {
+        list.innerHTML = '';
+        modal.querySelectorAll('[data-settings-section]').forEach(button => button.classList.toggle('active', button.dataset.settingsSection === section));
+        const newButton = modal.querySelector('[data-settings-action="new"]');
+        newButton.hidden = section === 'sessions';
+        newButton.textContent = section === 'providers' ? '＋ 新建 Provider' : '＋ 新建 Agent Instance';
+        if (section === 'providers') {
+          list.append(h('div', 'settings-group', 'Provider Profiles · 类似 CC Switch'));
+          providerProfiles.forEach(profile => {
+            const item = h('button', `settings-item ${selectedId === profile.id ? 'active' : ''}`, `<span class="agent-dot"></span><span class="settings-item-main"><span class="settings-item-name">${escapeHtml(profile.name)}</span><span class="settings-item-meta">${escapeHtml(profile.protocol)} · ${escapeHtml(profile.keyState)}</span></span>`);
+            item.onclick = () => { selectedId = profile.id; renderList(); renderDetail(); };
+            list.append(item);
+          });
+        } else if (section === 'instances') {
+          ['检测到的默认 CLI', '保存的智能体配置'].forEach(group => {
+            list.append(h('div', 'settings-group', group));
+            agentCatalog.filter(agent => agent.group === group).forEach(agent => {
+              const item = h('button', `settings-item ${selectedId === agent.id ? 'active' : ''}`, `<span class="agent-dot"></span><span class="settings-item-main"><span class="settings-item-name">${escapeHtml(agent.name)}</span><span class="settings-item-meta">${escapeHtml(agent.meta)}</span></span>`);
+              item.onclick = () => { selectedId = agent.id; renderList(); renderDetail(); };
+              list.append(item);
+            });
+          });
+        } else {
+          list.append(h('div', 'settings-group', '本机活动 Agent Session'));
+          activeSessions.forEach(session => {
+            const item = h('button', `settings-item ${selectedId === session.id ? 'active' : ''}`, `<span class="agent-dot"></span><span class="settings-item-main"><span class="settings-item-name">${escapeHtml(session.name)}</span><span class="settings-item-meta">${escapeHtml(session.agent)} · ${escapeHtml(session.state)}</span></span>`);
+            item.onclick = () => { selectedId = session.id; renderList(); renderDetail(); };
+            list.append(item);
+          });
+        }
+      };
+
+      const renderDetail = () => {
+        if (section === 'providers') renderProviderDetailV2();
+        else if (section === 'instances') renderInstanceDetail();
+        else renderSessionDetail();
+      };
+
+      const head = (title, note) => `<div class="settings-detail-head"><div><div class="settings-detail-title">${escapeHtml(title)}</div><div class="panel-note">${escapeHtml(note)}</div></div><button class="btn settings-close">关闭并返回画布</button></div>`;
+      const bindCommon = () => { detail.querySelector('.settings-close').onclick = () => backdrop.remove(); };
+
+      const renderProviderDetail = () => {
+        const isNew = selectedId === 'new-provider';
+        const profile = providerProfiles.find(item => item.id === selectedId) || { name: '未命名 Provider', protocol: 'OpenAI Compatible', baseUrl: '', keyState: '未配置 API Key', defaultModel: '', fastModel: '', reasoningModel: '' };
+        const official = selectedId.startsWith('official-');
+        detail.innerHTML = `${head(profile.name, 'Provider Profile · API、模型与鉴权')}<div class="settings-grid"><label class="inspector-section"><span class="label">Provider 名称</span><input class="field" value="${escapeAttr(profile.name)}"></label><label class="inspector-section"><span class="label">协议类型</span><select class="field"><option ${profile.protocol.includes('Anthropic') ? 'selected' : ''}>Anthropic Compatible</option><option ${profile.protocol.includes('OpenAI') ? 'selected' : ''}>OpenAI Compatible</option><option>官方登录 / OAuth</option></select></label><label class="inspector-section wide"><span class="label">Base URL</span><input class="field" value="${escapeAttr(profile.baseUrl)}" placeholder="https://api.example.com/v1"></label><div class="inspector-section wide"><span class="label">API Key</span><div class="secret-field"><input class="field" type="password" value="${official ? '' : 'stored-secret-placeholder'}" placeholder="sk-...（提交后不可读回）" ${official ? 'disabled' : ''}><button class="btn" ${official ? 'disabled' : ''}>${profile.keyState.includes('已保存') ? '替换 Key' : '保存 Key'}</button></div><span class="panel-note">${escapeHtml(profile.keyState)} · 明文只发送一次到 Rust Secret Store</span></div><label class="inspector-section"><span class="label">默认模型</span><input class="field" value="${escapeAttr(profile.defaultModel)}" placeholder="model-id"></label><label class="inspector-section"><span class="label">快速模型</span><input class="field" value="${escapeAttr(profile.fastModel)}" placeholder="fast-model-id"></label><label class="inspector-section"><span class="label">推理模型</span><input class="field" value="${escapeAttr(profile.reasoningModel)}" placeholder="reasoning-model-id"></label><label class="inspector-section"><span class="label">Model Alias</span><input class="field" value="default=${escapeAttr(profile.defaultModel)}"></label><label class="inspector-section wide"><span class="label">自定义请求头</span><textarea class="field" placeholder="X-Organization: ...">${official ? '' : 'X-Provider-Profile: ' + profile.id}</textarea></label><label class="inspector-section wide"><span class="label">环境变量映射</span><textarea class="field">${profile.protocol.includes('Anthropic') ? 'ANTHROPIC_BASE_URL={{base_url}}\nANTHROPIC_AUTH_TOKEN={{secret}}\nANTHROPIC_MODEL={{default_model}}' : 'OPENAI_BASE_URL={{base_url}}\nOPENAI_API_KEY={{secret}}\nOPENAI_MODEL={{default_model}}'}</textarea></label><div class="settings-help wide">Provider Profile 类似 CC Switch 的 profile，但 MonkeyFence 不切换全局配置；它在启动每个 Agent Instance 时注入快照。</div></div><div class="settings-footer"><button class="btn danger" ${official ? 'disabled' : ''}>删除 Provider</button><button class="btn" data-settings-action="validate">测试 API 与模型</button><button class="btn primary" data-settings-action="save">保存 Provider</button></div>`;
+        bindCommon();
+        detail.querySelector('[data-settings-action="validate"]').onclick = () => toast(`Provider 连通性测试通过：${profile.defaultModel || '(请配置模型)'}`);
+        detail.querySelector('[data-settings-action="save"]').onclick = () => { toast('Provider Profile 已保存（原型内存状态）'); backdrop.remove(); };
+      };
+
+      const renderProviderDetailV2 = () => {
+        const profile = providerProfiles.find(item => item.id === selectedId) || { id: 'custom', name: '未命名 Provider', protocol: 'OpenAI Compatible', baseUrl: '', keyState: '未配置 API Key', defaultModel: '', fastModel: '', reasoningModel: '', models: [] };
+        const official = selectedId.startsWith('official-');
+        const optionList = (selected) => `${profile.models.map(model => `<option value="${escapeAttr(model)}" ${model === selected ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('')}<option value="__manual__">手工输入 Model ID…</option>`;
+        const modelPicker = (label, key, value) => `<label class="inspector-section"><span class="label">${label}</span><div class="model-fetch-row"><select class="field" data-model-select="${key}"><optgroup label="Provider Models">${optionList(value)}</optgroup></select><button class="btn model-fetch" data-model-fetch="${key}" title="从 Provider 获取模型">↻ 获取</button></div><input class="field" data-model-manual="${key}" placeholder="手工输入 Model ID" hidden></label>`;
+        detail.innerHTML = `${head(profile.name, 'Provider Profile · CC Switch 风格配置')}<div class="settings-grid"><label class="inspector-section"><span class="label">Provider 预设</span><select class="field"><option ${profile.id === 'glm-zai' ? 'selected' : ''}>Zhipu GLM / Z.AI</option><option ${profile.id === 'deepseek' ? 'selected' : ''}>DeepSeek</option><option ${profile.id === 'official-anthropic' ? 'selected' : ''}>Anthropic Official</option><option ${profile.id === 'official-openai' ? 'selected' : ''}>OpenAI Official</option><option>Custom</option></select></label><label class="inspector-section"><span class="label">Provider 名称</span><input class="field" value="${escapeAttr(profile.name)}"></label><label class="inspector-section"><span class="label">协议类型</span><select class="field"><option ${profile.protocol.includes('Anthropic') ? 'selected' : ''}>Anthropic Compatible</option><option ${profile.protocol.includes('OpenAI') ? 'selected' : ''}>OpenAI Compatible</option><option>官方登录 / OAuth</option></select></label><label class="inspector-section"><span class="label">网站 / Console URL</span><input class="field" value="${profile.id === 'glm-zai' ? 'https://open.bigmodel.cn' : ''}" placeholder="https://provider.example.com"></label><label class="inspector-section wide"><span class="label">备注</span><input class="field" value="${profile.id === 'glm-zai' ? 'GLM 主力实现与低成本快速模型' : ''}" placeholder="Provider 使用说明"></label><label class="inspector-section wide"><span class="label">默认 Endpoint</span><input class="field" value="${escapeAttr(profile.baseUrl)}" placeholder="https://api.example.com/v1"></label><label class="inspector-section wide"><span class="label">备用 Endpoints（测速 / Failover）</span><textarea class="field" placeholder="每行一个 URL">${profile.id === 'glm-zai' ? 'https://open.bigmodel.cn/api/paas/v4' : ''}</textarea></label><div class="inspector-section wide"><span class="label">API Key</span><div class="secret-field"><input class="field" data-provider-key type="password" value="${official ? '' : 'stored-secret-placeholder'}" placeholder="sk-...（提交后不可读回）" ${official ? 'disabled' : ''}><button class="btn" data-key-visibility ${official ? 'disabled' : ''}>显示</button><button class="btn" ${official ? 'disabled' : ''}>${profile.keyState.includes('已保存') ? '替换 Key' : '保存 Key'}</button></div><span class="panel-note">${escapeHtml(profile.keyState)} · 正式版明文只提交一次到 Rust Secret Store</span></div>${modelPicker('默认模型', 'default', profile.defaultModel)}${modelPicker('快速模型', 'fast', profile.fastModel)}${modelPicker('推理模型', 'reasoning', profile.reasoningModel)}<label class="inspector-section"><span class="label">Model Alias</span><input class="field" value="default=${escapeAttr(profile.defaultModel)}"></label><div class="inspector-section wide"><span class="label">Claude 常用开关</span><div class="settings-grid"><div class="toggle-row"><span>Tool Search</span><button class="toggle on"></button></div><div class="toggle-row"><span>Disable Auto Upgrade</span><button class="toggle on"></button></div><div class="toggle-row"><span>Teammates</span><button class="toggle"></button></div><div class="toggle-row"><span>High Effort</span><button class="toggle on"></button></div></div></div><label class="inspector-section wide"><span class="label">自定义请求头</span><textarea class="field" placeholder="X-Organization: ...">${official ? '' : 'X-Provider-Profile: ' + profile.id}</textarea></label><label class="inspector-section wide"><span class="label">高级 JSON 配置</span><textarea class="field" style="font-family:Consolas,monospace;min-height:130px">${escapeHtml(JSON.stringify({ env: profile.protocol.includes('Anthropic') ? { ANTHROPIC_BASE_URL: '{{base_url}}', ANTHROPIC_AUTH_TOKEN: '{{secret}}', ANTHROPIC_MODEL: '{{default_model}}' } : { OPENAI_BASE_URL: '{{base_url}}', OPENAI_API_KEY: '{{secret}}', OPENAI_MODEL: '{{default_model}}' } }, null, 2))}</textarea></label><div class="settings-help wide">点击“↻ 获取”时，正式版由 Rust 使用已保存 Secret 请求 Provider 模型接口并返回分组列表；401/403、404/405 或解析失败时才显示手工 Model ID。</div></div><div class="settings-footer"><button class="btn danger" ${official ? 'disabled' : ''}>删除 Provider</button><button class="btn" data-settings-action="validate">Stream Check</button><button class="btn primary" data-settings-action="save">保存 Provider</button></div>`;
+        bindCommon();
+        const keyInput = detail.querySelector('[data-provider-key]');
+        detail.querySelector('[data-key-visibility]')?.addEventListener('click', event => { keyInput.type = keyInput.type === 'password' ? 'text' : 'password'; event.currentTarget.textContent = keyInput.type === 'password' ? '显示' : '隐藏'; });
+        detail.querySelectorAll('.toggle').forEach(toggle => toggle.onclick = () => toggle.classList.toggle('on'));
+        detail.querySelectorAll('[data-model-select]').forEach(select => select.onchange = () => { const manual = detail.querySelector(`[data-model-manual="${select.dataset.modelSelect}"]`); manual.hidden = select.value !== '__manual__'; if (!manual.hidden) manual.focus(); });
+        detail.querySelectorAll('[data-model-fetch]').forEach(button => button.onclick = () => {
+          const key = button.dataset.modelFetch;
+          const select = detail.querySelector(`[data-model-select="${key}"]`);
+          button.disabled = true; button.textContent = '获取中…';
+          setTimeout(() => { select.innerHTML = `<optgroup label="推荐">${profile.models.map(model => `<option>${escapeHtml(model)}</option>`).join('')}</optgroup><optgroup label="Fallback"><option value="__manual__">手工输入 Model ID…</option></optgroup>`; button.disabled = false; button.textContent = '↻ 获取'; toast(`已从 ${profile.name} 获取 ${profile.models.length} 个模型（原型模拟）`); }, 450);
+        });
+        detail.querySelector('[data-settings-action="validate"]').onclick = () => toast(`Stream Check 通过：API Key、Endpoint、模型可用（原型模拟）`);
+        detail.querySelector('[data-settings-action="save"]').onclick = () => { toast('Provider 已保存（原型内存状态）'); backdrop.remove(); };
+      };
+
+      const renderInstanceDetail = () => {
+        const agent = agentCatalog.find(item => item.id === selectedId);
+        const isNew = selectedId === 'new-instance';
+        const isDefault = ['claude', 'codex'].includes(selectedId);
+        const name = isNew ? '未命名 Agent Instance' : agent?.name || selectedId;
+        const command = selectedId === 'claude' ? 'claude' : selectedId === 'codex' ? 'codex' : selectedId === 'glm' ? 'claude' : 'codex';
+        const provider = selectedId === 'glm' ? 'glm-zai' : selectedId === 'claude' ? 'official-anthropic' : 'official-openai';
+        detail.innerHTML = `${head(name, isDefault ? 'Default CLI · 外部配置入口' : 'Agent Instance · 独立启动配置')}<div class="settings-grid"><label class="inspector-section"><span class="label">显示名称</span><input class="field" value="${escapeAttr(name)}" ${isDefault ? 'readonly' : ''}></label><label class="inspector-section"><span class="label">作用域</span><select class="field" ${isDefault ? 'disabled' : ''}><option>全局（所有项目）</option><option>当前项目：MonkeyFence</option></select></label><label class="inspector-section"><span class="label">Agent Type</span><select class="field"><option ${command === 'claude' ? 'selected' : ''}>Claude Code</option><option ${command === 'codex' ? 'selected' : ''}>Codex</option><option>OpenCode</option><option>Generic Command</option></select></label><label class="inspector-section"><span class="label">Provider Profile</span><select class="field">${providerProfiles.map(profile => `<option value="${profile.id}" ${profile.id === provider ? 'selected' : ''}>${escapeHtml(profile.name)}</option>`).join('')}</select></label><label class="inspector-section"><span class="label">模型覆盖</span><input class="field" value="${selectedId === 'glm' ? 'glm-5' : ''}" placeholder="留空使用 Provider 默认模型"></label><label class="inspector-section"><span class="label">权限模式</span><select class="field"><option>workspace-write</option><option>read-only</option><option>full-access（高风险）</option></select></label><label class="inspector-section wide"><span class="label">命令</span><input class="field" value="${escapeAttr(command)}" ${isDefault ? 'readonly' : ''}></label><label class="inspector-section wide"><span class="label">自定义参数 argv</span><input class="field" value="--permission-mode workspace-write --model {{model}}" ${isDefault ? 'readonly' : ''}></label><label class="inspector-section wide"><span class="label">附加环境变量</span><textarea class="field" ${isDefault ? 'readonly' : ''}>MONKEYFENCE_ROLE=builder\nNO_COLOR=0</textarea></label><label class="inspector-section"><span class="label">运行模式</span><select class="field"><option>交互式 Session</option><option>一次性运行</option></select></label><label class="inspector-section"><span class="label">完成契约</span><select class="field"><option>显式 Settlement</option><option>进程退出后需要你</option></select></label><div class="settings-help wide">运行时冻结 Agent Instance + Provider Profile 快照。API Key 只在 Rust 进程内解封，不进入浏览器 Snapshot、事件或终端历史。</div></div><div class="settings-footer"><button class="btn danger" ${isDefault ? 'disabled' : ''}>删除实例</button><button class="btn" data-settings-action="validate">验证启动配置</button><button class="btn primary" data-settings-action="save" ${isDefault ? 'disabled' : ''}>保存 Agent Instance</button></div>`;
+        bindCommon();
+        detail.querySelector('[data-settings-action="validate"]').onclick = () => toast(`启动配置有效：${command} + ${provider}`);
+        detail.querySelector('[data-settings-action="save"]')?.addEventListener('click', () => { toast('Agent Instance 已保存（原型内存状态）'); backdrop.remove(); });
+      };
+
+      const renderSessionDetail = () => {
+        const session = activeSessions.find(item => item.id === selectedId) || activeSessions[0];
+        detail.innerHTML = `${head(session.name, 'Active Agent Session · 运行时对象')}<div class="settings-grid"><div class="inspector-section"><span class="label">Agent</span><div class="field">${escapeHtml(session.agent)}</div></div><div class="inspector-section"><span class="label">状态</span><div class="field">${escapeHtml(session.state)}</div></div><div class="inspector-section"><span class="label">项目</span><div class="field">${escapeHtml(session.project)}</div></div><div class="inspector-section"><span class="label">Session ID</span><div class="field">${escapeHtml(session.id)}</div></div><div class="settings-help wide">活动 Session 只能作为本次运行覆盖。长期复用时，基于其启动快照创建新的 Agent Instance；不把 Session ID 永久写入 Project Workflow。</div></div><div class="settings-footer"><button class="btn" data-settings-action="clone">基于启动配置创建实例</button><button class="btn primary" data-settings-action="attach">打开 Session</button></div>`;
+        bindCommon();
+        detail.querySelector('[data-settings-action="clone"]').onclick = () => { section = 'instances'; selectedId = 'new-instance'; renderList(); renderDetail(); toast('已复制 Session 的启动快照'); };
+        detail.querySelector('[data-settings-action="attach"]').onclick = () => { backdrop.remove(); setPage('runs'); openTerminal('build'); };
+      };
+
+      modal.querySelectorAll('[data-settings-section]').forEach(button => button.onclick = () => {
+        section = button.dataset.settingsSection;
+        selectedId = section === 'providers' ? 'glm-zai' : section === 'instances' ? 'glm' : activeSessions[0].id;
+        renderList(); renderDetail();
+      });
+      modal.querySelector('[data-settings-action="new"]').onclick = () => { selectedId = section === 'providers' ? 'new-provider' : 'new-instance'; renderList(); renderDetail(); };
+      backdrop.addEventListener('click', event => { if (event.target === backdrop) backdrop.remove(); });
+      renderList();
+      renderDetail();
+    }
+
+    function openRunModal() {
+      const backdrop = h('div', 'modal-backdrop');
+      backdrop.innerHTML = `<div class="run-modal"><div class="run-modal-head"><div class="run-modal-title">运行「产品交付流水线」</div><div class="run-modal-sub">系统将冻结当前 DAG，在后台创建 Task 与 Pipeline Revision。</div></div><div class="run-modal-body"><label class="inspector-section"><span class="label">本次目标</span><textarea class="field run-goal" placeholder="例如：按计划实现可视化 DAG 编辑器，并保留未提交 diff 给 Codex review。"></textarea></label><div class="run-summary"><span class="state-chip">${state.nodes.length} 个节点</span><span class="state-chip">${state.edges.length} 条依赖</span><span class="state-chip">共享目录并行：关闭</span></div><div class="modal-actions"><button class="btn" data-modal="cancel">取消</button><button class="btn primary" data-modal="start">开始运行</button></div></div></div>`;
+      document.body.append(backdrop);
+      const goal = backdrop.querySelector('.run-goal'); goal.focus();
+      backdrop.querySelector('[data-modal="cancel"]').onclick = () => backdrop.remove();
+      backdrop.querySelector('[data-modal="start"]').onclick = () => {
+        if (!goal.value.trim()) { goal.style.borderColor = 'var(--danger)'; return; }
+        backdrop.remove(); startRun(goal.value.trim());
+      };
+    }
+
+    function topologicalOrder() {
+      const indegree = new Map(state.nodes.map(n => [n.id, 0]));
+      state.edges.forEach(e => indegree.set(e.to, (indegree.get(e.to) || 0) + 1));
+      const queue = state.nodes.filter(n => indegree.get(n.id) === 0).map(n => n.id).sort();
+      const order = [];
+      while (queue.length) {
+        const id = queue.shift(); order.push(id);
+        state.edges.filter(e => e.from === id).forEach(e => {
+          indegree.set(e.to, indegree.get(e.to) - 1);
+          if (indegree.get(e.to) === 0) queue.push(e.to);
+        });
+      }
+      return order;
+    }
+
+    function startRun(goal) {
+      if (state.runTimer) clearInterval(state.runTimer);
+      state.nodes.forEach(n => n.status = 'pending');
+      const order = topologicalOrder();
+      let index = 0;
+      state.page = 'runs';
+      state.runFilter = 'running';
+      state.message = `运行已创建：${goal}`;
+      toast('已冻结 Revision，开始运行第一个节点');
+      mountVariantShell();
+      const step = () => {
+        state.nodes.forEach(n => { if (n.status === 'running') n.status = 'succeeded'; });
+        if (index < order.length) {
+          nodeById(order[index]).status = 'running';
+          state.selection = { kind: 'node', id: order[index] };
+          state.message = `运行中：${nodeById(order[index]).title}`;
+          index++;
+        } else {
+          clearInterval(state.runTimer); state.runTimer = null;
+          state.message = '工作流运行完成 · 5/5 节点成功';
+          toast('运行完成，所有节点已结算');
+        }
+        renderAll();
+      };
+      step(); state.runTimer = setInterval(step, 1000);
+    }
+
+    function toast(message) {
+      const el = document.getElementById('toast');
+      el.textContent = message; el.classList.add('show');
+      clearTimeout(toast.timer); toast.timer = setTimeout(() => el.classList.remove('show'), 2200);
+    }
+
+    function setVariant(key) {
+      if (!variants.some(v => v.key === key)) key = 'A';
+      state.variant = key;
+      const params = new URLSearchParams(location.search); params.set('variant', key);
+      history.replaceState(null, '', `${location.pathname}?${params}`);
+      document.getElementById('variantLabel').textContent = variants.find(v => v.key === key).name;
+      mountVariantShell();
+    }
+
+    function cycleVariant(delta) {
+      const index = variants.findIndex(v => v.key === state.variant);
+      setVariant(variants[(index + delta + variants.length) % variants.length].key);
+    }
+
+    function escapeHtml(value) {
+      return String(value).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+    function escapeAttr(value) { return escapeHtml(value); }
+
+    document.getElementById('prevVariant').onclick = () => cycleVariant(-1);
+    document.getElementById('nextVariant').onclick = () => cycleVariant(1);
+    document.addEventListener('keydown', e => {
+      const editing = ['INPUT','TEXTAREA','SELECT'].includes(document.activeElement?.tagName) || document.activeElement?.isContentEditable;
+      if (!editing && e.key === 'ArrowLeft') cycleVariant(-1);
+      if (!editing && e.key === 'ArrowRight') cycleVariant(1);
+      if (!editing && state.page === 'workflows' && (e.key === 'Delete' || e.key === 'Backspace')) { e.preventDefault(); removeSelection(); }
+      if (!editing && e.key === 'Escape') cancelInteraction();
+      if (!editing && e.ctrlKey && e.key === '0') { e.preventDefault(); fitView(); }
+    });
+
+    setVariant(state.variant);
+  </script>
+</body>
+</html>

@@ -1,7 +1,7 @@
 # ADR 0001: Task 生命周期与版本控制完全解耦
 
 日期: 2026-08-27
-状态: 已接受
+状态: 已接受（Task/VCS 解耦继续有效；VCS 面板、Change Set 与 Delivery UI 的保留条款由 ADR 0005 废止）
 
 ## 背景
 

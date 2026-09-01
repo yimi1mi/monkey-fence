@@ -11,3 +11,8 @@ Thumbs.db
 .mf-agent/
 .monkeyfence/
 target-dev/
+
+# 可再生 Web prototype 依赖与 production build
+/.pnpm-store/
+/crates/mf/prototypes/*/node_modules/
+/crates/mf/prototypes/*/dist/

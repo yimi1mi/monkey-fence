@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PROTOTYPE — Real Agent PTY</title>
+</head>
+<body>
+  <main class="shell">
+    <header class="toolbar">
+      <div>
+        <strong>Node Session Panel</strong>
+        <span class="prototype">THROWAWAY · REAL LOCAL PTY</span>
+      </div>
+      <label>Agent
+        <select id="agent">
+          <option value="codex">Codex</option>
+          <option value="claude">Claude Code</option>
+          <option value="stress">Stress Fixture（无模型调用）</option>
+        </select>
+      </label>
+      <button id="connect">Connect</button>
+      <button id="take" disabled>Take writer</button>
+      <button id="interrupt" disabled>Send Ctrl+C</button>
+      <button id="disconnect" disabled>Disconnect</button>
+      <span id="status">disconnected</span>
+    </header>
+    <section id="terminal" aria-label="Real agent terminal"></section>
+    <footer>
+      <span id="metrics">seq 0 · ack 0 · 0×0</span>
+      <span>输入由真实 CLI 解释；Web 不解析 /skills、/model 或审批 TUI。</span>
+    </footer>
+  </main>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

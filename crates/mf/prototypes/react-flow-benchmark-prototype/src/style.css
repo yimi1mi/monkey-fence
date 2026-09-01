@@ -1,0 +1,18 @@
+:root { font-family: Bahnschrift, "Microsoft YaHei UI", sans-serif; color: #17211f; background: #f2eee4; }
+* { box-sizing: border-box; }
+html, body, #root, main { width: 100%; height: 100%; margin: 0; }
+main { display: grid; grid-template-rows: 58px minmax(0, 1fr); }
+header { display: flex; align-items: center; gap: 18px; padding: 0 16px; border-bottom: 1px solid #c7c1b4; background: #fffdf8; }
+header > div { display: flex; align-items: center; gap: 8px; margin-right: auto; }
+header span { padding: 3px 6px; border-radius: 999px; color: white; background: #bb4632; font-size: 8px; }
+nav { display: flex; gap: 5px; }
+button { border: 1px solid #c7c1b4; border-radius: 8px; padding: 6px 9px; background: #fffdf8; cursor: pointer; }
+button.active { color: white; border-color: #de583c; background: #de583c; }
+output { min-width: 310px; color: #65716d; font: 10px Consolas, monospace; text-align: right; }
+.canvas { min-height: 0; }
+.workflow-node { width: 220px; height: 88px; padding: 10px 13px; border: 1px solid #bfc6bc; border-radius: 12px; background: #fffdf8; box-shadow: 0 8px 18px rgba(23,33,31,.09); }
+.workflow-node strong { display: block; margin-top: 5px; font-family: Georgia, "Noto Serif SC", serif; font-size: 14px; }
+.node-key { color: #738079; font-size: 8px; letter-spacing: .08em; }
+.node-meta { display: flex; justify-content: space-between; margin-top: 9px; color: #6d7772; font-size: 8px; }
+.react-flow__handle { width: 10px; height: 10px; border: 2px solid #162220; background: #fffdf8; }
+.react-flow__edge-path { stroke: #586762; stroke-width: 1.5; }
