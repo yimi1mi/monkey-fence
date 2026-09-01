@@ -314,6 +314,7 @@ impl ExecutionDirectoryProvider for ScriptedDirectory {
 pub struct RecordingHost {
     pub workflow: Mutex<Vec<(WorkflowLaunchSpec, mf_agent::LaunchPlan)>>,
     pub senders: Mutex<HashMap<String, Sender<(i64, RuntimeEvent)>>>,
+    pub answers: Mutex<Vec<(i64, String)>>,
     pub stop_fails: AtomicBool,
 }
 
@@ -346,7 +347,9 @@ impl RuntimeHost for RecordingHost {
     }
     fn kill_session(&self, _project: &str, _session_id: i64) {}
     fn kill_ad_hoc(&self, _project: &str, _display_session_id: i64) {}
-    fn answer_question(&self, _project: &str, _run_id: i64, _answer: &str) {}
+    fn answer_question(&self, _project: &str, run_id: i64, answer: &str) {
+        self.answers.lock().push((run_id, answer.to_string()));
+    }
     fn launch_ad_hoc(&self, _spec: mf_agent::AdHocLaunchSpec) -> anyhow::Result<()> {
         Ok(())
     }

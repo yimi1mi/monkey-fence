@@ -1,0 +1,404 @@
+{
+  "actions": [
+    {
+      "action": "run_workflow",
+      "state": {
+        "answers": [],
+        "handoffs": [],
+        "leases": [
+          {
+            "status": "held",
+            "step_key": "migrate"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:执行迁移",
+                "key": "migrate",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "迁移"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/migrate"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": null,
+            "outcome_payload": null,
+            "session": 1,
+            "status": "running",
+            "step_key": "migrate"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": null,
+            "status": "running",
+            "step_key": "migrate"
+          }
+        ],
+        "task": {
+          "goal": "目标:迁移",
+          "paused": false,
+          "status": "running",
+          "title": "迁移任务",
+          "unread": false
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "running",
+              "step_key": "migrate"
+            }
+          ],
+          "task_status": "running"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "migrate",
+            "name": "迁移",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:执行迁移",
+                "key": "migrate",
+                "title": "迁移"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "agent_asks_question",
+      "state": {
+        "answers": [],
+        "handoffs": [],
+        "leases": [
+          {
+            "status": "held",
+            "step_key": "migrate"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:执行迁移",
+                "key": "migrate",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "迁移"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/migrate"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": null,
+            "outcome_payload": null,
+            "session": 1,
+            "status": "running",
+            "step_key": "migrate"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": null,
+            "status": "needs-input",
+            "step_key": "migrate"
+          }
+        ],
+        "task": {
+          "goal": "目标:迁移",
+          "paused": false,
+          "status": "needs-you",
+          "title": "迁移任务",
+          "unread": true
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": true,
+          "open_questions": [
+            "是否在生产库执行破坏性迁移?"
+          ],
+          "steps": [
+            {
+              "status": "needs-input",
+              "step_key": "migrate"
+            }
+          ],
+          "task_status": "needs-you"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "migrate",
+            "name": "迁移",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:执行迁移",
+                "key": "migrate",
+                "title": "迁移"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "respond_question",
+      "state": {
+        "answers": [
+          {
+            "answer": "批准执行",
+            "step_key": "migrate"
+          }
+        ],
+        "handoffs": [],
+        "leases": [
+          {
+            "status": "held",
+            "step_key": "migrate"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:执行迁移",
+                "key": "migrate",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "迁移"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/migrate"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": null,
+            "outcome_payload": null,
+            "session": 1,
+            "status": "running",
+            "step_key": "migrate"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": null,
+            "status": "running",
+            "step_key": "migrate"
+          }
+        ],
+        "task": {
+          "goal": "目标:迁移",
+          "paused": false,
+          "status": "running",
+          "title": "迁移任务",
+          "unread": true
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "running",
+              "step_key": "migrate"
+            }
+          ],
+          "task_status": "running"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "migrate",
+            "name": "迁移",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:执行迁移",
+                "key": "migrate",
+                "title": "迁移"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "settle_complete",
+      "state": {
+        "answers": [
+          {
+            "answer": "批准执行",
+            "step_key": "migrate"
+          }
+        ],
+        "handoffs": [
+          {
+            "output": null,
+            "status": "complete",
+            "step_key": "migrate",
+            "summary": "迁移完成"
+          }
+        ],
+        "leases": [
+          {
+            "status": "released",
+            "step_key": "migrate"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:执行迁移",
+                "key": "migrate",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "迁移"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/migrate"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": "complete",
+            "outcome_payload": "迁移完成",
+            "session": 1,
+            "status": "succeeded",
+            "step_key": "migrate"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": "迁移完成",
+            "status": "succeeded",
+            "step_key": "migrate"
+          }
+        ],
+        "task": {
+          "goal": "目标:迁移",
+          "paused": false,
+          "status": "succeeded",
+          "title": "迁移任务",
+          "unread": true
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "succeeded",
+              "step_key": "migrate"
+            }
+          ],
+          "task_status": "succeeded"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "migrate",
+            "name": "迁移",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:执行迁移",
+                "key": "migrate",
+                "title": "迁移"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "scenario": "question"
+}

@@ -235,28 +235,30 @@ fn regeneration_is_deterministic() {
     let dir2 = tempfile::tempdir().unwrap();
     let baseline1 = dir1.path().join("baseline");
     let baseline2 = dir2.path().join("baseline");
+    let workflow_goldens: Vec<_> = fs::read_dir(fixtures_dir().join("expected"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name.starts_with("workflow-") && name.ends_with(".json"))
+                .then(|| (name, fs::read(entry.path()).unwrap()))
+        })
+        .collect();
     for dir in [&baseline1, &baseline2] {
-        baseline::write_baseline(dir).unwrap();
+        baseline::write_baseline_with_workflow_goldens(dir, &workflow_goldens).unwrap();
     }
     // 再覆盖一次已有目录,显式覆盖 Windows 不支持 rename 覆盖
     // 已有文件的重生成路径。
-    baseline::write_baseline(&baseline1).unwrap();
-    for name in [
-        "project-v6.db",
-        "catalog-v1.db",
-        "session.json",
-        "expected/project-v6.dump.json",
-        "expected/catalog-v1.dump.json",
-        "expected/session.dump.json",
-        "manifest.json",
-    ] {
-        let a = fs::read(baseline1.join(name)).unwrap();
-        let b = fs::read(baseline2.join(name)).unwrap();
-        assert_eq!(a, b, "{name} 两轮生成不一致");
+    baseline::write_baseline_with_workflow_goldens(&baseline1, &workflow_goldens).unwrap();
+    for name in baseline::fixture_file_paths(&fixtures_dir()).unwrap() {
+        let a = fs::read(baseline1.join(&name)).unwrap();
+        let b = fs::read(baseline2.join(&name)).unwrap();
+        assert_eq!(a, b, "{} 两轮生成不一致", name.display());
         assert_eq!(
             a,
-            fs::read(fixtures_dir().join(name)).unwrap(),
-            "{name} 与提交的基线不一致"
+            fs::read(fixtures_dir().join(&name)).unwrap(),
+            "{} 与提交的基线不一致",
+            name.display()
         );
     }
     for parent in [dir1.path(), dir2.path()] {
@@ -339,7 +341,7 @@ fn fixtures_contain_no_secrets_or_tokens() {
 #[ignore = "会替换提交的基线 fixtures"]
 fn regenerate_baseline_fixtures() {
     assert!(
-        std::env::var_os("MF_REGEN_BASELINE").is_some(),
+        std::env::var("MF_REGEN_BASELINE").as_deref() == Ok("1"),
         "必须显式设置 MF_REGEN_BASELINE=1"
     );
     let dir = fixtures_dir();

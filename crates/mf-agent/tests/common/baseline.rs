@@ -24,7 +24,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// harness 版本:生成语义变化(加表、改规范化规则)时必须递增。
-pub const GENERATOR_VERSION: &str = "1";
+pub const GENERATOR_VERSION: &str = "2";
 pub const FROZEN_PROJECT_SCHEMA_VERSION: i64 = 6;
 pub const FROZEN_CATALOG_SCHEMA_VERSION: i64 = 1;
 
@@ -716,13 +716,68 @@ pub fn dump_session(raw: &str) -> Result<serde_json::Value> {
 // ---------------------------------------------------------------------------
 
 pub fn write_baseline(dir: &Path) -> Result<()> {
+    let mut workflow_goldens = Vec::new();
+    let expected = dir.join("expected");
+    if expected.is_dir() {
+        for entry in fs::read_dir(&expected)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("workflow-") && name.ends_with(".json") {
+                workflow_goldens.push((name, fs::read(entry.path())?));
+            }
+        }
+    }
+    write_baseline_with_workflow_goldens(dir, &workflow_goldens)
+}
+
+/// 生成完整基线包并原子换入精确的生命周期 golden 集合。
+/// 调用者必须先把所有场景渲染完;任一场景失败时不触碰已提交基线。
+pub fn write_baseline_with_workflow_goldens(
+    dir: &Path,
+    workflow_goldens: &[(String, Vec<u8>)],
+) -> Result<()> {
     let parent = dir.parent().context("基线目录缺少父目录")?;
     fs::create_dir_all(parent)?;
     let staging = tempfile::Builder::new()
         .prefix(".mf-baseline-staging-")
         .tempdir_in(parent)?;
     write_baseline_contents(staging.path())?;
+    for (name, bytes) in workflow_goldens {
+        anyhow::ensure!(
+            name.starts_with("workflow-")
+                && name.ends_with(".json")
+                && Path::new(name).file_name().and_then(|value| value.to_str()) == Some(name),
+            "非法生命周期 golden 文件名: {name}"
+        );
+        fs::write(staging.path().join("expected").join(name), bytes)?;
+    }
+    write_manifest(staging.path())?;
     install_baseline_directory(staging, dir)
+}
+
+/// manifest 覆盖除自身外全部文件,按路径排序。
+fn write_manifest(dir: &Path) -> Result<()> {
+    let mut files = Vec::new();
+    for rel in fixture_file_paths(dir)? {
+        if rel.to_string_lossy().replace('\\', "/") == "manifest.json" {
+            continue; // manifest 不哈希自身
+        }
+        let bytes = fs::read(dir.join(&rel))?;
+        files.push(serde_json::json!({
+            "path": rel.to_string_lossy().replace('\\', "/"),
+            "bytes": bytes.len(),
+            "sha256": sha256_hex(&bytes),
+        }));
+    }
+    let manifest = serde_json::json!({
+        "generator_version": GENERATOR_VERSION,
+        "files": files,
+    });
+    fs::write(
+        dir.join("manifest.json"),
+        serde_json::to_string_pretty(&manifest)? + "\n",
+    )?;
+    Ok(())
 }
 
 fn write_baseline_contents(dir: &Path) -> Result<()> {
@@ -751,27 +806,6 @@ fn write_baseline_contents(dir: &Path) -> Result<()> {
         serde_json::to_string_pretty(&dump_session(&session)?)? + "\n",
     )?;
 
-    // manifest 覆盖除自身外全部文件,按路径排序。
-    let mut files = Vec::new();
-    for rel in fixture_file_paths(dir)? {
-        if rel.to_string_lossy().replace('\\', "/") == "manifest.json" {
-            continue; // manifest 不哈希自身
-        }
-        let bytes = fs::read(dir.join(&rel))?;
-        files.push(serde_json::json!({
-            "path": rel.to_string_lossy().replace('\\', "/"),
-            "bytes": bytes.len(),
-            "sha256": sha256_hex(&bytes),
-        }));
-    }
-    let manifest = serde_json::json!({
-        "generator_version": GENERATOR_VERSION,
-        "files": files,
-    });
-    fs::write(
-        dir.join("manifest.json"),
-        serde_json::to_string_pretty(&manifest)? + "\n",
-    )?;
     Ok(())
 }
 

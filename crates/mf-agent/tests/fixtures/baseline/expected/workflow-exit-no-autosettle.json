@@ -1,0 +1,396 @@
+{
+  "actions": [
+    {
+      "action": "agent_done_no_settlement",
+      "state": {
+        "answers": [],
+        "handoffs": [],
+        "leases": [
+          {
+            "status": "held",
+            "step_key": "run"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:执行一次性命令",
+                "key": "run",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "执行"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/oneshot"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "done",
+            "outcome": null,
+            "outcome_payload": null,
+            "session": 1,
+            "status": "awaiting-outcome",
+            "step_key": "run"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": null,
+            "status": "awaiting-outcome",
+            "step_key": "run"
+          }
+        ],
+        "task": {
+          "goal": "目标:执行",
+          "paused": false,
+          "status": "needs-you",
+          "title": "一次性任务",
+          "unread": true
+        },
+        "visible": {
+          "awaiting_outcome_steps": [
+            "run"
+          ],
+          "needs_you": true,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "awaiting-outcome",
+              "step_key": "run"
+            }
+          ],
+          "task_status": "needs-you"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "oneshot",
+            "name": "一次性",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:执行一次性命令",
+                "key": "run",
+                "title": "执行"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "terminal_idle_no_settlement",
+      "state": {
+        "answers": [],
+        "handoffs": [],
+        "leases": [
+          {
+            "status": "held",
+            "step_key": "run"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:执行一次性命令",
+                "key": "run",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "执行"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/oneshot"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": null,
+            "outcome_payload": null,
+            "session": 1,
+            "status": "running",
+            "step_key": "run"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": null,
+            "status": "running",
+            "step_key": "run"
+          }
+        ],
+        "task": {
+          "goal": "目标:执行",
+          "paused": false,
+          "status": "running",
+          "title": "一次性任务",
+          "unread": true
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "running",
+              "step_key": "run"
+            }
+          ],
+          "task_status": "running"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "oneshot",
+            "name": "一次性",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:执行一次性命令",
+                "key": "run",
+                "title": "执行"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "process_exit_no_settlement",
+      "state": {
+        "answers": [],
+        "handoffs": [],
+        "leases": [
+          {
+            "status": "held",
+            "step_key": "run"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:执行一次性命令",
+                "key": "run",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "执行"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/oneshot"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": null,
+            "outcome_payload": null,
+            "session": 1,
+            "status": "awaiting-outcome",
+            "step_key": "run"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": null,
+            "status": "awaiting-outcome",
+            "step_key": "run"
+          }
+        ],
+        "task": {
+          "goal": "目标:执行",
+          "paused": false,
+          "status": "needs-you",
+          "title": "一次性任务",
+          "unread": true
+        },
+        "visible": {
+          "awaiting_outcome_steps": [
+            "run"
+          ],
+          "needs_you": true,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "awaiting-outcome",
+              "step_key": "run"
+            }
+          ],
+          "task_status": "needs-you"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "oneshot",
+            "name": "一次性",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:执行一次性命令",
+                "key": "run",
+                "title": "执行"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "manual_settlement",
+      "state": {
+        "answers": [],
+        "handoffs": [
+          {
+            "output": null,
+            "status": "complete",
+            "step_key": "run",
+            "summary": "人工确认完成"
+          }
+        ],
+        "leases": [
+          {
+            "status": "released",
+            "step_key": "run"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:执行一次性命令",
+                "key": "run",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "执行"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/oneshot"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": "complete",
+            "outcome_payload": "人工确认完成",
+            "session": 1,
+            "status": "succeeded",
+            "step_key": "run"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": "人工确认完成",
+            "status": "succeeded",
+            "step_key": "run"
+          }
+        ],
+        "task": {
+          "goal": "目标:执行",
+          "paused": false,
+          "status": "succeeded",
+          "title": "一次性任务",
+          "unread": true
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "succeeded",
+              "step_key": "run"
+            }
+          ],
+          "task_status": "succeeded"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "oneshot",
+            "name": "一次性",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:执行一次性命令",
+                "key": "run",
+                "title": "执行"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "scenario": "exit-no-autosettle"
+}

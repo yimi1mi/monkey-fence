@@ -1,0 +1,299 @@
+{
+  "actions": [
+    {
+      "action": "run_workflow",
+      "state": {
+        "answers": [],
+        "handoffs": [],
+        "leases": [
+          {
+            "status": "held",
+            "step_key": "work"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:工作",
+                "key": "work",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "工作"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/crash"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": null,
+            "outcome_payload": null,
+            "session": 1,
+            "status": "running",
+            "step_key": "work"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": null,
+            "status": "running",
+            "step_key": "work"
+          }
+        ],
+        "task": {
+          "goal": "目标:恢复",
+          "paused": false,
+          "status": "running",
+          "title": "恢复任务",
+          "unread": false
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "running",
+              "step_key": "work"
+            }
+          ],
+          "task_status": "running"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "crash",
+            "name": "崩溃恢复",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:工作",
+                "key": "work",
+                "title": "工作"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "restart_process_gone",
+      "state": {
+        "answers": [],
+        "handoffs": [],
+        "leases": [
+          {
+            "status": "held",
+            "step_key": "work"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:工作",
+                "key": "work",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "工作"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/crash"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": null,
+            "outcome_payload": null,
+            "session": 1,
+            "status": "interrupted",
+            "step_key": "work"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": null,
+            "status": "awaiting-outcome",
+            "step_key": "work"
+          }
+        ],
+        "task": {
+          "goal": "目标:恢复",
+          "paused": false,
+          "status": "needs-you",
+          "title": "恢复任务",
+          "unread": true
+        },
+        "visible": {
+          "awaiting_outcome_steps": [
+            "work"
+          ],
+          "needs_you": true,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "awaiting-outcome",
+              "step_key": "work"
+            }
+          ],
+          "task_status": "needs-you"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "crash",
+            "name": "崩溃恢复",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:工作",
+                "key": "work",
+                "title": "工作"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "manual_settlement_after_restart",
+      "state": {
+        "answers": [],
+        "handoffs": [
+          {
+            "output": null,
+            "status": "complete",
+            "step_key": "work",
+            "summary": "恢复后人工确认完成"
+          }
+        ],
+        "leases": [
+          {
+            "status": "released",
+            "step_key": "work"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:工作",
+                "key": "work",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "工作"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/crash"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": "complete",
+            "outcome_payload": "恢复后人工确认完成",
+            "session": 1,
+            "status": "succeeded",
+            "step_key": "work"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": "恢复后人工确认完成",
+            "status": "succeeded",
+            "step_key": "work"
+          }
+        ],
+        "task": {
+          "goal": "目标:恢复",
+          "paused": false,
+          "status": "succeeded",
+          "title": "恢复任务",
+          "unread": true
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "succeeded",
+              "step_key": "work"
+            }
+          ],
+          "task_status": "succeeded"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "crash",
+            "name": "崩溃恢复",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:工作",
+                "key": "work",
+                "title": "工作"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "scenario": "restart-needs-you"
+}

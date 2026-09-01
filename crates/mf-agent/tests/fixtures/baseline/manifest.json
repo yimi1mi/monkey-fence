@@ -21,6 +21,41 @@
       "sha256": "f453bb5228ec821b6c449ded12f0fec49e976deb7cac084afb7e1895fbd2a42a"
     },
     {
+      "bytes": 4920,
+      "path": "expected/workflow-cancel.json",
+      "sha256": "b1c1104513de5fed99707587beb6c561fffa39dfb999acb3f925838bdacd0a26"
+    },
+    {
+      "bytes": 10225,
+      "path": "expected/workflow-exit-no-autosettle.json",
+      "sha256": "4ac0e9de65641113e699a27cc449ccf8023ae4d1d10e4aebccdcca060d94d4d8"
+    },
+    {
+      "bytes": 15328,
+      "path": "expected/workflow-failure-retry.json",
+      "sha256": "f76b8cad387d3ced4f153813747e2ee1569db34efb6f63055a935a41c28baa35"
+    },
+    {
+      "bytes": 17765,
+      "path": "expected/workflow-happy-path.json",
+      "sha256": "2bb4c028e60b2f5bb2c8285928b578652e82c42c0c6b6a44cefcd47a96bf99f7"
+    },
+    {
+      "bytes": 10342,
+      "path": "expected/workflow-question.json",
+      "sha256": "5623be755a9c3cc792944f705918c25e53d6cbd248aa4008b22bc7d3536108f7"
+    },
+    {
+      "bytes": 7644,
+      "path": "expected/workflow-restart-needs-you.json",
+      "sha256": "717538f2d3c1b030d88c45d4e9ce073ab5c3c88877a47ff65316d47fe0b67c58"
+    },
+    {
+      "bytes": 8369,
+      "path": "expected/workflow-restart-settled.json",
+      "sha256": "0f3295fde39c1a87616bfbf163bc6f123542017ca9365d0554090cd5df93a9ef"
+    },
+    {
       "bytes": 188416,
       "path": "project-v6.db",
       "sha256": "4327a99f1c66666b7abd96fd57593addbedb265086659c241dae0f1d2b58fdb3"
@@ -31,5 +66,5 @@
       "sha256": "addcbacec24e35e82b2358ee828c258d6081c5612d46181c8df981cf0c18434d"
     }
   ],
-  "generator_version": "1"
+  "generator_version": "2"
 }

@@ -1,0 +1,329 @@
+{
+  "actions": [
+    {
+      "action": "all_settled",
+      "state": {
+        "answers": [],
+        "handoffs": [
+          {
+            "output": {
+              "artifacts": [
+                "a.txt"
+              ]
+            },
+            "status": "complete",
+            "step_key": "a",
+            "summary": "A 完成"
+          },
+          {
+            "output": null,
+            "status": "complete",
+            "step_key": "b",
+            "summary": "B 完成"
+          }
+        ],
+        "leases": [
+          {
+            "status": "released",
+            "step_key": "a"
+          },
+          {
+            "status": "released",
+            "step_key": "b"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:A",
+                "key": "a",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "A"
+              },
+              {
+                "deps": [
+                  "a"
+                ],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:B",
+                "key": "b",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "B"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/done"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": "complete",
+            "outcome_payload": "A 完成",
+            "session": 1,
+            "status": "succeeded",
+            "step_key": "a"
+          },
+          {
+            "agent_state": "working",
+            "outcome": "complete",
+            "outcome_payload": "B 完成",
+            "session": 2,
+            "status": "succeeded",
+            "step_key": "b"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": "A 完成",
+            "status": "succeeded",
+            "step_key": "a"
+          },
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [
+              "a"
+            ],
+            "result": "B 完成",
+            "status": "succeeded",
+            "step_key": "b"
+          }
+        ],
+        "task": {
+          "goal": "目标:完成",
+          "paused": false,
+          "status": "succeeded",
+          "title": "已完成任务",
+          "unread": false
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "succeeded",
+              "step_key": "a"
+            },
+            {
+              "status": "succeeded",
+              "step_key": "b"
+            }
+          ],
+          "task_status": "succeeded"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "done",
+            "name": "已完成",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:A",
+                "key": "a",
+                "title": "A"
+              },
+              {
+                "deps": [
+                  "a"
+                ],
+                "instance": "worker",
+                "instructions": "固定指令:B",
+                "key": "b",
+                "title": "B"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "restart_after_success",
+      "state": {
+        "answers": [],
+        "handoffs": [
+          {
+            "output": {
+              "artifacts": [
+                "a.txt"
+              ]
+            },
+            "status": "complete",
+            "step_key": "a",
+            "summary": "A 完成"
+          },
+          {
+            "output": null,
+            "status": "complete",
+            "step_key": "b",
+            "summary": "B 完成"
+          }
+        ],
+        "leases": [
+          {
+            "status": "released",
+            "step_key": "a"
+          },
+          {
+            "status": "released",
+            "step_key": "b"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:A",
+                "key": "a",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "A"
+              },
+              {
+                "deps": [
+                  "a"
+                ],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:B",
+                "key": "b",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "B"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/done"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": "complete",
+            "outcome_payload": "A 完成",
+            "session": 1,
+            "status": "succeeded",
+            "step_key": "a"
+          },
+          {
+            "agent_state": "working",
+            "outcome": "complete",
+            "outcome_payload": "B 完成",
+            "session": 2,
+            "status": "succeeded",
+            "step_key": "b"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": "A 完成",
+            "status": "succeeded",
+            "step_key": "a"
+          },
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [
+              "a"
+            ],
+            "result": "B 完成",
+            "status": "succeeded",
+            "step_key": "b"
+          }
+        ],
+        "task": {
+          "goal": "目标:完成",
+          "paused": false,
+          "status": "succeeded",
+          "title": "已完成任务",
+          "unread": false
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "succeeded",
+              "step_key": "a"
+            },
+            {
+              "status": "succeeded",
+              "step_key": "b"
+            }
+          ],
+          "task_status": "succeeded"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "done",
+            "name": "已完成",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:A",
+                "key": "a",
+                "title": "A"
+              },
+              {
+                "deps": [
+                  "a"
+                ],
+                "instance": "worker",
+                "instructions": "固定指令:B",
+                "key": "b",
+                "title": "B"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "scenario": "restart-settled"
+}

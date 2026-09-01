@@ -1,0 +1,195 @@
+{
+  "actions": [
+    {
+      "action": "run_workflow",
+      "state": {
+        "answers": [],
+        "handoffs": [],
+        "leases": [
+          {
+            "status": "held",
+            "step_key": "work"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:长时间工作",
+                "key": "work",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "工作"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/long"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": null,
+            "outcome_payload": null,
+            "session": 1,
+            "status": "running",
+            "step_key": "work"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": null,
+            "status": "running",
+            "step_key": "work"
+          }
+        ],
+        "task": {
+          "goal": "目标:工作",
+          "paused": false,
+          "status": "running",
+          "title": "长任务",
+          "unread": false
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "running",
+              "step_key": "work"
+            }
+          ],
+          "task_status": "running"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "long",
+            "name": "长任务",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:长时间工作",
+                "key": "work",
+                "title": "工作"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "cancel_task",
+      "state": {
+        "answers": [],
+        "handoffs": [],
+        "leases": [
+          {
+            "status": "released",
+            "step_key": "work"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:长时间工作",
+                "key": "work",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "工作"
+              }
+            ],
+            "revision": 1,
+            "status": "cancelled",
+            "template_key": "project-workflow/long"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": null,
+            "outcome_payload": null,
+            "session": 1,
+            "status": "cancelled",
+            "step_key": "work"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": null,
+            "status": "cancelled",
+            "step_key": "work"
+          }
+        ],
+        "task": {
+          "goal": "目标:工作",
+          "paused": false,
+          "status": "cancelled",
+          "title": "长任务",
+          "unread": false
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "cancelled",
+              "step_key": "work"
+            }
+          ],
+          "task_status": "cancelled"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "long",
+            "name": "长任务",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:长时间工作",
+                "key": "work",
+                "title": "工作"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "scenario": "cancel"
+}

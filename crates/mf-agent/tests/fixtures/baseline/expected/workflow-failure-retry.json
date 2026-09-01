@@ -1,0 +1,578 @@
+{
+  "actions": [
+    {
+      "action": "run_workflow",
+      "state": {
+        "answers": [],
+        "handoffs": [],
+        "leases": [
+          {
+            "status": "held",
+            "step_key": "build"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:构建",
+                "key": "build",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "构建"
+              },
+              {
+                "deps": [
+                  "build"
+                ],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:部署",
+                "key": "deploy",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "部署"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/deploy"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": null,
+            "outcome_payload": null,
+            "session": 1,
+            "status": "running",
+            "step_key": "build"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": null,
+            "status": "running",
+            "step_key": "build"
+          },
+          {
+            "attempts": 0,
+            "auto_retry": 0,
+            "deps": [
+              "build"
+            ],
+            "result": null,
+            "status": "pending",
+            "step_key": "deploy"
+          }
+        ],
+        "task": {
+          "goal": "目标:部署",
+          "paused": false,
+          "status": "running",
+          "title": "部署任务",
+          "unread": false
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "running",
+              "step_key": "build"
+            },
+            {
+              "status": "pending",
+              "step_key": "deploy"
+            }
+          ],
+          "task_status": "running"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "deploy",
+            "name": "部署",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:构建",
+                "key": "build",
+                "title": "构建"
+              },
+              {
+                "deps": [
+                  "build"
+                ],
+                "instance": "worker",
+                "instructions": "固定指令:部署",
+                "key": "deploy",
+                "title": "部署"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "settle_build_fail",
+      "state": {
+        "answers": [],
+        "handoffs": [],
+        "leases": [
+          {
+            "status": "released",
+            "step_key": "build"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:构建",
+                "key": "build",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "构建"
+              },
+              {
+                "deps": [
+                  "build"
+                ],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:部署",
+                "key": "deploy",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "部署"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/deploy"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": "fail",
+            "outcome_payload": "构建脚手架损坏",
+            "session": 1,
+            "status": "failed",
+            "step_key": "build"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": "构建脚手架损坏",
+            "status": "failed",
+            "step_key": "build"
+          },
+          {
+            "attempts": 0,
+            "auto_retry": 0,
+            "deps": [
+              "build"
+            ],
+            "result": null,
+            "status": "blocked",
+            "step_key": "deploy"
+          }
+        ],
+        "task": {
+          "goal": "目标:部署",
+          "paused": false,
+          "status": "needs-you",
+          "title": "部署任务",
+          "unread": true
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": true,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "failed",
+              "step_key": "build"
+            },
+            {
+              "status": "blocked",
+              "step_key": "deploy"
+            }
+          ],
+          "task_status": "needs-you"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "deploy",
+            "name": "部署",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:构建",
+                "key": "build",
+                "title": "构建"
+              },
+              {
+                "deps": [
+                  "build"
+                ],
+                "instance": "worker",
+                "instructions": "固定指令:部署",
+                "key": "deploy",
+                "title": "部署"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "retry_build_fresh_session",
+      "state": {
+        "answers": [],
+        "handoffs": [],
+        "leases": [
+          {
+            "status": "held",
+            "step_key": "build"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:构建",
+                "key": "build",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "构建"
+              },
+              {
+                "deps": [
+                  "build"
+                ],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:部署",
+                "key": "deploy",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "部署"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/deploy"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": "fail",
+            "outcome_payload": "构建脚手架损坏",
+            "session": 1,
+            "status": "failed",
+            "step_key": "build"
+          },
+          {
+            "agent_state": "working",
+            "outcome": null,
+            "outcome_payload": null,
+            "session": 2,
+            "status": "running",
+            "step_key": "build"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 2,
+            "auto_retry": 0,
+            "deps": [],
+            "result": "构建脚手架损坏",
+            "status": "running",
+            "step_key": "build"
+          },
+          {
+            "attempts": 0,
+            "auto_retry": 0,
+            "deps": [
+              "build"
+            ],
+            "result": null,
+            "status": "blocked",
+            "step_key": "deploy"
+          }
+        ],
+        "task": {
+          "goal": "目标:部署",
+          "paused": false,
+          "status": "running",
+          "title": "部署任务",
+          "unread": true
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "running",
+              "step_key": "build"
+            },
+            {
+              "status": "blocked",
+              "step_key": "deploy"
+            }
+          ],
+          "task_status": "running"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "deploy",
+            "name": "部署",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:构建",
+                "key": "build",
+                "title": "构建"
+              },
+              {
+                "deps": [
+                  "build"
+                ],
+                "instance": "worker",
+                "instructions": "固定指令:部署",
+                "key": "deploy",
+                "title": "部署"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "settle_all_complete",
+      "state": {
+        "answers": [],
+        "handoffs": [
+          {
+            "output": null,
+            "status": "complete",
+            "step_key": "build",
+            "summary": "重试成功"
+          },
+          {
+            "output": null,
+            "status": "complete",
+            "step_key": "deploy",
+            "summary": "部署完成"
+          }
+        ],
+        "leases": [
+          {
+            "status": "released",
+            "step_key": "build"
+          },
+          {
+            "status": "released",
+            "step_key": "deploy"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:构建",
+                "key": "build",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "构建"
+              },
+              {
+                "deps": [
+                  "build"
+                ],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:部署",
+                "key": "deploy",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "部署"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/deploy"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": "fail",
+            "outcome_payload": "构建脚手架损坏",
+            "session": 1,
+            "status": "failed",
+            "step_key": "build"
+          },
+          {
+            "agent_state": "working",
+            "outcome": "complete",
+            "outcome_payload": "重试成功",
+            "session": 2,
+            "status": "succeeded",
+            "step_key": "build"
+          },
+          {
+            "agent_state": "working",
+            "outcome": "complete",
+            "outcome_payload": "部署完成",
+            "session": 3,
+            "status": "succeeded",
+            "step_key": "deploy"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 2,
+            "auto_retry": 0,
+            "deps": [],
+            "result": "重试成功",
+            "status": "succeeded",
+            "step_key": "build"
+          },
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [
+              "build"
+            ],
+            "result": "部署完成",
+            "status": "succeeded",
+            "step_key": "deploy"
+          }
+        ],
+        "task": {
+          "goal": "目标:部署",
+          "paused": false,
+          "status": "succeeded",
+          "title": "部署任务",
+          "unread": true
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "succeeded",
+              "step_key": "build"
+            },
+            {
+              "status": "succeeded",
+              "step_key": "deploy"
+            }
+          ],
+          "task_status": "succeeded"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "deploy",
+            "name": "部署",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:构建",
+                "key": "build",
+                "title": "构建"
+              },
+              {
+                "deps": [
+                  "build"
+                ],
+                "instance": "worker",
+                "instructions": "固定指令:部署",
+                "key": "deploy",
+                "title": "部署"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "scenario": "failure-retry"
+}

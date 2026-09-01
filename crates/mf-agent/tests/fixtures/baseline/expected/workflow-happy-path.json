@@ -1,0 +1,665 @@
+{
+  "actions": [
+    {
+      "action": "create_workflow",
+      "state": {
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "release-check",
+            "name": "发布检查",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:探测环境",
+                "key": "probe",
+                "title": "探测"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "edit_workflow_add_node",
+      "state": {
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "release-check",
+            "name": "发布检查",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:探测环境",
+                "key": "probe",
+                "title": "探测"
+              },
+              {
+                "deps": [
+                  "probe"
+                ],
+                "instance": "worker",
+                "instructions": "固定指令:构建产物",
+                "key": "build",
+                "title": "构建"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "run_workflow",
+      "state": {
+        "answers": [],
+        "handoffs": [],
+        "leases": [
+          {
+            "status": "held",
+            "step_key": "probe"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:探测环境",
+                "key": "probe",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "探测"
+              },
+              {
+                "deps": [
+                  "probe"
+                ],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:构建产物",
+                "key": "build",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "构建"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/release-check"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": null,
+            "outcome_payload": null,
+            "session": 1,
+            "status": "running",
+            "step_key": "probe"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": null,
+            "status": "running",
+            "step_key": "probe"
+          },
+          {
+            "attempts": 0,
+            "auto_retry": 0,
+            "deps": [
+              "probe"
+            ],
+            "result": null,
+            "status": "pending",
+            "step_key": "build"
+          }
+        ],
+        "task": {
+          "goal": "完整目标:发布",
+          "paused": false,
+          "status": "running",
+          "title": "发布前检查",
+          "unread": false
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "running",
+              "step_key": "probe"
+            },
+            {
+              "status": "pending",
+              "step_key": "build"
+            }
+          ],
+          "task_status": "running"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "release-check",
+            "name": "发布检查",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "固定指令:探测环境",
+                "key": "probe",
+                "title": "探测"
+              },
+              {
+                "deps": [
+                  "probe"
+                ],
+                "instance": "worker",
+                "instructions": "固定指令:构建产物",
+                "key": "build",
+                "title": "构建"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "edit_workflow_after_freeze",
+      "state": {
+        "answers": [],
+        "handoffs": [],
+        "leases": [
+          {
+            "status": "held",
+            "step_key": "probe"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:探测环境",
+                "key": "probe",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "探测"
+              },
+              {
+                "deps": [
+                  "probe"
+                ],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:构建产物",
+                "key": "build",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "构建"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/release-check"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": null,
+            "outcome_payload": null,
+            "session": 1,
+            "status": "running",
+            "step_key": "probe"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": null,
+            "status": "running",
+            "step_key": "probe"
+          },
+          {
+            "attempts": 0,
+            "auto_retry": 0,
+            "deps": [
+              "probe"
+            ],
+            "result": null,
+            "status": "pending",
+            "step_key": "build"
+          }
+        ],
+        "task": {
+          "goal": "完整目标:发布",
+          "paused": false,
+          "status": "running",
+          "title": "发布前检查",
+          "unread": false
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "running",
+              "step_key": "probe"
+            },
+            {
+              "status": "pending",
+              "step_key": "build"
+            }
+          ],
+          "task_status": "running"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "release-check",
+            "name": "发布检查 v2",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "新指令:探测环境",
+                "key": "probe",
+                "title": "探测 v2"
+              },
+              {
+                "deps": [
+                  "probe"
+                ],
+                "instance": "worker",
+                "instructions": "新指令:构建产物",
+                "key": "build",
+                "title": "构建 v2"
+              },
+              {
+                "deps": [
+                  "build"
+                ],
+                "instance": "worker",
+                "instructions": "新指令:审计",
+                "key": "audit",
+                "title": "审计"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "settle_probe_complete",
+      "state": {
+        "answers": [],
+        "handoffs": [
+          {
+            "output": {
+              "env": "baseline",
+              "report_path": "artifacts/probe.json"
+            },
+            "status": "complete",
+            "step_key": "probe",
+            "summary": "探测完成"
+          }
+        ],
+        "leases": [
+          {
+            "status": "released",
+            "step_key": "probe"
+          },
+          {
+            "status": "held",
+            "step_key": "build"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:探测环境",
+                "key": "probe",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "探测"
+              },
+              {
+                "deps": [
+                  "probe"
+                ],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:构建产物",
+                "key": "build",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "构建"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/release-check"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": "complete",
+            "outcome_payload": "探测完成",
+            "session": 1,
+            "status": "succeeded",
+            "step_key": "probe"
+          },
+          {
+            "agent_state": "working",
+            "outcome": null,
+            "outcome_payload": null,
+            "session": 2,
+            "status": "running",
+            "step_key": "build"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": "探测完成",
+            "status": "succeeded",
+            "step_key": "probe"
+          },
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [
+              "probe"
+            ],
+            "result": null,
+            "status": "running",
+            "step_key": "build"
+          }
+        ],
+        "task": {
+          "goal": "完整目标:发布",
+          "paused": false,
+          "status": "running",
+          "title": "发布前检查",
+          "unread": false
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "succeeded",
+              "step_key": "probe"
+            },
+            {
+              "status": "running",
+              "step_key": "build"
+            }
+          ],
+          "task_status": "running"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "release-check",
+            "name": "发布检查 v2",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "新指令:探测环境",
+                "key": "probe",
+                "title": "探测 v2"
+              },
+              {
+                "deps": [
+                  "probe"
+                ],
+                "instance": "worker",
+                "instructions": "新指令:构建产物",
+                "key": "build",
+                "title": "构建 v2"
+              },
+              {
+                "deps": [
+                  "build"
+                ],
+                "instance": "worker",
+                "instructions": "新指令:审计",
+                "key": "audit",
+                "title": "审计"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "action": "settle_build_complete",
+      "state": {
+        "answers": [],
+        "handoffs": [
+          {
+            "output": {
+              "env": "baseline",
+              "report_path": "artifacts/probe.json"
+            },
+            "status": "complete",
+            "step_key": "probe",
+            "summary": "探测完成"
+          },
+          {
+            "output": null,
+            "status": "complete",
+            "step_key": "build",
+            "summary": "构建完成"
+          }
+        ],
+        "leases": [
+          {
+            "status": "released",
+            "step_key": "probe"
+          },
+          {
+            "status": "released",
+            "step_key": "build"
+          }
+        ],
+        "revisions": [
+          {
+            "directory_provider": {
+              "content_hash": "hash-scripted",
+              "full_id": "scripted",
+              "version": "1.2.3"
+            },
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:探测环境",
+                "key": "probe",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "探测"
+              },
+              {
+                "deps": [
+                  "probe"
+                ],
+                "instance": "worker",
+                "instance_version": 1,
+                "instructions": "固定指令:构建产物",
+                "key": "build",
+                "plugin": {
+                  "content_hash": "hash-generic",
+                  "full_id": "builtin.core",
+                  "version": "1.2.3"
+                },
+                "title": "构建"
+              }
+            ],
+            "revision": 1,
+            "status": "active",
+            "template_key": "project-workflow/release-check"
+          }
+        ],
+        "runs": [
+          {
+            "agent_state": "working",
+            "outcome": "complete",
+            "outcome_payload": "探测完成",
+            "session": 1,
+            "status": "succeeded",
+            "step_key": "probe"
+          },
+          {
+            "agent_state": "working",
+            "outcome": "complete",
+            "outcome_payload": "构建完成",
+            "session": 2,
+            "status": "succeeded",
+            "step_key": "build"
+          }
+        ],
+        "steps": [
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [],
+            "result": "探测完成",
+            "status": "succeeded",
+            "step_key": "probe"
+          },
+          {
+            "attempts": 1,
+            "auto_retry": 0,
+            "deps": [
+              "probe"
+            ],
+            "result": "构建完成",
+            "status": "succeeded",
+            "step_key": "build"
+          }
+        ],
+        "task": {
+          "goal": "完整目标:发布",
+          "paused": false,
+          "status": "succeeded",
+          "title": "发布前检查",
+          "unread": false
+        },
+        "visible": {
+          "awaiting_outcome_steps": [],
+          "needs_you": false,
+          "open_questions": [],
+          "steps": [
+            {
+              "status": "succeeded",
+              "step_key": "probe"
+            },
+            {
+              "status": "succeeded",
+              "step_key": "build"
+            }
+          ],
+          "task_status": "succeeded"
+        },
+        "workflow": [
+          {
+            "allow_unsafe_parallel": false,
+            "key": "release-check",
+            "name": "发布检查 v2",
+            "nodes": [
+              {
+                "deps": [],
+                "instance": "worker",
+                "instructions": "新指令:探测环境",
+                "key": "probe",
+                "title": "探测 v2"
+              },
+              {
+                "deps": [
+                  "probe"
+                ],
+                "instance": "worker",
+                "instructions": "新指令:构建产物",
+                "key": "build",
+                "title": "构建 v2"
+              },
+              {
+                "deps": [
+                  "build"
+                ],
+                "instance": "worker",
+                "instructions": "新指令:审计",
+                "key": "audit",
+                "title": "审计"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
+  "scenario": "happy-path"
+}
