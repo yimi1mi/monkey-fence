@@ -190,6 +190,10 @@ pub struct Config {
     /// 完整贡献 ID → 单一实例配置。当前不修改 Git/P4/Agent 的全局配置文件。
     #[serde(default)]
     pub plugin_instances: HashMap<String, PluginInstanceConfig>,
+    /// Core Service 的 `[limits]` 由 mf-kernel 解释；mf-agent 设置页不理解
+    /// 字段语义，但 load/save 必须无损保留，避免保存其它设置时丢配置。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<toml::Table>,
 }
 
 /// mock 提供方是否可用:仅调试用途,写死在代码里。
@@ -240,6 +244,7 @@ impl Default for Config {
             terminal: TerminalConfig::default(),
             agents: AgentsConfig::default(),
             plugin_instances: HashMap::new(),
+            limits: None,
         }
     }
 }
@@ -262,10 +267,13 @@ impl Config {
             cfg.save_example()?;
             return Ok(cfg);
         }
+        Self::load_from_path(&path)
+    }
+
+    pub fn load_from_path(path: &std::path::Path) -> Result<Self> {
         let text =
-            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-        let cfg: Config = toml::from_str(&text).with_context(|| "parse config.toml")?;
-        Ok(cfg)
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+        toml::from_str(&text).with_context(|| "parse config.toml")
     }
 
     /// 首次运行写入示例配置(含注释模板);mock 仅调试构建出现
@@ -278,10 +286,15 @@ impl Config {
 
     /// 把当前配置写回 config.toml(设置界面“保存”用)
     pub fn save(&self) -> Result<()> {
-        std::fs::create_dir_all(Self::config_dir())?;
+        self.save_to_path(&Self::config_path())
+    }
+
+    pub fn save_to_path(&self, path: &std::path::Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let text = toml::to_string_pretty(self).context("serialize config")?;
-        std::fs::write(Self::config_path(), text)
-            .with_context(|| format!("write {}", Self::config_path().display()))?;
+        std::fs::write(path, text).with_context(|| format!("write {}", path.display()))?;
         Ok(())
     }
 

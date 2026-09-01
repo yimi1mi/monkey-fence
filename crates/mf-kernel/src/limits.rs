@@ -1,9 +1,10 @@
-//! 附录 A4/A7 参数(canonical spec `docs/superpowers/specs/2026-09-01-web-interaction-core-service.md`)。
+//! 附录 A1/A4/A7 参数(canonical spec `docs/superpowers/specs/2026-09-01-web-interaction-core-service.md`)。
 //!
-//! 本文件是 A4(命令/审计 retention 与 GC)与 A7(生命周期)的唯一数值
+//! 本文件是 A1(Workflow 事件与 API)、A4(命令/审计 retention 与 GC)
+//! 与 A7(生命周期)的唯一数值
 //! 来源:默认值、允许范围、hard cap 与派生规则。可配置项仅能通过
 //! `~/.monkeyfence/config.toml` 的 `[limits]` 段在允许范围内覆盖默认值,
-//! 且不得超过 hard cap;A4/A7 各行的 hard cap 与允许范围上限一致。
+//! 且不得超过 hard cap;A1/A4/A7 各行的 hard cap 与允许范围上限一致。
 //! `discovery_heartbeat_ms` 派生 stale 判定(stale = 3×heartbeat,
 //! §11.1),派生值不可独立配置。
 //!
@@ -17,10 +18,256 @@
 //! 与启动时 GC 的间隔,`operation_progress_interval_ms` 是 Operation 进度
 //! 事件的最低间隔(节流阈值,不是禁止更早的终态事件)。
 
-/// 附录 A1 默认 journal 水位。#23 tracer 先按默认值 fail-closed；#24
-/// 将补齐完整可配置范围、hard cap、min-age 与 per-client queue。
+// ─────────────────────── 附录 A1:Workflow 事件与 API ───────────────────────
+
+/// 兼容 #23 tracer 的附录 A1 默认 journal 水位常量。
 pub const JOURNAL_MAX_EVENTS_DEFAULT: usize = 20_000;
 pub const JOURNAL_MAX_BYTES_DEFAULT: usize = 64 * 1024 * 1024;
+
+/// §5.2:命令 token bucket 的 burst 是速率的 3 倍,不可独立配置。
+pub const COMMAND_RATE_BURST_MULTIPLIER: u64 = 3;
+
+/// 单个 A1 参数的三元组描述(默认 / 允许范围 / hard cap)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalParamSpec {
+    /// A1 参数名(`config.toml [limits]` 键)。
+    pub name: &'static str,
+    pub default: u64,
+    pub min: u64,
+    pub max: u64,
+    /// 安全上限:取值不得超过;A1 全部行 hard cap == 允许范围上限。
+    pub hard_cap: u64,
+}
+
+/// A1 全量参数表(表驱动校验与 `limits_defaults` 契约测试的权威输入)。
+/// 字节值均以 byte 表示,速率值为每秒数量。
+pub const JOURNAL_PARAMS: [JournalParamSpec; 9] = [
+    JournalParamSpec {
+        name: "journal_max_events",
+        default: 20_000,
+        min: 1_000,
+        max: 100_000,
+        hard_cap: 100_000,
+    },
+    JournalParamSpec {
+        name: "journal_max_bytes",
+        default: 64 * 1024 * 1024,
+        min: 4 * 1024 * 1024,
+        max: 256 * 1024 * 1024,
+        hard_cap: 256 * 1024 * 1024,
+    },
+    JournalParamSpec {
+        name: "journal_min_age_secs",
+        default: 1_800,
+        min: 0,
+        max: 86_400,
+        hard_cap: 86_400,
+    },
+    JournalParamSpec {
+        name: "journal_event_max_bytes",
+        default: 1024 * 1024,
+        min: 64 * 1024,
+        max: 2 * 1024 * 1024,
+        hard_cap: 2 * 1024 * 1024,
+    },
+    JournalParamSpec {
+        name: "client_event_queue_max_events",
+        default: 2_000,
+        min: 100,
+        max: 20_000,
+        hard_cap: 20_000,
+    },
+    JournalParamSpec {
+        name: "client_event_queue_max_bytes",
+        default: 8 * 1024 * 1024,
+        min: 1024 * 1024,
+        max: 64 * 1024 * 1024,
+        hard_cap: 64 * 1024 * 1024,
+    },
+    JournalParamSpec {
+        name: "events_ws_ping_interval_ms",
+        default: 20_000,
+        min: 5_000,
+        max: 60_000,
+        hard_cap: 60_000,
+    },
+    JournalParamSpec {
+        name: "events_ws_idle_timeout_ms",
+        default: 90_000,
+        min: 30_000,
+        max: 300_000,
+        hard_cap: 300_000,
+    },
+    JournalParamSpec {
+        name: "command_rate_per_client",
+        default: 40,
+        min: 5,
+        max: 200,
+        hard_cap: 200,
+    },
+];
+
+/// 超出允许范围的 A1 配置值。
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error("invalid_limits:{name}={value} 超出允许范围 [{min}, {max}](hard cap {hard_cap})")]
+pub struct JournalLimitsError {
+    pub name: &'static str,
+    pub value: u64,
+    pub min: u64,
+    pub max: u64,
+    pub hard_cap: u64,
+}
+
+/// A1 Workflow 事件与 API 参数的运行时取值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalLimits {
+    pub journal_max_events: usize,
+    pub journal_max_bytes: usize,
+    pub journal_min_age_secs: u64,
+    pub journal_event_max_bytes: usize,
+    pub client_event_queue_max_events: usize,
+    pub client_event_queue_max_bytes: usize,
+    pub events_ws_ping_interval_ms: u64,
+    pub events_ws_idle_timeout_ms: u64,
+    pub command_rate_per_client: u64,
+}
+
+impl Default for JournalLimits {
+    fn default() -> Self {
+        Self {
+            journal_max_events: JOURNAL_MAX_EVENTS_DEFAULT,
+            journal_max_bytes: JOURNAL_MAX_BYTES_DEFAULT,
+            journal_min_age_secs: JOURNAL_PARAMS[2].default,
+            journal_event_max_bytes: JOURNAL_PARAMS[3].default as usize,
+            client_event_queue_max_events: JOURNAL_PARAMS[4].default as usize,
+            client_event_queue_max_bytes: JOURNAL_PARAMS[5].default as usize,
+            events_ws_ping_interval_ms: JOURNAL_PARAMS[6].default,
+            events_ws_idle_timeout_ms: JOURNAL_PARAMS[7].default,
+            command_rate_per_client: JOURNAL_PARAMS[8].default,
+        }
+    }
+}
+
+impl JournalLimits {
+    /// 校验全部取值落在 A1 允许范围内。越界一律拒绝,不静默钳制。
+    pub fn validate(&self) -> Result<(), JournalLimitsError> {
+        for (value, spec) in [
+            (usize_as_u64(self.journal_max_events), &JOURNAL_PARAMS[0]),
+            (usize_as_u64(self.journal_max_bytes), &JOURNAL_PARAMS[1]),
+            (self.journal_min_age_secs, &JOURNAL_PARAMS[2]),
+            (
+                usize_as_u64(self.journal_event_max_bytes),
+                &JOURNAL_PARAMS[3],
+            ),
+            (
+                usize_as_u64(self.client_event_queue_max_events),
+                &JOURNAL_PARAMS[4],
+            ),
+            (
+                usize_as_u64(self.client_event_queue_max_bytes),
+                &JOURNAL_PARAMS[5],
+            ),
+            (self.events_ws_ping_interval_ms, &JOURNAL_PARAMS[6]),
+            (self.events_ws_idle_timeout_ms, &JOURNAL_PARAMS[7]),
+            (self.command_rate_per_client, &JOURNAL_PARAMS[8]),
+        ] {
+            if value < spec.min || value > spec.max || value > spec.hard_cap {
+                return Err(JournalLimitsError {
+                    name: spec.name,
+                    value,
+                    min: spec.min,
+                    max: spec.max,
+                    hard_cap: spec.hard_cap,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// 派生 token bucket burst(3×每客户端命令速率),不可独立配置。
+    pub fn command_burst_per_client(&self) -> u64 {
+        self.command_rate_per_client * COMMAND_RATE_BURST_MULTIPLIER
+    }
+
+    /// 从 canonical `config.toml [limits]` 读取 A1 覆盖；缺文件使用默认值，
+    /// 语法错误或越界一律 fail-closed。
+    pub fn load_from_path(path: &std::path::Path) -> Result<Self, JournalLimitsLoadError> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => return Err(JournalLimitsLoadError::Io(error)),
+        };
+        let config: LimitsConfigFile = toml::from_str(&text)?;
+        let mut limits = Self::default();
+        if let Some(values) = config.limits {
+            values.apply(&mut limits);
+        }
+        limits.validate()?;
+        Ok(limits)
+    }
+
+    pub fn load_default_path() -> Result<Self, JournalLimitsLoadError> {
+        let home = dirs::home_dir().ok_or(JournalLimitsLoadError::HomeUnavailable)?;
+        Self::load_from_path(&home.join(".monkeyfence").join("config.toml"))
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum JournalLimitsLoadError {
+    #[error("limits_config_io:{0}")]
+    Io(#[from] std::io::Error),
+    #[error("limits_config_parse:{0}")]
+    Parse(#[from] toml::de::Error),
+    #[error(transparent)]
+    Invalid(#[from] JournalLimitsError),
+    #[error("limits_config_home_unavailable")]
+    HomeUnavailable,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct LimitsConfigFile {
+    limits: Option<JournalLimitOverrides>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct JournalLimitOverrides {
+    journal_max_events: Option<usize>,
+    journal_max_bytes: Option<usize>,
+    journal_min_age_secs: Option<u64>,
+    journal_event_max_bytes: Option<usize>,
+    client_event_queue_max_events: Option<usize>,
+    client_event_queue_max_bytes: Option<usize>,
+    events_ws_ping_interval_ms: Option<u64>,
+    events_ws_idle_timeout_ms: Option<u64>,
+    command_rate_per_client: Option<u64>,
+}
+
+impl JournalLimitOverrides {
+    fn apply(self, limits: &mut JournalLimits) {
+        macro_rules! apply {
+            ($field:ident) => {
+                if let Some(value) = self.$field {
+                    limits.$field = value;
+                }
+            };
+        }
+        apply!(journal_max_events);
+        apply!(journal_max_bytes);
+        apply!(journal_min_age_secs);
+        apply!(journal_event_max_bytes);
+        apply!(client_event_queue_max_events);
+        apply!(client_event_queue_max_bytes);
+        apply!(events_ws_ping_interval_ms);
+        apply!(events_ws_idle_timeout_ms);
+        apply!(command_rate_per_client);
+    }
+}
+
+fn usize_as_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
 
 /// 单个 A7 参数的三元组描述(默认 / 允许范围 / hard cap)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

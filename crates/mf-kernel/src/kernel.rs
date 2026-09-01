@@ -26,14 +26,14 @@ use crate::handles::{
 use crate::lease::{CommandAuthorizer, CommandPermit, LeaseCheck};
 use crate::project_registry::ServiceStore;
 use crate::projection::{
-    EventCursor, EventJournal, EventSubscription, RevisionVector, SnapshotData, SnapshotEnvelope,
+    EventCursor, EventSubscription, ProjectionHub, RevisionVector, SnapshotData, SnapshotEnvelope,
     SnapshotQuery, WorkflowSnapshotData, SNAPSHOT_SCHEMA,
 };
 use crate::reconcile::reconcile_startup;
 use crate::shutdown::{ShutdownAssessment, ShutdownIntent};
 use crate::singleton::{CoreOwnerLock, OwnerLockSetup};
 use mf_agent::store::Store;
-use parking_lot::{Mutex, RwLock, RwLockReadGuard};
+use parking_lot::{RwLock, RwLockReadGuard};
 use rusqlite::OptionalExtension;
 use rusqlite::{params, Transaction};
 use serde_json::Value;
@@ -322,6 +322,12 @@ impl CommandPermit for InProcessPermit<'_> {
 struct ProjectRegistration {
     store: Arc<Store>,
     target: TargetDatabase,
+    closing: bool,
+}
+
+pub struct ProjectCloseToken {
+    project: ProjectStoreHandle,
+    store: Arc<Store>,
 }
 
 /// 进程内 CoreKernel(Bridge A 前身):GPUI 与未来 WebGateway 共用的
@@ -333,14 +339,12 @@ pub(crate) struct InProcessCoreKernel {
     lease: Arc<ControllerLeaseShared>,
     authorizer: InProcessAuthorizer,
     projects: RwLock<HashMap<String, ProjectRegistration>>,
-    /// L-CMD commit→journal publication 与 Snapshot(cursor+Store read)共用。
-    publication: Mutex<()>,
-    journal: Arc<EventJournal>,
+    projections: ProjectionHub,
 }
 
 impl InProcessCoreKernel {
     pub(crate) fn new(service: Arc<ServiceStore>, idempotency_key: ServiceIdempotencyKey) -> Self {
-        Self::with_journal(service, idempotency_key, EventJournal::new())
+        Self::with_projections(service, idempotency_key, ProjectionHub::new())
     }
 
     #[cfg(test)]
@@ -350,17 +354,30 @@ impl InProcessCoreKernel {
         max_events: usize,
         max_bytes: usize,
     ) -> Self {
-        Self::with_journal(
+        Self::with_projections(
             service,
             idempotency_key,
-            EventJournal::for_test(max_events, max_bytes),
+            ProjectionHub::for_test(max_events, max_bytes),
         )
     }
 
-    fn with_journal(
+    #[cfg(test)]
+    pub(crate) fn new_with_projection_limits(
         service: Arc<ServiceStore>,
         idempotency_key: ServiceIdempotencyKey,
-        journal: EventJournal,
+        limits: crate::limits::JournalLimits,
+    ) -> Self {
+        Self::with_projections(
+            service,
+            idempotency_key,
+            ProjectionHub::for_test_limits(limits),
+        )
+    }
+
+    fn with_projections(
+        service: Arc<ServiceStore>,
+        idempotency_key: ServiceIdempotencyKey,
+        projections: ProjectionHub,
     ) -> Self {
         let lease = Arc::new(ControllerLeaseShared {
             state: RwLock::new(ControllerLeaseState::default()),
@@ -373,8 +390,7 @@ impl InProcessCoreKernel {
             lease,
             service,
             projects: RwLock::new(HashMap::new()),
-            publication: Mutex::new(()),
-            journal: Arc::new(journal),
+            projections,
         }
     }
 
@@ -393,42 +409,86 @@ impl InProcessCoreKernel {
             .map_err(|error| KernelProblem::Internal(error.to_string()))?;
         let target = TargetDatabase::project(project.as_str(), store.clone())
             .map_err(KernelProblem::from)?;
-        self.projects.write().insert(
-            project.as_str().to_string(),
-            ProjectRegistration { store, target },
-        );
+        let mut recovery_targets = self.registered_targets();
+        let live_targets = recovery_targets.clone();
+        recovery_targets.retain(|existing| existing.store_key() != target.store_key());
+        recovery_targets.push(target.clone());
+        self.projections.linearize(&recovery_targets, |hub| {
+            if self
+                .projects
+                .read()
+                .get(project.as_str())
+                .is_some_and(|registration| registration.closing)
+            {
+                return Err(KernelProblem::ServiceUnavailable(
+                    "project_close_in_progress".into(),
+                ));
+            }
+            // 已在线 target 的 pending 只能属于当前 epoch：先正常发布；
+            // publication fault 会 rotate/resync。新 target 尚未可见，其 pending
+            // 才由 startup reconcile 标为旧 epoch，二者不可混淆。
+            for live in &live_targets {
+                hub.publish_pending(live)?;
+            }
+            // Project 在旧 outbox / intent / Operation 收口前不进入可见
+            // registry；悬空 pending 一律按旧投影 reconciled。
+            reconcile_startup(&self.service, &recovery_targets, chrono::Utc::now())
+                .map_err(KernelProblem::from)?;
+            self.projects.write().insert(
+                project.as_str().to_string(),
+                ProjectRegistration {
+                    store,
+                    target,
+                    closing: false,
+                },
+            );
+            Ok(())
+        })?;
         Ok(project)
     }
 
-    pub(crate) fn unregister_project_store(&self, project: &ProjectStoreHandle) {
-        self.projects.write().remove(project.as_str());
+    pub(crate) fn unregister_project_store(
+        &self,
+        project: &ProjectStoreHandle,
+    ) -> Result<(), KernelProblem> {
+        let token = self.prepare_project_close(project)?;
+        self.finalize_project_close(token);
+        Ok(())
     }
 
-    fn reconcile_registered_projects(
+    pub(crate) fn prepare_project_close(
         &self,
-        newly_opened: &ProjectStoreHandle,
-    ) -> Result<(), KernelProblem> {
-        let registrations: Vec<(String, TargetDatabase)> = self
-            .projects
-            .read()
-            .iter()
-            .map(|(handle, registration)| (handle.clone(), registration.target.clone()))
-            .collect();
-        let _barrier = self.publication.lock();
-        // 已在当前 epoch 服务的 Project 先正常发布；新打开 Project 的 pending
-        // outbox 才属于旧进程，由 startup reconcile 标记 reconciled。
-        for (handle, target) in &registrations {
-            if handle != newly_opened.as_str() {
-                self.journal.publish_pending(target)?;
+        project: &ProjectStoreHandle,
+    ) -> Result<ProjectCloseToken, KernelProblem> {
+        let targets = self.registered_targets();
+        self.projections.linearize(&targets, |_| {
+            let mut projects = self.projects.write();
+            let registration = projects
+                .get_mut(project.as_str())
+                .ok_or(KernelProblem::ResourceNotFound)?;
+            if registration.closing {
+                return Err(KernelProblem::ServiceUnavailable(
+                    "project_close_in_progress".into(),
+                ));
             }
-        }
-        let targets: Vec<TargetDatabase> = registrations
-            .into_iter()
-            .map(|(_, target)| target)
-            .collect();
-        reconcile_startup(&self.service, &targets, chrono::Utc::now())
-            .map_err(KernelProblem::from)?;
-        Ok(())
+            registration.closing = true;
+            Ok(ProjectCloseToken {
+                project: project.clone(),
+                store: registration.store.clone(),
+            })
+        })
+    }
+
+    pub(crate) fn finalize_project_close(&self, token: ProjectCloseToken) {
+        self.projections.finalize_close(|| {
+            let mut projects = self.projects.write();
+            let remove = projects.get(token.project.as_str()).is_some_and(|current| {
+                current.closing && Arc::ptr_eq(&current.store, &token.store)
+            });
+            if remove {
+                projects.remove(token.project.as_str());
+            }
+        });
     }
 
     /// 授予 Controller lease(新 controller 使旧 epoch 立即失效)并返回
@@ -450,8 +510,22 @@ impl InProcessCoreKernel {
     /// 当前事件游标(客户端先取 cursor 再 subscribe)。
     #[cfg(test)]
     pub(crate) fn current_event_cursor(&self) -> EventCursor {
-        let _barrier = self.publication.lock();
-        self.journal.cursor()
+        let registered_targets = self.registered_targets();
+        self.projections
+            .linearize(&registered_targets, |hub| Ok(hub.cursor()))
+            .expect("contract cursor requires recovered projection hub")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn projection_stats(&self) -> crate::journal::JournalStats {
+        self.projections.stats()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_projection_probe(&self) -> Result<u64, KernelProblem> {
+        let targets = self.registered_targets();
+        self.projections
+            .linearize(&targets, |hub| hub.append_probe())
     }
 
     /// 崩溃恢复:以 target receipt 为权威终结 intent 并补发事件;
@@ -462,14 +536,16 @@ impl InProcessCoreKernel {
         project: &ProjectStoreHandle,
         command_id: &CommandId,
     ) -> Result<ReconcileOutcome, KernelProblem> {
-        let registration = self.project_registration(project)?;
-        let _barrier = self.publication.lock();
-        let outcome = self
-            .coordinator
-            .reconcile(command_id, &registration.target)
-            .map_err(KernelProblem::from)?;
-        self.journal.publish_pending(&registration.target)?;
-        Ok(outcome)
+        let registered_targets = self.registered_targets();
+        self.projections.linearize(&registered_targets, |hub| {
+            let registration = self.project_registration(project)?;
+            let outcome = self
+                .coordinator
+                .reconcile(command_id, &registration.target)
+                .map_err(KernelProblem::from)?;
+            hub.publish_pending(&registration.target)?;
+            Ok(outcome)
+        })
     }
 
     #[cfg(test)]
@@ -477,9 +553,11 @@ impl InProcessCoreKernel {
         &self,
         project: &ProjectStoreHandle,
     ) -> Result<(), KernelProblem> {
-        let registration = self.project_registration(project)?;
-        let _barrier = self.publication.lock();
-        self.journal.publish_pending(&registration.target)
+        let registered_targets = self.registered_targets();
+        self.projections.linearize(&registered_targets, |hub| {
+            let registration = self.project_registration(project)?;
+            hub.publish_pending(&registration.target)
+        })
     }
 
     /// 契约测试故障注入缝隙:模拟 dispatch 在指定线性化点崩溃。
@@ -490,8 +568,19 @@ impl InProcessCoreKernel {
         fault: Option<FaultPoint>,
     ) -> Result<KernelOutcome, KernelProblem> {
         match &request.command {
-            KernelCommand::WorkflowRename(_) => self.dispatch_workflow_rename(request, fault),
+            KernelCommand::WorkflowRename(_) => {
+                self.dispatch_workflow_rename(request, fault, || {})
+            }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dispatch_rename_with_barrier_hook(
+        &self,
+        request: KernelCommandRequest,
+        before_barrier: impl FnOnce(),
+    ) -> Result<KernelOutcome, KernelProblem> {
+        self.dispatch_workflow_rename(request, None, before_barrier)
     }
 
     fn project_registration(
@@ -501,8 +590,17 @@ impl InProcessCoreKernel {
         self.projects
             .read()
             .get(project.as_str())
+            .filter(|registration| !registration.closing)
             .cloned()
             .ok_or(KernelProblem::ResourceNotFound)
+    }
+
+    fn registered_targets(&self) -> Vec<TargetDatabase> {
+        self.projects
+            .read()
+            .values()
+            .map(|registration| registration.target.clone())
+            .collect()
     }
 
     fn legacy_workflow_locator(
@@ -510,22 +608,24 @@ impl InProcessCoreKernel {
         project: &ProjectStoreHandle,
         workflow_key: &str,
     ) -> Result<(WorkflowHandle, u64), KernelProblem> {
-        let registration = self.project_registration(project)?;
-        let _barrier = self.publication.lock();
-        let row = registration
-            .store
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT public_handle, presentation_revision FROM project_workflows
-                     WHERE workflow_key=?1",
-                    [workflow_key],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-                )
-                .optional()
-                .map_err(anyhow::Error::from)
-            })
-            .map_err(|error| KernelProblem::Internal(format!("{error:#}")))?
-            .ok_or(KernelProblem::ResourceNotFound)?;
+        let registered_targets = self.registered_targets();
+        let row = self.projections.linearize(&registered_targets, |_| {
+            let registration = self.project_registration(project)?;
+            registration
+                .store
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT public_handle, presentation_revision FROM project_workflows
+                         WHERE workflow_key=?1",
+                        [workflow_key],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()
+                    .map_err(anyhow::Error::from)
+                })
+                .map_err(|error| KernelProblem::Internal(format!("{error:#}")))?
+                .ok_or(KernelProblem::ResourceNotFound)
+        })?;
         Ok((
             WorkflowHandle::parse(row.0)
                 .map_err(|error| KernelProblem::Internal(error.to_string()))?,
@@ -538,6 +638,7 @@ impl InProcessCoreKernel {
         &self,
         request: KernelCommandRequest,
         fault: Option<FaultPoint>,
+        before_barrier: impl FnOnce(),
     ) -> Result<KernelOutcome, KernelProblem> {
         let KernelCommand::WorkflowRename(command) = &request.command;
         let project = &command.project;
@@ -548,85 +649,120 @@ impl InProcessCoreKernel {
         if name.is_empty() {
             return Err(KernelProblem::InvalidEnvelope("工作流名称不能为空".into()));
         }
-        let registration = self.project_registration(project)?;
-        let _barrier = self.publication.lock();
-        let aggregate = AggregateRef::new(
-            AggregateKind::ProjectWorkflow,
-            workflow.as_str().to_string(),
-        )
-        .map_err(|error| KernelProblem::Internal(error.to_string()))?;
-        let mut revisions = std::collections::BTreeMap::new();
-        revisions.insert(
-            "presentation_revision".to_string(),
-            *expected_presentation_revision,
-        );
-        let envelope = CommandEnvelope::new(
-            request.command_id.clone(),
-            request.client_id.clone(),
-            request.principal.clone(),
-            request.controller_epoch,
-            None,
-            CommandTarget {
-                store: TargetStoreKind::Project,
-                store_handle: project.as_str().to_string(),
-                aggregate: aggregate.clone(),
-            },
-            vec![ExpectedRevision {
-                aggregate,
-                revisions,
-            }],
-            CommandType::WorkflowRename,
-            CommandPayload::Plain(serde_json::json!({ "name": name })),
-        )?;
-        let workflow_handle = workflow.as_str().to_string();
-        let new_name = name.to_string();
-        let outcome = self.coordinator.dispatch_internal(
-            &envelope,
-            &registration.target,
-            &self.authorizer,
-            |tx| workflow_rename_effect(tx, &workflow_handle, &new_name),
-            fault,
-            || {},
-        )?;
-        // L-PUBLISH:目标事务 commit + receipt + outbox 之后才对外可见。
-        self.journal.publish_pending(&registration.target)?;
-        let CommandOutcome::Applied {
-            result_revisions,
-            replayed,
-        } = outcome;
-        Ok(KernelOutcome::Applied {
-            revisions: revision_vector_of(&result_revisions)?,
-            replayed,
+        let registered_targets = self.registered_targets();
+        before_barrier();
+        self.projections.linearize(&registered_targets, |hub| {
+            // unregister 若先线性化，任何 barrier 外预取的 Store clone 都
+            // 不得在注销后继续写；所以 registration 必须在这里重新解析。
+            let registration = self.project_registration(project)?;
+            let aggregate = AggregateRef::new(
+                AggregateKind::ProjectWorkflow,
+                workflow.as_str().to_string(),
+            )
+            .map_err(|error| KernelProblem::Internal(error.to_string()))?;
+            let mut revisions = std::collections::BTreeMap::new();
+            revisions.insert(
+                "presentation_revision".to_string(),
+                *expected_presentation_revision,
+            );
+            let envelope = CommandEnvelope::new(
+                request.command_id.clone(),
+                request.client_id.clone(),
+                request.principal.clone(),
+                request.controller_epoch,
+                None,
+                CommandTarget {
+                    store: TargetStoreKind::Project,
+                    store_handle: project.as_str().to_string(),
+                    aggregate: aggregate.clone(),
+                },
+                vec![ExpectedRevision {
+                    aggregate,
+                    revisions,
+                }],
+                CommandType::WorkflowRename,
+                CommandPayload::Plain(serde_json::json!({ "name": name })),
+            )?;
+            let workflow_handle = workflow.as_str().to_string();
+            let new_name = name.to_string();
+            let outcome = self.coordinator.dispatch_internal(
+                &envelope,
+                &registration.target,
+                &self.authorizer,
+                |tx| workflow_rename_effect(tx, &workflow_handle, &new_name),
+                fault,
+                || {},
+            );
+            let outcome = match outcome {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    // dispatch 错误既可能发生在 target commit 前，也可能发生在
+                    // target receipt/outbox 已提交之后（crash window）。不能靠错误
+                    // 类型猜测；以 target receipt 为权威判断。commit 后失败必须
+                    // 旋转 epoch + reconciled outbox，避免 Snapshot 暴露新 Store
+                    // 状态却仍携带旧 cursor。
+                    let target_committed = registration.target.with_conn(|conn| {
+                        conn.query_row(
+                            "SELECT EXISTS(
+                                 SELECT 1 FROM command_receipt
+                                 WHERE command_id=?1 AND state='applied'
+                                   AND finalized_at IS NOT NULL
+                             )",
+                            [request.command_id.as_str()],
+                            |row| row.get::<_, bool>(0),
+                        )
+                        .map_err(|query_error| CommandProblem::Internal(query_error.to_string()))
+                    });
+                    match target_committed {
+                        Ok(true) | Err(_) => {
+                            hub.abort_publication(&registration.target)?;
+                        }
+                        Ok(false) => {}
+                    }
+                    return Err(KernelProblem::from(error));
+                }
+            };
+            // L-PUBLISH:目标事务 commit + receipt + outbox 之后才对外可见。
+            hub.publish_pending(&registration.target)?;
+            let CommandOutcome::Applied {
+                result_revisions,
+                replayed,
+            } = outcome;
+            Ok(KernelOutcome::Applied {
+                revisions: revision_vector_of(&result_revisions)?,
+                replayed,
+            })
         })
     }
 
     fn workflow_snapshot(&self, query: SnapshotQuery) -> Result<SnapshotEnvelope, KernelProblem> {
         let SnapshotQuery::Workflow { project, workflow } = &query;
-        let registration = self.project_registration(project)?;
-        // publication barrier 覆盖 cursor + Store read：不可能返回新 Store
-        // 状态配旧 through_seq。
-        let _barrier = self.publication.lock();
-        let cursor = self.journal.cursor();
-        let row = registration
-            .store
-            .with_conn(|conn| {
-                conn.query_row(
-                    "SELECT public_handle, name, semantic_revision, presentation_revision
-                     FROM project_workflows WHERE public_handle=?1",
-                    [workflow.as_str()],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
-                            row.get::<_, i64>(3)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(anyhow::Error::from)
-            })
-            .map_err(|error| KernelProblem::Internal(format!("{error:#}")))?;
+        let registered_targets = self.registered_targets();
+        // ProjectionHub 同时拥有 cursor 与 Store reader 的 publication
+        // barrier，不可能返回新 Store 状态配旧 through_seq。
+        let (cursor, row) = self.projections.snapshot(&registered_targets, || {
+            let registration = self.project_registration(project)?;
+            registration
+                .store
+                .with_conn(|conn| {
+                    conn.query_row(
+                        "SELECT public_handle, name, semantic_revision, presentation_revision
+                         FROM project_workflows WHERE public_handle=?1",
+                        [workflow.as_str()],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, i64>(2)?,
+                                row.get::<_, i64>(3)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                    .map_err(anyhow::Error::from)
+                })
+                .map_err(|error| KernelProblem::Internal(format!("{error:#}")))
+        })?;
         let Some((workflow_handle, name, semantic, presentation)) = row else {
             return Err(KernelProblem::ResourceNotFound);
         };
@@ -638,7 +774,7 @@ impl InProcessCoreKernel {
         };
         Ok(SnapshotEnvelope {
             schema: SNAPSHOT_SCHEMA,
-            server_instance_id: self.journal.server_instance_id().clone(),
+            server_instance_id: self.projections.server_instance_id().clone(),
             cursor,
             data: SnapshotData::Workflow(WorkflowSnapshotData {
                 workflow: WorkflowHandle::parse(workflow_handle)
@@ -651,6 +787,22 @@ impl InProcessCoreKernel {
 
     fn assess_shutdown(&self, _intent: ShutdownIntent) -> ShutdownAssessment {
         let mut assessment = ShutdownAssessment::default();
+        let journal = self.projections.stats();
+        log::debug!(
+            "workflow journal events={} bytes={} first_seq={} clients={} queue_events={} queue_bytes={} rotations={} capacity_rotations={} publication_rotations={} protocol_rotations={} evicted={} resyncs={}",
+            journal.events,
+            journal.bytes,
+            journal.first_available_seq,
+            journal.clients,
+            journal.max_client_queue_events,
+            journal.max_client_queue_bytes,
+            journal.rotations,
+            journal.capacity_rotations,
+            journal.publication_rotations,
+            journal.protocol_rotations,
+            journal.evicted,
+            journal.resyncs,
+        );
         let registrations: Vec<(String, ProjectRegistration)> = self
             .projects
             .read()
@@ -719,7 +871,7 @@ impl InProcessCoreKernel {
 impl CoreKernel for InProcessCoreKernel {
     fn dispatch(&self, request: KernelCommandRequest) -> Result<KernelOutcome, KernelProblem> {
         match &request.command {
-            KernelCommand::WorkflowRename(_) => self.dispatch_workflow_rename(request, None),
+            KernelCommand::WorkflowRename(_) => self.dispatch_workflow_rename(request, None, || {}),
         }
     }
 
@@ -728,7 +880,9 @@ impl CoreKernel for InProcessCoreKernel {
     }
 
     fn subscribe_events(&self, cursor: EventCursor) -> Result<EventSubscription, KernelProblem> {
-        self.journal.subscribe(&cursor)
+        let registered_targets = self.registered_targets();
+        self.projections
+            .subscribe_live(&registered_targets, &cursor)
     }
 
     fn attach_terminal(
@@ -920,15 +1074,31 @@ impl InProcessKernelRuntime {
         let store = Store::open(&mf_agent::project_db_path(root))
             .map_err(|error| KernelProblem::ServiceUnavailable(format!("{error:#}")))?;
         let handle = self.kernel.register_project_store(root, store.clone())?;
-        if let Err(error) = self.kernel.reconcile_registered_projects(&handle) {
-            self.kernel.unregister_project_store(&handle);
-            return Err(error);
-        }
         Ok(InProcessProject { handle, store })
     }
 
-    pub fn unregister_project_store(&self, project: &ProjectStoreHandle) {
-        self.kernel.unregister_project_store(project);
+    pub fn unregister_project_store(
+        &self,
+        project: &ProjectStoreHandle,
+    ) -> Result<(), KernelProblem> {
+        self.kernel.unregister_project_store(project)
+    }
+
+    pub fn prepare_project_close(
+        &self,
+        project: &ProjectStoreHandle,
+    ) -> Result<ProjectCloseToken, KernelProblem> {
+        self.kernel.prepare_project_close(project)
+    }
+
+    pub fn finalize_project_close(&self, token: ProjectCloseToken) {
+        self.kernel.finalize_project_close(token);
+    }
+
+    /// WebGateway/diagnostics adapter 的生产可观测 seam；不包含 payload、
+    /// Project 路径或 Secret。
+    pub fn projection_diagnostics(&self) -> crate::projection::ProjectionDiagnostics {
+        self.kernel.projections.stats()
     }
 }
 

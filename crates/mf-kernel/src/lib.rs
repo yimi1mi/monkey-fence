@@ -10,12 +10,14 @@
 //! T2a(Issue #23)交付 CoreKernel facade(§2.2 唯一深模块缝隙):封闭
 //! `workflow.rename` 命令经 dispatch→Project Store→snapshot/event 贯通,
 //! `crates/mf` 的 GPUI rename 经 in-process adapter 改走 facade。除该
-//! tracer 外,本 crate 不接管 `crates/mf` AppCtx 的权威状态;standalone
-//! Core bin、WebGateway、完整可配置 journal/min-age/client queues 与
-//! attach_terminal 属后续 ticket。
+//! tracer 外,本 crate 不接管 `crates/mf` AppCtx 的其它权威状态。
+//! T2b(Issue #24)交付 ProjectionHub/L-PUBLISH、跨 Project 有界 journal、
+//! resume/gap、独立 client queue、epoch rotate/recovery 与 A1/A9 契约。
+//! standalone Core bin、WebGateway 与 attach_terminal 属后续 ticket。
 
 pub mod command;
 pub mod handles;
+mod journal;
 pub mod kernel;
 pub mod lease;
 pub mod limits;
@@ -31,6 +33,9 @@ pub mod singleton;
 // Command contracts 需要 crate-private target effect seam；源文件仍位于
 // `tests/contract/`，作为 lib unit module 编译，release test 同样覆盖。
 #[cfg(test)]
+#[path = "../tests/contract/barrier_consistency.rs"]
+mod barrier_consistency;
+#[cfg(test)]
 #[path = "../tests/contract/command_idempotency.rs"]
 mod command_idempotency;
 #[cfg(test)]
@@ -40,6 +45,15 @@ mod command_support;
 #[path = "../tests/contract/intent_recovery.rs"]
 mod intent_recovery;
 #[cfg(test)]
+#[path = "../tests/contract/journal_limits.rs"]
+mod journal_limits;
+#[cfg(test)]
+#[path = "../tests/contract/journal_overflow.rs"]
+mod journal_overflow;
+#[cfg(test)]
+#[path = "../tests/contract/journal_recovery.rs"]
+mod journal_recovery;
+#[cfg(test)]
 #[path = "../tests/contract/kernel_first_tracer.rs"]
 mod kernel_first_tracer;
 #[cfg(test)]
@@ -48,6 +62,9 @@ mod multistore_crash_recovery;
 #[cfg(test)]
 #[path = "../tests/contract/operation_saga.rs"]
 mod operation_saga;
+#[cfg(test)]
+#[path = "../tests/contract/projection_support.rs"]
+mod projection_support;
 #[cfg(test)]
 #[path = "../tests/contract/retention_gc.rs"]
 mod retention_gc;

@@ -399,13 +399,19 @@ fn events_publish_only_after_commit_and_reconcile_repairs_fault_window() {
     assert_eq!(error.code(), "internal_error", "故障注入以内部错误表面化");
     assert_eq!(fixture.record().name, "崩溃窗口", "目标事务确已提交");
     assert_eq!(fixture.receipts(), 1);
-    assert_eq!(fixture.pending_outbox(), 1);
-    assert!(
-        subscription.poll().unwrap().is_empty(),
-        "publication 前事件绝不可见"
+    assert_eq!(
+        fixture.pending_outbox(),
+        0,
+        "旧 epoch outbox 必须 reconciled"
+    );
+    assert_eq!(
+        subscription.poll().unwrap_err(),
+        KernelProblem::ResyncRequired,
+        "target commit 后 publication 失败必须旋转 epoch"
     );
 
-    // 恢复:reconcile 以 target receipt 为权威,不重放业务写,只补发事件。
+    // 恢复:reconcile 以 target receipt 为权威,不重放业务写；旧 epoch
+    // outbox 已 reconciled，新 epoch 由 Snapshot 覆盖，不补造陈旧 delta。
     let outcome = fixture
         .kernel
         .reconcile_command(&fixture.project, &command_id)
@@ -414,10 +420,12 @@ fn events_publish_only_after_commit_and_reconcile_repairs_fault_window() {
         outcome,
         ReconcileOutcome::Applied(crate::command::CommandOutcome::Applied { replayed: true, .. })
     ));
-    let events = subscription.poll().unwrap();
-    assert_eq!(events.len(), 1);
-    assert_eq!(event_revision(&events[0]), fixture.revisions());
     assert_eq!(fixture.pending_outbox(), 0);
+    let mut recovered = fixture
+        .kernel
+        .subscribe_events(fixture.kernel.current_event_cursor())
+        .unwrap();
+    assert!(recovered.poll().unwrap().is_empty());
 
     // 崩溃窗口后同 id 重试:命中 receipt,幂等且不产生第二条事件。
     let retry = fixture
@@ -781,8 +789,4 @@ fn wire_revisions_and_seq_serialize_as_decimal_strings() {
     event.seq = large;
     let event = serde_json::to_value(event).unwrap();
     assert_eq!(event["seq"], large.to_string());
-}
-
-fn event_revision(event: &crate::projection::EventEnvelope) -> RevisionVector {
-    event.aggregate_revision
 }

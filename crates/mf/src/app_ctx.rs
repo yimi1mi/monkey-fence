@@ -209,6 +209,7 @@ impl mf_agent::execution_directory::DirectoryProviderResolver for PluginDirector
     }
 }
 
+#[derive(Clone)]
 pub struct ProjectHandle {
     pub root: PathBuf,
     pub orchestrator: Arc<Orchestrator>,
@@ -816,7 +817,11 @@ impl AppCtx {
             Ok(orch) => orch,
             Err(error) => {
                 if let (Some(tracer), Some(project)) = (&tracer, &kernel_project) {
-                    tracer.runtime.unregister_project_store(project);
+                    if let Err(unregister) = tracer.runtime.unregister_project_store(project) {
+                        return Err(anyhow::anyhow!(
+                            "Orchestrator 启动失败:{error:#}; CoreKernel 注销也失败:{unregister}"
+                        ));
+                    }
                 }
                 return Err(error);
             }
@@ -833,13 +838,30 @@ impl AppCtx {
     }
 
     /// 关闭项目:停止其任务并移除;PTY 会话按 run 归属杀掉。
-    pub fn close_project(&self, root: &PathBuf) {
+    pub fn try_close_project(&self, root: &PathBuf) -> Result<()> {
         let handle = {
-            let mut projects = self.projects.lock();
-            let idx = projects.iter().position(|p| &p.root == root);
-            idx.map(|i| projects.remove(i))
+            let projects = self.projects.lock();
+            projects
+                .iter()
+                .find(|project| &project.root == root)
+                .cloned()
         };
         if let Some(h) = handle {
+            // 两阶段关闭：先执行唯一可能因 ProjectionHub Recovering 失败的
+            // prepare；closing 状态拒绝新命令但仍参与 shutdown assessment。
+            // 失败时不触碰 PTY/Task/Orchestrator/UI，可安全重试。
+            let tracer = self.kernel.lock().clone();
+            let close_token = match (&tracer, &h.kernel_project) {
+                (Some(tracer), Some(project)) => Some(
+                    tracer
+                        .runtime
+                        .prepare_project_close(project)
+                        .map_err(|error| {
+                            anyhow::anyhow!("CoreKernel 准备关闭 Project 失败:{error}")
+                        })?,
+                ),
+                _ => None,
+            };
             // 先快照活动 run(取消后 running_runs 会变空,先取后杀才有效)
             let active_runs = h.orchestrator.store.running_runs().unwrap_or_default();
             // 杀掉该项目 run 关联的会话(按项目作用域,不会误杀其他项目)
@@ -862,14 +884,21 @@ impl AppCtx {
             // cancel_task 会 emit 状态事件；保持 drain 到所有取消操作结束，
             // 避免关闭大型项目时 bounded events_rx 反压当前线程。
             self.overview.detach(&h.root);
-            // T2a tracer:同项目重开时按最新 Store 实例重新登记。
-            if let Some(tracer) = self.kernel.lock().clone() {
-                if let Some(project) = &h.kernel_project {
-                    tracer.runtime.unregister_project_store(project);
-                }
+            if let (Some(tracer), Some(token)) = (&tracer, close_token) {
+                tracer.runtime.finalize_project_close(token);
+            }
+            let mut projects = self.projects.lock();
+            if let Some(index) = projects.iter().position(|project| project.root == h.root) {
+                projects.remove(index);
             }
         }
         self.sync_pipe_routing();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn close_project(&self, root: &PathBuf) {
+        self.try_close_project(root).unwrap();
     }
 
     /// 持久化当前打开项目、前台项目与每项目恢复状态(原子写)。

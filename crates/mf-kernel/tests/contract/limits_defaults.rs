@@ -1,19 +1,211 @@
-//! T1e/T1g 契约(Issue #20/#22):附录 A7 生命周期与 A4 命令/审计
-//! retention 参数的默认值/允许范围/hard cap。
+//! T1e/T1g/T2b 契约(Issue #20/#22/#24):附录 A1 Workflow 事件与 API、
+//! A7 生命周期与 A4 命令/审计 retention 参数的默认值/允许范围/hard cap。
 //!
-//! 表驱动断言 `LIFECYCLE_PARAMS`/`RETENTION_PARAMS` 与 spec 附录逐行一致;
+//! 表驱动断言 `JOURNAL_PARAMS`/`LIFECYCLE_PARAMS`/`RETENTION_PARAMS`
+//! 与 spec 附录逐行一致;
 //! 边界值(min/max)接受、越界(min-1/max+1,即超过 hard cap)拒绝;
-//! stale 派生 = 3×heartbeat。
+//! stale 派生 = 3×heartbeat,command burst 派生 = 3×rate。
 
 use mf_kernel::limits::{
-    LifecycleLimits, LifecycleParamSpec, RetentionLimits, RetentionParamSpec,
-    DISCOVERY_STALE_HEARTBEATS, JOURNAL_MAX_BYTES_DEFAULT, JOURNAL_MAX_EVENTS_DEFAULT,
+    JournalLimits, JournalParamSpec, LifecycleLimits, LifecycleParamSpec, RetentionLimits,
+    RetentionParamSpec, COMMAND_RATE_BURST_MULTIPLIER, DISCOVERY_STALE_HEARTBEATS,
+    JOURNAL_MAX_BYTES_DEFAULT, JOURNAL_MAX_EVENTS_DEFAULT,
 };
 
+/// 附录 A1 原文行(唯一数值来源):name/default/min/max/hard cap。
+fn appendix_a1_rows() -> Vec<JournalParamSpec> {
+    vec![
+        JournalParamSpec {
+            name: "journal_max_events",
+            default: 20_000,
+            min: 1_000,
+            max: 100_000,
+            hard_cap: 100_000,
+        },
+        JournalParamSpec {
+            name: "journal_max_bytes",
+            default: 64 * 1024 * 1024,
+            min: 4 * 1024 * 1024,
+            max: 256 * 1024 * 1024,
+            hard_cap: 256 * 1024 * 1024,
+        },
+        JournalParamSpec {
+            name: "journal_min_age_secs",
+            default: 1_800,
+            min: 0,
+            max: 86_400,
+            hard_cap: 86_400,
+        },
+        JournalParamSpec {
+            name: "journal_event_max_bytes",
+            default: 1024 * 1024,
+            min: 64 * 1024,
+            max: 2 * 1024 * 1024,
+            hard_cap: 2 * 1024 * 1024,
+        },
+        JournalParamSpec {
+            name: "client_event_queue_max_events",
+            default: 2_000,
+            min: 100,
+            max: 20_000,
+            hard_cap: 20_000,
+        },
+        JournalParamSpec {
+            name: "client_event_queue_max_bytes",
+            default: 8 * 1024 * 1024,
+            min: 1024 * 1024,
+            max: 64 * 1024 * 1024,
+            hard_cap: 64 * 1024 * 1024,
+        },
+        JournalParamSpec {
+            name: "events_ws_ping_interval_ms",
+            default: 20_000,
+            min: 5_000,
+            max: 60_000,
+            hard_cap: 60_000,
+        },
+        JournalParamSpec {
+            name: "events_ws_idle_timeout_ms",
+            default: 90_000,
+            min: 30_000,
+            max: 300_000,
+            hard_cap: 300_000,
+        },
+        JournalParamSpec {
+            name: "command_rate_per_client",
+            default: 40,
+            min: 5,
+            max: 200,
+            hard_cap: 200,
+        },
+    ]
+}
+
 #[test]
-fn tracer_journal_defaults_match_appendix_a1() {
+fn workflow_event_params_match_appendix_a1() {
+    let expected = appendix_a1_rows();
+    let actual = mf_kernel::limits::JOURNAL_PARAMS.to_vec();
+    assert_eq!(actual.len(), expected.len(), "A1 恰好 9 个参数");
+    for (spec, want) in actual.iter().zip(&expected) {
+        assert_eq!(spec, want, "{} 参数三元组", want.name);
+        assert!(
+            spec.min <= spec.default && spec.default <= spec.max,
+            "{} 默认值必须在允许范围内",
+            want.name
+        );
+        assert!(
+            spec.max <= spec.hard_cap,
+            "{} 范围不得超过 hard cap",
+            want.name
+        );
+    }
+}
+
+#[test]
+fn journal_defaults_match_appendix_a1_and_legacy_constants() {
+    let defaults = JournalLimits::default();
+    let rows = appendix_a1_rows();
+    assert_eq!(defaults.journal_max_events, rows[0].default as usize);
+    assert_eq!(defaults.journal_max_bytes, rows[1].default as usize);
+    assert_eq!(defaults.journal_min_age_secs, rows[2].default);
+    assert_eq!(defaults.journal_event_max_bytes, rows[3].default as usize);
+    assert_eq!(
+        defaults.client_event_queue_max_events,
+        rows[4].default as usize
+    );
+    assert_eq!(
+        defaults.client_event_queue_max_bytes,
+        rows[5].default as usize
+    );
+    assert_eq!(defaults.events_ws_ping_interval_ms, rows[6].default);
+    assert_eq!(defaults.events_ws_idle_timeout_ms, rows[7].default);
+    assert_eq!(defaults.command_rate_per_client, rows[8].default);
     assert_eq!(JOURNAL_MAX_EVENTS_DEFAULT, 20_000);
     assert_eq!(JOURNAL_MAX_BYTES_DEFAULT, 64 * 1024 * 1024);
+    assert_eq!(defaults.journal_max_events, JOURNAL_MAX_EVENTS_DEFAULT);
+    assert_eq!(defaults.journal_max_bytes, JOURNAL_MAX_BYTES_DEFAULT);
+    defaults.validate().unwrap();
+}
+
+#[test]
+fn journal_range_boundaries_are_accepted() {
+    JournalLimits {
+        journal_max_events: 1_000,
+        journal_max_bytes: 4 * 1024 * 1024,
+        journal_min_age_secs: 0,
+        journal_event_max_bytes: 64 * 1024,
+        client_event_queue_max_events: 100,
+        client_event_queue_max_bytes: 1024 * 1024,
+        events_ws_ping_interval_ms: 5_000,
+        events_ws_idle_timeout_ms: 30_000,
+        command_rate_per_client: 5,
+    }
+    .validate()
+    .unwrap();
+
+    JournalLimits {
+        journal_max_events: 100_000,
+        journal_max_bytes: 256 * 1024 * 1024,
+        journal_min_age_secs: 86_400,
+        journal_event_max_bytes: 2 * 1024 * 1024,
+        client_event_queue_max_events: 20_000,
+        client_event_queue_max_bytes: 64 * 1024 * 1024,
+        events_ws_ping_interval_ms: 60_000,
+        events_ws_idle_timeout_ms: 300_000,
+        command_rate_per_client: 200,
+    }
+    .validate()
+    .unwrap();
+}
+
+#[test]
+fn journal_out_of_range_is_rejected_with_param_name() {
+    for index in 0..mf_kernel::limits::JOURNAL_PARAMS.len() {
+        let spec = mf_kernel::limits::JOURNAL_PARAMS[index];
+        let below = spec.min.checked_sub(1);
+        for bad in below.into_iter().chain(std::iter::once(spec.hard_cap + 1)) {
+            let mut limits = JournalLimits::default();
+            match index {
+                0 => limits.journal_max_events = bad as usize,
+                1 => limits.journal_max_bytes = bad as usize,
+                2 => limits.journal_min_age_secs = bad,
+                3 => limits.journal_event_max_bytes = bad as usize,
+                4 => limits.client_event_queue_max_events = bad as usize,
+                5 => limits.client_event_queue_max_bytes = bad as usize,
+                6 => limits.events_ws_ping_interval_ms = bad,
+                7 => limits.events_ws_idle_timeout_ms = bad,
+                _ => limits.command_rate_per_client = bad,
+            }
+            let error = limits.validate().unwrap_err();
+            assert_eq!(error.name, spec.name);
+            assert_eq!(error.value, bad);
+            assert_eq!(error.min, spec.min);
+            assert_eq!(error.max, spec.max);
+            assert_eq!(error.hard_cap, spec.hard_cap);
+        }
+    }
+}
+
+#[test]
+fn command_burst_is_derived_as_three_times_rate() {
+    assert_eq!(COMMAND_RATE_BURST_MULTIPLIER, 3);
+    assert_eq!(JournalLimits::default().command_burst_per_client(), 120);
+    assert_eq!(
+        JournalLimits {
+            command_rate_per_client: 5,
+            ..Default::default()
+        }
+        .command_burst_per_client(),
+        15
+    );
+    assert_eq!(
+        JournalLimits {
+            command_rate_per_client: 200,
+            ..Default::default()
+        }
+        .command_burst_per_client(),
+        600
+    );
 }
 
 /// 附录 A7 原文行(唯一数值来源):name/default/min/max/hard cap。
@@ -323,4 +515,62 @@ fn retention_out_of_range_rejected_with_param_name() {
             );
         }
     }
+}
+
+#[test]
+fn journal_limits_load_partial_config_and_ignore_other_limit_groups() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[limits]\njournal_max_events = 1234\nclient_event_queue_max_events = 321\nreceipt_retention_days = 30\n",
+    )
+    .unwrap();
+    let limits = JournalLimits::load_from_path(&path).unwrap();
+    assert_eq!(limits.journal_max_events, 1_234);
+    assert_eq!(limits.client_event_queue_max_events, 321);
+    assert_eq!(limits.journal_max_bytes, JOURNAL_MAX_BYTES_DEFAULT);
+}
+
+#[test]
+fn journal_limits_config_parse_and_range_errors_fail_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let malformed = tmp.path().join("malformed.toml");
+    std::fs::write(&malformed, "[limits\njournal_max_events=1234").unwrap();
+    assert!(JournalLimits::load_from_path(&malformed)
+        .unwrap_err()
+        .to_string()
+        .starts_with("limits_config_parse:"));
+
+    let invalid = tmp.path().join("invalid.toml");
+    std::fs::write(&invalid, "[limits]\njournal_max_events=999\n").unwrap();
+    assert!(JournalLimits::load_from_path(&invalid)
+        .unwrap_err()
+        .to_string()
+        .contains("invalid_limits:journal_max_events=999"));
+}
+
+#[test]
+fn missing_journal_limits_config_uses_defaults() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert_eq!(
+        JournalLimits::load_from_path(&tmp.path().join("missing.toml")).unwrap(),
+        JournalLimits::default()
+    );
+}
+
+#[test]
+fn mf_agent_config_roundtrip_preserves_core_limits_table() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("config.toml");
+    std::fs::write(
+        &path,
+        "[limits]\njournal_max_events = 4321\njournal_min_age_secs = 99\n",
+    )
+    .unwrap();
+    let config = mf_agent::Config::load_from_path(&path).unwrap();
+    config.save_to_path(&path).unwrap();
+    let limits = JournalLimits::load_from_path(&path).unwrap();
+    assert_eq!(limits.journal_max_events, 4_321);
+    assert_eq!(limits.journal_min_age_secs, 99);
 }

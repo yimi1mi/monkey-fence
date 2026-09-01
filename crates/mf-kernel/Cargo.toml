@@ -17,6 +17,7 @@ chrono.workspace = true
 parking_lot.workspace = true
 dirs.workspace = true
 thiserror = "2"
+toml.workspace = true
 uuid.workspace = true
 sha2.workspace = true
 hmac.workspace = true

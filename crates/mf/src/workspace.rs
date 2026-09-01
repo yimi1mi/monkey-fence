@@ -715,7 +715,12 @@ impl Workspace {
     }
 
     fn do_close_project(&mut self, root: &PathBuf, cx: &mut Context<Self>) {
-        self.app.close_project(root);
+        if let Err(error) = self.app.try_close_project(root) {
+            self.status_message = format!("项目关闭失败：{error:#}").into();
+            self.close_confirm = None;
+            cx.notify();
+            return;
+        }
         let (id, _) = normalize_project_path(root);
         let outcome = self.context.remove_project(&id);
         self.surfaces.remove(&id.root());
