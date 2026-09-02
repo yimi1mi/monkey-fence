@@ -12,6 +12,8 @@ serde_json.workspace = true
 uuid = { workspace = true, features = ["v7", "v4"] }
 sha2.workspace = true
 hmac.workspace = true
+mf-kernel.workspace = true
+mf-agent.workspace = true
 chrono.workspace = true
 # T7a 网关外壳:loopback 绑定 + 安全头 middleware;领域路由在 #41 接入
 axum = "0.8"
@@ -20,3 +22,5 @@ tower = "0.5"
 
 [dev-dependencies]
 tempfile = "3"
+uuid = { workspace = true, features = ["v7"] }
+mf-kernel = { workspace = true, features = ["test-support"] }

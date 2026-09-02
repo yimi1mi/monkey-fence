@@ -2741,6 +2741,8 @@ dependencies = [
  "axum",
  "chrono",
  "hmac",
+ "mf-agent",
+ "mf-kernel",
  "serde",
  "serde_json",
  "sha2",

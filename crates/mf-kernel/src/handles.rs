@@ -291,6 +291,12 @@ impl StreamEpoch {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// 按客户端回传的 opaque 字符串重建(T7c resume)。值是否匹配当前
+    /// journal epoch 由订阅端 fail-closed 判定,构造本身不校验。
+    pub fn parse(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
 }
 
 impl Default for StreamEpoch {

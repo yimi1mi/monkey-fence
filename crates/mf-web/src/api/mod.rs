@@ -6,6 +6,7 @@
 
 pub mod commands;
 pub mod events;
+pub mod kernel_bridge;
 pub mod snapshot;
 
 /// opaque handle 前缀(§7.1):`wf_/run_/step_/sess_/inst_/op_/proj_` +
@@ -13,7 +14,9 @@ pub mod snapshot;
 pub mod handle {
     pub const PREFIXES: &[&str] = &["wf_", "run_", "step_", "sess_", "inst_", "op_", "proj_"];
 
-    /// 校验 opaque handle 形态(前缀 + 32 hex)。
+    /// 校验 opaque handle 形态:前缀 + UUIDv7(simple 32-hex 或
+    /// hyphenated;存储侧两种生成形态并存——workflow/run 系列为
+    /// simple hex,project registry 为 hyphenated)。
     pub fn is_valid(handle: &str) -> bool {
         let Some(prefix_len) = PREFIXES
             .iter()
@@ -23,7 +26,8 @@ pub mod handle {
             return false;
         };
         let body = &handle[prefix_len..];
-        body.len() == 32 && body.bytes().all(|b| b.is_ascii_hexdigit())
+        let compact: String = body.chars().filter(|c| *c != '-').collect();
+        compact.len() == 32 && compact.bytes().all(|b| b.is_ascii_hexdigit())
     }
 
     /// 校验并返回 handle(非法 → Err,统一映射 resource_not_found)。
