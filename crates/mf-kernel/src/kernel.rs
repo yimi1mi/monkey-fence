@@ -1053,6 +1053,18 @@ impl InProcessCoreKernel {
         Ok(())
     }
 
+    /// L-INPUT(§8.4)的 Controller epoch 复验:writer lease 授予后,
+    /// 每次终端字节入队前调用;takeover 旋转 epoch 后旧 lease 的写入
+    /// 被拒绝(已线性化字节不受影响)。
+    pub fn verify_controller_epoch(&self, epoch: u64) -> crate::lease::InputLeaseVerdict {
+        let guard = self.lease.state.read();
+        if guard.epoch == epoch {
+            crate::lease::InputLeaseVerdict::Current
+        } else {
+            crate::lease::InputLeaseVerdict::ControllerTakeover
+        }
+    }
+
     /// 幂等注入终端宿主(装配件在创建/注册 kernel 时调用;重复注入以
     /// 先到者为准,不覆盖,避免装配竞态换掉已生效的宿主)。
     pub fn ensure_terminal_host(

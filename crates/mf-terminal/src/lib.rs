@@ -21,5 +21,6 @@ pub mod pty;
 pub mod redactor;
 pub mod session;
 pub mod term_screen;
+pub mod writer_lease;
 
 pub use channel::{TerminalChannel, TerminalHost, TerminalProblem, TerminalSessionRef};

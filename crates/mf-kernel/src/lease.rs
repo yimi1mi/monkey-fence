@@ -34,3 +34,28 @@ pub trait CommandAuthorizer: Send + Sync {
         check: &LeaseCheck<'_>,
     ) -> Result<Box<dyn CommandPermit + 'a>, CommandProblem>;
 }
+
+// ---------------------------------------------------------------------------
+// L-INPUT(§2.4/T3c,Issue #31):终端输入的原子复验缝隙
+// ---------------------------------------------------------------------------
+
+/// 字节进入 Agent Session 单线程有序 PTY 写队列前的复验输入。
+/// 与 L-CMD 的 `LeaseCheck` 平行;区别在于 effect 是内存写队列 enqueue
+/// (非 Store 事务),但复验同样必须发生在 effect 之前——takeover 旋转
+/// epoch 后,旧 Controller 的在途字节不得再入队(已线性化字节不回收)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputLeaseCheck {
+    /// 发起写的 Controller epoch(writer lease 授予时绑定)。
+    pub controller_epoch: u64,
+    /// mf-terminal `WriterLeaseManager` 签发的 lease(UUID bytes)。
+    pub writer_lease_id: [u8; 16],
+}
+
+/// L-INPUT 复验结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputLeaseVerdict {
+    /// epoch 与当前 Controller 一致:允许进入写队列。
+    Current,
+    /// epoch 已被 takeover 旋转:拒绝入队,撤销 writer lease。
+    ControllerTakeover,
+}
