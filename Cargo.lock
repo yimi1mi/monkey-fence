@@ -2504,6 +2504,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mf-installer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "mf-kernel"
 version = "0.1.0"
 dependencies = [

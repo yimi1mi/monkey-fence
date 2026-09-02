@@ -549,3 +549,73 @@ fn projection(
         "plugin_pins": plugin_pins,
     })
 }
+
+// ---------------------------------------------------------------------------
+// T4b(Issue #40):discovery 结果的 Catalog v2 additive adapter
+// ---------------------------------------------------------------------------
+
+fn installation(
+    handle: &str,
+    agent_type: &str,
+    canonical: &str,
+    source: &str,
+) -> mf_agent::catalog_store::CliInstallationRecord {
+    mf_agent::catalog_store::CliInstallationRecord {
+        installation_handle: handle.into(),
+        agent_type_id: agent_type.into(),
+        executable_path: canonical.into(),
+        canonical_path: canonical.into(),
+        actual_version: Some("1.2.3".into()),
+        source: source.into(),
+        scope: "user".into(),
+        health: "detected".into(),
+    }
+}
+
+#[test]
+fn t4b_cli_installation_upsert_is_additive_and_idempotent_by_canonical() {
+    let store = CatalogV2Store::memory().unwrap();
+    // 同一 Agent Type 呈现多安装(external + managed 并存)
+    store
+        .upsert_cli_installation(&installation(
+            "inst-1",
+            "codex",
+            "/usr/local/bin/codex",
+            "external",
+        ))
+        .unwrap();
+    store
+        .upsert_cli_installation(&installation(
+            "inst-2",
+            "codex",
+            "/managed/codex.exe",
+            "managed",
+        ))
+        .unwrap();
+    let mut all = store.list_cli_installations(None).unwrap();
+    assert_eq!(all.len(), 2, "同一 Type 双安装并存");
+    // canonical 幂等:重复写入不产生第二行
+    store
+        .upsert_cli_installation(&installation(
+            "inst-1b",
+            "codex",
+            "/usr/local/bin/codex",
+            "external",
+        ))
+        .unwrap();
+    all = store.list_cli_installations(None).unwrap();
+    assert_eq!(all.len(), 2, "canonical 幂等去重");
+    // 按 Type 过滤
+    store
+        .upsert_cli_installation(&installation(
+            "inst-3",
+            "claude",
+            "/usr/local/bin/claude",
+            "external",
+        ))
+        .unwrap();
+    let codex_only = store.list_cli_installations(Some("codex")).unwrap();
+    assert_eq!(codex_only.len(), 2);
+    assert!(codex_only.iter().all(|r| r.agent_type_id == "codex"));
+    assert_eq!(store.list_cli_installations(None).unwrap().len(), 3);
+}

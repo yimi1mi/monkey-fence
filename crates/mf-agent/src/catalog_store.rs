@@ -49,6 +49,22 @@ pub const CATALOG_V2_REQUIRED_TABLES: &[&str] = &[
     "migration_marker",
 ];
 
+/// T4b(Issue #40):Catalog v2 的 CLI 安装记录(discovery additive 写入)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliInstallationRecord {
+    pub installation_handle: String,
+    pub agent_type_id: String,
+    pub executable_path: String,
+    pub canonical_path: String,
+    pub actual_version: Option<String>,
+    /// external | managed。
+    pub source: String,
+    /// user | machine。
+    pub scope: String,
+    /// detected | healthy | unhealthy | repair-needed | missing。
+    pub health: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginPinRecord {
     pub run_key: String,
@@ -1122,5 +1138,69 @@ fn version_row(
             Ok(Some(v))
         }
         None => Ok(None),
+    }
+}
+
+impl CatalogV2Store {
+    /// T4b(Issue #40)discovery 结果的 Catalog v2 adapter:additive 写入。
+    /// 幂等键 = canonical_path(同一 canonical 只一行;health 保持
+    /// discovered 由 discovery 周期刷新,安装域状态由 #43 receipt 链管理)。
+    pub fn upsert_cli_installation(&self, record: &CliInstallationRecord) -> Result<()> {
+        let now = now();
+        self.with_tx(|tx| {
+            tx.execute(
+                "INSERT INTO cli_installations
+                 (installation_handle, agent_type_id, executable_path, canonical_path,
+                  actual_version, source, scope, health, receipt_handle, detected_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'detected', NULL, ?8)
+                 ON CONFLICT(canonical_path) DO UPDATE SET
+                    executable_path = excluded.executable_path,
+                    actual_version = excluded.actual_version,
+                    source = excluded.source,
+                    detected_at = excluded.detected_at",
+                rusqlite::params![
+                    record.installation_handle,
+                    record.agent_type_id,
+                    record.executable_path,
+                    record.canonical_path,
+                    record.actual_version,
+                    record.source,
+                    record.scope,
+                    now,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// 列出安装(可选按 Agent Type 过滤);同一 Type 多安装并存呈现。
+    pub fn list_cli_installations(
+        &self,
+        agent_type: Option<&str>,
+    ) -> Result<Vec<CliInstallationRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT installation_handle, agent_type_id, executable_path, canonical_path,
+                        actual_version, source, scope, health
+                 FROM cli_installations
+                 WHERE (?1 IS NULL OR agent_type_id = ?1)
+                 ORDER BY agent_type_id, canonical_path",
+            )?;
+            let rows = stmt
+                .query_map(rusqlite::params![agent_type], |row| {
+                    Ok(CliInstallationRecord {
+                        installation_handle: row.get(0)?,
+                        agent_type_id: row.get(1)?,
+                        executable_path: row.get(2)?,
+                        canonical_path: row.get(3)?,
+                        actual_version: row.get(4)?,
+                        source: row.get(5)?,
+                        scope: row.get(6)?,
+                        health: row.get(7)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
     }
 }

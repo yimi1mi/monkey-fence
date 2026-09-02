@@ -10,6 +10,7 @@ members = [
     "crates/mf-kernel",
     "crates/mf-terminal",
     "crates/mf-elevated",
+    "crates/mf-installer",
     "crates/mfctl",
 ]
 # 裸命令(cargo run / build / test)的默认目标:主程序而非 mfctl 辅助程序。
@@ -24,6 +25,7 @@ default-members = [
     "crates/mf-kernel",
     "crates/mf-terminal",
     "crates/mf-elevated",
+    "crates/mf-installer",
 ]
 
 [workspace.package]
@@ -40,6 +42,7 @@ mf-plugins = { path = "crates/mf-plugins" }
 mf-kernel = { path = "crates/mf-kernel" }
 mf-terminal = { path = "crates/mf-terminal" }
 mf-elevated = { path = "crates/mf-elevated" }
+mf-installer = { path = "crates/mf-installer" }
 
 # Zed 同源依赖(本地 checkout,保证 Windows DirectX 后端可用)
 gpui = { path = "D:/workspace/zed/crates/gpui" }
