@@ -6,7 +6,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { isValidHandle, type CommandEnvelope } from "../protocol.ts";
 
-const fixtures = join(import.meta.dirname, "../../../crates/mf-web/tests/fixtures");
+const fixtures = join(import.meta.dirname, "../../../../crates/mf-web/tests/fixtures");
 
 function readJson(kind: string, name: string): unknown {
   return JSON.parse(readFileSync(join(fixtures, kind, `${name}.json`), "utf8"));
