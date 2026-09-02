@@ -10,6 +10,8 @@ thiserror = "2"
 zeroize.workspace = true
 # StreamingRedactor/SecretLease:统一脱敏入口(T3a)与 PTY secret 环境块
 mf-agent.workspace = true
+# terminal epoch 用 UUIDv7(时间有序;跨 PTY 不复用)
+uuid = { workspace = true, features = ["v7"] }
 
 [target.'cfg(windows)'.dependencies]
 # ConPTY/Job Object PTY 实现(自 crates/mf pty_spawn 迁入,T3a)

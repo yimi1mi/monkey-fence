@@ -15,8 +15,11 @@
 //! 并注入 kernel。本 crate 不依赖 `mf-kernel`,也不接触 Store/Orchestrator。
 
 pub mod channel;
+pub mod journal;
+pub mod limits;
 pub mod pty;
 pub mod redactor;
+pub mod session;
 pub mod term_screen;
 
 pub use channel::{TerminalChannel, TerminalHost, TerminalProblem, TerminalSessionRef};

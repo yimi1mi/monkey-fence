@@ -178,3 +178,169 @@ mod tests {
         assert!(channel.send_input(b"\x1b").is_err());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Terminal v1 binary frame codec(§8.1;T3b,Issue #30)
+// ---------------------------------------------------------------------------
+
+/// 固定 32-byte network-order header;v1 双向 frame 上限 256 KiB。
+pub const FRAME_HEADER_BYTES: usize = 32;
+pub const FRAME_MAGIC: [u8; 4] = *b"MFT1";
+/// kind 1:server → client 的脱敏输出。
+pub const FRAME_KIND_OUTPUT: u8 = 1;
+/// kind 2:client → server 的原始输入(writer lease 绑定)。
+pub const FRAME_KIND_INPUT: u8 = 2;
+/// v1 不发送 checkpoint(§8.3):kind 3..255 保留,解码即拒绝。
+pub const FRAME_KIND_CHECKPOINT_RESERVED: u8 = 3;
+
+/// frame 解码问题。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FrameProblem {
+    #[error("frame 太短({len} bytes,头部需 32)")]
+    TooShort { len: usize },
+    #[error("frame magic 不符")]
+    BadMagic,
+    #[error("frame kind {kind} 保留/未知(v1 仅 1=output、2=input;不发送 checkpoint)")]
+    UnknownKind { kind: u8 },
+    #[error("reserved 字节非零")]
+    ReservedNotZero,
+    #[error("frame 超过 frame_max_bytes({len} > {max})")]
+    TooLarge { len: usize, max: usize },
+}
+
+/// 解码后的 frame 头 + payload 切片。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Frame<'a> {
+    pub kind: u8,
+    pub flags: u8,
+    pub seq: u64,
+    /// writer lease UUID 原始字节(output 全 0)。
+    pub writer_lease_id: [u8; 16],
+    pub payload: &'a [u8],
+}
+
+/// 编码 binary frame(kind/flags/seq/lease + payload,network order)。
+/// 超过 `FRAME_MAX_BYTES` 由调用方(transport 分帧策略)保证;本函数
+/// 仍做防御性断言。
+pub fn encode_frame(
+    kind: u8,
+    flags: u8,
+    seq: u64,
+    writer_lease_id: [u8; 16],
+    payload: &[u8],
+) -> Result<Vec<u8>, FrameProblem> {
+    let total = FRAME_HEADER_BYTES + payload.len();
+    if total > crate::limits::FRAME_MAX_BYTES {
+        return Err(FrameProblem::TooLarge {
+            len: total,
+            max: crate::limits::FRAME_MAX_BYTES,
+        });
+    }
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&FRAME_MAGIC);
+    out.push(kind);
+    out.push(flags);
+    out.extend_from_slice(&[0u8; 2]);
+    out.extend_from_slice(&seq.to_be_bytes());
+    out.extend_from_slice(&writer_lease_id);
+    out.extend_from_slice(payload);
+    Ok(out)
+}
+
+/// 编码 output frame(lease 全 0)。
+pub fn encode_output_frame(seq: u64, payload: &[u8]) -> Result<Vec<u8>, FrameProblem> {
+    encode_frame(FRAME_KIND_OUTPUT, 0, seq, [0u8; 16], payload)
+}
+
+/// 解码 frame(校验 magic/kind/reserved/长度)。
+pub fn decode_frame(bytes: &[u8]) -> Result<Frame<'_>, FrameProblem> {
+    if bytes.len() < FRAME_HEADER_BYTES {
+        return Err(FrameProblem::TooShort { len: bytes.len() });
+    }
+    if bytes.len() > crate::limits::FRAME_MAX_BYTES {
+        return Err(FrameProblem::TooLarge {
+            len: bytes.len(),
+            max: crate::limits::FRAME_MAX_BYTES,
+        });
+    }
+    if bytes[0..4] != FRAME_MAGIC {
+        return Err(FrameProblem::BadMagic);
+    }
+    let kind = bytes[4];
+    if kind != FRAME_KIND_OUTPUT && kind != FRAME_KIND_INPUT {
+        return Err(FrameProblem::UnknownKind { kind });
+    }
+    if bytes[6] != 0 || bytes[7] != 0 {
+        return Err(FrameProblem::ReservedNotZero);
+    }
+    let mut seq_bytes = [0u8; 8];
+    seq_bytes.copy_from_slice(&bytes[8..16]);
+    let mut writer_lease_id = [0u8; 16];
+    writer_lease_id.copy_from_slice(&bytes[16..32]);
+    Ok(Frame {
+        kind,
+        flags: bytes[5],
+        seq: u64::from_be_bytes(seq_bytes),
+        writer_lease_id,
+        payload: &bytes[FRAME_HEADER_BYTES..],
+    })
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    #[test]
+    fn output_frame_round_trip() {
+        let encoded = encode_output_frame(7, b"hello").unwrap();
+        assert_eq!(encoded.len(), 32 + 5);
+        let frame = decode_frame(&encoded).unwrap();
+        assert_eq!(frame.kind, FRAME_KIND_OUTPUT);
+        assert_eq!(frame.seq, 7);
+        assert_eq!(frame.payload, b"hello");
+        assert_eq!(frame.writer_lease_id, [0u8; 16]);
+        assert_eq!(frame.flags, 0);
+    }
+
+    #[test]
+    fn input_frame_carries_lease_and_be_seq() {
+        let lease = [9u8; 16];
+        let encoded =
+            encode_frame(FRAME_KIND_INPUT, 0, 0x0102_0304_0506_0708, lease, b"\r").unwrap();
+        // seq 大端:bytes[8..16]
+        assert_eq!(&encoded[8..16], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        let frame = decode_frame(&encoded).unwrap();
+        assert_eq!(frame.seq, 0x0102_0304_0506_0708);
+        assert_eq!(frame.writer_lease_id, lease);
+    }
+
+    #[test]
+    fn reserved_checkpoint_kind_is_rejected() {
+        let mut encoded = encode_output_frame(1, b"x").unwrap();
+        encoded[4] = FRAME_KIND_CHECKPOINT_RESERVED;
+        assert_eq!(
+            decode_frame(&encoded),
+            Err(FrameProblem::UnknownKind { kind: 3 })
+        );
+    }
+
+    #[test]
+    fn bad_magic_short_and_oversize_rejected() {
+        assert_eq!(decode_frame(b"MFT"), Err(FrameProblem::TooShort { len: 3 }));
+        let mut bad_magic = encode_output_frame(1, b"x").unwrap();
+        bad_magic[0] = b'X';
+        assert_eq!(decode_frame(&bad_magic), Err(FrameProblem::BadMagic));
+        let oversized = vec![0u8; crate::limits::FRAME_MAX_BYTES + 1];
+        assert!(matches!(
+            decode_frame(&oversized),
+            Err(FrameProblem::TooLarge { .. })
+        ));
+    }
+
+    #[test]
+    fn nonzero_reserved_rejected() {
+        let mut encoded = encode_output_frame(1, b"x").unwrap();
+        encoded[6] = 1;
+        assert_eq!(decode_frame(&encoded), Err(FrameProblem::ReservedNotZero));
+    }
+}
