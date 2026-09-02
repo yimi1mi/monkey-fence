@@ -2492,6 +2492,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "mf-elevated"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "mf-kernel"
 version = "0.1.0"
 dependencies = [
