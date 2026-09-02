@@ -16,6 +16,7 @@
 //! standalone Core bin、WebGateway 与 attach_terminal 属后续 ticket。
 
 pub mod command;
+pub mod feature_gate;
 pub mod handles;
 mod journal;
 pub mod kernel;
@@ -47,6 +48,9 @@ mod command_idempotency;
 #[cfg(test)]
 #[path = "../tests/contract/command_support.rs"]
 mod command_support;
+#[cfg(test)]
+#[path = "../tests/contract/feature_gate.rs"]
+mod feature_gate_contract;
 #[cfg(test)]
 #[path = "../tests/contract/intent_recovery.rs"]
 mod intent_recovery;
