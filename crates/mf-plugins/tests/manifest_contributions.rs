@@ -1,10 +1,10 @@
-//! Manifest v2 贡献词汇表验收:解析全部贡献类型、能力指纹覆盖新权限。
+//! Manifest 贡献解析契约(原 manifest_v2;fixture 已随 T4a 迁 v3)。
 
 use mf_plugins::manifest::{Capabilities, PluginManifest};
 
 #[test]
 fn parses_every_v2_contribution() {
-    let manifest = PluginManifest::parse(include_str!("fixtures/manifest-v2.toml")).unwrap();
+    let manifest = PluginManifest::parse(include_str!("fixtures/manifest-v3.toml")).unwrap();
     assert_eq!(manifest.agent_types.len(), 1);
     assert_eq!(manifest.node_types.len(), 1);
     assert_eq!(manifest.execution_directory_providers.len(), 1);
@@ -50,7 +50,7 @@ command = "demo"
 
 #[test]
 fn duplicate_contribution_ids_rejected_per_class() {
-    let base = include_str!("fixtures/manifest-v2.toml");
+    let base = include_str!("fixtures/manifest-v3.toml");
     // agent_types id 重复
     let dup_agent = base.replace(
         r#"[[node_types]]"#,
@@ -87,7 +87,7 @@ kind = "agent"
 #[test]
 fn referenced_schema_paths_must_stay_inside_plugin_root() {
     let tmp = tempfile::tempdir().unwrap();
-    let manifest = PluginManifest::parse(include_str!("fixtures/manifest-v2.toml")).unwrap();
+    let manifest = PluginManifest::parse(include_str!("fixtures/manifest-v3.toml")).unwrap();
     let escaping = PluginManifest {
         ui_schemas: vec![mf_plugins::manifest::UiSchemaContribution {
             id: "settings-form".into(),
@@ -101,7 +101,7 @@ fn referenced_schema_paths_must_stay_inside_plugin_root() {
         "ui_schemas 路径逃逸必须拒绝"
     );
     // 完整 fixture 的引用文件在临时根内建好后应通过
-    let manifest = PluginManifest::parse(include_str!("fixtures/manifest-v2.toml")).unwrap();
+    let manifest = PluginManifest::parse(include_str!("fixtures/manifest-v3.toml")).unwrap();
     for rel in [
         "schemas/agent.json",
         "schemas/node.json",

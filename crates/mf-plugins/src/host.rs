@@ -213,8 +213,13 @@ impl PluginHost {
                         detect_commands: vec![],
                         modes: vec!["oneshot".into()],
                         supports_isolated_config: false,
+                        discovery: None,
+                        models: None,
+                        root_launch: None,
+                        installers: vec![],
                     })
                     .collect(),
+                provider_types: vec![],
                 node_types: vec![],
                 execution_directory_providers: vec![],
                 vcs_providers: vec![],
@@ -255,6 +260,7 @@ impl PluginHost {
                 worker: None,
                 agent_types: vec![],
                 node_types: vec![],
+                provider_types: vec![],
                 // worktree 提供器读写工作区并操作集成 refs:
                 // 能力声明由清单承载,解析方(app_ctx)据此做 pinned 校验
                 capabilities: crate::manifest::Capabilities {
@@ -324,6 +330,7 @@ impl PluginHost {
                 worker: None,
                 agent_types: vec![],
                 node_types: vec![],
+                provider_types: vec![],
                 execution_directory_providers: vec![],
                 vcs_providers: vec![],
                 secret_stores: vec![],
@@ -1080,6 +1087,7 @@ mod tests {
             }),
             agent_types: vec![],
             node_types: vec![],
+            provider_types: vec![],
             execution_directory_providers: vec![],
             vcs_providers: vec![],
             secret_stores: vec![],

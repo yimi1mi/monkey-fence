@@ -1,5 +1,5 @@
 [manifest]
-version = 2
+version = 3
 publisher = "test"
 id = "demo"
 name = "Demo Plugin"

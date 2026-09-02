@@ -17,38 +17,50 @@ pub struct BuiltinAgent {
     pub name: String,
     pub command: String,
     pub args: Vec<String>,
-    pub permission_args: Vec<String>,
+    /// 自动批准(yolo)参数。T4a:不再作为独立旁路字段——它就是该 CLI 的
+    /// Root 启动映射,进入 synthetic manifest v3 的 `root_launch.argv`,
+    /// 消费方(yolo_args_of/profile_spec_from_builtin)从 manifest 读回。
+    pub yolo_args: Vec<String>,
     pub homepage: String,
     pub icon: String,
     /// 状态钩子写入的本地 Agent 配置(JSON)。
     pub hook_config: Option<&'static str>,
-    /// 一键安装:仅收录官方包管理器来源(npm 包已逐一核实);
-    /// None = 走官方安装页(独立安装器/未核实包,不做自动执行)。
-    pub install: Option<InstallSpec>,
+    /// 一键安装 recipe(v3 InstallerContribution;None = 走官方安装页)。
+    /// T4a:InstallSpec 旁路删除,统一为 manifest v3 installer 贡献。
+    pub installer: Option<crate::manifest::InstallerContribution>,
 }
 
-/// 一键安装规格(program 需在 PATH)。
-#[derive(Debug, Clone)]
-pub struct InstallSpec {
-    pub program: String,
-    pub args: Vec<String>,
-    /// 安装命令的人类可读形式(复制用)。
-    pub display: String,
-}
-
-fn pip_install(package: &str) -> InstallSpec {
-    InstallSpec {
-        program: "python".into(),
-        args: vec!["-m".into(), "pip".into(), "install".into(), package.into()],
-        display: format!("python -m pip install {package}"),
+fn pip_install(package: &str) -> crate::manifest::InstallerContribution {
+    crate::manifest::InstallerContribution {
+        id: format!("pip-{package}"),
+        platforms: vec![
+            "windows-x64".into(),
+            "linux-x64".into(),
+            "macos-arm64".into(),
+        ],
+        kind: "package-manager".into(),
+        manager: "python".into(),
+        package: package.into(),
+        argv: vec!["-m".into(), "pip".into(), "install".into(), package.into()],
+        scope: "user".into(),
+        post_install_probe: true,
     }
 }
 
-fn npm_install(package: &str) -> InstallSpec {
-    InstallSpec {
-        program: "npm".into(),
-        args: vec!["install".into(), "-g".into(), package.into()],
-        display: format!("npm install -g {package}"),
+fn npm_install(package: &str) -> crate::manifest::InstallerContribution {
+    crate::manifest::InstallerContribution {
+        id: format!("npm-{package}"),
+        platforms: vec![
+            "windows-x64".into(),
+            "linux-x64".into(),
+            "macos-arm64".into(),
+        ],
+        kind: "package-manager".into(),
+        manager: "npm".into(),
+        package: package.into(),
+        argv: vec!["install".into(), "-g".into(), package.into()],
+        scope: "user".into(),
+        post_install_probe: true,
     }
 }
 
@@ -60,124 +72,124 @@ pub fn builtin_cli_agents() -> Vec<BuiltinAgent> {
             name: "Codex".into(),
             command: "codex".into(),
             args: vec![],
-            permission_args: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
+            yolo_args: vec!["--dangerously-bypass-approvals-and-sandbox".into()],
             homepage: "https://developers.openai.com/codex/cli".into(),
             icon: "◉".into(),
             hook_config: Some("~/.codex/config.toml"),
-            install: Some(npm_install("@openai/codex")),
+            installer: Some(npm_install("@openai/codex")),
         },
         BuiltinAgent {
             profile_id: "claude".into(),
             name: "Claude".into(),
             command: "claude".into(),
             args: vec![],
-            permission_args: vec!["--dangerously-skip-permissions".into()],
+            yolo_args: vec!["--dangerously-skip-permissions".into()],
             homepage: "https://claude.com/claude-code".into(),
             icon: "✳".into(),
             hook_config: Some("~/.claude/settings.json"),
-            install: Some(npm_install("@anthropic-ai/claude-code")),
+            installer: Some(npm_install("@anthropic-ai/claude-code")),
         },
         BuiltinAgent {
             profile_id: "opencode".into(),
             name: "OpenCode".into(),
             command: "opencode".into(),
             args: vec![],
-            permission_args: vec![],
+            yolo_args: vec![],
             homepage: "https://opencode.ai".into(),
             icon: "⌘".into(),
             hook_config: None,
-            install: Some(npm_install("opencode-ai")),
+            installer: Some(npm_install("opencode-ai")),
         },
         BuiltinAgent {
             profile_id: "cursor".into(),
             name: "Cursor".into(),
             command: "cursor-agent".into(),
             args: vec![],
-            permission_args: vec!["--full-auto".into()],
+            yolo_args: vec!["--full-auto".into()],
             homepage: "https://cursor.com/docs/agent/cli".into(),
             icon: "▲".into(),
             hook_config: None,
             // npm 上的 cursor-agent 包非官方(第三方仓库);走官方安装页
-            install: None,
+            installer: None,
         },
         BuiltinAgent {
             profile_id: "gemini".into(),
             name: "Gemini CLI".into(),
             command: "gemini".into(),
             args: vec![],
-            permission_args: vec!["--yolo".into()],
+            yolo_args: vec!["--yolo".into()],
             homepage: "https://github.com/google-gemini/gemini-cli".into(),
             icon: "✧".into(),
             hook_config: None,
-            install: Some(npm_install("@google/gemini-cli")),
+            installer: Some(npm_install("@google/gemini-cli")),
         },
         BuiltinAgent {
             profile_id: "copilot".into(),
             name: "GitHub Copilot".into(),
             command: "copilot".into(),
             args: vec![],
-            permission_args: vec![],
+            yolo_args: vec![],
             homepage: "https://githubnext.com/projects/copilot-cli/".into(),
             icon: "⊶".into(),
             hook_config: None,
-            install: Some(npm_install("@github/copilot")),
+            installer: Some(npm_install("@github/copilot")),
         },
         BuiltinAgent {
             profile_id: "qwen".into(),
             name: "Qwen Code".into(),
             command: "qwen".into(),
             args: vec![],
-            permission_args: vec!["--yolo".into()],
+            yolo_args: vec!["--yolo".into()],
             homepage: "https://github.com/QwenLM/qwen-code".into(),
             icon: "◈".into(),
             hook_config: None,
-            install: Some(npm_install("@qwen-code/qwen-code")),
+            installer: Some(npm_install("@qwen-code/qwen-code")),
         },
         BuiltinAgent {
             profile_id: "iflow".into(),
             name: "iFlow CLI".into(),
             command: "iflow".into(),
             args: vec![],
-            permission_args: vec![],
+            yolo_args: vec![],
             homepage: "https://github.com/iflow-ai/iflow-cli".into(),
             icon: "≋".into(),
             hook_config: None,
-            install: Some(npm_install("@iflow-ai/iflow-cli")),
+            installer: Some(npm_install("@iflow-ai/iflow-cli")),
         },
         BuiltinAgent {
             profile_id: "aider".into(),
             name: "Aider".into(),
             command: "aider".into(),
             args: vec![],
-            permission_args: vec!["--yes-always".into()],
+            yolo_args: vec!["--yes-always".into()],
             homepage: "https://aider.chat".into(),
             icon: "⌥".into(),
             hook_config: None,
-            install: Some(pip_install("aider-chat")),
+            installer: Some(pip_install("aider-chat")),
         },
         BuiltinAgent {
             profile_id: "amp".into(),
             name: "Amp".into(),
             command: "amp".into(),
             args: vec![],
-            permission_args: vec![],
+            yolo_args: vec![],
             homepage: "https://ampcode.com".into(),
             icon: "⚡".into(),
             hook_config: None,
             // npm @sourcegraph/amp 无仓库字段,未核实 → 官方页
-            install: None,
+            installer: None,
         },
         BuiltinAgent {
             profile_id: "kimi".into(),
             name: "Kimi".into(),
             command: "kimi".into(),
             args: vec![],
-            permission_args: vec![],
+            yolo_args: vec![],
             homepage: "https://kimi.com".into(),
             icon: "◐".into(),
             hook_config: None,
             // Moonshot 官方为独立安装器;npm 未核实官方包,不自动安装
-            install: None,
+            installer: None,
         },
     ]
 }
@@ -188,16 +200,18 @@ pub fn yolo_args_of(profile_id: &str) -> Option<String> {
     builtin_cli_agents()
         .iter()
         .find(|a| a.profile_id == profile_id)
-        .filter(|a| !a.permission_args.is_empty())
-        .map(|a| a.permission_args.join(" "))
+        .filter(|a| !a.yolo_args.is_empty())
+        .map(|a| a.yolo_args.join(" "))
 }
 
 /// 供设置页展示:内置 Agent 的安装规格(克隆返回)。
-pub fn install_spec_of(profile_id: &str) -> Option<InstallSpec> {
+/// v3 installer 贡献(原 InstallSpec 旁路的替代;settings 等消费方经
+/// 此取得结构化 recipe,不再有独立安装旁路类型)。
+pub fn installer_of(profile_id: &str) -> Option<crate::manifest::InstallerContribution> {
     builtin_cli_agents()
         .iter()
         .find(|a| a.profile_id == profile_id)
-        .and_then(|a| a.install.clone())
+        .and_then(|a| a.installer.clone())
 }
 
 /// 内置 CLI 的 Agent Adapter 契约标识。
@@ -256,6 +270,8 @@ pub fn synthetic_manifest(agent: &BuiltinAgent) -> PluginManifest {
         capabilities: Capabilities {
             net: true,
             hooks: true,
+            // v3:声明 installer recipe 需要显式 package_install 授权
+            package_install: agent.installer.is_some(),
             ..Default::default()
         },
         worker: None,
@@ -268,7 +284,29 @@ pub fn synthetic_manifest(agent: &BuiltinAgent) -> PluginManifest {
             detect_commands: vec![agent.command.clone()],
             modes: vec!["interactive".into(), "oneshot".into()],
             supports_isolated_config: supports_isolated_config(&agent.profile_id),
+            // v3 discovery:结构化版本探测(候选命令 = 默认命令)
+            discovery: Some(crate::manifest::DiscoveryContribution {
+                commands: vec![agent.command.clone()],
+                version_argv: vec!["--version".into()],
+                version_parser: "semver-first".into(),
+            }),
+            models: None,
+            // v3 root_launch:自动批准参数即该 CLI 的 Root 启动映射
+            // (generic-command 适配器必须显式 passthrough-full-access)
+            root_launch: (!agent.yolo_args.is_empty()).then(|| {
+                crate::manifest::RootLaunchContribution {
+                    permission_mode: if adapter_of(&agent.profile_id) == "generic-command" {
+                        "passthrough-full-access".into()
+                    } else {
+                        "full-access".into()
+                    },
+                    argv: agent.yolo_args.clone(),
+                    env: vec![],
+                }
+            }),
+            installers: agent.installer.clone().into_iter().collect(),
         }],
+        provider_types: vec![],
         node_types: vec![],
         execution_directory_providers: vec![],
         vcs_providers: vec![],
@@ -319,7 +357,7 @@ pub fn profile_spec_from_builtin(agent: &BuiltinAgent) -> AgentProfileSpec {
         command: agent.command.clone(),
         args: agent.args.clone(),
         env: vec![],
-        permission_args: agent.permission_args.clone(),
+        permission_args: agent.yolo_args.clone(),
         provider: None,
         icon: (!agent.icon.is_empty()).then(|| agent.icon.clone()),
         homepage: (!agent.homepage.is_empty()).then(|| agent.homepage.clone()),
@@ -432,7 +470,7 @@ mod tests {
         // 已核实的官方 npm 包
         let auto: Vec<&str> = agents
             .iter()
-            .filter(|a| a.install.is_some())
+            .filter(|a| a.installer.is_some())
             .map(|a| a.profile_id.as_str())
             .collect();
         let mut auto = auto;
@@ -441,18 +479,19 @@ mod tests {
             auto,
             vec!["aider", "claude", "codex", "copilot", "gemini", "iflow", "opencode", "qwen"]
         );
-        assert!(install_spec_of("codex")
+        assert!(installer_of("codex")
             .unwrap()
-            .display
+            .package
             .contains("@openai/codex"));
-        assert!(install_spec_of("aider")
+        assert!(installer_of("aider")
             .unwrap()
-            .display
+            .argv
+            .join(" ")
             .contains("pip install aider-chat"));
         // cursor/kimi/amp 不提供自动安装(npm 包非官方/未核实)
-        assert!(install_spec_of("cursor").is_none());
-        assert!(install_spec_of("kimi").is_none());
-        assert!(install_spec_of("amp").is_none());
+        assert!(installer_of("cursor").is_none());
+        assert!(installer_of("kimi").is_none());
+        assert!(installer_of("amp").is_none());
     }
 
     #[test]

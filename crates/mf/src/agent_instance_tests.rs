@@ -530,7 +530,7 @@ mod short_alias_shadow_tests {
             src.path().join("monkeyfence-plugin.toml"),
             format!(
                 r#"[manifest]
-version = 2
+version = 3
 publisher = "{publisher}"
 id = "{id}"
 name = "{publisher}.{id} shadow fixture"

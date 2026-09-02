@@ -2101,7 +2101,7 @@ fn install_cli_plugin(
         src.path().join("monkeyfence-plugin.toml"),
         format!(
             r#"[manifest]
-version = 2
+version = 3
 publisher = "mf-test"
 id = "{plugin_id}"
 name = "{plugin_id} Test"

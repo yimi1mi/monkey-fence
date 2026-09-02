@@ -46,7 +46,7 @@ fn install_dir_plugin(
     std::fs::write(&worker_script, "@echo off\r\n").unwrap();
     let manifest = format!(
         r#"[manifest]
-version = 2
+version = 3
 publisher = "{publisher}"
 id = "{id}"
 name = "{id} provider"
@@ -138,7 +138,7 @@ fn contribution_id_may_contain_dots_without_misparsing_plugin_identity() {
     std::fs::write(
         dir.path().join("monkeyfence-plugin.toml"),
         r#"[manifest]
-version = 2
+version = 3
 publisher = "dots"
 id = "provider"
 name = "dotted contribution"
@@ -245,7 +245,7 @@ fn unauthorized_or_missing_capabilities_rejected() {
     std::fs::write(
         manifest_no_vcs.path().join("monkeyfence-plugin.toml"),
         r#"[manifest]
-version = 2
+version = 3
 publisher = "weak"
 id = "caps"
 name = "weak caps"

@@ -191,6 +191,25 @@ fn ui_production_files_have_no_workflow_run_orchestrator_bypass() {
 }
 
 #[test]
+fn plugin_manifest_has_no_install_bypass_types() {
+    // T4a(Issue #36,spec §9.2):BuiltinAgent::InstallSpec/permission_args
+    // 旁路删除——安装 recipe 统一为 v3 InstallerContribution、自动批准
+    // 参数统一进入 root_launch 映射。
+    let builtin = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../mf-plugins/src/builtin.rs"),
+    )
+    .expect("读取 builtin.rs");
+    assert!(
+        !builtin.contains("pub struct InstallSpec"),
+        "InstallSpec 旁路类型不得重新出现(v3 InstallerContribution 是唯一形态)"
+    );
+    assert!(
+        !builtin.contains("pub permission_args:"),
+        "BuiltinAgent 不得再携带 permission_args 旁路字段(root_launch 是唯一映射)"
+    );
+}
+
+#[test]
 fn runtime_host_has_no_output_tail_bypass() {
     // T3f(Issue #34,spec §8.8):256 KiB output_tail 旁路已删——输出只
     // 经 redactor → journal(seq 权威) → Screen 投影/tail_bytes 只读派生。

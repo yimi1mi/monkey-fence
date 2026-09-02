@@ -1,5 +1,5 @@
 [manifest]
-version = 2
+version = 3
 publisher = "zhipu"
 id = "demo"
 name = "Demo Plugin"

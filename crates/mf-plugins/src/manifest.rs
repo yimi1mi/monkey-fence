@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 pub const MANIFEST_FILE: &str = "monkeyfence-plugin.toml";
-pub const MANIFEST_VERSION: i64 = 2;
+/// 当前 Manifest schema 版本(v3,T4a)。旧 v2 清单可解析为数据,但
+/// validate 明确拒绝(不做安全敏感字段的静默兼容推断;回滚由旧 bundle
+/// 的旧 reader 继续读 v2,spec §9.2)。
+pub const MANIFEST_VERSION: i64 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
@@ -20,6 +23,9 @@ pub struct PluginManifest {
     pub worker: Option<WorkerSpec>,
     #[serde(default)]
     pub agent_types: Vec<AgentTypeContribution>,
+    /// v3:Provider Type 贡献。
+    #[serde(default)]
+    pub provider_types: Vec<ProviderTypeContribution>,
     #[serde(default)]
     pub node_types: Vec<NodeTypeContribution>,
     #[serde(default)]
@@ -75,14 +81,22 @@ pub struct Capabilities {
     pub background_worker: bool,
     #[serde(default)]
     pub hooks: bool,
+    /// v3(T4a):允许贡献安装 recipe(插件启用 ≠ 允许安装)。
+    #[serde(default)]
+    pub package_install: bool,
+    /// v3(T4a):允许贡献 privileged 安装 recipe(仍经 Root Mode 授权)。
+    #[serde(default)]
+    pub privileged_install: bool,
+    /// v3(T4a):允许 Agent Type 请求 full-access(默认拒绝)。
+    #[serde(default)]
+    pub agent_full_access: bool,
 }
 
 /// 能力声明 → 稳定字符串(用于授权指纹)。
 impl Capabilities {
     pub fn fingerprint_part(&self) -> String {
         format!(
-            "fs_read={} fs_write={} net={} spawn={} shell={} secrets={} vcs={} \
-             background_worker={} hooks={}",
+            "fs_read={} fs_write={} net={} spawn={} shell={} secrets={} vcs={}              background_worker={} hooks={} package_install={} privileged_install={}              agent_full_access={}",
             self.fs_read,
             self.fs_write,
             self.net,
@@ -91,7 +105,10 @@ impl Capabilities {
             self.secrets,
             self.vcs,
             self.background_worker,
-            self.hooks
+            self.hooks,
+            self.package_install,
+            self.privileged_install,
+            self.agent_full_access
         )
     }
 }
@@ -122,6 +139,89 @@ pub struct AgentTypeContribution {
     pub modes: Vec<String>,
     #[serde(default)]
     pub supports_isolated_config: bool,
+    /// v3:CLI discovery 候选命令与结构化版本探测(调用方不能提交任意
+    /// 路径)。
+    #[serde(default)]
+    pub discovery: Option<DiscoveryContribution>,
+    /// v3:本地模型探测声明(local_probe = adapter)。
+    #[serde(default)]
+    pub models: Option<ModelsContribution>,
+    /// v3:Root 启动的结构化 argv/env 映射;缺失时 Root Agent 启动
+    /// fail-closed(不能 OS 提权后宣称最高权限)。
+    #[serde(default)]
+    pub root_launch: Option<RootLaunchContribution>,
+    /// v3:0..n 稳定 installer id(与 Agent Type 分离声明)。
+    #[serde(default)]
+    pub installers: Vec<InstallerContribution>,
+}
+
+/// v3:CLI discovery 贡献(§9.2)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryContribution {
+    #[serde(default)]
+    pub commands: Vec<String>,
+    #[serde(default)]
+    pub version_argv: Vec<String>,
+    /// 版本输出解析器(当前仅 semver-first)。
+    #[serde(default)]
+    pub version_parser: String,
+}
+
+/// v3:模型探测声明。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelsContribution {
+    #[serde(default)]
+    pub local_probe: String,
+}
+
+/// v3:Root 启动映射。permission_mode:
+/// - full-access:CLI 自带权限层;
+/// - passthrough-full-access:无内部权限层的 Generic Command 必须显式
+///   声明(不做静默推断)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RootLaunchContribution {
+    pub permission_mode: String,
+    #[serde(default)]
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+}
+
+/// v3:安装 recipe 贡献(三类 executor 的执行在 #43;此处冻结结构)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallerContribution {
+    pub id: String,
+    #[serde(default)]
+    pub platforms: Vec<String>,
+    /// package-manager | verified-download | custom-command。
+    pub kind: String,
+    #[serde(default)]
+    pub manager: String,
+    #[serde(default)]
+    pub package: String,
+    #[serde(default)]
+    pub argv: Vec<String>,
+    /// user | project。
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub post_install_probe: bool,
+}
+
+/// v3:Provider Type 贡献(与 CLI 安装分开声明;模型目录探测不挂在
+/// CLI discovery 上)。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderTypeContribution {
+    pub id: String,
+    /// API 协议(openai / anthropic / ...)。
+    pub protocol: String,
+    #[serde(default)]
+    pub config_schema: String,
+    /// remote-catalog | none。
+    #[serde(default)]
+    pub model_probe: String,
+    #[serde(default)]
+    pub cache_ttl_seconds: u64,
 }
 
 /// Node Type:工作流节点类型(第一版仅 agent / join,由内核识别;其余由插件扩展)。
@@ -297,6 +397,81 @@ impl PluginManifest {
             self.agent_types.iter().map(|a| a.id.as_str()).collect(),
         )?;
         ensure_unique(
+            "provider_types",
+            self.provider_types.iter().map(|a| a.id.as_str()).collect(),
+        )?;
+        // ---- v3(T4a)安全贡献校验 ----
+        for agent in &self.agent_types {
+            if let Some(root) = &agent.root_launch {
+                match root.permission_mode.as_str() {
+                    "full-access" => {}
+                    // 无内部权限层的 Generic Command 必须显式透传声明
+                    "passthrough-full-access" => {}
+                    other => bail!(
+                        "agent_type `{}` root_launch.permission_mode 非法:                         {other}(仅 full-access / passthrough-full-access)",
+                        agent.id
+                    ),
+                }
+                if agent.adapter == "generic-command"
+                    && root.permission_mode != "passthrough-full-access"
+                {
+                    bail!(
+                        "agent_type `{}` 为 Generic Command(无内部权限层),                         root_launch 必须显式 passthrough-full-access",
+                        agent.id
+                    );
+                }
+            }
+            for installer in &agent.installers {
+                if !self.capabilities.package_install {
+                    bail!(
+                        "agent_type `{}` 声明 installer `{}` 但未授权                          capabilities.package_install(插件启用 ≠ 允许安装)",
+                        agent.id,
+                        installer.id
+                    );
+                }
+                match installer.kind.as_str() {
+                    "package-manager" | "verified-download" | "custom-command" => {}
+                    other => bail!(
+                        "installer `{}` kind 非法:{other}                         (package-manager / verified-download / custom-command)",
+                        installer.id
+                    ),
+                }
+                if installer.kind == "package-manager" && installer.manager.is_empty() {
+                    bail!("package-manager installer `{}` 缺少 manager", installer.id);
+                }
+                if !matches!(installer.scope.as_str(), "user" | "project" | "") {
+                    bail!(
+                        "installer `{}` scope 非法:{}",
+                        installer.id,
+                        installer.scope
+                    );
+                }
+            }
+            if let Some(discovery) = &agent.discovery {
+                if discovery.commands.is_empty() {
+                    bail!("agent_type `{}` discovery.commands 不能为空", agent.id);
+                }
+                if discovery.commands.iter().any(|c| c.trim().is_empty()) {
+                    bail!("agent_type `{}` discovery 候选命令不能为空串", agent.id);
+                }
+            }
+        }
+        for provider in &self.provider_types {
+            if provider.protocol.trim().is_empty() {
+                bail!("provider_type `{}` protocol 不能为空", provider.id);
+            }
+            if !matches!(
+                provider.model_probe.as_str(),
+                "remote-catalog" | "none" | ""
+            ) {
+                bail!(
+                    "provider_type `{}` model_probe 非法:{}",
+                    provider.id,
+                    provider.model_probe
+                );
+            }
+        }
+        ensure_unique(
             "node_types",
             self.node_types.iter().map(|a| a.id.as_str()).collect(),
         )?;
@@ -389,6 +564,32 @@ impl PluginManifest {
         ];
         if let Some(w) = &self.worker {
             parts.push(format!("worker={} {:?}", w.command, w.args));
+        }
+        // v3(T4a):安全敏感贡献全部参与授权指纹——能力/recipe/worker/
+        // root 映射/Provider 贡献任一变化都要求重新授权。
+        for agent in &self.agent_types {
+            if let Some(root) = &agent.root_launch {
+                parts.push(format!(
+                    "root_launch={} {:?} {:?}",
+                    root.permission_mode, root.argv, root.env
+                ));
+            }
+            for installer in &agent.installers {
+                parts.push(format!(
+                    "installer={} {} {} {:?} {}",
+                    installer.id,
+                    installer.kind,
+                    installer.manager,
+                    installer.argv,
+                    installer.scope
+                ));
+            }
+        }
+        for provider in &self.provider_types {
+            parts.push(format!(
+                "provider_type={} {} {} {}",
+                provider.id, provider.protocol, provider.model_probe, provider.cache_ttl_seconds
+            ));
         }
         parts.push(format!("content={content_hash}"));
         let mut hasher = Sha256::new();
@@ -518,7 +719,7 @@ mod tests {
 
     const VALID: &str = r#"
 [manifest]
-version = 2
+version = 3
 publisher = "zhipu"
 id = "demo"
 name = "Demo Plugin"

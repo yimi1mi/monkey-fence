@@ -867,7 +867,7 @@ impl NodeChain {
         std::fs::write(
             src.path().join("monkeyfence-plugin.toml"),
             r#"[manifest]
-version = 2
+version = 3
 publisher = "mf-e2e"
 id = "fakeagent"
 name = "Fake Agent Fixture"
@@ -1323,7 +1323,7 @@ fn install_e2e_cli_plugin(
     std::fs::write(
         src.path().join("monkeyfence-plugin.toml"),
         r#"[manifest]
-version = 2
+version = 3
 publisher = "mf-e2e"
 id = "hostcli"
 name = "Hostname CLI E2E"

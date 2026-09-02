@@ -362,7 +362,7 @@ fn default_cli_workflow_node_external_config_reaches_runtime() {
     std::fs::write(
         src.path().join("monkeyfence-plugin.toml"),
         r#"[manifest]
-version = 2
+version = 3
 publisher = "mf-test"
 id = "cmdcli"
 name = "Cmd CLI Test"

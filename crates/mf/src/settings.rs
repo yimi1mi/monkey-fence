@@ -2164,13 +2164,14 @@ impl SettingsView {
         }
         for a in installable {
             let homepage = a.homepage.clone();
-            let spec = mf_plugins::builtin::install_spec_of(&a.profile_id);
-            // 按安装器程序检测可用性(npm / python 各自检查 PATH)
+            let spec = mf_plugins::builtin::installer_of(&a.profile_id);
+            // 按安装器程序检测可用性(npm / python 各自检查 PATH)。
+            // T4a:v3 installer 贡献,manager 即安装器程序。
             let can_auto = spec
                 .as_ref()
-                .is_some_and(|sp| mf_plugins::builtin::detect_on_path(&sp.program).is_some());
+                .is_some_and(|sp| mf_plugins::builtin::detect_on_path(&sp.manager).is_some());
             let missing_tool = match &spec {
-                Some(sp) if !can_auto => Some(sp.program.clone()),
+                Some(sp) if !can_auto => Some(sp.manager.clone()),
                 _ => None,
             };
             let aid = a.profile_id.clone();
@@ -2203,7 +2204,7 @@ impl SettingsView {
                                 .rounded_sm()
                                 .bg(rgb(crate::theme::Theme::bg_active()))
                                 .text_color(rgb(crate::theme::Theme::fg_faint()))
-                                .child(sp.display.clone()),
+                                .child(format!("{} {}", sp.manager, sp.argv.join(" "))),
                         )
                     })
                     .child(div().flex_1())
@@ -2224,7 +2225,7 @@ impl SettingsView {
                             "一键安装",
                             crate::theme::Theme::success(),
                             move |s: &mut SettingsView, _, _, cx| {
-                                s.run_agent_install(&sp.program, &sp.args, &aid_btn, cx);
+                                s.run_agent_install(&sp.manager, &sp.argv, &aid_btn, cx);
                             },
                         ))
                     })

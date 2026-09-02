@@ -226,8 +226,13 @@ mod tests {
                     detect_commands: vec![],
                     modes: vec![],
                     supports_isolated_config: false,
+                    discovery: None,
+                    models: None,
+                    root_launch: None,
+                    installers: vec![],
                 })
                 .collect(),
+            provider_types: vec![],
             node_types: vec![],
             execution_directory_providers: vec![],
             vcs_providers: vec![],

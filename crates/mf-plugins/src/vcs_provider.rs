@@ -182,6 +182,7 @@ pub fn synthetic_manifest() -> PluginManifest {
         worker: None,
         agent_types: vec![],
         node_types: vec![],
+        provider_types: vec![],
         execution_directory_providers: vec![],
         vcs_providers: vec![git_contribution(), p4_contribution()],
         secret_stores: vec![],

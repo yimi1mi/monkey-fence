@@ -515,7 +515,7 @@ fn install_third_party(host: &PluginHost, publisher: &str, id: &str, agent_id: &
         src.path().join("monkeyfence-plugin.toml"),
         format!(
             r#"[manifest]
-version = 2
+version = 3
 publisher = "{publisher}"
 id = "{id}"
 name = "{publisher}.{id} alias fixture"

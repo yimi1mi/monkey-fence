@@ -402,7 +402,7 @@ mod tests {
             dir.join(MANIFEST_FILE),
             r#"
 [manifest]
-version = 2
+version = 3
 publisher = "test"
 id = "p1"
 name = "Test Plugin"
