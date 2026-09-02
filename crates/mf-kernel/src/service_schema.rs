@@ -19,6 +19,17 @@ use std::path::{Path, PathBuf};
 /// service 库 schema 版本(新库新版本链,从 v1 起)。
 pub const SERVICE_SCHEMA_VERSION: i64 = 4;
 
+/// T5a(Issue #35)bundle 兼容性 DTO:当前 Core 代码支持的 schema
+/// 上限集合(bundle manager 的对照面)。schema 常量前滚时同步更新。
+pub struct SupportedSchemas;
+
+impl SupportedSchemas {
+    /// Core 当前支持的 Project/Catalog/Service schema 版本。
+    pub const PROJECT: i64 = mf_agent::schema::PROJECT_SCHEMA_VERSION;
+    pub const CATALOG: i64 = mf_agent::schema::CATALOG_V2_SCHEMA_VERSION;
+    pub const SERVICE: i64 = SERVICE_SCHEMA_VERSION;
+}
+
 /// 稳定错误码:与主规格 §7.5 problem code `schema_future_version` 对齐。
 pub const CODE_SCHEMA_FUTURE_VERSION: &str = "schema_future_version";
 
