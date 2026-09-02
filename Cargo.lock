@@ -2560,7 +2560,13 @@ dependencies = [
 name = "mf-terminal"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "libc",
+ "mf-agent",
+ "tempfile",
  "thiserror 2.0.20",
+ "windows-sys 0.59.0",
+ "zeroize",
 ]
 
 [[package]]

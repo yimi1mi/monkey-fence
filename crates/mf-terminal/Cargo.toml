@@ -5,4 +5,19 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 thiserror = "2"
+zeroize.workspace = true
+# StreamingRedactor/SecretLease:统一脱敏入口(T3a)与 PTY secret 环境块
+mf-agent.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# ConPTY/Job Object PTY 实现(自 crates/mf pty_spawn 迁入,T3a)
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+# openpty/fork/execve 与 TIOCSWINSZ resize
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

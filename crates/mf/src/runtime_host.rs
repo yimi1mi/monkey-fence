@@ -757,6 +757,11 @@ fn launch_pty(
         }
     };
 
+    // T3a 统一脱敏入口:Preview/普通会话与另两条 launch 路径同一条
+    // 管线 —— capability token 在注入环境前进入 redactor,输出先脱敏
+    // 再进 Screen/output_tail(spec §8.8,消灭未脱敏旁路)。
+    let mut redactor =
+        mf_terminal::redactor::launch_redactor(Vec::new(), Some(&spec.capability_token));
     let mut cmd = SpawnCommand::new(&spec.profile.command);
     // yolo 模式追加权限参数;manual 模式不附加(用户在终端里手动批准)
     let yolo = {
@@ -907,16 +912,18 @@ fn launch_pty(
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
+                        // 脱敏在进入 screen/output_tail 之前(跨块部分匹配)
+                        let clean = redactor.redact_chunk(&buf[..n]);
                         {
                             let mut screen = reader_session.screen.lock();
-                            screen.feed(&buf[..n]);
+                            screen.feed(&clean);
                             if !screen.title.is_empty() {
                                 *reader_session.title.lock() = screen.title.clone();
                             }
                         }
                         {
                             let mut tail = reader_session.output_tail.lock();
-                            tail.extend_from_slice(&buf[..n]);
+                            tail.extend_from_slice(&clean);
                             if tail.len() > OUT_BUFFER_CAP {
                                 let drop = tail.len() - OUT_BUFFER_CAP;
                                 tail.drain(..drop);
@@ -927,6 +934,18 @@ fn launch_pty(
                             let _ = events_out.send((run_id, RuntimeEvent::Output));
                         }
                     }
+                }
+            }
+            // 流结束:flush 脱敏 carry(尾部截断的 token/Secret 前缀)
+            let rest = redactor.finish();
+            if !rest.is_empty() {
+                let mut screen = reader_session.screen.lock();
+                screen.feed(&rest);
+                let mut tail = reader_session.output_tail.lock();
+                tail.extend_from_slice(&rest);
+                if tail.len() > OUT_BUFFER_CAP {
+                    let drop = tail.len() - OUT_BUFFER_CAP;
+                    tail.drain(..drop);
                 }
             }
             let code = *exit_code_slot_reader.lock();
@@ -1111,12 +1130,15 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
     // Secret 值只进入 spawn 调用的一次性 zeroize 环境块;脱敏器共享
     // zeroizing 租约(不复制明文副本),流结束即释放 —— 不随会话长期
     // 持明文。与工作流路径统一走 pty_spawn(宿主侧零普通 OsString 副本)
-    let mut redactor = mf_agent::secrets::StreamingRedactor::from_leases(
+    // T3a 统一脱敏入口:Secret 租约(离散会话无 capability token)在
+    // 进程启动前全部进入同一 redactor(spec §8.8)。
+    let mut redactor = mf_terminal::redactor::launch_redactor(
         spec.plan
             .secret_env
             .iter()
             .map(|(_, l)| l.clone())
             .collect(),
+        None,
     );
     for (key, lease) in &spec.plan.secret_env {
         cmd.env_secret(key, lease);
@@ -1354,8 +1376,11 @@ fn launch_workflow_pty(
     // Secret 值只进入 spawn 调用的一次性 zeroize 环境块(pty_spawn 统一
     // 注入点,宿主侧不产生普通 String/OsString 副本);脱敏器共享
     // zeroizing 租约,流结束即释放 —— 不随会话长期持明文。
-    let mut redactor = mf_agent::secrets::StreamingRedactor::from_leases(
+    // T3a 统一脱敏入口:后注入的 MF_RUN_TOKEN 必须与 Secret 同一
+    // redactor 覆盖(修复 echo 泄漏窗口,spec §8.8)。
+    let mut redactor = mf_terminal::redactor::launch_redactor(
         plan.secret_env.iter().map(|(_, l)| l.clone()).collect(),
+        Some(&spec.capability_token),
     );
     for (key, lease) in &plan.secret_env {
         cmd.env_secret(key, lease);

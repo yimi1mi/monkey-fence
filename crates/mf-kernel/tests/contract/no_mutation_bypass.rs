@@ -202,3 +202,27 @@ fn mf_terminal_is_the_only_terminal_channel_source() {
         "mf-kernel 的 TerminalChannel 必须 re-export 自 mf-terminal(单一契约源)"
     );
 }
+
+#[test]
+fn terminal_output_feeds_are_post_redaction_only() {
+    // T3a(Issue #29,spec §8.8):Screen/output_tail 只能接收脱敏后字节。
+    // reader 管线的唯一合法形态是 `redactor.redact_chunk`/`finish` 的
+    // 返回值(`clean`/`rest`);原始 buf 直达 feed/tail 即为旁路。
+    let runtime_host = read("runtime_host.rs");
+    for banned in ["screen.feed(&buf", "tail.extend_from_slice(&buf"] {
+        assert!(
+            !runtime_host.contains(banned),
+            "未脱敏输出不得进入 Screen/output_tail:`{banned}` 是旁路,\
+             必须先经 StreamingRedactor"
+        );
+    }
+    // 三条 launch 路径(Preview/Ad-hoc/工作流)必须都从统一入口构造
+    // redactor(capability token 与 Secret 同一脱敏器覆盖)。
+    let unified = runtime_host
+        .matches("mf_terminal::redactor::launch_redactor")
+        .count();
+    assert!(
+        unified >= 3,
+        "三条 PTY launch 路径必须全部经 launch_redactor 统一脱敏入口(当前 {unified} 处)"
+    );
+}
