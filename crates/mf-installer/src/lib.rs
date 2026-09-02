@@ -12,5 +12,8 @@
 
 pub mod adoption;
 pub mod discovery;
+pub mod executor;
 pub mod limits;
+pub mod plan;
 pub mod provider_probe;
+pub mod receipt;
