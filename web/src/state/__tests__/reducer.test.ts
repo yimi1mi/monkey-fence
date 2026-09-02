@@ -10,7 +10,7 @@ function state(epoch: string, seq: string) {
 
 function event(type: string, seq: string, critical: boolean, epoch = "ep1") {
   return {
-    schema: "mf.event.v1",
+    schema: "mf.event.v1" as const,
     type,
     critical,
     stream_epoch: epoch,
