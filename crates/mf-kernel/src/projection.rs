@@ -21,7 +21,7 @@ use crate::handles::{
 use crate::journal::EventJournal;
 use crate::kernel::KernelProblem;
 use crate::operation::{OperationHandle, OperationProgress};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -74,7 +74,7 @@ impl PartialEq<AggregateRevision> for RevisionVector {
 }
 
 /// 事件流游标:Snapshot 与 resume 都携带(epoch, through_seq)。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventCursor {
     pub stream_epoch: StreamEpoch,
     #[serde(serialize_with = "serialize_u64_decimal")]
@@ -103,7 +103,7 @@ pub struct EventEnvelope {
 }
 
 /// Snapshot 查询(当前 workflow tracer；Workspace 快照随完整投影扩展)。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapshotQuery {
     Workspace,
     Workflow {

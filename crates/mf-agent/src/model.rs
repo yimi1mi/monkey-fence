@@ -459,7 +459,7 @@ pub struct MergeBatchRecovery {
 }
 
 /// 手动重试模式(设计 §9.6):继续仍存活的交互式会话,或创建新会话。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RetryMode {
     /// 继续存活会话(仅当存在 live session 时合法)。
     ContinueSession,

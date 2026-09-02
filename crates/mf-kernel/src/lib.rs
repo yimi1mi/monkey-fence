@@ -20,6 +20,7 @@ pub mod handles;
 mod journal;
 pub mod kernel;
 pub mod lease;
+pub mod legacy_transport;
 pub mod limits;
 pub mod operation;
 mod platform_acl;

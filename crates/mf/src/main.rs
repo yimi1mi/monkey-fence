@@ -19,6 +19,8 @@ mod file_index;
 mod file_tree;
 #[cfg(test)]
 mod kernel_projection_audit_tests;
+#[allow(dead_code)]
+mod legacy_transport_client;
 mod navigation;
 mod pipe_server;
 mod plugin_contribution_view;

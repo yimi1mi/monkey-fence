@@ -13,7 +13,8 @@
 //! (in-process adapter)只读定位后走 `dispatch`,是拆进程后
 //! `mf.legacy-transport.v1` 的前置形态。
 
-#[cfg(test)]
+use serde::{Deserialize, Serialize};
+
 use crate::command::ReconcileOutcome;
 use crate::command::{
     CommandCoordinator, CommandEnvelope, CommandOutcome, CommandPayload, CommandProblem,
@@ -62,7 +63,7 @@ use zeroize::Zeroizing;
 
 /// facade 层封闭命令枚举。新增命令 = 显式扩枚举 + 编译到 T1 effect,
 /// transport/UI 不能自造命令或 payload 形状。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum KernelCommand {
     /// `workflow.rename`(§7.4:rename 归入 presentation 轴):
     /// 经 Project v7 持久 handle 定位,只推进 presentation revision;
@@ -77,7 +78,7 @@ pub enum KernelCommand {
 }
 
 /// 引用一个已存在聚合及客户端最后观察到的单轴 revision。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionedHandle<H> {
     pub handle: H,
     pub revision: u64,
@@ -86,7 +87,7 @@ pub struct VersionedHandle<H> {
 /// Run 命令的全量并发前提。Workflow Run 由命令字段定位，
 /// 这里只保留它的 revision；Step/Agent Run/Agent Session 必须
 /// 显式列出，不允许 kernel 在 envelope 外暗自补 expected。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunExpected {
     pub workflow_run_revision: u64,
     pub steps: Vec<VersionedHandle<StepHandle>>,
@@ -105,7 +106,7 @@ impl WorkflowRunExpected {
     }
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum WorkflowRunCommand {
     /// 启动仍需 Operation saga；本层只冻结「必须是 Core 已确认
     /// semantic revision」的授权契约。
@@ -245,7 +246,7 @@ impl std::fmt::Debug for WorkflowRunCommand {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ProjectWorkflowCommand {
     Create {
         project: ProjectStoreHandle,
@@ -315,7 +316,7 @@ pub enum ProjectWorkflowCommand {
     },
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowRenameCommand {
     project: ProjectStoreHandle,
     workflow: WorkflowHandle,
