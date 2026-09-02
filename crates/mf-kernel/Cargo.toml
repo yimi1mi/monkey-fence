@@ -42,3 +42,7 @@ uuid = { workspace = true }
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization"] }
+
+[[bin]]
+name = "monkeyfence-core"
+path = "src/bin/monkeyfence-core.rs"

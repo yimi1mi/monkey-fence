@@ -16,6 +16,7 @@
 //! standalone Core bin、WebGateway 与 attach_terminal 属后续 ticket。
 
 pub mod command;
+pub mod core_lifecycle;
 pub mod feature_gate;
 pub mod handles;
 pub mod handoff;
