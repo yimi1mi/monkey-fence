@@ -1,0 +1,11 @@
+{
+  "schema": "mf.event.v1",
+  "type": "workflow_run.needs_you",
+  "critical": true,
+  "stream_epoch": "ep_golden",
+  "seq": "2049",
+  "data": {
+    "run_handle": "run_0123456789abcdef0123456789abcdef",
+    "reason": "awaiting_outcome"
+  }
+}

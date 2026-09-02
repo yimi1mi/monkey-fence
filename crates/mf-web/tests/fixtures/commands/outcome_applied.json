@@ -1,0 +1,13 @@
+{
+  "outcome": "applied",
+  "revisions": [
+    {
+      "aggregate": {
+        "kind": "project_workflow",
+        "handle": "wf_0123456789abcdef0123456789abcdef"
+      },
+      "semantic_revision": "14"
+    }
+  ],
+  "replayed": false
+}

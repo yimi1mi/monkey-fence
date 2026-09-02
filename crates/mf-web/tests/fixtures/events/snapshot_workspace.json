@@ -1,0 +1,16 @@
+{
+  "schema": "mf.snapshot.v1",
+  "server_instance_id": "srv_golden",
+  "cursor": {
+    "stream_epoch": "ep_golden",
+    "through_seq": "1842"
+  },
+  "data": {
+    "projects": [
+      {
+        "handle": "proj_0123456789abcdef0123456789abcdef",
+        "name": "demo"
+      }
+    ]
+  }
+}

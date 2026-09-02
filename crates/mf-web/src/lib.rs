@@ -8,8 +8,10 @@
 //! 可达 bootstrap 与 Workbench 属后续 ticket;Core 重启使全部 Web auth
 //! 状态失效。
 
+pub mod api;
 pub mod assets;
 pub mod auth;
 pub mod gateway;
 pub mod headers;
 pub mod limits;
+pub mod problem;
