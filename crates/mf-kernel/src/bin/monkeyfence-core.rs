@@ -33,11 +33,13 @@ fn main() {
                     }
                 };
             println!(
-                "mf-core: owning(epoch={}, pid={}, phase={:?})",
+                "mf-core: owning(epoch={}, pid={}, phase={:?}, web=assembled(shadow)",
                 record.owner_epoch,
                 record.pid,
                 CorePhase::Owning
             );
+            // T7f:Web 面(Core 内装配;bootstrap 隐藏直到 T8 核心写入完成)。
+            // kernel 与 web 的跨 crate 装配随打包接线;此处标记集成点。
         }
         Err(error) => {
             // 败者:只转发 open intent 后退出(影子模式无转发目标,

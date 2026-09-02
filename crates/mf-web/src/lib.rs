@@ -13,6 +13,7 @@ pub mod assets;
 pub mod auth;
 pub mod gateway;
 pub mod headers;
+pub mod integration;
 pub mod limits;
 pub mod problem;
 pub mod takeover;
