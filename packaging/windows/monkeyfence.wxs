@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  MonkeyFence Windows x64 per-user MSI(T11b,Issue #63)。
+  per-user(无 UAC):ProgramFiles 之外的 LocalAppData versions\<semver>  side-by-side 布局 + current.json 原子指针(#35 bundle manager)。
+  Core/launcher/tray/picker/mfctl/Broker/hosts 全部 asInvoker;
+  Broker 的 requireAdministrator 提权在运行时经 UAC(非安装期)。
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="MonkeyFence"
+    Manufacturer="MonkeyFence"
+    Version="$(var.BuildVersion)"
+    Scope="perUser"
+    Compressed="yes"
+    InstallerVersion="500">
+    <MajorUpgrade DowngradeErrorMessage="已安装更新版本的 MonkeyFence。" />
+
+    <Media Id="1" Cabinet="mf.cab" EmbedCab="yes" />
+
+    <!-- side-by-side 布局:versions\<semver>\ 整包;current.json 由
+         bootstrapper(bundles\current.json 切换)在安装后原子写入。
+         回滚 = 指针切回 previous(MSI 不删旧版本目录)。 -->
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="MfRoot" Name="MonkeyFence">
+        <Directory Id="BundlesDir" Name="bundles">
+          <Directory Id="VersionDir" Name="$(var.BuildVersion)">
+            <Directory Id="BinDir" Name="bin" />
+            <Directory Id="WebDir" Name="web" />
+          </Directory>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <!-- 组件:bin(monkeyfence-core/launcher/tray/picker/mfctl/
+         broker/root-host/install-host)与 web assets 同版本整包 -->
+    <ComponentGroup Id="BundleComponents" Directory="BinDir">
+      <Component Id="CoreBin">
+        <File Source="$(var.BuildDir)\monkeyfence-core.exe" />
+      </Component>
+      <Component Id="LauncherBin">
+        <File Source="$(var.BuildDir)\mf-launcher.exe" />
+      </Component>
+      <Component Id="TrayBin">
+        <File Source="$(var.BuildDir)\mf-tray.exe" />
+      </Component>
+      <Component Id="PickerBin">
+        <File Source="$(var.BuildDir)\mf-picker.exe" />
+      </Component>
+      <Component Id="MfctlBin">
+        <File Source="$(var.BuildDir)\mfctl.exe" />
+      </Component>
+      <Component Id="BrokerBin">
+        <File Source="$(var.BuildDir)\mf-broker.exe" />
+      </Component>
+      <Component Id="RootHostBin">
+        <File Source="$(var.BuildDir)\mf-root-host.exe" />
+      </Component>
+      <Component Id="InstallHostBin">
+        <File Source="$(var.BuildDir)\mf-install-host.exe" />
+      </Component>
+    </ComponentGroup>
+
+    <!-- 权限边界:安装进程 asValidator(per-user);Broker 二进制以
+         requireAdministrator manifest 标记(运行时 UAC,安装不需要)。 -->
+    <Property Id="ALLUSERS" Value="2" />
+    <Property Id="MSIINSTALLPERUSER" Value="1" />
+  </Package>
+</Wix>
