@@ -14,6 +14,7 @@ sha2.workspace = true
 hmac.workspace = true
 mf-kernel.workspace = true
 mf-agent.workspace = true
+mf-terminal.workspace = true
 chrono.workspace = true
 # T7a 网关外壳:loopback 绑定 + 安全头 middleware;领域路由在 #41 接入
 axum = "0.8"

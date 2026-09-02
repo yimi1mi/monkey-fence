@@ -2743,6 +2743,7 @@ dependencies = [
  "hmac",
  "mf-agent",
  "mf-kernel",
+ "mf-terminal",
  "serde",
  "serde_json",
  "sha2",
