@@ -16,3 +16,8 @@ target-dev/
 /.pnpm-store/
 /crates/mf/prototypes/*/node_modules/
 /crates/mf/prototypes/*/dist/
+
+# web 工作台依赖与构建产物(T11/T12 web lane)
+web/node_modules/
+web/dist/
+web/tsconfig.tsbuildinfo
