@@ -1,11 +1,11 @@
 {
-  "schema": "mf.problem.v1",
   "code": "revision_conflict",
-  "message": "工作流已被更新",
-  "trace_id": "trace_golden",
   "command_id": "018f3e2a-1b2c-7d3e-9f4a-5b6c7d8e9f0a",
-  "retry": "after_resync",
   "current": {
     "semantic_revision": "13"
-  }
+  },
+  "message": "工作流已被更新",
+  "retry": "after_resync",
+  "schema": "mf.problem.v1",
+  "trace_id": "trace_golden"
 }

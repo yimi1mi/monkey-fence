@@ -1,26 +1,26 @@
 {
-  "schema": "mf.command.v1",
-  "command_id": "018f3e2a-1b2c-7d3e-9f4a-5b6c7d8e9f0a",
   "client_id": "cl_0123456789abcdef0123456789abcdef",
+  "command_id": "018f3e2a-1b2c-7d3e-9f4a-5b6c7d8e9f0a",
   "controller_lease_epoch": "17",
-  "target": {
-    "kind": "project_workflow",
-    "handle": "wf_0123456789abcdef0123456789abcdef"
-  },
   "expected": [
     {
       "aggregate": {
-        "kind": "project_workflow",
-        "handle": "wf_0123456789abcdef0123456789abcdef"
+        "handle": "wf_0123456789abcdef0123456789abcdef",
+        "kind": "project_workflow"
       },
-      "semantic_revision": "13",
-      "presentation_revision": "91"
+      "presentation_revision": "91",
+      "semantic_revision": "13"
     }
   ],
-  "type": "workflow.move_node",
   "payload": {
     "node_handle": "step_0123456789abcdef0123456789abcdef",
     "x": 420,
     "y": 180
-  }
+  },
+  "schema": "mf.command.v1",
+  "target": {
+    "handle": "wf_0123456789abcdef0123456789abcdef",
+    "kind": "project_workflow"
+  },
+  "type": "workflow.move_node"
 }

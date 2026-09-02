@@ -1,0 +1,96 @@
+<h2>默认 B：实例库 · 工作链画布 · 节点配置</h2>
+<p class="subtitle">工具栏可随时切换布局；默认使用“侧栏 + 画布”，偏好按用户保存。</p>
+
+<div class="mockup">
+  <div class="mockup-header" style="display:flex;justify-content:space-between;align-items:center">
+    <span>工作链：功能开发流水线</span>
+    <div style="display:flex;align-items:center;gap:8px">
+      <span style="font-size:11px;color:#8fa0b5">布局</span>
+      <div style="display:flex;border:1px solid #3a4352;border-radius:8px;padding:2px;background:#111720">
+        <span style="padding:5px 10px;border-radius:6px;background:#35465e;color:#fff;font-size:11px">B 侧栏</span>
+        <span style="padding:5px 10px;color:#9aa7b8;font-size:11px">A 上下</span>
+      </div>
+      <button class="mock-button">运行工作链</button>
+    </div>
+  </div>
+  <div class="mockup-body" style="padding:0;background:#0b1016">
+    <div style="display:grid;grid-template-columns:205px minmax(440px,1fr) 270px;min-height:520px">
+      <aside style="border-right:1px solid #303949;padding:14px;background:#111720">
+        <div style="display:flex;justify-content:space-between;align-items:center;color:#f4f7fb;margin-bottom:12px">
+          <strong>Agent 实例</strong><button class="mock-button">＋</button>
+        </div>
+        <input class="mock-input" placeholder="搜索名称、CLI、标签" style="width:100%;box-sizing:border-box;margin-bottom:12px">
+        <div class="label" style="margin:8px 0;color:#7f90a5">开发</div>
+        <div style="border:1px solid #58708e;border-radius:9px;padding:10px;margin-bottom:8px;background:#19212d;color:#f4f7fb">
+          <div style="display:flex;justify-content:space-between"><strong>Claude · 实现</strong><span style="color:#7ee2a8">●</span></div>
+          <div style="font-size:10px;color:#9aa7b8;margin-top:4px">claude · dev.json</div>
+        </div>
+        <div style="border:1px solid #3a4352;border-radius:9px;padding:10px;margin-bottom:12px;background:#151b24;color:#f4f7fb">
+          <strong>Codex · 修复</strong><div style="font-size:10px;color:#9aa7b8;margin-top:4px">codex · high</div>
+        </div>
+        <div class="label" style="margin:8px 0;color:#7f90a5">验收</div>
+        <div style="border:1px solid #3a4352;border-radius:9px;padding:10px;margin-bottom:8px;background:#151b24;color:#f4f7fb">
+          <strong>Claude · Review</strong><div style="font-size:10px;color:#9aa7b8;margin-top:4px">claude · review.json</div>
+        </div>
+        <div style="border:1px solid #3a4352;border-radius:9px;padding:10px;background:#151b24;color:#f4f7fb">
+          <strong>Codex · 测试</strong><div style="font-size:10px;color:#9aa7b8;margin-top:4px">codex exec</div>
+        </div>
+      </aside>
+
+      <main style="position:relative;padding:18px;background-color:#0e141c;background-image:radial-gradient(#2a3442 1px,transparent 1px);background-size:18px 18px">
+        <div style="display:flex;justify-content:space-between;font-size:11px;color:#9aa7b8">
+          <span>拖动 Agent 实例创建节点 · 连线设置依赖</span>
+          <span style="color:#82d7a5">● worktree 可用 · 并行开启</span>
+        </div>
+        <div style="display:flex;align-items:center;justify-content:center;gap:12px;margin-top:128px">
+          <div style="border:1px solid #60728c;border-radius:10px;padding:13px;background:#19212d;color:#f4f7fb;width:104px;text-align:center;box-shadow:0 8px 22px #0006">需求分析<br><small style="color:#9aa7b8">一次性</small></div>
+          <span style="color:#78879a">→</span>
+          <div style="border:2px solid #6f9bd1;border-radius:10px;padding:13px;background:#1b2635;color:#f4f7fb;width:104px;text-align:center;box-shadow:0 0 0 3px #6f9bd124">编码实现<br><small style="color:#9aa7b8">Claude · 实现</small></div>
+          <span style="color:#78879a">→</span>
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <div style="border:1px solid #5b8e76;border-radius:9px;padding:10px;background:#17251f;color:#f4f7fb;width:96px;text-align:center">测试</div>
+            <div style="border:1px solid #8272a0;border-radius:9px;padding:10px;background:#211b2b;color:#f4f7fb;width:96px;text-align:center">Review</div>
+          </div>
+          <span style="color:#78879a">→</span>
+          <div style="border:1px solid #60728c;border-radius:10px;padding:13px;background:#19212d;color:#f4f7fb;width:82px;text-align:center">汇合</div>
+        </div>
+        <div style="position:absolute;left:18px;right:18px;bottom:18px;display:flex;gap:8px;color:#8fa0b5;font-size:10px">
+          <span style="border:1px solid #303949;border-radius:7px;padding:5px 8px;background:#111720">滚轮缩放</span>
+          <span style="border:1px solid #303949;border-radius:7px;padding:5px 8px;background:#111720">拖动平移</span>
+          <span style="border:1px solid #303949;border-radius:7px;padding:5px 8px;background:#111720">自动排列</span>
+        </div>
+      </main>
+
+      <aside style="border-left:1px solid #303949;padding:14px;background:#111720">
+        <div style="display:flex;justify-content:space-between;align-items:center;color:#f4f7fb;margin-bottom:14px">
+          <strong>节点配置</strong><span style="color:#7f90a5">×</span>
+        </div>
+        <div class="label" style="color:#7f90a5">基本信息</div>
+        <div style="font-size:11px;color:#9aa7b8;margin:7px 0 4px">节点名称</div>
+        <input class="mock-input" value="编码实现" style="width:100%;box-sizing:border-box">
+        <div style="font-size:11px;color:#9aa7b8;margin:10px 0 4px">Agent 实例</div>
+        <div style="border:1px solid #3a4352;border-radius:7px;padding:8px;color:#f4f7fb;background:#151b24">Claude · 实现⌄</div>
+        <div style="font-size:11px;color:#9aa7b8;margin:10px 0 4px">运行模式</div>
+        <div style="display:flex;border:1px solid #3a4352;border-radius:7px;padding:2px;background:#151b24">
+          <span style="flex:1;text-align:center;padding:5px;border-radius:5px;background:#35465e;color:#fff;font-size:10px">一次性</span>
+          <span style="flex:1;text-align:center;padding:5px;color:#9aa7b8;font-size:10px">交互式</span>
+        </div>
+        <div class="label" style="color:#7f90a5;margin-top:16px">任务与输入</div>
+        <div style="font-size:11px;color:#9aa7b8;margin:7px 0 4px">提示词模板</div>
+        <div style="border:1px solid #3a4352;border-radius:7px;padding:8px;height:70px;color:#c6d0dd;background:#151b24;font-size:10px">根据需求完成实现。<br><span style="color:#8fc1ff">${nodes.analysis.output.summary}</span></div>
+        <div class="label" style="color:#7f90a5;margin-top:16px">失败与重试</div>
+        <div style="display:grid;grid-template-columns:1fr 74px;gap:8px;margin-top:7px;align-items:center;color:#b8c3d2;font-size:11px"><span>自动重试</span><span style="border:1px solid #3a4352;border-radius:7px;padding:6px;text-align:center;background:#151b24">2 次⌄</span></div>
+        <div style="display:grid;grid-template-columns:1fr 74px;gap:8px;margin-top:7px;align-items:center;color:#b8c3d2;font-size:11px"><span>完成检测</span><span style="border:1px solid #3a4352;border-radius:7px;padding:6px;text-align:center;background:#151b24">预设⌄</span></div>
+      </aside>
+    </div>
+  </div>
+</div>
+
+<div class="options">
+  <div class="option" data-choice="approve-three-pane" onclick="toggleSelect(this)">
+    <div class="letter">✓</div><div class="content"><h3>采用三栏交互</h3><p>右侧配置面板可折叠；未选节点时画布自动扩展。</p></div>
+  </div>
+  <div class="option" data-choice="prefer-modal" onclick="toggleSelect(this)">
+    <div class="letter">M</div><div class="content"><h3>改用弹窗配置节点</h3><p>画布更宽，但编辑时会遮挡上下文。</p></div>
+  </div>
+</div>

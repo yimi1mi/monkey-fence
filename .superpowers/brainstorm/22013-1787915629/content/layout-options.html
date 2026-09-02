@@ -1,0 +1,81 @@
+<h2>Agent 实例与工作链：哪种总体布局更合适？</h2>
+<p class="subtitle">两种方案都支持拖入节点、串行/并行/汇合，以及点击节点打开配置面板。</p>
+
+<div class="cards">
+  <div class="card" data-choice="stacked" onclick="toggleSelect(this)">
+    <div class="card-image" style="padding:18px;background:#0c1016;min-height:410px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <strong style="color:#f4f7fb">Agent 实例</strong>
+        <button class="mock-button">＋ 新建实例</button>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:18px">
+        <div style="border:1px solid #3a4352;border-radius:10px;padding:11px;background:#151b24">
+          <div style="font-weight:650;color:#f4f7fb">Claude · 实现</div>
+          <div style="font-size:11px;color:#9aa7b8;margin-top:5px">claude --config dev.json</div>
+        </div>
+        <div style="border:1px solid #3a4352;border-radius:10px;padding:11px;background:#151b24">
+          <div style="font-weight:650;color:#f4f7fb">Claude · Review</div>
+          <div style="font-size:11px;color:#9aa7b8;margin-top:5px">claude --config review.json</div>
+        </div>
+        <div style="border:1px dashed #4d596a;border-radius:10px;padding:11px;color:#9aa7b8;text-align:center">拖动到工作链 ↓</div>
+      </div>
+
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+        <strong style="color:#f4f7fb">工作链</strong>
+        <span style="font-size:11px;color:#84d4a6">● 支持 worktree · 并行已开启</span>
+      </div>
+      <div style="border:1px solid #303949;border-radius:12px;background:#10151d;padding:28px 16px;min-height:190px">
+        <div style="display:flex;align-items:center;justify-content:center;gap:12px">
+          <div style="border:1px solid #6d7f99;border-radius:9px;padding:14px;background:#19212d;color:#f4f7fb;width:118px;text-align:center">需求分析<br><small style="color:#9aa7b8">Claude · 分析</small></div>
+          <div style="color:#728096">→</div>
+          <div style="border:1px solid #6d7f99;border-radius:9px;padding:14px;background:#19212d;color:#f4f7fb;width:118px;text-align:center">编码实现<br><small style="color:#9aa7b8">Claude · 实现</small></div>
+          <div style="color:#728096">→</div>
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <div style="border:1px solid #5c8a75;border-radius:9px;padding:10px;background:#17251f;color:#f4f7fb;width:118px;text-align:center">测试</div>
+            <div style="border:1px solid #806f9e;border-radius:9px;padding:10px;background:#211b2b;color:#f4f7fb;width:118px;text-align:center">Review</div>
+          </div>
+          <div style="color:#728096">→</div>
+          <div style="border:1px solid #6d7f99;border-radius:9px;padding:14px;background:#19212d;color:#f4f7fb;width:96px;text-align:center">汇合</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>A · 上下分区（草图增强版）</h3>
+      <p>实例库始终在画布上方，拖放关系直观；实例很多时可以折叠或搜索。</p>
+    </div>
+  </div>
+
+  <div class="card" data-choice="sidebar" onclick="toggleSelect(this)">
+    <div class="card-image" style="padding:18px;background:#0c1016;min-height:410px">
+      <div style="display:grid;grid-template-columns:190px 1fr;gap:12px;min-height:368px">
+        <div style="border:1px solid #303949;border-radius:12px;background:#111720;padding:12px">
+          <div style="display:flex;justify-content:space-between;color:#f4f7fb;margin-bottom:12px"><strong>Agent 实例</strong><span>＋</span></div>
+          <input class="mock-input" placeholder="搜索实例" style="width:100%;box-sizing:border-box;margin-bottom:10px">
+          <div style="border:1px solid #3a4352;border-radius:9px;padding:10px;margin-bottom:8px;background:#19212d;color:#f4f7fb">Claude · 实现<br><small style="color:#9aa7b8">dev.json</small></div>
+          <div style="border:1px solid #3a4352;border-radius:9px;padding:10px;margin-bottom:8px;background:#19212d;color:#f4f7fb">Claude · Review<br><small style="color:#9aa7b8">review.json</small></div>
+          <div style="border:1px solid #3a4352;border-radius:9px;padding:10px;background:#19212d;color:#f4f7fb">Codex · 测试<br><small style="color:#9aa7b8">gpt-5.4</small></div>
+        </div>
+        <div style="border:1px solid #303949;border-radius:12px;background:#10151d;padding:14px">
+          <div style="display:flex;justify-content:space-between;color:#f4f7fb;margin-bottom:35px"><strong>工作链画布</strong><span style="font-size:11px;color:#84d4a6">并行已开启</span></div>
+          <div style="display:flex;align-items:center;justify-content:center;gap:11px;margin-top:72px">
+            <div style="border:1px solid #6d7f99;border-radius:9px;padding:13px;background:#19212d;color:#f4f7fb;width:98px;text-align:center">分析</div>
+            <div style="color:#728096">→</div>
+            <div style="border:1px solid #6d7f99;border-radius:9px;padding:13px;background:#19212d;color:#f4f7fb;width:98px;text-align:center">实现</div>
+            <div style="color:#728096">→</div>
+            <div style="display:flex;flex-direction:column;gap:8px">
+              <div style="border:1px solid #5c8a75;border-radius:9px;padding:9px;background:#17251f;color:#f4f7fb;width:92px;text-align:center">测试</div>
+              <div style="border:1px solid #806f9e;border-radius:9px;padding:9px;background:#211b2b;color:#f4f7fb;width:92px;text-align:center">Review</div>
+            </div>
+          </div>
+          <div style="position:relative;margin-top:88px;border-top:1px solid #303949;padding-top:10px;color:#9aa7b8;font-size:11px">选中节点后，右侧抽屉显示提示词、重试和执行契约。</div>
+        </div>
+      </div>
+    </div>
+    <div class="card-body">
+      <h3>B · 左侧实例库 + 右侧画布</h3>
+      <p>实例数量多时更容易浏览和拖放；但与 Orca 设置页的纵向阅读方式差异更大。</p>
+    </div>
+  </div>
+</div>
+
+<p class="subtitle" style="margin-top:18px">点击选择一个方案，也可以在对话里说希望混合哪些部分。</p>

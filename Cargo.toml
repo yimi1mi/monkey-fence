@@ -1,8 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/mf",
-    "crates/mf-core",
     "crates/mf-agent",
     "crates/mf-vcs",
     "crates/mf-skills",
@@ -18,8 +16,6 @@ members = [
 # 裸命令(cargo run / build / test)的默认目标:主程序而非 mfctl 辅助程序。
 # 显式 --workspace 仍然覆盖全部成员(mfctl 无测试,构建由 --workspace 兜底)。
 default-members = [
-    "crates/mf",
-    "crates/mf-core",
     "crates/mf-agent",
     "crates/mf-vcs",
     "crates/mf-skills",
@@ -38,7 +34,6 @@ edition = "2021"
 license = "Apache-2.0"
 
 [workspace.dependencies]
-mf-core = { path = "crates/mf-core" }
 mf-agent = { path = "crates/mf-agent" }
 mf-vcs = { path = "crates/mf-vcs" }
 mf-skills = { path = "crates/mf-skills" }
@@ -49,11 +44,6 @@ mf-elevated = { path = "crates/mf-elevated" }
 mf-installer = { path = "crates/mf-installer" }
 mf-web = { path = "crates/mf-web" }
 mf-companions = { path = "crates/mf-companions" }
-
-# Zed 同源依赖(本地 checkout,保证 Windows DirectX 后端可用)
-gpui = { path = "D:/workspace/zed/crates/gpui" }
-# 平台引导 vendored 副本(gpui_windows 带 IME 补丁);gpui 核心仍只读引用 zed
-gpui_platform = { path = "vendor/gpui_platform" }
 
 anyhow = "1"
 log = "0.4"

@@ -873,7 +873,7 @@ pub struct InProcessCoreKernel {
     /// 只持有 channel sender；worker 仅持有 Kernel 的 Weak，避免
     /// runtime → kernel → worker → kernel 的强引用环。
     workflow_start_worker: RwLock<Option<Arc<WorkflowStartWorker>>>,
-    /// T2f 终端宿主缝隙:由拥有 SessionRuntime 的装配件(mf crate AppCtx)
+    /// T2f 终端宿主缝隙:由拥有 SessionRuntime 的装配件(AppRuntime/core bin)
     /// 注入;未注入时 attach_terminal 显式 fail-closed,不回退旁路。
     terminal_host: RwLock<Option<Arc<dyn mf_terminal::TerminalHost>>>,
     projections: ProjectionHub,

@@ -11,10 +11,10 @@
 //! - 错误路径(缺管道/缺令牌/令牌无效)的退出码与诊断;
 //! - stdout/stderr 不回显能力令牌原文。
 
-// 单一事实源:直接编译 mf 包的生产服务端(mf 是 bin-only crate,
-// 无法作为库依赖;#[path] include 避免复制协议实现)。
+// 单一事实源:直接编译 mf-kernel 的生产服务端(T12 迁移;#[path]
+// include 保持契约与生产同源)。
 #[allow(dead_code)]
-#[path = "../../mf/src/pipe_server.rs"]
+#[path = "../../mf-kernel/src/pipe_server.rs"]
 mod pipe_server;
 
 use std::path::PathBuf;

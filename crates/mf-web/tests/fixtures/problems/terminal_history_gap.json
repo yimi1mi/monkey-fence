@@ -1,8 +1,8 @@
 {
-  "schema": "mf.problem.v1",
   "code": "terminal_history_gap",
-  "message": "请求的输出已被 journal 驱逐",
-  "trace_id": "",
   "command_id": null,
-  "retry": "after_resync"
+  "message": "请求的输出已被 journal 驱逐",
+  "retry": "after_resync",
+  "schema": "mf.problem.v1",
+  "trace_id": ""
 }
