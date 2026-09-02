@@ -314,6 +314,24 @@ impl BundleManager {
     }
 }
 
+pub use switch::switch_bundle;
+
+mod switch {
+    use super::{BundleManager, BundleManifest, Installed, StorageEligibility};
+
+    /// T5c(Issue #47)whole-bundle 切换编排:Bridge A 交出的 Core 在新
+    /// bundle 上恢复。切换 = 安装(健康检查通过才切 pointer)→ 旧 bundle
+    /// 保留(retention);失败 = pointer 不动,旧 bundle 继续服务。
+    pub fn switch_bundle(
+        manager: &BundleManager,
+        manifest: &BundleManifest,
+        components: &[(String, Vec<u8>)],
+        storage: &StorageEligibility,
+    ) -> anyhow::Result<Installed> {
+        // 复用安装路径(健康检查 + 兼容判定 + 原子 pointer)
+        manager.install(manifest, components, storage)
+    }
+}
 /// 活动清理保护:清理仅删除 current/previous 之外的 bundle 目录。
 /// `active_pins` = 活动引用的 bundle id(如活动 Agent Run 的 Revision
 /// pin)——即使非 current/previous 也不清理。

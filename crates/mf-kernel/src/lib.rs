@@ -18,6 +18,7 @@
 pub mod command;
 pub mod feature_gate;
 pub mod handles;
+pub mod handoff;
 mod journal;
 pub mod kernel;
 pub mod lease;
