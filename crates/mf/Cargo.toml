@@ -22,7 +22,7 @@ serde_json = { workspace = true }
 mf-core.workspace = true
 mf-agent.workspace = true
 mf-kernel.workspace = true
-mf-terminal.workspace = true
+mf-terminal = { workspace = true, features = ["test-support"] }
 mf-vcs.workspace = true
 mf-skills.workspace = true
 mf-plugins.workspace = true

@@ -2725,8 +2725,14 @@ name = "mf-terminal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "crossbeam-channel",
  "libc",
+ "log",
  "mf-agent",
+ "mf-plugins",
+ "parking_lot",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.20",
  "uuid",
