@@ -2755,6 +2755,7 @@ dependencies = [
  "chrono",
  "hmac",
  "mf-agent",
+ "mf-elevated",
  "mf-kernel",
  "mf-terminal",
  "serde",
