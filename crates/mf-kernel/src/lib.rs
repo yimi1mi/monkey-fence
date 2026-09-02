@@ -15,6 +15,7 @@
 //! resume/gap、独立 client queue、epoch rotate/recovery 与 A1/A9 契约。
 //! standalone Core bin、WebGateway 与 attach_terminal 属后续 ticket。
 
+pub mod app_runtime;
 pub mod command;
 pub mod core_lifecycle;
 pub mod feature_gate;
