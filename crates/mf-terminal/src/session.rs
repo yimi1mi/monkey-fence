@@ -11,7 +11,38 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use crate::journal::{AttachProblem, HelloFacts, HistoryGap, JournalChunk, TerminalJournal};
 use crate::limits::TerminalLimits;
+
+/// attach 组合判定(T3d,Issue #32;§8.3):把 journal 校验结果翻译为
+/// transport 动作——gap 的连接必须 4409 关闭且**不得申请 writer**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttachPlan {
+    /// 正常:发 hello + 增量 replay;此后才允许 request_writer。
+    Live {
+        hello: HelloFacts,
+        replay: Vec<JournalChunk>,
+    },
+    /// history gap:发 `terminal_history_gap`(含 first/last/as_of)+
+    /// close 4409;该连接不得申请 writer,Web 改读只读 transcript。
+    GapClose { gap: HistoryGap },
+    /// `after_seq > last_seq`:协议错误,关闭。
+    ProtocolError { after_seq: u64, last_seq: u64 },
+}
+
+pub fn plan_attach(journal: &TerminalJournal, after_seq: u64) -> AttachPlan {
+    match journal.check_attach(after_seq) {
+        Ok(hello) => AttachPlan::Live {
+            hello,
+            replay: journal.replay(after_seq),
+        },
+        Err(AttachProblem::HistoryGap(gap)) => AttachPlan::GapClose { gap },
+        Err(AttachProblem::AfterSeqBeyondLast { requested, last }) => AttachPlan::ProtocolError {
+            after_seq: requested,
+            last_seq: last,
+        },
+    }
+}
 
 /// ACK 校验问题(§8.2)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

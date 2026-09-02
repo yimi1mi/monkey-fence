@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-pub const PROJECT_SCHEMA_VERSION: i64 = 10;
+pub const PROJECT_SCHEMA_VERSION: i64 = 11;
 pub const CATALOG_SCHEMA_VERSION: i64 = 1;
 /// Catalog v2 使用独立文件与独立版本链，不能复用 v1 的 user_version
 /// 含义，否则 pre-Bridge 旧程序可能把新库当作 v1 打开。
@@ -139,6 +139,9 @@ fn apply_project_chain(
         if to >= 10 {
             tx.execute_batch(PROJECT_SCHEMA_V10_DELTA)?;
         }
+        if to >= 11 {
+            backfill_project_v11_transcript(tx)?;
+        }
         return Ok(Some(stats));
     }
     if to >= 8 {
@@ -150,7 +153,40 @@ fn apply_project_chain(
     if to >= 10 {
         tx.execute_batch(PROJECT_SCHEMA_V10_DELTA)?;
     }
+    if to >= 11 {
+        backfill_project_v11_transcript(tx)?;
+    }
     Ok(None)
+}
+
+/// v11(T3d,Issue #32):v7 已建 terminal_transcript/_segment;本步补
+/// GC/UUID epoch 所需列(expand-only,幂等):`updated_at`(LRU/retention)
+/// 与 `terminal_epoch_v2`(mf-terminal 的 UUIDv7 epoch 文本;v7 的
+/// INTEGER 列保留不动,新代码写 0 占位)。前一 bundle 忽略新列。
+fn backfill_project_v11_transcript(tx: &rusqlite::Transaction<'_>) -> Result<()> {
+    let has_column = |column: &str| -> Result<bool> {
+        let mut stmt = tx.prepare("PRAGMA table_info(terminal_transcript)")?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+        for name in rows {
+            if name? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    if !has_column("updated_at")? {
+        tx.execute_batch(
+            "ALTER TABLE terminal_transcript ADD COLUMN updated_at TEXT;
+             UPDATE terminal_transcript SET updated_at = '1970-01-01T00:00:00Z';",
+        )?;
+    }
+    if !has_column("terminal_epoch_v2")? {
+        tx.execute_batch(
+            "ALTER TABLE terminal_transcript ADD COLUMN terminal_epoch_v2 TEXT;
+             UPDATE terminal_transcript SET terminal_epoch_v2 = '';",
+        )?;
+    }
+    Ok(())
 }
 
 /// 早期开发库(v1 期间缺列/缺表的库,user_version 已是 1)的幂等补齐:

@@ -34,7 +34,7 @@ impl Default for TerminalEpoch {
 }
 
 /// ring 中一个已分配 seq 的脱敏输出 chunk。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JournalChunk {
     pub seq: u64,
     pub bytes: Arc<[u8]>,

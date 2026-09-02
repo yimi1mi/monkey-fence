@@ -5878,3 +5878,221 @@ impl Store {
         })
     }
 }
+
+// ---------------------------------------------------------------------------
+// T3d durable transcript(Issue #32;spec 3.2/8.5)
+// ---------------------------------------------------------------------------
+
+/// transcript 头状态(final_state: live|complete|crash_incomplete|lost)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalTranscriptHead {
+    pub session_handle: String,
+    pub terminal_epoch: String,
+    pub final_state: String,
+    pub durable_through_seq: i64,
+    pub exit_code: Option<i64>,
+    pub exit_signal: Option<String>,
+    pub as_of_seq: i64,
+}
+
+/// 只读 transcript 投影(8.3:history gap 后 Web 改读此投影)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalTranscriptView {
+    pub head: TerminalTranscriptHead,
+    pub segments: Vec<(i64, i64, Vec<u8>)>,
+}
+
+/// transcript 段 flush 的最小不可变参数(mf-terminal 注入)。
+pub struct TranscriptSegment<'a> {
+    pub seq_start: i64,
+    pub seq_end: i64,
+    pub bytes: &'a [u8],
+}
+
+impl Store {
+    /// 单事务原子提交 segment + 头状态(durable-before-notify 的存储原语:
+    /// exit 元数据与最后字节同一 commit;8.5)。同段重复提交幂等。
+    pub fn terminal_transcript_commit(
+        &self,
+        session_handle: &str,
+        terminal_epoch: &str,
+        segment: Option<TranscriptSegment<'_>>,
+        final_state: &str,
+        durable_through_seq: i64,
+        exit_code: Option<i64>,
+        exit_signal: Option<&str>,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.with_tx(|tx| {
+            // 头行先于 segment 存在(FK),初值 'live' 随后覆盖:
+            tx.execute(
+                "INSERT OR IGNORE INTO terminal_transcript
+                 (session_handle, terminal_epoch, final_state, durable_through_seq,
+                  exit_code, exit_signal, as_of_seq, updated_at, terminal_epoch_v2)
+                 VALUES (?1, 0, 'live', 0, NULL, NULL, 0, ?2, ?3)",
+                rusqlite::params![session_handle, now, terminal_epoch],
+            )?;
+            if let Some(seg) = segment {
+                tx.execute(
+                    "INSERT OR REPLACE INTO terminal_transcript_segment
+                     (session_handle, seq_start, seq_end, bytes)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![session_handle, seg.seq_start, seg.seq_end, seg.bytes],
+                )?;
+            }
+            tx.execute(
+                "UPDATE terminal_transcript SET
+                    terminal_epoch_v2 = ?2,
+                    final_state = ?3,
+                    durable_through_seq = ?4,
+                    exit_code = ?5,
+                    exit_signal = ?6,
+                    as_of_seq = ?7,
+                    updated_at = ?8
+                 WHERE session_handle = ?1",
+                rusqlite::params![
+                    session_handle,
+                    terminal_epoch,
+                    final_state,
+                    durable_through_seq,
+                    exit_code,
+                    exit_signal,
+                    durable_through_seq,
+                    now
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// 无新字节的纯状态标记(crash 恢复/lost/终态收口)。
+    pub fn terminal_transcript_mark(
+        &self,
+        session_handle: &str,
+        terminal_epoch: &str,
+        final_state: &str,
+        durable_through_seq: i64,
+        exit_code: Option<i64>,
+        exit_signal: Option<&str>,
+    ) -> Result<()> {
+        self.terminal_transcript_commit(
+            session_handle,
+            terminal_epoch,
+            None,
+            final_state,
+            durable_through_seq,
+            exit_code,
+            exit_signal,
+        )
+    }
+
+    /// 只读投影(脱敏输出 + as_of_seq;complete 语义由 final_state 给出)。
+    pub fn terminal_transcript_view(
+        &self,
+        session_handle: &str,
+    ) -> Result<Option<TerminalTranscriptView>> {
+        self.with_conn(|conn| {
+            let head = conn
+                .query_row(
+                    "SELECT session_handle,
+                            COALESCE(NULLIF(terminal_epoch_v2, ''), CAST(terminal_epoch AS TEXT)),
+                            final_state, durable_through_seq, exit_code, exit_signal, as_of_seq
+                     FROM terminal_transcript WHERE session_handle = ?1",
+                    rusqlite::params![session_handle],
+                    |row| {
+                        Ok(TerminalTranscriptHead {
+                            session_handle: row.get(0)?,
+                            terminal_epoch: row.get(1)?,
+                            final_state: row.get(2)?,
+                            durable_through_seq: row.get(3)?,
+                            exit_code: row.get(4)?,
+                            exit_signal: row.get(5)?,
+                            as_of_seq: row.get(6)?,
+                        })
+                    },
+                )
+                .optional()?;
+            let Some(head) = head else {
+                return Ok(None);
+            };
+            let mut stmt = conn.prepare(
+                "SELECT seq_start, seq_end, bytes FROM terminal_transcript_segment
+                 WHERE session_handle = ?1 ORDER BY seq_start",
+            )?;
+            let segments = stmt
+                .query_map(rusqlite::params![session_handle], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(Some(TerminalTranscriptView { head, segments }))
+        })
+    }
+
+    /// GC(附录 A2):retention 天数清理已终结会话;Project cap 超限时按
+    /// updated_at LRU 清已终结(final_state != live)会话;活动/pin 的
+    /// 会话永不清理。返回清理的会话数。
+    pub fn gc_terminal_transcripts(
+        &self,
+        retention_days: i64,
+        project_cap_bytes: i64,
+        keep_handles: &[&str],
+    ) -> Result<usize> {
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::days(retention_days.max(1))).to_rfc3339();
+        self.with_tx(|tx| {
+            let keep_json = serde_json::to_string(keep_handles)?;
+            let removed_retention = tx.execute(
+                "DELETE FROM terminal_transcript
+                 WHERE final_state != 'live'
+                   AND updated_at < ?1
+                   AND session_handle NOT IN (SELECT value FROM json_each(?2))",
+                rusqlite::params![cutoff, keep_json],
+            )?;
+            let total_bytes: i64 = tx.query_row(
+                "SELECT COALESCE(SUM(LENGTH(bytes)), 0) FROM terminal_transcript_segment",
+                [],
+                |row| row.get(0),
+            )?;
+            let mut removed_cap = 0usize;
+            if total_bytes > project_cap_bytes {
+                let victims: Vec<String> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT t.session_handle, MIN(t.updated_at) FROM terminal_transcript t
+                         WHERE t.final_state != 'live'
+                           AND t.session_handle NOT IN (SELECT value FROM json_each(?1))
+                         GROUP BY t.session_handle
+                         ORDER BY MIN(t.updated_at) ASC",
+                    )?;
+                    let rows: Vec<String> = stmt
+                        .query_map(rusqlite::params![keep_json], |row| row.get(0))?
+                        .filter_map(std::result::Result::ok)
+                        .collect();
+                    rows
+                };
+                let mut bytes = total_bytes;
+                for victim in victims {
+                    if bytes <= project_cap_bytes {
+                        break;
+                    }
+                    let seg_bytes: i64 = tx.query_row(
+                        "SELECT COALESCE(SUM(LENGTH(bytes)), 0)
+                         FROM terminal_transcript_segment WHERE session_handle = ?1",
+                        rusqlite::params![victim],
+                        |row| row.get(0),
+                    )?;
+                    tx.execute(
+                        "DELETE FROM terminal_transcript WHERE session_handle = ?1",
+                        rusqlite::params![victim],
+                    )?;
+                    bytes -= seg_bytes;
+                    removed_cap += 1;
+                }
+            }
+            Ok(removed_retention + removed_cap)
+        })
+    }
+}

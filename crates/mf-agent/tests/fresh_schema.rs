@@ -250,7 +250,12 @@ fn v9_database_migrates_to_v10_with_cancel_fence_and_backup() {
         serde_json::from_slice(&std::fs::read(artifacts[0].join("manifest.json")).unwrap())
             .unwrap();
     assert_eq!(manifest["from_version"], 9);
-    assert_eq!(manifest["to_version"], 10);
+    // v9 库升级到当前 schema 版本(v11 起 T3d 补列;backup manifest 记录
+    // 实际迁移目标)。
+    assert_eq!(
+        manifest["to_version"],
+        serde_json::json!(mf_agent::schema::PROJECT_SCHEMA_VERSION)
+    );
 }
 
 #[test]

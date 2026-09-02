@@ -333,7 +333,10 @@ fn v7_schema_matches_spec_exactly() {
             "durable_through_seq",
             "exit_code",
             "exit_signal",
-            "as_of_seq"
+            "as_of_seq",
+            // v11(T3d)expand-only 补列:GC LRU 时间戳与 UUID epoch 文本
+            "updated_at",
+            "terminal_epoch_v2"
         ]
     );
     assert!(column_of(&db, "terminal_transcript", "session_handle").pk);
