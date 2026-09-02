@@ -21,3 +21,6 @@ target-dev/
 web/node_modules/
 web/dist/
 web/tsconfig.tsbuildinfo
+# agent 会话工作目录(永不提交)
+.zcode/
+.superpowers/
