@@ -18,8 +18,7 @@ fn test_app() -> std::sync::Arc<AppCtx> {
     let ctx = AppCtx::with_catalog_for_tests(mf_agent::CatalogStore::memory().unwrap());
     let tmp = tempfile::tempdir().unwrap();
     let service =
-        mf_kernel::project_registry::ServiceStore::open(&tmp.path().join("service-v1.db"))
-            .unwrap();
+        mf_kernel::project_registry::ServiceStore::open(&tmp.path().join("service-v1.db")).unwrap();
     std::mem::forget(tmp);
     let (runtime, client) = InProcessKernelRuntime::for_test(
         service,
@@ -34,15 +33,12 @@ fn test_app() -> std::sync::Arc<AppCtx> {
 
 fn real_cli(name: &str) -> Option<std::path::PathBuf> {
     let path = match name {
-        "codex" => std::path::PathBuf::from(
-            r"C:\Users\hongjinmin\AppData\Roaming\npm\codex.cmd",
-        ),
+        "codex" => std::path::PathBuf::from(r"C:\Users\hongjinmin\AppData\Roaming\npm\codex.cmd"),
         "claude" => std::path::PathBuf::from(r"C:\Users\hongjinmin\.local\bin\claude.exe"),
         _ => return None,
     };
     path.exists().then_some(path)
 }
-
 
 /// 存活期内抓取 journal 输出(退出后注册表摘除;竞态窗口内轮询)。
 fn capture_while_alive(
@@ -72,7 +68,11 @@ fn capture_while_alive(
     last
 }
 /// 启动 spec(行命令形式;快速退出场景用 completion=ProcessExit)。
-fn quick_spec(exe: std::path::PathBuf, display_id: i64, argv: Vec<String>) -> (AdHocLaunchSpec, tempfile::TempDir, tempfile::TempDir) {
+fn quick_spec(
+    exe: std::path::PathBuf,
+    display_id: i64,
+    argv: Vec<String>,
+) -> (AdHocLaunchSpec, tempfile::TempDir, tempfile::TempDir) {
     let record = tempfile::tempdir().unwrap();
     let workdir = tempfile::tempdir().unwrap();
     let (events, _rx) = crossbeam_channel::bounded(64);
@@ -116,8 +116,8 @@ fn real_cli_version_probe_flows_through_pipeline() {
     let handle = spec.display_session_handle.clone();
     host.launch_ad_hoc(spec).expect("真实 codex --version 启动");
     // 存活期内抓 journal 输出(退出后注册表摘除)
-    let (channel, text) = capture_while_alive(&app, &handle, 30)
-        .expect("codex --version 输出未到达 journal(30s)");
+    let (channel, text) =
+        capture_while_alive(&app, &handle, 30).expect("codex --version 输出未到达 journal(30s)");
     assert!(
         text.contains("codex-cli") || text.contains("codex"),
         "版本输出可见:{text}"
@@ -127,7 +127,10 @@ fn real_cli_version_probe_flows_through_pipeline() {
     while app.registry().session_alive(&handle) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(!app.registry().session_alive(&handle), "--version 应自然退出");
+    assert!(
+        !app.registry().session_alive(&handle),
+        "--version 应自然退出"
+    );
     drop(channel);
 }
 
@@ -141,9 +144,10 @@ fn real_claude_version_probe_flows_through_pipeline() {
     let host = RuntimeHostImpl::new(app.registry().clone());
     let (spec, _record, _workdir) = quick_spec(exe, 951, vec!["--version".into()]);
     let handle = spec.display_session_handle.clone();
-    host.launch_ad_hoc(spec).expect("真实 claude --version 启动");
-    let (_channel, text) = capture_while_alive(&app, &handle, 30)
-        .expect("claude --version 输出未到达 journal(30s)");
+    host.launch_ad_hoc(spec)
+        .expect("真实 claude --version 启动");
+    let (_channel, text) =
+        capture_while_alive(&app, &handle, 30).expect("claude --version 输出未到达 journal(30s)");
     assert!(
         text.contains("Claude Code") || text.contains("claude"),
         "claude 版本输出可见:{text}"
@@ -152,7 +156,10 @@ fn real_claude_version_probe_flows_through_pipeline() {
     while app.registry().session_alive(&handle) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(!app.registry().session_alive(&handle), "--version 应自然退出");
+    assert!(
+        !app.registry().session_alive(&handle),
+        "--version 应自然退出"
+    );
 }
 
 /// ② codex TUI banner:输出流进 journal、**真实 PTY resize**、terminate
@@ -174,18 +181,28 @@ fn real_codex_tui_banner_resize_and_terminate() {
     let deadline = Instant::now() + Duration::from_secs(20);
     let channel = loop {
         if let Ok(channel) = app.attach_terminal(&handle, 0) {
-            if channel.output_facts().map(|f| f.last_seq >= 1).unwrap_or(false) {
+            if channel
+                .output_facts()
+                .map(|f| f.last_seq >= 1)
+                .unwrap_or(false)
+            {
                 break channel;
             }
         }
-        assert!(Instant::now() < deadline, "codex TUI banner 未在 20s 内到达 journal");
+        assert!(
+            Instant::now() < deadline,
+            "codex TUI banner 未在 20s 内到达 journal"
+        );
         std::thread::sleep(Duration::from_millis(20));
     };
     // 真实 resize(ConPTY):不报错;TUI 继续输出(journal 前进或保持)
     channel.resize(120, 40).expect("真实 PTY resize 失败");
     std::thread::sleep(Duration::from_millis(800));
     let facts_after_resize = channel.output_facts().unwrap();
-    assert!(facts_after_resize.last_seq >= 1, "resize 后 journal 仍有内容");
+    assert!(
+        facts_after_resize.last_seq >= 1,
+        "resize 后 journal 仍有内容"
+    );
     // terminate:进程树收口(Job Object;无人值守不留孤儿 CLI)
     channel.terminate().expect("terminate 失败");
     let deadline = Instant::now() + Duration::from_secs(15);

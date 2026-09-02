@@ -46,8 +46,6 @@ mod session_restore_tests;
 mod settings;
 mod task_cli_menu;
 #[cfg(test)]
-mod terminal_real_cli_matrix_tests;
-#[cfg(test)]
 mod task_cli_menu_tests;
 mod task_composer;
 #[cfg(test)]
@@ -58,6 +56,8 @@ mod term;
 mod terminal_channel_shim_tests;
 #[cfg(test)]
 mod terminal_matrix_tests;
+#[cfg(test)]
+mod terminal_real_cli_matrix_tests;
 mod theme;
 mod vcs_panel;
 #[allow(dead_code)]
