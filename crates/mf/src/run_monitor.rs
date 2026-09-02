@@ -761,7 +761,7 @@ impl RunMonitor {
         // 事务内,不经 events_rx):主动 nudge 统一快照重建,运行列表/
         // 徽标不等待下一个无关事件才更新。失败也 nudge——prepare 阶段的
         // 进程停止可能已改变事实。
-        self.app.overview.request_refresh();
+        self.app.overview().request_refresh();
         self.refresh();
         cx.notify();
     }

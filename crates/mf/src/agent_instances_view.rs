@@ -216,7 +216,7 @@ impl AgentInstancesPage {
     /// 从插件贡献 + 目录库刷新。
     pub fn refresh(&mut self) {
         let mut model = AgentInstancesViewModel::default();
-        let contributions = self.app.plugins.contributions();
+        let contributions = self.app.plugins().contributions();
         let mut types: Vec<crate::agent_instance_editor::AgentTypeInfo> = contributions
             .agent_types()
             .into_iter()
@@ -233,7 +233,7 @@ impl AgentInstancesPage {
                     plugin_version: src.plugin_version.clone(),
                     content_hash: src.content_hash.clone(),
                     config_schema_fields: crate::adapter_launch::config_schema_fields(
-                        &self.app.plugins,
+                        &self.app.plugins(),
                         &full_contribution_id,
                     ),
                     detected,
@@ -253,12 +253,12 @@ impl AgentInstancesPage {
         for info in types {
             model.push_type(info);
         }
-        if let Ok(rows) = self.app.catalog_store.list_agent_instances(None) {
+        if let Ok(rows) = self.app.catalog_store().list_agent_instances(None) {
             // 快照解析 executable/run_mode(列表投影不再丢字段)
             for row in &rows {
                 let snapshot = self
                     .app
-                    .catalog_store
+                    .catalog_store()
                     .snapshot_agent_instance(&row.id, None)
                     .ok();
                 model.push_instance(InstanceListInstance {
@@ -358,7 +358,7 @@ impl AgentInstancesPage {
             // Orca 式权限默认:全局 yolo 时新建实例预填 yolo 参数
             // (参数即状态;Manual 留空,由用户在终端里手动批准)
             let global_yolo = {
-                let cfg = self.app.config.lock();
+                let cfg = self.app.config_snapshot();
                 cfg.agents.permission_mode != "manual"
             };
             if global_yolo {
@@ -374,13 +374,13 @@ impl AgentInstancesPage {
     pub fn open_editor_for_instance(&mut self, instance_id: &str, cx: &mut Context<Self>) {
         match self
             .app
-            .catalog_store
+            .catalog_store()
             .snapshot_agent_instance(instance_id, None)
         {
             Ok(snapshot) => {
                 let row = self
                     .app
-                    .catalog_store
+                    .catalog_store()
                     .get_agent_instance(instance_id)
                     .ok()
                     .flatten();
@@ -424,12 +424,12 @@ impl AgentInstancesPage {
         let result = match &state.editing_instance_id {
             Some(id) => self
                 .app
-                .catalog_store
+                .catalog_store()
                 .update_agent_instance(id, draft)
                 .map(|i| i.id),
             None => self
                 .app
-                .catalog_store
+                .catalog_store()
                 .create_agent_instance(draft)
                 .map(|i| i.id),
         };
@@ -491,7 +491,7 @@ impl AgentInstancesPage {
         let Some(id) = state.editing_instance_id.clone() else {
             return;
         };
-        match self.app.catalog_store.delete_agent_instance(&id) {
+        match self.app.catalog_store().delete_agent_instance(&id) {
             Ok(true) => {
                 self.status = format!("已删除实例 {id}");
                 self.editor = None;

@@ -233,6 +233,14 @@ impl SessionHandle {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// T2f shim 过渡构造:legacy SessionRegistry 的会话键(display handle
+    /// 或裸 UUIDv7)尚未迁移到 §3.2 持久 handle 空间,`sess_` 强校验会
+    /// 拒绝全部现存会话。存在性由 TerminalHost 的 attach 校验判定;
+    /// T3 统一 handle 空间后本构造收紧为 `parse`。
+    pub fn from_opaque(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
 }
 
 impl fmt::Display for SessionHandle {

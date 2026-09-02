@@ -225,7 +225,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let app = AppCtx::new();
-        let editor_config = app.config.lock().editor.clone();
+        let editor_config = app.config_snapshot().editor.clone();
         crate::theme::set_theme_id(&editor_config.theme);
         let task_sidebar = cx.new(|cx| TaskSidebar::new(app.clone(), cx));
         let agent_workspace = cx.new(|cx| AgentWorkspace::new(app.clone(), cx));
@@ -260,7 +260,7 @@ impl Workspace {
         // 唯一的轻量 snapshot 监听:revision 变化时把同一份快照推给
         // TaskSidebar 与 AgentWorkspace(两者不再各自轮询数据库)。
         {
-            let hub = ws.app.overview.clone();
+            let hub = ws.app.overview().clone();
             cx.spawn(async move |this, cx| {
                 let mut last = 0u64;
                 loop {
@@ -688,9 +688,9 @@ impl Workspace {
     }
 
     fn vcs_environment(&self) -> mf_plugins::vcs_provider::VcsEnvironment {
-        let config = self.app.config.lock().clone();
+        let config = self.app.config_snapshot().clone();
         mf_plugins::vcs_provider::VcsEnvironment::resolve(
-            &self.app.plugins.contributions(),
+            &self.app.plugins().contributions(),
             &config,
         )
     }
@@ -1338,13 +1338,8 @@ impl Workspace {
         cx.subscribe(&s, move |ws, _, ev: &Saved, cx| {
             ws.apply_editor_font(&ev.0.editor, cx);
             ws.editor_font = ev.0.editor.clone();
-            // 引擎并发设置实时生效
-            ws.app
-                .limiter
-                .set_max(ev.0.engine.global_concurrency.max(1));
-            *ws.app.config.lock() = ev.0.clone();
-            ws.app.registry.update_config(ev.0.clone());
-            ws.app.keep_awake.set_enabled(ev.0.agents.keep_awake);
+            // 引擎并发/注册表/防休眠配置传播(T2f:经 AppCtx 统一入口)
+            ws.app.apply_engine_settings(ev.0.clone());
             let environment = ws.vcs_environment();
             if let Some(panel) = &ws.vcs_panel {
                 panel.update(cx, |panel, cx| panel.set_environment(environment, cx));
@@ -2479,7 +2474,7 @@ impl Workspace {
             .as_ref()
             .map(|v| v.read(cx).change_count())
             .unwrap_or(0);
-        let working = self.app.limiter.active();
+        let working = self.app.limiter().active();
         let projects = self.project_count();
         let root_name = self
             .context

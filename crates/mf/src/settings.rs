@@ -140,7 +140,7 @@ impl SettingsView {
     ) -> Self {
         let mut view = Self::new(cx);
         view.selected_vcs_provider = app
-            .plugins
+            .plugins()
             .contributions()
             .vcs_providers()
             .into_iter()
@@ -852,7 +852,7 @@ impl SettingsView {
     fn vcs_provider(&self, full_id: &str) -> Option<mf_plugins::manifest::VcsProviderContribution> {
         self.app
             .as_ref()?
-            .plugins
+            .plugins()
             .contributions()
             .find_vcs_provider(full_id)
             .map(|(_, provider)| provider)
@@ -870,7 +870,7 @@ impl SettingsView {
             cx.notify();
             return;
         }
-        let registry = app.plugins.contributions();
+        let registry = app.plugins().contributions();
         let config = self.draft.clone();
         let cwd = self
             .vcs_test_root
@@ -909,7 +909,7 @@ impl SettingsView {
                 .child("此页面需要应用上下文")
                 .into_any_element();
         };
-        let providers = app.plugins.contributions().vcs_providers();
+        let providers = app.plugins().contributions().vcs_providers();
         if providers.is_empty() {
             return div()
                 .flex()
@@ -1653,11 +1653,16 @@ impl SettingsView {
             ));
         }
         if let Some(app) = self.app.as_ref() {
-            for profile in app.plugins.agent_profiles().into_iter().filter(|profile| {
-                profile.id != "blank-terminal"
-                    && (profile.runtime != mf_agent::RuntimeKind::Pty
-                        || mf_plugins::builtin::detect_on_path(&profile.command).is_some())
-            }) {
+            for profile in app
+                .plugins()
+                .agent_profiles()
+                .into_iter()
+                .filter(|profile| {
+                    profile.id != "blank-terminal"
+                        && (profile.runtime != mf_agent::RuntimeKind::Pty
+                            || mf_plugins::builtin::detect_on_path(&profile.command).is_some())
+                })
+            {
                 let id = profile.id.clone();
                 let label = profile.display_name.clone();
                 let selected = selected_default == id;
@@ -1781,8 +1786,8 @@ impl SettingsView {
                 .child("此页面需要应用上下文")
                 .into_any_element();
         };
-        let profiles = app.plugins.agent_profiles();
-        let summaries = app.plugins.summaries();
+        let profiles = app.plugins().agent_profiles();
+        let summaries = app.plugins().summaries();
         let default_agent = self.draft.agents.default_agent.clone();
 
         let mut col = div().flex().flex_col().gap_2().child(section("默认智能体"));
@@ -1955,7 +1960,7 @@ impl SettingsView {
                                         // 载入当前覆盖缓冲
                                         if let Some(app) = &s.app {
                                             if let Some(spec) = app
-                                                .plugins
+                                                .plugins()
                                                 .agent_profiles()
                                                 .into_iter()
                                                 .find(|x| x.id == pid)
@@ -2058,7 +2063,7 @@ impl SettingsView {
                                                         .collect();
                                                     if let Some(app) = &s.app {
                                                         if let Some(mut spec) = app
-                                                            .plugins
+                                                            .plugins()
                                                             .agent_profiles()
                                                             .into_iter()
                                                             .find(|x| x.id == pid)
@@ -2067,7 +2072,7 @@ impl SettingsView {
                                                             spec.args = args;
                                                             spec.permission_args = perm;
                                                             spec.env = env;
-                                                            app.plugins.set_agent_override(spec);
+                                                            app.plugins().set_agent_override(spec);
                                                             app.refresh_catalog();
                                                             s.status = "已应用(会话内生效)".into();
                                                         }
@@ -2342,11 +2347,11 @@ impl SettingsView {
                 .child("此页面需要应用上下文")
                 .into_any_element();
         };
-        let summaries = app.plugins.summaries();
+        let summaries = app.plugins().summaries();
         let mut col = div().flex().flex_col().gap_2().child(section("已安装插件"));
         // 贡献视图:类型/权限/固定版本/哈希(设计 §11.5)
         let contribution_rows =
-            crate::plugin_contribution_view::summaries_from_registry(&app.plugins);
+            crate::plugin_contribution_view::summaries_from_registry(&app.plugins());
         if summaries.is_empty() {
             col = col.child(label_value("暂无插件"));
         }
@@ -2510,7 +2515,7 @@ impl SettingsView {
                                         if let Some(app) = app {
                                             // 只做常规启用;需要重新授权时置为待确认,
                                             // 绝不在同一次点击里自动重授权
-                                            match app.plugins.enable(&fid_enable, false) {
+                                            match app.plugins().enable(&fid_enable, false) {
                                                 Ok(()) => {
                                                     s2.pending_reauth = None;
                                                     s2.plugin_status = "已启用".into();
@@ -2544,7 +2549,7 @@ impl SettingsView {
                                         let app = s2.app.clone();
                                         if let Some(app) = app {
                                             s2.plugin_status =
-                                                match app.plugins.disable(&fid_disable) {
+                                                match app.plugins().disable(&fid_disable) {
                                                     Ok(()) => "已禁用".into(),
                                                     Err(e) => format!("{e}").into(),
                                                 };
@@ -2564,7 +2569,7 @@ impl SettingsView {
                                     move |s2: &mut SettingsView, _, _, cx| {
                                         let app = s2.app.clone();
                                         s2.plugin_status = match app {
-                                            Some(app) => match app.plugins.uninstall(&fid) {
+                                            Some(app) => match app.plugins().uninstall(&fid) {
                                                 Ok(()) => "已删除(重载后生效)".into(),
                                                 Err(e) => format!("{e:#}").into(),
                                             },
@@ -2611,7 +2616,7 @@ impl SettingsView {
                                                     if let Some(app) = app {
                                                         let fid = fid_reauth.clone();
                                                         s2.plugin_status =
-                                                            match app.plugins.enable(&fid, true) {
+                                                            match app.plugins().enable(&fid, true) {
                                                                 Ok(()) => "已重新授权并启用".into(),
                                                                 Err(e) => format!("{e}").into(),
                                                             };

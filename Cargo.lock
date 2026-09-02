@@ -2429,6 +2429,7 @@ dependencies = [
  "mf-kernel",
  "mf-plugins",
  "mf-skills",
+ "mf-terminal",
  "mf-vcs",
  "notify",
  "nucleo-matcher",
@@ -2502,6 +2503,7 @@ dependencies = [
  "libc",
  "log",
  "mf-agent",
+ "mf-terminal",
  "parking_lot",
  "rand 0.8.8",
  "rusqlite",
@@ -2552,6 +2554,13 @@ dependencies = [
  "serde",
  "tempfile",
  "toml 0.8.23",
+]
+
+[[package]]
+name = "mf-terminal"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.20",
 ]
 
 [[package]]

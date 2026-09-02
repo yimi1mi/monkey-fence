@@ -219,7 +219,7 @@ fn run_project_workflow_creates_task_revision_and_starts_scheduling() {
     assert!(prompt.contains("做 a"), "节点工作说明进入 prompt");
     assert_eq!(orch.store.list_tasks(false).unwrap().len(), before + 1);
     // 不把项目工作流自动保存成全局模板
-    let templates = ctx.catalog_store.list_templates(false).unwrap();
+    let templates = ctx.catalog_store().list_templates(false).unwrap();
     assert!(
         templates.iter().all(|t| t.key != "wf-e2e"),
         "项目工作流不得自动晋升全局模板: {templates:?}"
@@ -228,7 +228,7 @@ fn run_project_workflow_creates_task_revision_and_starts_scheduling() {
     for r in orch.store.list_runs_of_task(task.id).unwrap() {
         if let Some(sid) = r.session_id {
             if let Some(session) = orch.store.session_view(sid).unwrap() {
-                ctx.registry.kill_session(&session.public_handle);
+                ctx.registry().kill_session(&session.public_handle);
             }
         }
     }
@@ -287,7 +287,7 @@ fn single_and_multi_node_workflows_use_the_same_api() {
     for r in orch.store.list_runs_of_task(task.id).unwrap() {
         if let Some(sid) = r.session_id {
             if let Some(session) = orch.store.session_view(sid).unwrap() {
-                ctx.registry.kill_session(&session.public_handle);
+                ctx.registry().kill_session(&session.public_handle);
             }
         }
     }

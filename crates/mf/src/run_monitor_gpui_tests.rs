@@ -27,7 +27,7 @@ fn run_monitor_confirm_gate_first_click_holds_and_confirm_executes_once(
 
     // task-local 单节点草稿(opencode 类型 + cmd.exe /K 常驻)→ 确认运行
     let instance = ctx
-        .catalog_store
+        .catalog_store()
         .create_agent_instance(mf_agent::agent_instance::AgentInstanceDraft {
             name: "worker".into(),
             agent_type: "opencode".into(),
@@ -59,7 +59,7 @@ fn run_monitor_confirm_gate_first_click_holds_and_confirm_executes_once(
     orch.store
         .save_task_workflow(&root_key, task.id, &draft, false)
         .unwrap();
-    let index = crate::adapter_launch::workflow_plugin_index(&ctx.plugins);
+    let index = crate::adapter_launch::workflow_plugin_index(&ctx.plugins());
     orch.assign_and_confirm_task_local(task.id, &index).unwrap();
 
     // 等待 run 真实运行 + 租约持有

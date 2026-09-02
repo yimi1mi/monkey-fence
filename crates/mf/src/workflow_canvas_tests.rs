@@ -6,7 +6,7 @@
 use crate::workflow_canvas::{AgentLibraryEntry, WorkflowCanvas};
 
 fn cmd_instance(ctx: &std::sync::Arc<crate::app_ctx::AppCtx>, name: &str) -> String {
-    ctx.catalog_store
+    ctx.catalog_store()
         .create_agent_instance(mf_agent::AgentInstanceDraft {
             name: name.into(),
             agent_type: "opencode".into(),

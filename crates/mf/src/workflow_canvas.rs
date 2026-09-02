@@ -90,8 +90,8 @@ impl AgentLibraryEntry {
 /// 检测到且启用的默认 CLI 投影(完整贡献 ID + 用户可见名)。
 /// 未检测到的 CLI 不出现在画布选择器(设置页会解释原因)。
 pub fn detected_default_cli_entries(app: &Arc<crate::app_ctx::AppCtx>) -> Vec<(String, String)> {
-    let contributions = app.plugins.contributions();
-    let summaries = app.plugins.summaries();
+    let contributions = app.plugins().contributions();
+    let summaries = app.plugins().summaries();
     contributions
         .agent_types()
         .into_iter()
@@ -191,7 +191,7 @@ impl WorkflowCanvas {
             .collect();
         library.extend(
             self.app
-                .catalog_store
+                .catalog_store()
                 .list_agent_instances(None)
                 .map(|rows| {
                     rows.into_iter()
@@ -299,7 +299,7 @@ impl WorkflowCanvas {
     fn refresh_templates(&mut self) {
         self.templates = self
             .app
-            .catalog_store
+            .catalog_store()
             .list_templates(false)
             .map(|rows| rows.into_iter().map(|t| (t.key, t.name)).collect())
             .unwrap_or_default();
@@ -902,7 +902,7 @@ impl WorkflowCanvas {
             return;
         };
         // 解析模板当前版本(复制其节点;失败给出稳定错误)
-        let version = match self.app.catalog_store.template_versions(template_key) {
+        let version = match self.app.catalog_store().template_versions(template_key) {
             Ok(versions) => versions.into_iter().next_back(),
             Err(e) => {
                 self.status = format!("读取模板失败: {e:#}");
@@ -992,7 +992,7 @@ impl WorkflowCanvas {
             task_local: false,
             nodes: draft.nodes,
         };
-        match self.app.catalog_store.save_template(&template) {
+        match self.app.catalog_store().save_template(&template) {
             Ok(version) => {
                 self.refresh_templates();
                 self.status = format!("已另存为全局模板(版本 {})", version.version);

@@ -134,14 +134,14 @@ fn full_workflow_e2e_real_process_secret_pin_merge() {
     );
     draft.config = serde_json::json!({ "secret_env": { "MY_TOKEN": secret_id } });
     draft.sealed_secret_ids = vec![secret_id.clone()];
-    let instance = ctx.catalog_store.create_agent_instance(draft).unwrap();
+    let instance = ctx.catalog_store().create_agent_instance(draft).unwrap();
 
     // 2) 模板分配(编译 + 插件 pin + Revision 冻结)
     let task = orch
         .create_task("E2E 发布检查", "把检查产物落到项目目录")
         .unwrap();
     let version = ctx
-        .catalog_store
+        .catalog_store()
         .save_template(&mf_agent::workflow::WorkflowTemplateDraft {
             key: "e2e-release".into(),
             name: "E2E 发布检查".into(),
@@ -338,7 +338,7 @@ fn default_cli_leaves_external_config_untouched() {
             s.status,
             mf_agent::SessionStatus::Dead | mf_agent::SessionStatus::Hidden
         ) {
-            ctx.registry.kill_session(&s.public_handle);
+            ctx.registry().kill_session(&s.public_handle);
         }
     }
     orch.stop();
@@ -678,8 +678,8 @@ fn e2e_parallel_join_real_processes_merge_as_batch_downstream_sees_all() {
     let mk = |argv: &[&str]| -> mf_agent::AgentInstanceSnapshot {
         let draft = e2e_instance_draft(&cmd, argv);
         // 只取一次实例:直接用 snapshot 形态(draft→snapshot 同构)
-        let id = ctx.catalog_store.create_agent_instance(draft).unwrap().id;
-        ctx.catalog_store
+        let id = ctx.catalog_store().create_agent_instance(draft).unwrap().id;
+        ctx.catalog_store()
             .snapshot_agent_instance(&id, None)
             .unwrap()
     };
@@ -697,7 +697,7 @@ fn e2e_parallel_join_real_processes_merge_as_batch_downstream_sees_all() {
         .create_task("并行 join E2E", "真实进程并行+汇合")
         .unwrap();
     let version = ctx
-        .catalog_store
+        .catalog_store()
         .save_template(&mf_agent::workflow::WorkflowTemplateDraft {
             key: "e2e-join".into(),
             name: "并行 join".into(),
@@ -810,7 +810,7 @@ fn e2e_nested_file_merge_failure_rolls_back_then_recovers() {
     let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
     // 真实进程在 worktree 内创建嵌套目录文件
     let instance = ctx
-        .catalog_store
+        .catalog_store()
         .create_agent_instance(e2e_instance_draft(
             &cmd,
             &[
@@ -823,7 +823,7 @@ fn e2e_nested_file_merge_failure_rolls_back_then_recovers() {
         .create_task("嵌套回滚 E2E", "嵌套文件+失败回滚")
         .unwrap();
     let version = ctx
-        .catalog_store
+        .catalog_store()
         .save_template(&mf_agent::workflow::WorkflowTemplateDraft {
             key: "e2e-nested".into(),
             name: "嵌套".into(),
@@ -913,12 +913,12 @@ fn e2e_cancel_run_terminates_real_os_process_and_releases_worktree() {
     let cmd = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".into());
     // 常驻进程(/K 不退出),等待取消
     let instance = ctx
-        .catalog_store
+        .catalog_store()
         .create_agent_instance(e2e_instance_draft(&cmd, &["/K"]))
         .unwrap();
     let task = orch.create_task("PID 终止 E2E", "取消真实进程").unwrap();
     let version = ctx
-        .catalog_store
+        .catalog_store()
         .save_template(&mf_agent::workflow::WorkflowTemplateDraft {
             key: "e2e-cancel".into(),
             name: "取消".into(),
@@ -979,12 +979,12 @@ fn e2e_cancel_run_terminates_real_os_process_and_releases_worktree() {
     // OS PID 可观测且进程真实存活
     assert!(
         wait_until(Duration::from_secs(10), || ctx
-            .registry
+            .registry()
             .session_pid(&session_handle)
             .is_some()),
         "会话应有可观测 OS PID"
     );
-    let pid = ctx.registry.session_pid(&session_handle).unwrap();
+    let pid = ctx.registry().session_pid(&session_handle).unwrap();
     assert!(tasklist_has_pid(pid), "前置:PID {pid} 应存活");
 
     // 取消:确认真实 OS 进程终止(不是 kill 后立刻谎报)

@@ -50,6 +50,8 @@ mod task_composer;
 mod task_composer_tests;
 mod task_sidebar;
 mod term;
+#[cfg(test)]
+mod terminal_channel_shim_tests;
 mod theme;
 mod vcs_panel;
 #[allow(dead_code)]

@@ -1540,7 +1540,7 @@ fn project_workflow_first_run_loop_e2e(cx: &mut gpui::TestAppContext) {
 
     // 8) 徽标显示 1：只读真实 Overview Hub，不在测试中手算 Attention。
     let attention_of = || {
-        ctx.overview
+        ctx.overview()
             .current()
             .attention_runs
             .iter()
@@ -1615,12 +1615,12 @@ fn project_workflow_first_run_loop_e2e(cx: &mut gpui::TestAppContext) {
     for r in orch.store.list_runs_of_task(task_id).unwrap() {
         if let Some(sid) = r.session_id {
             if let Some(session) = orch.store.session_view(sid).unwrap() {
-                ctx.registry.kill_session(&session.public_handle);
+                ctx.registry().kill_session(&session.public_handle);
             }
         }
     }
-    let restart_config = ctx.config.lock().clone();
-    let restart_plugins = ctx.plugins.clone();
+    let restart_config = ctx.config_snapshot().clone();
+    let restart_plugins = ctx.plugins().clone();
     orch.stop();
     ctx.close_project(&project.path().to_path_buf());
 
@@ -1641,7 +1641,7 @@ fn project_workflow_first_run_loop_e2e(cx: &mut gpui::TestAppContext) {
     assert_eq!(workflow_kept.nodes.len(), 2);
     assert!(
         e2e_wait(Duration::from_secs(10), || restarted
-            .overview
+            .overview()
             .current()
             .attention_runs
             .iter()

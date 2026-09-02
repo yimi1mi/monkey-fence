@@ -511,20 +511,19 @@ impl From<crate::operation::OperationProblem> for KernelProblem {
 }
 
 // ---------------------------------------------------------------------------
-// attach_terminal 占位 DTO(T3 mf-terminal 接管前 fail-closed)
+// attach_terminal(T2f:mf-terminal shim 委托 TerminalHost)
 // ---------------------------------------------------------------------------
 
-/// 终端 attach 请求(T3 冻结完整形状前的最小占位)。
+/// 终端 attach 请求(T3 冻结完整形状前的最小占位;shim 忽略 `after_seq`,
+/// replay/seq 语义随 mf-terminal 管线落地)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TerminalAttach {
     pub after_seq: u64,
 }
 
-/// 终端通道(T3 由 `mf-terminal::channel` 接管;当前不可构造)。
-#[derive(Debug, Clone)]
-pub struct TerminalChannel {
-    _private: (),
-}
+pub use mf_terminal::channel::{
+    TerminalChannel, TerminalHost, TerminalProblem, TerminalSessionRef,
+};
 
 // ---------------------------------------------------------------------------
 // CoreKernel trait(§2.2:唯一深模块缝隙)
@@ -854,7 +853,7 @@ pub struct ProjectCloseToken {
 /// 进程内 CoreKernel(Bridge A 前身):GPUI 与未来 WebGateway 共用的
 /// 唯一写路径。持有 service-v1、已登记 Project Store 与事件 journal;
 /// 不拥有 Orchestrator/PTY(那些仍在 legacy AppCtx,后续 ticket 迁移)。
-pub(crate) struct InProcessCoreKernel {
+pub struct InProcessCoreKernel {
     coordinator: CommandCoordinator,
     service: Arc<ServiceStore>,
     idempotency_key: ServiceIdempotencyKey,
@@ -873,6 +872,9 @@ pub(crate) struct InProcessCoreKernel {
     /// 只持有 channel sender；worker 仅持有 Kernel 的 Weak，避免
     /// runtime → kernel → worker → kernel 的强引用环。
     workflow_start_worker: RwLock<Option<Arc<WorkflowStartWorker>>>,
+    /// T2f 终端宿主缝隙:由拥有 SessionRuntime 的装配件(mf crate AppCtx)
+    /// 注入;未注入时 attach_terminal 显式 fail-closed,不回退旁路。
+    terminal_host: RwLock<Option<Arc<dyn mf_terminal::TerminalHost>>>,
     projections: ProjectionHub,
 }
 
@@ -1040,6 +1042,7 @@ impl InProcessCoreKernel {
             cancel_gates: Mutex::new(HashMap::new()),
             workflow_start_ports: RwLock::new(HashMap::new()),
             workflow_start_worker: RwLock::new(None),
+            terminal_host: RwLock::new(None),
             projections,
         }
     }
@@ -1048,6 +1051,21 @@ impl InProcessCoreKernel {
         let worker = WorkflowStartWorker::spawn(Arc::downgrade(self))?;
         *self.workflow_start_worker.write() = Some(worker);
         Ok(())
+    }
+
+    /// 幂等注入终端宿主(装配件在创建/注册 kernel 时调用;重复注入以
+    /// 先到者为准,不覆盖,避免装配竞态换掉已生效的宿主)。
+    pub fn ensure_terminal_host(
+        &self,
+        populate: impl FnOnce() -> Arc<dyn mf_terminal::TerminalHost>,
+    ) {
+        if self.terminal_host.read().is_some() {
+            return;
+        }
+        let mut guard = self.terminal_host.write();
+        if guard.is_none() {
+            *guard = Some(populate());
+        }
     }
 
     /// 登记一个 Project Store(handle 来自 service-v1 `project_registry`,
@@ -2605,13 +2623,22 @@ impl CoreKernel for InProcessCoreKernel {
 
     fn attach_terminal(
         &self,
-        _session: SessionHandle,
+        session: SessionHandle,
         _attach: TerminalAttach,
     ) -> Result<TerminalChannel, KernelProblem> {
-        // T3(mf-terminal)接管前显式 fail-closed,不给半吊子终端通道。
-        Err(KernelProblem::ServiceUnavailable(
-            "attach_terminal 在 T3 Terminal 管线落地后才可用".into(),
-        ))
+        // T2f shim:委托装配件注入的 TerminalHost(legacy SessionRegistry)。
+        // `after_seq` 的 replay 语义随 T3 管线生效,shim 忽略。
+        let host = self.terminal_host.read().clone().ok_or_else(|| {
+            KernelProblem::ServiceUnavailable(
+                "终端宿主未装配:attach_terminal 需要装配件注入 TerminalHost".into(),
+            )
+        })?;
+        let reference = TerminalSessionRef::new(session.as_str().to_owned());
+        if !host.session_alive(&reference) {
+            log::warn!("attach_terminal:会话不存在或已结束:{session}");
+            return Err(KernelProblem::ResourceNotFound);
+        }
+        Ok(TerminalChannel::attach(host, reference))
     }
 
     fn shutdown(&self, intent: ShutdownIntent) -> ShutdownAssessment {
@@ -5058,6 +5085,12 @@ impl InProcessProject {
 }
 
 impl InProcessKernelRuntime {
+    /// kernel facade 句柄(装配件用于注入 TerminalHost 等宿主缝隙;
+    /// 不改变命令/投影所有权)。
+    pub fn kernel(&self) -> &Arc<InProcessCoreKernel> {
+        &self.kernel
+    }
+
     pub fn acquire_default(
         build: &str,
         client_id: ClientId,

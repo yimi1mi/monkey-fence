@@ -14,7 +14,9 @@ use mf_agent::orchestrator::{
 use mf_agent::workflow::{PluginSourcePin, WorkflowTemplateVersion};
 use mf_agent::{CatalogStore, Store, TaskStatus};
 use mf_kernel::handles::{ClientId, Principal, ProjectStoreHandle};
-use mf_kernel::kernel::{InProcessKernelRuntime, KernelOutcome, KernelProblem, LegacyKernelClient};
+use mf_kernel::kernel::{
+    CoreKernel, InProcessKernelRuntime, KernelOutcome, KernelProblem, LegacyKernelClient,
+};
 use mf_plugins::PluginRegistry;
 use parking_lot::{Mutex, RwLock};
 use std::path::{Path, PathBuf};
@@ -211,9 +213,17 @@ impl mf_agent::execution_directory::DirectoryProviderResolver for PluginDirector
 
 #[derive(Clone)]
 pub struct ProjectHandle {
-    pub root: PathBuf,
-    pub orchestrator: Arc<Orchestrator>,
+    root: PathBuf,
+    orchestrator: Arc<Orchestrator>,
     kernel_project: Option<ProjectStoreHandle>,
+}
+
+impl ProjectHandle {
+    /// 项目根路径(只读;`ProjectHandle` 其余字段私有,orchestrator 经
+    /// `AppCtx::orchestrator_of` 获取)。
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 }
 
 /// 工作流默认 CLI 节点引用前缀:`default-cli:<完整 Agent Type 贡献 ID>`。
@@ -551,18 +561,21 @@ impl crate::project_overview::KernelProjectionSource for KernelProjectionAdapter
 }
 
 pub struct AppCtx {
-    pub registry: Arc<SessionRegistry>,
-    pub plugins: Arc<PluginRegistry>,
+    /// T2f(Issue #28):全部字段私有。外部读经访问器;终端写输入必须经
+    /// `attach_terminal` 返回的 `TerminalChannel`,Workflow/Run/Settlement
+    /// 写路径经 CoreKernel dispatch。
+    registry: Arc<SessionRegistry>,
+    plugins: Arc<PluginRegistry>,
     /// 用户级目录库(Agent Instance、模板、Secret、插件包;~/.monkeyfence/catalog-v1.db)。
     /// 读写 API 随 Agent Instance / Secret Store 里程碑接入。
     #[allow(dead_code)]
-    pub catalog_store: Arc<CatalogStore>,
-    pub limiter: Arc<GlobalLimiter>,
-    pub keep_awake: Arc<KeepAwake>,
-    pub catalog: Arc<RwLock<ProfileCatalog>>,
-    pub config: Arc<Mutex<mf_agent::Config>>,
+    catalog_store: Arc<CatalogStore>,
+    limiter: Arc<GlobalLimiter>,
+    keep_awake: Arc<KeepAwake>,
+    catalog: Arc<RwLock<ProfileCatalog>>,
+    config: Arc<Mutex<mf_agent::Config>>,
     /// 统一项目总览快照 + Orchestrator Event Hub(UI 不再直接扫描项目列表)。
-    pub overview: Arc<ProjectOverviewHub>,
+    overview: Arc<ProjectOverviewHub>,
     /// 已打开项目(私有:外部走 overview snapshot / 查询方法)。
     projects: Mutex<Vec<ProjectHandle>>,
     /// Secret Store 主密钥覆盖(None = 生产 OS keyring;测试注入确定性密钥)。
@@ -580,6 +593,73 @@ pub struct AppCtx {
 }
 
 impl AppCtx {
+    // ---------- T2f 字段私有化访问器(只读) ----------
+
+    /// Agent Session 注册表(读投影:tail/snapshot/alive)。终端**写输入**
+    /// 必须经 `attach_terminal` 返回的 `TerminalChannel`。
+    pub fn registry(&self) -> &Arc<SessionRegistry> {
+        &self.registry
+    }
+
+    pub fn plugins(&self) -> &Arc<PluginRegistry> {
+        &self.plugins
+    }
+
+    pub fn catalog_store(&self) -> &Arc<CatalogStore> {
+        &self.catalog_store
+    }
+
+    pub fn limiter(&self) -> &Arc<GlobalLimiter> {
+        &self.limiter
+    }
+
+    pub fn keep_awake(&self) -> &Arc<KeepAwake> {
+        &self.keep_awake
+    }
+
+    pub fn catalog(&self) -> &Arc<RwLock<ProfileCatalog>> {
+        &self.catalog
+    }
+
+    /// 引擎/Agent 配置快照(深拷贝;写经 `apply_engine_settings`)。
+    pub fn config_snapshot(&self) -> mf_agent::Config {
+        self.config.lock().clone()
+    }
+
+    pub fn overview(&self) -> &Arc<ProjectOverviewHub> {
+        &self.overview
+    }
+
+    /// 设置保存后的引擎配置传播(并发上限、注册表配置、防休眠)。
+    /// T2f:字段私有化后这是唯一的配置应用入口。
+    pub fn apply_engine_settings(&self, config: mf_agent::Config) {
+        self.limiter
+            .set_max(config.engine.global_concurrency.max(1));
+        *self.config.lock() = config.clone();
+        self.registry.update_config(config.clone());
+        self.keep_awake.set_enabled(config.agents.keep_awake);
+    }
+
+    /// T2f(Issue #28):终端通道唯一 UI 入口。经 CoreKernel
+    /// `attach_terminal` 委托 TerminalHost shim(legacy SessionRegistry);
+    /// 调用者拿到 `TerminalChannel`,不接触 raw writer/`PtyMaster`。
+    pub fn attach_terminal(
+        &self,
+        session_handle: &str,
+        after_seq: u64,
+    ) -> Result<mf_terminal::TerminalChannel, KernelProblem> {
+        // shim 阶段沿用 legacy 会话键空间(display handle/裸 UUIDv7);
+        // 存在性由 TerminalHost 判定,格式收敛随 T3 handle 空间统一。
+        let session = mf_kernel::handles::SessionHandle::from_opaque(session_handle);
+        let tracer = self
+            .ensure_kernel_tracer()?
+            .ok_or_else(|| KernelProblem::ServiceUnavailable("CoreKernel runtime 未装配".into()))?;
+        let kernel = tracer.runtime.kernel();
+        let registry = self.registry.clone();
+        kernel.ensure_terminal_host(move || registry as Arc<dyn mf_terminal::TerminalHost>);
+        kernel.attach_terminal(session, mf_kernel::kernel::TerminalAttach { after_seq })
+    }
+
     pub fn new() -> Arc<AppCtx> {
         let config = mf_agent::Config::load().unwrap_or_default();
         let catalog_store = CatalogStore::open_default().unwrap_or_else(|e| {

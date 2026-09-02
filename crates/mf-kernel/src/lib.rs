@@ -65,6 +65,9 @@ mod kernel_first_tracer;
 #[path = "../tests/contract/multistore_crash_recovery.rs"]
 mod multistore_crash_recovery;
 #[cfg(test)]
+#[path = "../tests/contract/no_mutation_bypass.rs"]
+mod no_mutation_bypass;
+#[cfg(test)]
 #[path = "../tests/contract/operation_saga.rs"]
 mod operation_saga;
 #[cfg(test)]
@@ -82,6 +85,9 @@ mod retention_gc;
 #[cfg(test)]
 #[path = "../tests/contract/run_control.rs"]
 mod run_control_contract;
+#[cfg(test)]
+#[path = "../tests/contract/terminal_channel_shim.rs"]
+mod terminal_channel_shim;
 #[cfg(test)]
 #[path = "../tests/contract/workflow_run_commands.rs"]
 mod workflow_run_commands;

@@ -200,6 +200,37 @@ pub struct SessionRegistry {
     stop_confirm_timeout: parking_lot::RwLock<std::time::Duration>,
 }
 
+/// T2f(Issue #28):legacy SessionRegistry 作为 `TerminalHost` 的 shim
+/// 实现——`CoreKernel::attach_terminal` 经此委托既有 PTY 管线;调用者只
+/// 拿到 `TerminalChannel`,不再接触 raw writer。T3 在 mf-terminal 落地
+/// 真实管线后本实现整体移除(同接口换内部)。
+impl mf_terminal::TerminalHost for SessionRegistry {
+    fn session_alive(&self, session: &mf_terminal::TerminalSessionRef) -> bool {
+        SessionRegistry::session_alive(self, session.as_str())
+    }
+
+    fn send_input(
+        &self,
+        session: &mf_terminal::TerminalSessionRef,
+        bytes: &[u8],
+    ) -> Result<(), mf_terminal::TerminalProblem> {
+        self.send_prompt_raw(session.as_str(), bytes)
+            .map_err(|error| mf_terminal::TerminalProblem::WriteFailed(format!("{error:#}")))
+    }
+
+    fn terminate_session(
+        &self,
+        session: &mf_terminal::TerminalSessionRef,
+    ) -> Result<(), mf_terminal::TerminalProblem> {
+        self.kill_session(session.as_str());
+        Ok(())
+    }
+
+    fn tail_lines(&self, session: &mf_terminal::TerminalSessionRef, lines: usize) -> Vec<String> {
+        self.pty_tail(session.as_str(), lines)
+    }
+}
+
 impl SessionRegistry {
     pub fn new(config: mf_agent::Config) -> Arc<SessionRegistry> {
         Arc::new(SessionRegistry {
@@ -217,7 +248,9 @@ impl SessionRegistry {
         *self.stop_confirm_timeout.write() = timeout;
     }
 
-    pub fn update_config(&self, config: mf_agent::Config) {
+    /// T2f:引擎配置传播收窄为 crate 内部(AppCtx 统一入口),不再作为
+    /// SessionRegistry 的外部 mutation 入口。
+    pub(crate) fn update_config(&self, config: mf_agent::Config) {
         *self.config.lock() = config;
     }
 
@@ -284,7 +317,9 @@ impl SessionRegistry {
         }
     }
 
-    pub fn send_prompt(&self, session_handle: &str, text: &str) -> Result<()> {
+    /// T2f:终端文本输入收窄为 crate 内部;UI 写输入必须经
+    /// `CoreKernel::attach_terminal` 返回的 `TerminalChannel`。
+    pub(crate) fn send_prompt(&self, session_handle: &str, text: &str) -> Result<()> {
         self.send_prompt_at(session_handle, text)
     }
 
@@ -310,7 +345,9 @@ impl SessionRegistry {
     }
 
     /// 终端键盘直通:原始字节写入 PTY(不追加回车)。
-    pub fn send_prompt_raw(&self, session_handle: &str, bytes: &[u8]) -> Result<()> {
+    /// T2f:不再是外部入口;唯一跨模块调用方是本文件的
+    /// `TerminalHost` shim 实现与测试 harness。
+    pub(crate) fn send_prompt_raw(&self, session_handle: &str, bytes: &[u8]) -> Result<()> {
         let sess = {
             let sessions = self.sessions.lock();
             sessions.get(session_handle).cloned()
@@ -330,7 +367,8 @@ impl SessionRegistry {
         }
     }
 
-    pub fn kill_session(&self, session_handle: &str) {
+    /// T2f:会话终止收窄为 crate 内部;UI 侧经 `TerminalChannel::terminate`。
+    pub(crate) fn kill_session(&self, session_handle: &str) {
         if let Some(session) = self.remove_session_and_bindings(session_handle) {
             Self::terminate_session(session);
         }
@@ -340,7 +378,8 @@ impl SessionRegistry {
     /// reader/waiter 线程 wait/reap、生命周期已收口)。
     /// Ok = 已确认停止(或本无绑定会话);Err = 时限内未确认
     /// (进程可能仍在运行,调用方不得标记 Cancelled/释放租约)。
-    pub fn stop_run(&self, run_handle: &str) -> Result<()> {
+    /// T2f:收窄为 crate 内部(RunLifecyclePort/Host 生命周期内部使用)。
+    pub(crate) fn stop_run(&self, run_handle: &str) -> Result<()> {
         // I10:只查找、不预先移除 —— 未确认终止前 binding/session 保留
         // (超时后可重试停止);确认 terminated 并回收线程后才移除。
         let bound = self.run_sessions.lock().get(run_handle).cloned();

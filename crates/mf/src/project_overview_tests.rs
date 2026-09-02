@@ -356,10 +356,10 @@ fn kernel_workspace_snapshot_feeds_attention_and_run_cards() {
     let (ctx, root, orch) = kernel_ctx(tmp.path());
     let (task_id, build_step_id) = seed_failed_run_with_blocked_descendants(&orch);
 
-    ctx.overview.request_refresh();
+    ctx.overview().request_refresh();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let snap = ctx.overview.current();
+        let snap = ctx.overview().current();
         let attention = snap
             .attention_runs
             .iter()
@@ -381,7 +381,7 @@ fn kernel_workspace_snapshot_feeds_attention_and_run_cards() {
     }
 
     // 运行卡片事实来自 Kernel 摘要(标题/状态/未读),身份 rowid 可接线
-    let snap = ctx.overview.current();
+    let snap = ctx.overview().current();
     let project = snap
         .projects
         .iter()
@@ -411,10 +411,10 @@ fn kernel_attention_clears_after_reason_resolved() {
     let (task_id, build_step_id) = seed_failed_run_with_blocked_descendants(&orch);
 
     // 等待初始徽标出现
-    ctx.overview.request_refresh();
+    ctx.overview().request_refresh();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !ctx
-        .overview
+        .overview()
         .current()
         .attention_runs
         .iter()
@@ -438,10 +438,10 @@ fn kernel_attention_clears_after_reason_resolved() {
     orch.store
         .set_task_status(task_id, mf_agent::TaskStatus::Succeeded)
         .unwrap();
-    ctx.overview.request_refresh();
+    ctx.overview().request_refresh();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while ctx
-        .overview
+        .overview()
         .current()
         .attention_runs
         .iter()
@@ -467,10 +467,10 @@ fn hub_without_kernel_source_falls_back_to_legacy_scan() {
     let orch = ctx.open_project(root.clone()).unwrap();
     let (task_id, _) = seed_failed_run_with_blocked_descendants(&orch);
 
-    ctx.overview.request_refresh();
+    ctx.overview().request_refresh();
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let snap = ctx.overview.current();
+        let snap = ctx.overview().current();
         if snap
             .attention_runs
             .iter()
@@ -526,10 +526,10 @@ fn kernel_reason_copy_maps_run_level_kinds_with_step_title() {
         .unwrap();
 
     let wait_for_reason = |fragment: &str| {
-        ctx.overview.request_refresh();
+        ctx.overview().request_refresh();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
-            let snap = ctx.overview.current();
+            let snap = ctx.overview().current();
             let card = snap
                 .projects
                 .iter()

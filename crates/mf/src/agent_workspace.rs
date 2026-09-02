@@ -430,7 +430,7 @@ impl AgentWorkspace {
     /// 第一个可用 profile,兜底空白终端(始终可用)。
     fn default_step_profile(&self) -> String {
         let mock_ok = mf_agent::config::mock_available();
-        let catalog = self.app.catalog.read();
+        let catalog = self.app.catalog().read();
         let mut ids: Vec<String> = catalog
             .index
             .entries
@@ -513,7 +513,7 @@ impl AgentWorkspace {
     }
 
     fn validate_draft(&mut self, cx: &mut Context<Self>) {
-        let catalog = self.app.catalog.read();
+        let catalog = self.app.catalog().read();
         self.validation = PipelineDraft {
             steps: self.draft.clone(),
         }
@@ -603,7 +603,7 @@ impl AgentWorkspace {
         };
         // CoreKernel 写路径不产生 Orchestrator 调度事件:统一快照需显式 nudge
         if action == "cancel" {
-            self.app.overview.request_refresh();
+            self.app.overview().request_refresh();
         }
         self.status_message = result.unwrap_or_else(|e| format!("{e:#}"));
         self.refresh_pipeline_state();
@@ -667,7 +667,7 @@ impl AgentWorkspace {
         };
         // CoreKernel 写路径不产生 Orchestrator 调度事件:统一快照需显式 nudge
         if matches!(action, "retry" | "retry-continue" | "skip") {
-            self.app.overview.request_refresh();
+            self.app.overview().request_refresh();
         }
         self.status_message = result.unwrap_or_default();
         self.dirty = false;
@@ -692,7 +692,7 @@ impl AgentWorkspace {
             .settle_agent_run_via_kernel(project, run_id, settlement);
         // 结算的 Store 写在 CoreKernel L-CMD 事务内,不经 events_rx;
         // post-commit 动作虽然会发调度事件,统一快照不依赖其时序,显式 nudge
-        self.app.overview.request_refresh();
+        self.app.overview().request_refresh();
         cx.notify();
     }
 
@@ -724,7 +724,7 @@ impl AgentWorkspace {
             Ok(_) => "已通过 Core 继续会话".into(),
             Err(error) => format!("继续会话失败:{error}"),
         };
-        self.app.overview.request_refresh();
+        self.app.overview().request_refresh();
         cx.notify();
     }
 
@@ -751,7 +751,17 @@ impl AgentWorkspace {
     fn kill_session_by(&mut self, project: &PathBuf, session_id: i64, cx: &mut Context<Self>) {
         if let Some(orch) = self.app.orchestrator_of(project) {
             if let Ok(Some(session)) = orch.store.session_view(session_id) {
-                self.app.registry.kill_session(&session.public_handle);
+                // T2f:终止经 TerminalChannel,不直接调 SessionRegistry。
+                match self.app.attach_terminal(&session.public_handle, 0) {
+                    Ok(channel) => {
+                        if let Err(error) = channel.terminate() {
+                            log::warn!("终止会话失败({}):{error}", session.public_handle);
+                        }
+                    }
+                    Err(error) => {
+                        log::warn!("attach_terminal 失败({}):{error}", session.public_handle)
+                    }
+                }
             }
             if let Err(e) = orch.set_session_status(session_id, SessionStatus::Dead) {
                 log::warn!("更新会话状态失败: {e:#}");
@@ -899,7 +909,7 @@ impl AgentWorkspace {
                         "{} 会话 · 活动运行 {} · 全局并发上限 {}",
                         filtered.len(),
                         self.global_active_runs,
-                        self.app.limiter.max()
+                        self.app.limiter().max()
                     )),
             );
 
@@ -1634,7 +1644,7 @@ impl AgentWorkspace {
             return div().into_any_element();
         };
         let profiles: Vec<String> = {
-            let catalog = self.app.catalog.read();
+            let catalog = self.app.catalog().read();
             // 只列出可用 Profile(已安装+已启用+已检测到),与编译检查的
             // is_usable 同口径;未配置的 CLI 不应出现在指派列表里
             let mut ids: Vec<String> = catalog
@@ -2082,7 +2092,7 @@ impl AgentWorkspace {
             .map(|session| session.public_handle);
         let snapshot = session_handle
             .as_deref()
-            .and_then(|handle| self.app.registry.snapshot(handle, session_id));
+            .and_then(|handle| self.app.registry().snapshot(handle, session_id));
         let title = snapshot
             .as_ref()
             .map(|s| s.title.clone())
@@ -2348,6 +2358,34 @@ where
         .on_click(cx.listener(handler))
 }
 
+/// T2f(Issue #28):终端键盘直通的唯一写入口。经 CoreKernel
+/// `attach_terminal` 取 `TerminalChannel` 后发送字节;不再直接调用
+/// SessionRegistry 的 raw 旁路。shim 阶段每次按键 attach(开销为一次
+/// handle 校验与会话存活检查;T3 的 epoch/writer lease 语义随后接入)。
+fn send_terminal_input_via_channel(
+    ws: &AgentWorkspace,
+    project: &std::path::Path,
+    session_id: i64,
+    bytes: &[u8],
+) {
+    let Some(handle) = ws
+        .app
+        .orchestrator_of(project)
+        .and_then(|orch| orch.store.session_view(session_id).ok().flatten())
+        .map(|session| session.public_handle)
+    else {
+        return;
+    };
+    match ws.app.attach_terminal(&handle, 0) {
+        Ok(channel) => {
+            if let Err(error) = channel.send_input(bytes) {
+                log::warn!("终端输入发送失败({handle}):{error}");
+            }
+        }
+        Err(error) => log::warn!("attach_terminal 失败({handle}):{error}"),
+    }
+}
+
 fn terminal_key_bytes(ev: &gpui::KeyDownEvent) -> Option<Vec<u8>> {
     let k = &ev.keystroke;
     if let Some(ch) = &k.key_char {
@@ -2485,16 +2523,7 @@ impl Render for AgentWorkspace {
                                 ..
                             }) = ws.overlay.clone()
                             {
-                                if let Some(handle) = ws
-                                    .app
-                                    .orchestrator_of(&project)
-                                    .and_then(|orch| {
-                                        orch.store.session_view(session_id).ok().flatten()
-                                    })
-                                    .map(|session| session.public_handle)
-                                {
-                                    let _ = ws.app.registry.send_prompt_raw(&handle, &[0x1b]);
-                                }
+                                send_terminal_input_via_channel(ws, &project, session_id, &[0x1b]);
                             }
                             cx.stop_propagation();
                             return;
@@ -2570,16 +2599,7 @@ impl Render for AgentWorkspace {
                     {
                         if focused && ws.active_field == Field::None {
                             if let Some(seq) = terminal_key_bytes(ev) {
-                                if let Some(handle) = ws
-                                    .app
-                                    .orchestrator_of(&project)
-                                    .and_then(|orch| {
-                                        orch.store.session_view(session_id).ok().flatten()
-                                    })
-                                    .map(|session| session.public_handle)
-                                {
-                                    let _ = ws.app.registry.send_prompt_raw(&handle, &seq);
-                                }
+                                send_terminal_input_via_channel(ws, &project, session_id, &seq);
                             }
                             cx.stop_propagation();
                             return;

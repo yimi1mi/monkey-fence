@@ -23,6 +23,7 @@ sha2.workspace = true
 hmac.workspace = true
 zeroize.workspace = true
 mf-agent.workspace = true
+mf-terminal.workspace = true
 keyring.workspace = true
 rand.workspace = true
 

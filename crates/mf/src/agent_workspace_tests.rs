@@ -232,7 +232,7 @@ fn run_requested_opens_composer_and_submit_activates_task(cx: &mut gpui::TestApp
     let orch = ctx.open_project(project.path().to_path_buf()).unwrap();
     // 可运行工作流(cmd.exe 实例,进程退出即完成)
     let instance = ctx
-        .catalog_store
+        .catalog_store()
         .create_agent_instance(mf_agent::AgentInstanceDraft {
             name: "w".into(),
             agent_type: "claude".into(),
@@ -301,7 +301,7 @@ fn run_requested_opens_composer_and_submit_activates_task(cx: &mut gpui::TestApp
     for r in orch.store.list_runs_of_task(tasks[0].id).unwrap() {
         if let Some(sid) = r.session_id {
             if let Some(session) = orch.store.session_view(sid).unwrap() {
-                ctx.registry.kill_session(&session.public_handle);
+                ctx.registry().kill_session(&session.public_handle);
             }
         }
     }

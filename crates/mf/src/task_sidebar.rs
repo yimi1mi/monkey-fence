@@ -109,7 +109,7 @@ impl TaskSidebar {
             .unwrap_or_default();
         let mut state = TaskComposerState::new(projects, self.foreground.as_ref());
         // 可分配的全局模板(任务本地默认私有,不进选择列表)
-        if let Ok(templates) = self.app.catalog_store.list_templates(false) {
+        if let Ok(templates) = self.app.catalog_store().list_templates(false) {
             state.set_templates(templates.into_iter().map(|t| (t.key, t.name)).collect());
         }
         let composer = cx.new(|cx| TaskComposer::new(state, cx));
@@ -143,7 +143,7 @@ impl TaskSidebar {
                     return Ok(()); // 任务本地:画布稍后创建草稿
                 };
                 let version = assign_app
-                    .catalog_store
+                    .catalog_store()
                     .template_versions(key)?
                     .into_iter()
                     .next_back()
@@ -354,7 +354,7 @@ fn task_color(status: TaskStatus) -> u32 {
 impl TaskSidebar {
     /// 构建 `+` 菜单条目(插件类型 + 目录实例;设计 §10)。
     pub(crate) fn build_menu(&self) -> Vec<crate::task_cli_menu::MenuEntry> {
-        let contributions = self.app.plugins.contributions();
+        let contributions = self.app.plugins().contributions();
         let types: Vec<crate::agent_instance_editor::AgentTypeInfo> = contributions
             .agent_types()
             .into_iter()
@@ -382,14 +382,14 @@ impl TaskSidebar {
             .collect();
         let instances = self
             .app
-            .catalog_store
+            .catalog_store()
             .list_agent_instances(None)
             .map(|rows| {
                 rows.into_iter()
                     .map(|row| {
                         let snapshot = self
                             .app
-                            .catalog_store
+                            .catalog_store()
                             .snapshot_agent_instance(&row.id, None)
                             .ok();
                         crate::agent_instances_view::InstanceListInstance {
@@ -498,7 +498,7 @@ impl TaskSidebar {
                 };
                 match self
                     .app
-                    .catalog_store
+                    .catalog_store()
                     .snapshot_agent_instance(&instance_id, None)
                 {
                     Ok(snapshot) => {
@@ -843,7 +843,7 @@ fn ad_hoc_snapshot_for(
 
 /// agent type 的默认命令(贡献声明)。
 fn default_command_of(app: &std::sync::Arc<crate::app_ctx::AppCtx>, agent_type: &str) -> String {
-    app.plugins
+    app.plugins()
         .contributions()
         .agent_types()
         .into_iter()
