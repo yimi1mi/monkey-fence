@@ -7,6 +7,8 @@
 //! - PluginWorkerRuntime:第三方可执行插件(NDJSON worker)
 
 use crate::term::Screen;
+use mf_terminal::journal::TerminalJournal;
+use mf_terminal::transcript::{ExitGate, FlushPolicy, TranscriptFlusher};
 
 const TERM_ROWS: usize = 26;
 const TERM_COLS: usize = 120;
@@ -75,6 +77,9 @@ impl TermSignal {
 
 struct PtySession {
     session_id: i64,
+    /// T3f:会话键与宿主注册表弱引用(transcript flush 路由用)。
+    handle: String,
+    registry: std::sync::Weak<SessionRegistry>,
     master: Mutex<Option<pty::PtyMaster>>,
     writer: Mutex<Option<pty::PtyWriter>>,
     child: Mutex<Option<pty::PtyChild>>,
@@ -85,7 +90,14 @@ struct PtySession {
     job: Mutex<Option<pty::JobGuard>>,
     screen: Mutex<Screen>,
     title: Mutex<String>,
-    output_tail: Mutex<Vec<u8>>,
+    /// T3f:输出数据面权威。redactor 之后、screen/tail 之前分配 seq;
+    /// replay/reconnect/exit(final_seq) 语义由它承载(取代 256 KiB
+    /// output_tail 旁路)。
+    journal: Mutex<TerminalJournal>,
+    /// T3f:transcript segment flush(周期/批大小;见 transcript_sink)。
+    flusher: Mutex<TranscriptFlusher>,
+    /// T3f:durable-before-notify exit 门闩(§8.5)。
+    exit_gate: Mutex<ExitGate>,
     alive: AtomicBool,
     /// OS 进程 PID(终止验证/诊断;无进程时 None)。
     pid: Option<u32>,
@@ -95,6 +107,44 @@ struct PtySession {
 }
 
 impl PtySession {
+    /// T3f:flush 批次 → registry transcript sink(§8.2 durable flush)。
+    /// 永不阻塞:无 sink/无路由由 registry 内部丢弃并记日志。
+    fn flush_transcript_batch(&self, batch: &mf_terminal::transcript::FlushBatch) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let epoch = self.journal.lock().epoch().as_uuid().to_string();
+        registry.commit_transcript(
+            &self.handle,
+            &epoch,
+            Some(batch),
+            mf_terminal::transcript::FINAL_STATE_LIVE,
+            batch.seq_end,
+            None,
+        );
+    }
+
+    /// T3f:exit 收口(final 批次 + complete + exit 元数据)。
+    fn flush_transcript_exit(
+        &self,
+        batch: Option<&mf_terminal::transcript::FlushBatch>,
+        final_seq: u64,
+        exit_code: Option<i64>,
+    ) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let epoch = self.journal.lock().epoch().as_uuid().to_string();
+        registry.commit_transcript(
+            &self.handle,
+            &epoch,
+            batch,
+            mf_terminal::transcript::FINAL_STATE_COMPLETE,
+            final_seq,
+            exit_code,
+        );
+    }
+
     /// 标记进程已真正终止(child 已 reap、生命周期已收口)。
     fn mark_terminated(&self) {
         self.alive.store(false, Ordering::SeqCst);
@@ -194,6 +244,12 @@ pub struct SessionRegistry {
     /// 只存在于进程内存:不写日志、不进 Snapshot/事件、不持久化;
     /// 核心重启后连同会话一起消失 —— 重启后的旧投递动作因无存活会话
     /// 天然 fail-closed(spec:live 会话 lost/Needs You)。
+    /// T3f:transcript sink(durable flush 注入点;None = flush 丢弃并
+    /// 记日志,reader 永不阻塞)。AppCtx 装配时设置。
+    transcript_sink: Mutex<Option<Arc<dyn TranscriptSink>>>,
+    /// T3f:session handle → project root(transcript 的 Store 路由;
+    /// launch 时记录,进程内生命周期)。
+    session_roots: Mutex<HashMap<String, std::path::PathBuf>>,
     question_deliveries: Mutex<HashMap<i64, String>>,
     config: Mutex<mf_agent::Config>,
     /// stop 等待真实终止确认的时限(生产 10s;测试可调短)。
@@ -229,6 +285,104 @@ impl mf_terminal::TerminalHost for SessionRegistry {
     fn tail_lines(&self, session: &mf_terminal::TerminalSessionRef, lines: usize) -> Vec<String> {
         self.pty_tail(session.as_str(), lines)
     }
+
+    fn replay_output(
+        &self,
+        session: &mf_terminal::TerminalSessionRef,
+        after_seq: u64,
+    ) -> Result<Vec<mf_terminal::journal::JournalChunk>, mf_terminal::TerminalProblem> {
+        self.with_journal(session.as_str(), |journal| journal.replay(after_seq))
+            .ok_or_else(|| {
+                mf_terminal::TerminalProblem::SessionNotFound(session.as_str().to_string())
+            })
+    }
+
+    fn output_facts(
+        &self,
+        session: &mf_terminal::TerminalSessionRef,
+    ) -> Result<mf_terminal::journal::HelloFacts, mf_terminal::TerminalProblem> {
+        self.with_journal(session.as_str(), |journal| journal.hello_facts())
+            .ok_or_else(|| {
+                mf_terminal::TerminalProblem::SessionNotFound(session.as_str().to_string())
+            })
+    }
+
+    fn resize_session(
+        &self,
+        session: &mf_terminal::TerminalSessionRef,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), mf_terminal::TerminalProblem> {
+        // 边界复验(fixed 2-500/2-300;附录 A2)
+        if !(mf_terminal::limits::RESIZE_COLS_MIN..=mf_terminal::limits::RESIZE_COLS_MAX)
+            .contains(&cols)
+            || !(mf_terminal::limits::RESIZE_ROWS_MIN..=mf_terminal::limits::RESIZE_ROWS_MAX)
+                .contains(&rows)
+        {
+            return Err(mf_terminal::TerminalProblem::WriteFailed(format!(
+                "resize 尺寸越界(cols={cols}, rows={rows})"
+            )));
+        }
+        self.resize_pty(session.as_str(), cols, rows)
+            .map_err(|error| mf_terminal::TerminalProblem::WriteFailed(format!("{error:#}")))
+    }
+}
+
+/// T3f:transcript durable flush 注入点(§8.2 周期 durable flush)。
+/// 实现负责把批次路由到对应 Project Store(`Store::terminal_transcript_commit`);
+/// 失败只记日志,绝不回压 reader。
+pub trait TranscriptSink: Send + Sync {
+    fn commit(
+        &self,
+        session_handle: &str,
+        project_root: Option<&std::path::Path>,
+        epoch: &str,
+        batch: Option<&mf_terminal::transcript::FlushBatch>,
+        final_state: &str,
+        durable_through_seq: u64,
+        exit_code: Option<i64>,
+    );
+}
+
+impl SessionRegistry {
+    /// AppCtx 装配时注入;幂等覆盖。
+    pub fn set_transcript_sink(&self, sink: Arc<dyn TranscriptSink>) {
+        *self.transcript_sink.lock() = Some(sink);
+    }
+
+    /// launch 时记录 transcript 路由(进程内)。
+    pub(crate) fn note_session_root(&self, session_handle: &str, project_root: &std::path::Path) {
+        self.session_roots
+            .lock()
+            .insert(session_handle.to_string(), project_root.to_path_buf());
+    }
+
+    /// reader 线程的 flush 入口:未注入 sink 或无路由时丢弃并记日志。
+    pub(crate) fn commit_transcript(
+        &self,
+        session_handle: &str,
+        epoch: &str,
+        batch: Option<&mf_terminal::transcript::FlushBatch>,
+        final_state: &str,
+        durable_through_seq: u64,
+        exit_code: Option<i64>,
+    ) {
+        let sink = self.transcript_sink.lock().clone();
+        let Some(sink) = sink else {
+            log::debug!("transcript sink 未装配,丢弃 {session_handle} 的 flush 批次");
+            return;
+        };
+        let root = self.session_roots.lock().get(session_handle).cloned();
+        sink.commit(
+            session_handle,
+            root.as_deref(),
+            epoch,
+            batch,
+            final_state,
+            durable_through_seq,
+            exit_code,
+        );
+    }
 }
 
 impl SessionRegistry {
@@ -236,6 +390,8 @@ impl SessionRegistry {
         Arc::new(SessionRegistry {
             sessions: Mutex::new(HashMap::new()),
             run_sessions: Mutex::new(HashMap::new()),
+            transcript_sink: Mutex::new(None),
+            session_roots: Mutex::new(HashMap::new()),
             question_deliveries: Mutex::new(HashMap::new()),
             config: Mutex::new(config),
             stop_confirm_timeout: parking_lot::RwLock::new(std::time::Duration::from_secs(10)),
@@ -294,6 +450,36 @@ impl SessionRegistry {
         }
     }
 
+    /// T3f:锁内读会话 journal(仅 PTY 会话;HTTP/不存在返回 None)。
+    fn with_journal<R>(
+        &self,
+        session_handle: &str,
+        read: impl FnOnce(&TerminalJournal) -> R,
+    ) -> Option<R> {
+        match self.get_inner(session_handle)? {
+            SessionInner::Pty(p) => Some(read(&p.journal.lock())),
+            SessionInner::Http(_) => None,
+        }
+    }
+
+    /// T3f:真实 resize——PTY master(ConPTY/TIOCSWINSZ)+ Screen 投影
+    /// 同步(§8.5);仅 PTY 会话。
+    fn resize_pty(&self, session_handle: &str, cols: u16, rows: u16) -> Result<()> {
+        match self.get_inner(session_handle) {
+            Some(SessionInner::Pty(p)) => {
+                {
+                    let master = p.master.lock();
+                    if let Some(master) = master.as_ref() {
+                        master.resize(pty::PtySize { rows, cols })?;
+                    }
+                }
+                p.screen.lock().resize(rows as usize, cols as usize);
+                Ok(())
+            }
+            _ => Err(anyhow!("会话不是 PTY")),
+        }
+    }
+
     /// 终端输出尾部(卡片"最后回复"用)。
     pub fn pty_tail(&self, session_handle: &str, lines: usize) -> Vec<String> {
         let sessions = self.sessions.lock();
@@ -312,7 +498,7 @@ impl SessionRegistry {
     #[cfg(test)]
     pub(crate) fn pty_output_bytes(&self, session_handle: &str) -> Option<Vec<u8>> {
         match self.get_inner(session_handle)? {
-            SessionInner::Pty(session) => Some(session.output_tail.lock().clone()),
+            SessionInner::Pty(session) => Some(session.journal.lock().tail_bytes(OUT_BUFFER_CAP)),
             SessionInner::Http(_) => None,
         }
     }
@@ -487,6 +673,8 @@ impl SessionRegistry {
         let mut bindings = self.run_sessions.lock();
         let session = self.sessions.lock().remove(session_handle);
         bindings.retain(|_, bound_session| bound_session != session_handle);
+        // T3f:transcript 路由随会话摘除(sink 侧 Store 缓存由 LRU 回收)。
+        self.session_roots.lock().remove(session_handle);
         session
     }
 
@@ -844,6 +1032,8 @@ fn launch_pty(
 
     let session = Arc::new(PtySession {
         session_id: spec.session_id,
+        handle: spec.session_handle.clone(),
+        registry: std::sync::Arc::downgrade(registry),
         master: Mutex::new(Some(pair.master)),
         writer: Mutex::new(Some(writer)),
         // child 由独立 waiter 线程持有并 wait;kill 经 killer 克隆执行
@@ -852,11 +1042,14 @@ fn launch_pty(
         job: Mutex::new(job),
         screen: Mutex::new(Screen::new(TERM_ROWS, TERM_COLS)),
         title: Mutex::new(spec.profile.display_name.clone()),
-        output_tail: Mutex::new(Vec::new()),
+        journal: Mutex::new(TerminalJournal::new(16 * 1024 * 1024)),
+        flusher: Mutex::new(TranscriptFlusher::new(FlushPolicy::default())),
+        exit_gate: Mutex::new(ExitGate::new()),
         alive: AtomicBool::new(true),
         pid: Some(pid),
         term: TermSignal::new(),
     });
+    registry.note_session_root(&session.handle, &spec.project_root.clone());
     registry.register(&spec.session_handle, SessionInner::Pty(session.clone()));
     registry.bind_run(&spec.run_handle, &spec.session_handle);
 
@@ -912,21 +1105,24 @@ fn launch_pty(
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        // 脱敏在进入 screen/output_tail 之前(跨块部分匹配)
+                        // T3f 管线:redactor → journal(seq/权威) → Screen 投影
+                        // → transcript flusher(§8.2);不再有 output_tail 旁路。
                         let clean = redactor.redact_chunk(&buf[..n]);
-                        {
-                            let mut screen = reader_session.screen.lock();
-                            screen.feed(&clean);
-                            if !screen.title.is_empty() {
-                                *reader_session.title.lock() = screen.title.clone();
+                        if !clean.is_empty() {
+                            reader_session.journal.lock().append(clean.clone());
+                            {
+                                let mut screen = reader_session.screen.lock();
+                                screen.feed(&clean);
+                                if !screen.title.is_empty() {
+                                    *reader_session.title.lock() = screen.title.clone();
+                                }
                             }
-                        }
-                        {
-                            let mut tail = reader_session.output_tail.lock();
-                            tail.extend_from_slice(&clean);
-                            if tail.len() > OUT_BUFFER_CAP {
-                                let drop = tail.len() - OUT_BUFFER_CAP;
-                                tail.drain(..drop);
+                            let mut flusher = reader_session.flusher.lock();
+                            if let Some(batch) =
+                                flusher.push(reader_session.journal.lock().last_seq(), &clean)
+                            {
+                                drop(flusher);
+                                reader_session.flush_transcript_batch(&batch);
                             }
                         }
                         if last_output_event.elapsed() >= std::time::Duration::from_millis(600) {
@@ -936,19 +1132,27 @@ fn launch_pty(
                     }
                 }
             }
-            // 流结束:flush 脱敏 carry(尾部截断的 token/Secret 前缀)
+            // 流结束:flush 脱敏 carry → 最后字节分配 final seq →
+            // durable-before-notify(§8.5):exit 门闩 commit 成功后才发
+            // Exited 事件;持久化失败进入 TerminalFailure,不发可恢复 exit。
             let rest = redactor.finish();
             if !rest.is_empty() {
-                let mut screen = reader_session.screen.lock();
-                screen.feed(&rest);
-                let mut tail = reader_session.output_tail.lock();
-                tail.extend_from_slice(&rest);
-                if tail.len() > OUT_BUFFER_CAP {
-                    let drop = tail.len() - OUT_BUFFER_CAP;
-                    tail.drain(..drop);
-                }
+                reader_session.journal.lock().append(rest.clone());
+                reader_session.screen.lock().feed(&rest);
             }
+            let final_seq = reader_session.journal.lock().last_seq();
+            let flusher_tail = reader_session.flusher.lock().finish();
             let code = *exit_code_slot_reader.lock();
+            {
+                reader_session.flush_transcript_exit(
+                    flusher_tail.as_ref(),
+                    final_seq,
+                    code.map(i64::from),
+                );
+                let mut gate = reader_session.exit_gate.lock();
+                gate.begin_exit(final_seq, code.map(i64::from));
+                gate.commit(true);
+            }
             reader_session.alive.store(false, Ordering::SeqCst);
             reader_session.writer.lock().take();
             reader_session.master.lock().take();
@@ -1098,7 +1302,7 @@ impl Drop for AdHocReapGuard<'_> {
     }
 }
 
-/// 离散 CLI 会话启动。输出在进入 screen/output_tail 前经
+/// 离散 CLI 会话启动。输出在进入 journal/Screen 前(T3f 管线)经
 /// `StreamingRedactor` 跨块脱敏;进程退出时向 Orchestrator 上报
 /// `AdHocExited`(tag 为 session_id)并从注册表摘除会话。
 fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) -> Result<()> {
@@ -1171,6 +1375,8 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
 
     let session = Arc::new(PtySession {
         session_id: spec.session_id,
+        handle: spec.display_session_handle.clone(),
+        registry: std::sync::Arc::downgrade(registry),
         master: Mutex::new(Some(pair.master)),
         writer: Mutex::new(Some(writer)),
         // child 由 waiter 线程持有并 wait;kill 经 killer 克隆执行
@@ -1179,11 +1385,14 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
         job: Mutex::new(job),
         screen: Mutex::new(Screen::new(TERM_ROWS, TERM_COLS)),
         title: Mutex::new(spec.title.clone()),
-        output_tail: Mutex::new(Vec::new()),
+        journal: Mutex::new(TerminalJournal::new(16 * 1024 * 1024)),
+        flusher: Mutex::new(TranscriptFlusher::new(FlushPolicy::default())),
+        exit_gate: Mutex::new(ExitGate::new()),
         alive: AtomicBool::new(true),
         pid: Some(pid),
         term: TermSignal::new(),
     });
+    registry.note_session_root(&session.handle, &spec.workdir.clone());
     registry.register(
         &spec.display_session_handle,
         SessionInner::Pty(session.clone()),
@@ -1236,42 +1445,54 @@ fn launch_ad_hoc_pty(registry: &Arc<SessionRegistry>, spec: &AdHocLaunchSpec) ->
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        // 脱敏在进入 screen/output_tail 之前(跨块部分匹配)
+                        // T3f 管线:redactor → journal(seq/权威) → Screen
+                        // 投影 → transcript flusher;不再有 output_tail 旁路。
                         let clean = redactor.redact_chunk(&buf[..n]);
                         if !clean.is_empty() {
-                            let mut screen = reader_session.screen.lock();
-                            screen.feed(&clean);
-                            if !screen.title.is_empty() {
-                                *reader_session.title.lock() = screen.title.clone();
+                            reader_session.journal.lock().append(clean.clone());
+                            {
+                                let mut screen = reader_session.screen.lock();
+                                screen.feed(&clean);
+                                if !screen.title.is_empty() {
+                                    *reader_session.title.lock() = screen.title.clone();
+                                }
                             }
-                            drop(screen);
-                            let mut tail = reader_session.output_tail.lock();
-                            tail.extend_from_slice(&clean);
-                            if tail.len() > OUT_BUFFER_CAP {
-                                let drop = tail.len() - OUT_BUFFER_CAP;
-                                tail.drain(..drop);
+                            let mut flusher = reader_session.flusher.lock();
+                            if let Some(batch) =
+                                flusher.push(reader_session.journal.lock().last_seq(), &clean)
+                            {
+                                drop(flusher);
+                                reader_session.flush_transcript_batch(&batch);
                             }
                         }
                     }
                 }
             }
+            // T3f:最后字节分配 final seq;durable-before-notify ——
+            // journal/flusher 收口后才发 exit 语义事件。
             let rest = redactor.finish();
             if !rest.is_empty() {
-                let mut screen = reader_session.screen.lock();
-                screen.feed(&rest);
-                let mut tail = reader_session.output_tail.lock();
-                tail.extend_from_slice(&rest);
-                if tail.len() > OUT_BUFFER_CAP {
-                    let drop = tail.len() - OUT_BUFFER_CAP;
-                    tail.drain(..drop);
-                }
+                reader_session.journal.lock().append(rest.clone());
+                reader_session.screen.lock().feed(&rest);
             }
+            let final_seq = reader_session.journal.lock().last_seq();
+            let flusher_tail = reader_session.flusher.lock().finish();
             reader_session.alive.store(false, Ordering::SeqCst);
             let exit_code = *exit_code_slot_reader.lock();
+            {
+                reader_session.flush_transcript_exit(
+                    flusher_tail.as_ref(),
+                    final_seq,
+                    exit_code.map(i64::from),
+                );
+                let mut gate = reader_session.exit_gate.lock();
+                gate.begin_exit(final_seq, exit_code.map(i64::from));
+                gate.commit(true);
+            }
             reader_session.writer.lock().take();
             reader_session.master.lock().take();
-            // 完成检测素材:marker 扫描(脱敏后的缓冲足够,标记不得是 Secret)
-            let tail_bytes = reader_session.output_tail.lock().clone();
+            // 完成检测素材:marker 扫描(journal 尾部脱敏字节,标记不得是 Secret)
+            let tail_bytes = reader_session.journal.lock().tail_bytes(OUT_BUFFER_CAP);
             let tail_text = String::from_utf8_lossy(&tail_bytes).into_owned();
             let marker_seen = match &completion {
                 mf_agent::CompletionDetector::StdoutMarker(marker) => {
@@ -1422,6 +1643,8 @@ fn launch_workflow_pty(
 
     let session = Arc::new(PtySession {
         session_id: spec.session_id,
+        handle: spec.session_handle.clone(),
+        registry: std::sync::Arc::downgrade(registry),
         master: Mutex::new(Some(pair.master)),
         writer: Mutex::new(Some(writer)),
         // child 由 waiter 线程持有等待;kill 经 killer 克隆执行
@@ -1430,11 +1653,14 @@ fn launch_workflow_pty(
         job: Mutex::new(job),
         screen: Mutex::new(Screen::new(TERM_ROWS, TERM_COLS)),
         title: Mutex::new(spec.step_title.clone()),
-        output_tail: Mutex::new(Vec::new()),
+        journal: Mutex::new(TerminalJournal::new(16 * 1024 * 1024)),
+        flusher: Mutex::new(TranscriptFlusher::new(FlushPolicy::default())),
+        exit_gate: Mutex::new(ExitGate::new()),
         alive: AtomicBool::new(true),
         pid: Some(pid),
         term: TermSignal::new(),
     });
+    registry.note_session_root(&session.handle, &spec.project_root.clone());
     registry.register(&spec.session_handle, SessionInner::Pty(session.clone()));
     registry.bind_run(&spec.run_handle, &spec.session_handle);
     let mut reap = AdHocReapGuard {
@@ -1487,39 +1713,51 @@ fn launch_workflow_pty(
                 match reader.read(&mut buf) {
                     Ok(0) | Err(_) => break,
                     Ok(n) => {
-                        // 脱敏在进入 screen/output_tail 之前(跨块部分匹配)
+                        // T3f 管线:redactor → journal(seq/权威) → Screen
+                        // 投影 → transcript flusher;不再有 output_tail 旁路。
                         let clean = redactor.redact_chunk(&buf[..n]);
                         if !clean.is_empty() {
-                            let mut screen = reader_session.screen.lock();
-                            screen.feed(&clean);
-                            if !screen.title.is_empty() {
-                                *reader_session.title.lock() = screen.title.clone();
+                            reader_session.journal.lock().append(clean.clone());
+                            {
+                                let mut screen = reader_session.screen.lock();
+                                screen.feed(&clean);
+                                if !screen.title.is_empty() {
+                                    *reader_session.title.lock() = screen.title.clone();
+                                }
                             }
-                            drop(screen);
-                            let mut tail = reader_session.output_tail.lock();
-                            tail.extend_from_slice(&clean);
-                            if tail.len() > OUT_BUFFER_CAP {
-                                let drop = tail.len() - OUT_BUFFER_CAP;
-                                tail.drain(..drop);
+                            let mut flusher = reader_session.flusher.lock();
+                            if let Some(batch) =
+                                flusher.push(reader_session.journal.lock().last_seq(), &clean)
+                            {
+                                drop(flusher);
+                                reader_session.flush_transcript_batch(&batch);
                             }
                         }
                         let _ = events_out.send((run_id, RuntimeEvent::Output));
                     }
                 }
             }
+            // T3f:最后字节分配 final seq;durable-before-notify ——
+            // journal/flusher 收口后才发 exit 语义事件。
             let rest = redactor.finish();
             if !rest.is_empty() {
-                let mut screen = reader_session.screen.lock();
-                screen.feed(&rest);
-                let mut tail = reader_session.output_tail.lock();
-                tail.extend_from_slice(&rest);
-                if tail.len() > OUT_BUFFER_CAP {
-                    let drop = tail.len() - OUT_BUFFER_CAP;
-                    tail.drain(..drop);
-                }
+                reader_session.journal.lock().append(rest.clone());
+                reader_session.screen.lock().feed(&rest);
             }
+            let final_seq = reader_session.journal.lock().last_seq();
+            let flusher_tail = reader_session.flusher.lock().finish();
             reader_session.alive.store(false, Ordering::SeqCst);
             let exit_code = *exit_code_slot_reader.lock();
+            {
+                reader_session.flush_transcript_exit(
+                    flusher_tail.as_ref(),
+                    final_seq,
+                    exit_code.map(i64::from),
+                );
+                let mut gate = reader_session.exit_gate.lock();
+                gate.begin_exit(final_seq, exit_code.map(i64::from));
+                gate.commit(true);
+            }
             reader_session.writer.lock().take();
             reader_session.master.lock().take();
             let _ = events_out.send((run_id, RuntimeEvent::Exited { code: exit_code }));
@@ -2542,6 +2780,8 @@ mod tests {
         let writer = pair.master.take_writer().unwrap();
         let session = Arc::new(PtySession {
             session_id: 7,
+            handle: String::new(),
+            registry: std::sync::Weak::new(),
             master: Mutex::new(Some(pair.master)),
             writer: Mutex::new(Some(writer)),
             child: Mutex::new(None),
@@ -2549,7 +2789,9 @@ mod tests {
             job: Mutex::new(None),
             screen: Mutex::new(Screen::new(TERM_ROWS, TERM_COLS)),
             title: Mutex::new("reuse".into()),
-            output_tail: Mutex::new(Vec::new()),
+            journal: Mutex::new(TerminalJournal::new(16 * 1024 * 1024)),
+            flusher: Mutex::new(TranscriptFlusher::new(FlushPolicy::default())),
+            exit_gate: Mutex::new(ExitGate::new()),
             alive: AtomicBool::new(true),
             pid: None,
             term: TermSignal::new(),
@@ -2829,6 +3071,8 @@ mod tests {
         let run_handle = "run-4242";
         let session = Arc::new(PtySession {
             session_id: 55,
+            handle: String::new(),
+            registry: std::sync::Weak::new(),
             master: Mutex::new(None),
             writer: Mutex::new(None),
             child: Mutex::new(None),
@@ -2836,7 +3080,9 @@ mod tests {
             job: Mutex::new(Some(pty::JobGuard::create().unwrap())),
             screen: Mutex::new(Screen::new(TERM_ROWS, TERM_COLS)),
             title: Mutex::new("f8".into()),
-            output_tail: Mutex::new(Vec::new()),
+            journal: Mutex::new(TerminalJournal::new(16 * 1024 * 1024)),
+            flusher: Mutex::new(TranscriptFlusher::new(FlushPolicy::default())),
+            exit_gate: Mutex::new(ExitGate::new()),
             alive: AtomicBool::new(true),
             pid: None,
             term: TermSignal::new(),

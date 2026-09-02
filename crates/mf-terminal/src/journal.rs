@@ -173,6 +173,24 @@ impl TerminalJournal {
         Ok(self.hello_facts())
     }
 
+    /// 尾部原始(已脱敏)字节拼接,至多 `max` 字节(完成检测 marker 扫描、
+    /// 兼容旧 output_tail 语义的只读查询)。
+    pub fn tail_bytes(&self, max: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        for chunk in self.ring.iter().rev() {
+            if out.len() >= max {
+                break;
+            }
+            out.extend_from_slice(&chunk.bytes);
+        }
+        let mut out = out;
+        if out.len() > max {
+            let drop = out.len() - max;
+            out.drain(..drop);
+        }
+        out
+    }
+
     /// 增量 replay:返回 seq > after_seq 的全部仍留存 chunk(同 epoch
     /// 覆盖内)。调用前必须先 `check_attach` 通过。
     pub fn replay(&self, after_seq: u64) -> Vec<JournalChunk> {

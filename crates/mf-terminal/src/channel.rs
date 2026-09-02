@@ -56,6 +56,41 @@ pub trait TerminalHost: Send + Sync {
 
     /// 只读 tail 查询(渲染后行;shim 兼容旧 `pty_tail`)。
     fn tail_lines(&self, session: &TerminalSessionRef, lines: usize) -> Vec<String>;
+
+    /// T3f:journal 增量 replay(reconnect;8.3)。默认不可用——宿主
+    /// 未接 journal 管线时明确拒绝,不给半吊子 replay。
+    fn replay_output(
+        &self,
+        _session: &TerminalSessionRef,
+        _after_seq: u64,
+    ) -> Result<Vec<crate::journal::JournalChunk>, TerminalProblem> {
+        Err(TerminalProblem::HostUnavailable(
+            "该宿主未接入 journal replay".into(),
+        ))
+    }
+
+    /// T3f:会话输出事实(hello 投影;8.1)。默认不可用。
+    fn output_facts(
+        &self,
+        _session: &TerminalSessionRef,
+    ) -> Result<crate::journal::HelloFacts, TerminalProblem> {
+        Err(TerminalProblem::HostUnavailable(
+            "该宿主未接入 journal".into(),
+        ))
+    }
+
+    /// T3f:真实 resize 到 PTY + Screen 投影(仅 PTY 会话;HTTP 会话
+    /// 与未接线的宿主明确拒绝)。边界由实现复验(cols 2-500/rows 2-300)。
+    fn resize_session(
+        &self,
+        _session: &TerminalSessionRef,
+        _cols: u16,
+        _rows: u16,
+    ) -> Result<(), TerminalProblem> {
+        Err(TerminalProblem::HostUnavailable(
+            "该宿主不支持 resize".into(),
+        ))
+    }
 }
 
 /// `attach_terminal` 返回的终端通道。
@@ -99,6 +134,24 @@ impl TerminalChannel {
     /// 只读 tail 查询(shim 兼容旧渲染 tail;T3 起由 journal/replay 取代)。
     pub fn tail_lines(&self, lines: usize) -> Vec<String> {
         self.host.tail_lines(&self.session, lines)
+    }
+
+    /// T3f:journal 增量 replay(reconnect 后恢复屏幕/状态;8.3)。
+    pub fn replay_output(
+        &self,
+        after_seq: u64,
+    ) -> Result<Vec<crate::journal::JournalChunk>, TerminalProblem> {
+        self.host.replay_output(&self.session, after_seq)
+    }
+
+    /// T3f:输出事实(next/last/first_available seq + epoch)。
+    pub fn output_facts(&self) -> Result<crate::journal::HelloFacts, TerminalProblem> {
+        self.host.output_facts(&self.session)
+    }
+
+    /// T3f:真实 resize(到达 PTY 与 Screen;8.5)。
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), TerminalProblem> {
+        self.host.resize_session(&self.session, cols, rows)
     }
 }
 

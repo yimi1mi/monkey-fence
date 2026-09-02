@@ -52,6 +52,8 @@ mod task_sidebar;
 mod term;
 #[cfg(test)]
 mod terminal_channel_shim_tests;
+#[cfg(test)]
+mod terminal_matrix_tests;
 mod theme;
 mod vcs_panel;
 #[allow(dead_code)]

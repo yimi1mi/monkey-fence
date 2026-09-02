@@ -191,6 +191,27 @@ fn ui_production_files_have_no_workflow_run_orchestrator_bypass() {
 }
 
 #[test]
+fn runtime_host_has_no_output_tail_bypass() {
+    // T3f(Issue #34,spec §8.8):256 KiB output_tail 旁路已删——输出只
+    // 经 redactor → journal(seq 权威) → Screen 投影/tail_bytes 只读派生。
+    let runtime_host = read("runtime_host.rs");
+    assert!(
+        !runtime_host.contains("output_tail:"),
+        "PtySession 不得再有 output_tail 字段(journal 是唯一输出权威)"
+    );
+    assert!(
+        runtime_host.contains("journal: Mutex<TerminalJournal>"),
+        "PtySession 必须以 TerminalJournal 为输出数据面权威"
+    );
+    // reader 管线必须 journal 在 Screen 之前(seq 分配先于解释)
+    let feed_after_journal = runtime_host.matches("journal.lock().append").count();
+    assert!(
+        feed_after_journal >= 3,
+        "三条 PTY launch 路径都必须 journal.append(当前 {feed_after_journal} 处)"
+    );
+}
+
+#[test]
 fn mf_terminal_is_the_only_terminal_channel_source() {
     // TerminalChannel/TerminalHost 的定义只存在于 mf-terminal;kernel
     // 仅 re-export。防止在 kernel/UI 侧复制类型形成第二套通道契约。

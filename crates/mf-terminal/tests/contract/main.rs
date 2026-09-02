@@ -3,6 +3,7 @@
 //! cargo 的集成测试目标发现要求 `tests/<dir>/main.rs`;各契约模块
 //! (`seq_ack`/`terminal_limits`/`limits_defaults`)在此声明。
 
+mod b3_gate;
 mod crash_incomplete;
 mod gap_and_exit;
 mod input_dedupe;
