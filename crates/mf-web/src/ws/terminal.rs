@@ -172,16 +172,18 @@ impl TerminalWsSession {
                     ),
                 }
             }
-            FactsVerdict::Gap { first, last } => return AttachResult::Close {
-                close_code: close_code::RESYNC_OR_HISTORY_GAP,
-                problem: Problem::new(
-                    ProblemCode::TerminalHistoryGap,
-                    format!(
+            FactsVerdict::Gap { first, last } => {
+                return AttachResult::Close {
+                    close_code: close_code::RESYNC_OR_HISTORY_GAP,
+                    problem: Problem::new(
+                        ProblemCode::TerminalHistoryGap,
+                        format!(
                         "history gap:first_available={first} last={last};改读 terminal-transcript"
                     ),
-                    Some(Retry::AfterResync),
-                ),
-            },
+                        Some(Retry::AfterResync),
+                    ),
+                }
+            }
             FactsVerdict::Ok => {}
         }
         let replay = host
