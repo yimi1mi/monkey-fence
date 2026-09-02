@@ -8,3 +8,4 @@
 //! 属后续 ticket。
 
 pub mod bundle;
+pub mod commands;
