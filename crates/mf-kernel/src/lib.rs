@@ -81,6 +81,9 @@ mod operation_saga;
 #[path = "../tests/contract/operation_snapshot.rs"]
 mod operation_snapshot;
 #[cfg(test)]
+#[path = "../tests/contract/owner_handoff.rs"]
+mod owner_handoff;
+#[cfg(test)]
 #[path = "../tests/contract/project_workflow_commands.rs"]
 mod project_workflow_commands;
 #[cfg(test)]
