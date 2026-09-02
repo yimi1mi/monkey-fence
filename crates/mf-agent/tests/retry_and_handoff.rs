@@ -2,6 +2,9 @@
 //! 重试模式(续会话/新会话)、有限自动重试、下游仅在
 //! "成功结算 + Handoff 落库"后解锁、重试耗尽保持阻塞。
 
+#[path = "common/run_lifecycle.rs"]
+mod run_lifecycle;
+
 use crossbeam_channel::Sender;
 use mf_agent::model::*;
 use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
@@ -230,9 +233,7 @@ impl Fixture {
     }
 
     fn retry_and_complete(&self, key: &str) {
-        self.orch
-            .retry_step(self.step_id(key), RetryMode::FreshSession)
-            .unwrap();
+        run_lifecycle::retry_step(&self.orch, self.step_id(key), RetryMode::FreshSession).unwrap();
         self.wait_running(&[key]);
         self.complete(key, "重试成功");
     }
@@ -333,9 +334,7 @@ fn continue_session_requires_live_session() {
         .store
         .update_session(session_id, Some(SessionStatus::Dead), None, None)
         .unwrap();
-    let err = fx
-        .orch
-        .retry_step(fx.step_id("build"), RetryMode::ContinueSession)
+    let err = run_lifecycle::retry_step(&fx.orch, fx.step_id("build"), RetryMode::ContinueSession)
         .unwrap_err();
     assert!(
         err.to_string().contains("存活") || err.to_string().contains("FreshSession"),
@@ -343,9 +342,7 @@ fn continue_session_requires_live_session() {
     );
 
     // FreshSession 对死会话也可用
-    fx.orch
-        .retry_step(fx.step_id("build"), RetryMode::FreshSession)
-        .unwrap();
+    run_lifecycle::retry_step(&fx.orch, fx.step_id("build"), RetryMode::FreshSession).unwrap();
     fx.orch.stop();
 }
 
@@ -362,9 +359,7 @@ fn continue_session_attaches_the_same_live_session() {
         .find(|s| s.step_id == fx.step_id("build"))
         .cloned()
         .unwrap();
-    fx.orch
-        .retry_step(fx.step_id("build"), RetryMode::ContinueSession)
-        .unwrap();
+    run_lifecycle::retry_step(&fx.orch, fx.step_id("build"), RetryMode::ContinueSession).unwrap();
     let attached = wait_until(Duration::from_secs(5), || {
         fx.host
             .launches
@@ -390,9 +385,7 @@ fn exhausted_retries_leave_failed_and_descendants_blocked() {
     let fx = Fixture::parallel();
     fx.complete("docs", "完成");
     fx.fail("build");
-    fx.orch
-        .retry_step(fx.step_id("build"), RetryMode::FreshSession)
-        .unwrap();
+    run_lifecycle::retry_step(&fx.orch, fx.step_id("build"), RetryMode::FreshSession).unwrap();
     fx.wait_running(&["build"]);
     fx.fail("build");
     // 重试耗尽:build 保持 failed,package 保持 blocked,任务 needs-you

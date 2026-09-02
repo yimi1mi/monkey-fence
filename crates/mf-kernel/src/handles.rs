@@ -154,6 +154,67 @@ impl TryFrom<String> for WorkflowHandle {
     }
 }
 
+macro_rules! project_uuid_handle {
+    ($(#[$meta:meta])* $name:ident, $label:literal) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(try_from = "String")]
+        pub struct $name(String);
+
+        impl $name {
+            pub fn parse(value: impl Into<String>) -> anyhow::Result<Self> {
+                let value = value.into();
+                parse_uuidv7(&value)
+                    .map_err(|error| anyhow::anyhow!("{} handle 无效: {error}", $label))?;
+                Ok(Self(value))
+            }
+
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+
+        impl TryFrom<String> for $name {
+            type Error = anyhow::Error;
+
+            fn try_from(value: String) -> anyhow::Result<Self> {
+                Self::parse(value)
+            }
+        }
+    };
+}
+
+project_uuid_handle!(
+    /// Workflow Run 聚合的持久 opaque handle
+    /// (`agent_tasks.public_handle`)。Task 只是 Project Store 内部承载，
+    /// facade 不对外暴露其 rowid。
+    WorkflowRunHandle,
+    "workflow run"
+);
+project_uuid_handle!(
+    /// Step 聚合的持久 opaque handle(`steps.public_handle`)。
+    StepHandle,
+    "step"
+);
+project_uuid_handle!(
+    /// Agent Run 聚合的持久 opaque handle(`agent_runs.public_handle`)。
+    AgentRunHandle,
+    "agent run"
+);
+project_uuid_handle!(
+    /// Project Store 内 Agent Session 聚合的持久 opaque handle
+    /// (`agent_sessions.public_handle`)。与 Terminal attach 的 [`SessionHandle`]
+    /// 是不同命名空间。
+    AgentSessionHandle,
+    "agent session"
+);
+
 /// Agent Session opaque handle(`sess_` + UUIDv7)。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String")]
@@ -253,6 +314,7 @@ pub enum AggregateKind {
     ProjectWorkflow,
     WorkflowRun,
     Step,
+    AgentRun,
     AgentSession,
     AgentInstance,
     ProviderProfile,
@@ -267,6 +329,7 @@ impl AggregateKind {
             Self::ProjectWorkflow => "project_workflow",
             Self::WorkflowRun => "workflow_run",
             Self::Step => "step",
+            Self::AgentRun => "agent_run",
             Self::AgentSession => "agent_session",
             Self::AgentInstance => "agent_instance",
             Self::ProviderProfile => "provider_profile",

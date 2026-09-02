@@ -1,12 +1,22 @@
 //! mfctl 命名管道服务端:`\\.\pipe\monkeyfence-mfctl-<pid>`。
 //!
 //! NDJSON 协议:
-//! 请求  {"id":N,"token":"...","method":"step.complete|step.fail|pipeline.propose|agent.state","params":{...}}
+//! 请求  {"id":N,"token":"...","method":"step.complete|step.fail|pipeline.propose|agent.state","params":{...},"command_id":"<uuidv7>"(可选)}
 //! 响应  {"id":N,"ok":true,"result":"..."} / {"id":N,"ok":false,"error":"..."}
+//!
+//! T2d(Issue #26):step.complete/step.fail 的 capability-token Settlement
+//! 路由到 Core(`mf_kernel::run_control`,L-CMD 事务 + durable RunAction
+//! outbox),Core 未装配或 Project 正在关闭时 fail-closed;其余命令保持
+//! legacy Orchestrator 路径不变。
 
-use mf_agent::model::{AgentState, RunView, SettleOutcome, Settlement};
+use mf_agent::model::{AgentState, Settlement};
+#[cfg(test)]
 use mf_agent::orchestrator::Orchestrator;
 use mf_agent::pipeline::PipelineDraft;
+use mf_kernel::run_control::{
+    RunControl, RunControlCommand, RunControlOutcome, TokenSettleOutcome,
+};
+#[cfg(test)]
 use parking_lot::Mutex;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,19 +26,27 @@ pub fn pipe_name_for_current_process() -> String {
     format!(r"\\.\pipe\monkeyfence-mfctl-{}", std::process::id())
 }
 
+/// pipe 命令的两条路由:settlement 走 Core run-control,其余命令走
+/// legacy Orchestrator 注册表。
+struct PipeRouting {
+    run_control: Option<Arc<dyn RunControl>>,
+}
+
 pub struct PipeServer {
     shutdown: Arc<AtomicBool>,
 }
 
 impl PipeServer {
-    /// 启动管道服务线程。令牌全局唯一,跨所有打开项目的 Orchestrator 路由。
-    pub fn start(orchestrators: Arc<Mutex<Vec<Arc<Orchestrator>>>>) -> anyhow::Result<PipeServer> {
+    /// 启动管道服务线程。令牌全局唯一;settlement 经 Core run_control
+    /// 跨已登记 Project 路由；transport 不持有 Orchestrator。
+    pub fn start(run_control: Option<Arc<dyn RunControl>>) -> anyhow::Result<PipeServer> {
         let shutdown = Arc::new(AtomicBool::new(false));
         let name = pipe_name_for_current_process();
         let flag = shutdown.clone();
+        let routing = Arc::new(PipeRouting { run_control });
         std::thread::Builder::new()
             .name("mfctl-pipe".into())
-            .spawn(move || run_server(&name, &orchestrators, &flag))?;
+            .spawn(move || run_server(&name, &routing, &flag))?;
         Ok(PipeServer { shutdown })
     }
 
@@ -37,11 +55,7 @@ impl PipeServer {
     }
 }
 
-fn run_server(
-    name: &str,
-    orchestrators: &Arc<Mutex<Vec<Arc<Orchestrator>>>>,
-    shutdown: &Arc<AtomicBool>,
-) {
+fn run_server(name: &str, routing: &Arc<PipeRouting>, shutdown: &Arc<AtomicBool>) {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW};
 
@@ -90,27 +104,24 @@ fn run_server(
         }
         // 每连接一个线程:一个卡住的客户端不阻塞其他 Agent 的结算
         // (HANDLE 是裸指针,以 usize 跨线程传递后在目标线程还原)
-        let orch = orchestrators.clone();
+        let routing = routing.clone();
         let pipe_raw = pipe as usize;
         std::thread::Builder::new()
             .name("mfctl-conn".into())
             .spawn(move || {
                 let handle = pipe_raw as windows_sys::Win32::Foundation::HANDLE;
-                serve_connection(handle, &orch)
+                serve_connection(handle, &routing)
             })
             .ok();
     }
 }
 
 /// 处理单个客户端连接:读一行请求 → 处理 → 写响应 → 断开。
-fn serve_connection(
-    pipe: windows_sys::Win32::Foundation::HANDLE,
-    orchestrators: &Arc<Mutex<Vec<Arc<Orchestrator>>>>,
-) {
+fn serve_connection(pipe: windows_sys::Win32::Foundation::HANDLE, routing: &Arc<PipeRouting>) {
     use windows_sys::Win32::Foundation::CloseHandle;
     use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
     let response = match read_line(pipe) {
-        Some(request) => handle_request(&request, orchestrators),
+        Some(request) => handle_request(&request, routing),
         None => String::new(),
     };
     if !response.is_empty() {
@@ -170,7 +181,7 @@ fn read_line(pipe: windows_sys::Win32::Foundation::HANDLE) -> Option<String> {
     }
 }
 
-fn handle_request(line: &str, orchestrators: &Arc<Mutex<Vec<Arc<Orchestrator>>>>) -> String {
+fn handle_request(line: &str, routing: &Arc<PipeRouting>) -> String {
     let req: Value = match serde_json::from_str(line.trim()) {
         Ok(v) => v,
         Err(e) => return error_response(0, &format!("请求解析失败: {e}")),
@@ -179,7 +190,10 @@ fn handle_request(line: &str, orchestrators: &Arc<Mutex<Vec<Arc<Orchestrator>>>>
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let token = req.get("token").and_then(|t| t.as_str()).unwrap_or("");
     let params = req.get("params").cloned().unwrap_or(json!({}));
-    match dispatch(method, token, &params, orchestrators) {
+    // 可选幂等键(同 command_id + canonical digest 返回原结果);
+    // 旧客户端不发送,每次结算都是新命令,幂等由 Settlement 语义保证。
+    let command_id = req.get("command_id").and_then(|c| c.as_str());
+    match dispatch(method, token, &params, command_id, routing) {
         Ok(result) => json!({ "id": id, "ok": true, "result": result }).to_string(),
         Err(e) => error_response(id, &e),
     }
@@ -189,33 +203,31 @@ fn error_response(id: i64, msg: &str) -> String {
     json!({ "id": id, "ok": false, "error": msg }).to_string()
 }
 
-fn find_by_token(
-    orchestrators: &[Arc<Orchestrator>],
-    token: &str,
-) -> Option<(Arc<Orchestrator>, RunView)> {
-    for orch in orchestrators {
-        if let Ok(Some(run)) = orch.store.run_by_token(token) {
-            return Some((orch.clone(), run));
-        }
-    }
-    None
-}
-
 fn dispatch(
     method: &str,
     token: &str,
     params: &Value,
-    orchestrators: &Arc<Mutex<Vec<Arc<Orchestrator>>>>,
+    command_id: Option<&str>,
+    routing: &Arc<PipeRouting>,
 ) -> std::result::Result<String, String> {
     if token.is_empty() {
         return Err("缺少能力令牌(环境变量 MF_RUN_TOKEN)".into());
     }
-    let orch_list = orchestrators.lock().clone();
     match method {
-        "step.complete" | "step.fail" => {
-            let (orch, run) = find_by_token(&orch_list, token).ok_or("能力令牌无效")?;
-            let settlement = if method == "step.complete" {
-                Settlement::Complete {
+        "step.complete" | "step.fail" | "agent.state" | "pipeline.propose" => {
+            // fail-closed:Core 未装配时拒绝结算,绝不回退直写路径。
+            let Some(settle) = routing.run_control.as_ref() else {
+                return Err("Core 未装配,结算不可用".into());
+            };
+            // capability token 是认证材料，不能被调用方再塞进任何会
+            // 持久化的 RunControl payload。已知 token 的 taint 在
+            // transport 边界 fail-closed；
+            // 错误文案只给稳定分类，绝不回显命中的值。
+            if value_contains_sensitive(params, token) {
+                return Err("结算内容包含认证材料,已拒绝持久化".into());
+            }
+            let command = if method == "step.complete" {
+                RunControlCommand::Settle(Settlement::Complete {
                     summary: params
                         .get("summary")
                         .and_then(|s| s.as_str())
@@ -224,46 +236,70 @@ fn dispatch(
                     // 结构化输出(mfctl --output-json):进入 Handoff.output,
                     // 下游按 ${nodes.<key>.output.<path>} 精确引用
                     output: params.get("output").cloned().unwrap_or_default(),
-                }
-            } else {
-                Settlement::Fail {
+                })
+            } else if method == "step.fail" {
+                RunControlCommand::Settle(Settlement::Fail {
                     reason: params
                         .get("reason")
                         .and_then(|s| s.as_str())
                         .unwrap_or("")
                         .to_string(),
-                }
+                })
+            } else if method == "agent.state" {
+                let state = params
+                    .get("state")
+                    .and_then(|state| state.as_str())
+                    .ok_or("缺少 state 参数")?;
+                RunControlCommand::ReportState(
+                    AgentState::parse(state).ok_or_else(|| format!("未知状态: {state}"))?,
+                )
+            } else {
+                let draft: PipelineDraft = serde_json::from_value(
+                    params.get("draft").cloned().unwrap_or_else(|| json!({})),
+                )
+                .map_err(|error| format!("PipelineDraft 解析失败: {error}"))?;
+                RunControlCommand::ProposePipeline(draft)
             };
-            match orch.settle_by_token(token, settlement) {
-                Ok(SettleOutcome::Applied) => Ok(format!("Step 已结算(run #{})", run.id)),
-                Ok(SettleOutcome::AlreadyApplied) => Ok("幂等:该结算此前已提交".into()),
-                Err(e) => Err(e.to_string()),
+            let command_id = match command_id {
+                None => None,
+                Some(raw) => Some(
+                    mf_kernel::handles::CommandId::parse(raw)
+                        .map_err(|_| "command_id 必须是 UUIDv7".to_string())?,
+                ),
+            };
+            match settle.execute_agent_run_by_token(token, command, command_id) {
+                Ok(RunControlOutcome::Settled(TokenSettleOutcome::Applied { agent_run })) => {
+                    Ok(format!("Step 已结算(run {agent_run})"))
+                }
+                Ok(RunControlOutcome::Settled(TokenSettleOutcome::AlreadyApplied {
+                    agent_run,
+                })) => Ok(format!("幂等:该结算此前已提交(run {agent_run})")),
+                Ok(RunControlOutcome::StateReported { agent_run, state }) => {
+                    Ok(format!("状态已上报:{state}(run {agent_run})"))
+                }
+                Ok(RunControlOutcome::PipelineProposed {
+                    workflow_run,
+                    revision,
+                }) => Ok(format!(
+                    "草案已提交(run {workflow_run},revision {revision};等待用户确认)"
+                )),
+                Err(problem) => Err(problem.to_string()),
             }
-        }
-        "agent.state" => {
-            let state = params
-                .get("state")
-                .and_then(|s| s.as_str())
-                .ok_or("缺少 state 参数")?;
-            let state = AgentState::parse(state).ok_or_else(|| format!("未知状态: {state}"))?;
-            let (orch, run) = find_by_token(&orch_list, token).ok_or("能力令牌无效")?;
-            // 一次性令牌:已结算的 run 不再接受状态上报
-            if run.outcome.is_some() {
-                return Err("令牌所属运行已结算".into());
-            }
-            orch.handle_agent_state_report(run.id, state);
-            Ok(format!("状态已上报: {state}"))
-        }
-        "pipeline.propose" => {
-            let (orch, run) = find_by_token(&orch_list, token).ok_or("能力令牌无效")?;
-            let draft: PipelineDraft =
-                serde_json::from_value(params.get("draft").cloned().unwrap_or(json!({})))
-                    .map_err(|e| format!("PipelineDraft 解析失败: {e}"))?;
-            orch.planner_propose(run.task_id, &draft)
-                .map_err(|e| format!("提案失败: {e:#}"))?;
-            Ok(format!("草案已提交任务 #{}(等待用户确认)", run.task_id))
         }
         other => Err(format!("未知方法: {other}")),
+    }
+}
+
+fn value_contains_sensitive(value: &Value, sensitive: &str) -> bool {
+    match value {
+        Value::String(text) => text.contains(sensitive),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| value_contains_sensitive(value, sensitive)),
+        Value::Object(object) => object
+            .values()
+            .any(|value| value_contains_sensitive(value, sensitive)),
+        _ => false,
     }
 }
 
@@ -278,10 +314,33 @@ fn dispatch(
 
 #[cfg(test)]
 pub(crate) mod contract_tests {
+    #[test]
+    fn run_control_transport_has_no_orchestrator_domain_write_bypass() {
+        let source = include_str!("pipe_server.rs")
+            .split("pub(crate) mod contract_tests")
+            .next()
+            .unwrap_or_default();
+        for forbidden in [
+            "fn find_by_token(",
+            ".planner_propose(",
+            ".handle_agent_state_report(",
+            "routing.orchestrators",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "pipe transport 不得绕过 Kernel RunControl:{forbidden}"
+            );
+        }
+    }
+
     use super::*;
     use crossbeam_channel::Sender;
     use mf_agent::runtime::{LaunchSpec, RuntimeEvent, RuntimeHost, WorkflowLaunchSpec};
     use mf_agent::workflow::{ProjectWorkflowDraft, WorkflowNodeDraft, WorkflowTemplateVersion};
+    use mf_kernel::handles::{ClientId, CommandId, Principal};
+    use mf_kernel::kernel::{InProcessKernelRuntime, KernelProblem, LegacyKernelClient};
+    use mf_kernel::project_registry::ServiceStore;
+    use mf_kernel::run_lifecycle::{RunActionDelivery, RunLifecyclePort, RunPreparation};
     use std::sync::OnceLock;
 
     /// no-op 宿主:只为让 Orchestrator 创建持有 capability_token 的
@@ -318,16 +377,140 @@ pub(crate) mod contract_tests {
     /// 进程内唯一的 PipeServer(管道名含本进程 pid,
     /// FIRST_PIPE_INSTANCE 要求全进程单实例)。pub(crate) 暴露给
     /// crates/mfctl 的集成测试复用(#[path] include 本文件时,
-    /// 同一二进制内必须共享同一服务端实例)。
+    /// 同一二进制内必须共享同一服务端实例)。settlement 经共享的
+    /// in-process Core run_control 路由(真实 kernel 命令链)。
     pub(crate) fn shared_pipe_server() -> Arc<Mutex<Vec<Arc<Orchestrator>>>> {
         static SERVER: OnceLock<Arc<Mutex<Vec<Arc<Orchestrator>>>>> = OnceLock::new();
         SERVER
             .get_or_init(|| {
                 let list: Arc<Mutex<Vec<Arc<Orchestrator>>>> = Arc::new(Mutex::new(Vec::new()));
-                PipeServer::start(list.clone()).expect("PipeServer 启动失败");
+                let run_control = shared_kernel_client();
+                PipeServer::start(Some(run_control)).expect("PipeServer 启动失败");
                 list
             })
             .clone()
+    }
+
+    /// 进程内共享的测试 Core(service-v1 落 tempfile,不触用户目录)。
+    /// Project 注册表与 settle 客户端跨越所有测试存活。
+    pub(crate) struct SharedCore {
+        pub(crate) runtime: Arc<InProcessKernelRuntime>,
+        client: Arc<LegacyKernelClient>,
+        _service_dir: tempfile::TempDir,
+    }
+
+    pub(crate) fn shared_kernel_core() -> &'static SharedCore {
+        static CORE: OnceLock<SharedCore> = OnceLock::new();
+        CORE.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("service tempdir");
+            let service =
+                ServiceStore::open(&dir.path().join("service-v1.db")).expect("service store");
+            let (runtime, client) = InProcessKernelRuntime::for_test(
+                service,
+                mf_kernel::command::ServiceIdempotencyKey::for_test(vec![0x2d; 32])
+                    .expect("idempotency key"),
+                ClientId::parse("mfctl-pipe-core").expect("client id"),
+                Principal::parse("mfctl-agent").expect("principal"),
+            )
+            .expect("测试 Core 装配");
+            SharedCore {
+                runtime,
+                client: Arc::new(client),
+                _service_dir: dir,
+            }
+        })
+    }
+
+    fn shared_kernel_client() -> Arc<dyn RunControl> {
+        shared_kernel_core().client.clone()
+    }
+
+    /// 外部测试模块(main.rs v2_tests)共享同一测试 Core 注册项目;
+    /// guard Drop 时注销,防止已删除库进入令牌路由扫描。
+    pub(crate) struct KernelProjectGuard {
+        runtime: Option<Arc<InProcessKernelRuntime>>,
+        project: Option<mf_kernel::handles::ProjectStoreHandle>,
+    }
+
+    impl KernelProjectGuard {
+        pub(crate) fn new(
+            runtime: Arc<InProcessKernelRuntime>,
+            project: mf_kernel::handles::ProjectStoreHandle,
+        ) -> Self {
+            Self {
+                runtime: Some(runtime),
+                project: Some(project),
+            }
+        }
+    }
+
+    impl Drop for KernelProjectGuard {
+        fn drop(&mut self) {
+            if let Some((runtime, project)) = self.runtime.take().zip(self.project.take()) {
+                if let Err(error) = runtime.unregister_project_store(&project) {
+                    log::warn!("测试 Core 注销项目失败:{error}");
+                }
+            }
+        }
+    }
+
+    /// pipe 契约的 orchestrator lifecycle port:与生产
+    /// `run_lifecycle_port::OrchestratorRunLifecyclePort` 同语义(委托
+    /// Orchestrator 的 durable action 执行),但在此自足定义,供
+    /// crates/mfctl 以 #[path] include 本文件时独立编译。
+    pub(crate) struct PipeOrchestratorPort {
+        pub(crate) orchestrator: Arc<Orchestrator>,
+    }
+
+    impl RunLifecyclePort for PipeOrchestratorPort {
+        fn supports_question_bound_answers(&self) -> bool {
+            self.orchestrator.supports_question_bound_answers()
+        }
+
+        fn prepare(
+            &self,
+            _command_id: &CommandId,
+            command: &mf_kernel::kernel::WorkflowRunCommand,
+        ) -> Result<RunPreparation, KernelProblem> {
+            match command {
+                mf_kernel::kernel::WorkflowRunCommand::Cancel { expected, .. } => {
+                    let handles = expected
+                        .agent_runs
+                        .iter()
+                        .map(|run| run.handle.as_str().to_owned())
+                        .collect::<Vec<_>>();
+                    let run_stops = self
+                        .orchestrator
+                        .prepare_cancel_runs(&handles)
+                        .map_err(|error| KernelProblem::ServiceUnavailable(format!("{error:#}")))?
+                        .into_iter()
+                        .map(|(handle, outcome)| {
+                            Ok(mf_kernel::run_lifecycle::PreparedRunStop {
+                                agent_run: mf_kernel::handles::AgentRunHandle::parse(handle)
+                                    .map_err(|error| {
+                                        KernelProblem::Internal(format!(
+                                            "Agent Run handle 损坏:{error}"
+                                        ))
+                                    })?,
+                                outcome,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, KernelProblem>>()?;
+                    Ok(RunPreparation::Cancel { run_stops })
+                }
+                _ => Ok(RunPreparation::Ready),
+            }
+        }
+
+        fn execute_post_commit(&self, delivery: &RunActionDelivery) -> Result<(), KernelProblem> {
+            self.orchestrator
+                .execute_durable_run_action(&delivery.action)
+                .map_err(|error| {
+                    KernelProblem::ServiceUnavailable(format!(
+                        "run_lifecycle_action_failed:{error:#}"
+                    ))
+                })
+        }
     }
 
     /// 服务端串行锁:同一服务端的 orchestrator 注册表被并行测试
@@ -351,14 +534,18 @@ pub(crate) mod contract_tests {
         test(&handle);
     }
 
-    /// 注册一个真实 orchestrator(项目 Store + no-op 宿主的工作流 run)。
-    /// guard 持有项目临时目录(数据库生命周期),Drop 时从服务端注册表
-    /// 移除并停止调度线程。
+    /// 注册一个真实 orchestrator(真实 Core 登记的项目 Store + no-op 宿主
+    /// 的工作流 run)。guard 持有项目临时目录(数据库生命周期),Drop 时
+    /// 从服务端注册表移除、停止调度线程并注销 Core Project 登记。
     pub(crate) struct RegisteredRun {
         pub(crate) orch: Arc<Orchestrator>,
         pub(crate) run: mf_agent::model::RunView,
         pub(crate) task_id: i64,
         orchestrators: Option<Arc<Mutex<Vec<Arc<Orchestrator>>>>>,
+        kernel: Option<(
+            Arc<InProcessKernelRuntime>,
+            mf_kernel::handles::ProjectStoreHandle,
+        )>,
         _dir: tempfile::TempDir,
     }
 
@@ -371,6 +558,11 @@ pub(crate) mod contract_tests {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while Arc::strong_count(&self.orch) > 1 && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if let Some((runtime, project)) = self.kernel.take() {
+                if let Err(error) = runtime.unregister_project_store(&project) {
+                    log::warn!("测试 Core 注销项目失败:{error}");
+                }
             }
         }
     }
@@ -407,8 +599,16 @@ pub(crate) mod contract_tests {
                 sealed_secret_ids: vec![],
             })
             .expect("创建实例");
+        let core = shared_kernel_core();
+        // 真实 Core 登记链:runtime 打开权威 Project Store(同生产
+        // open_project),Orchestrator 借用同一 Store 实例,lifecycle port
+        // 注册后 settlement 的 durable action 才有投递端。
+        let kernel_project = core
+            .runtime
+            .open_project(dir.path())
+            .expect("Core 登记项目");
         let orch = Orchestrator::start_with(
-            mf_agent::Store::open(&dir.path().join("workflow-v1.db")).expect("打开 Store"),
+            kernel_project.legacy_store(),
             dir.path().to_path_buf(),
             mf_agent::Config::default(),
             Arc::new(MockHost),
@@ -478,11 +678,20 @@ pub(crate) mod contract_tests {
         if let Some(list) = &orchestrators {
             list.lock().push(orch.clone());
         }
+        core.runtime
+            .register_run_lifecycle_port(
+                kernel_project.handle(),
+                Arc::new(PipeOrchestratorPort {
+                    orchestrator: orch.clone(),
+                }),
+            )
+            .expect("注册 run lifecycle port");
         RegisteredRun {
             orch,
             run,
             task_id: task.id,
             orchestrators,
+            kernel: Some((core.runtime.clone(), kernel_project.handle().clone())),
             _dir: dir,
         }
     }
@@ -494,15 +703,33 @@ pub(crate) mod contract_tests {
         method: &str,
         params: &serde_json::Value,
     ) -> serde_json::Value {
+        pipe_request_with_command_id(pipe_name, token, method, params, None)
+    }
+
+    /// 支持可选顶层 command_id(幂等键)的请求变体。
+    fn pipe_request_with_command_id(
+        pipe_name: &str,
+        token: &str,
+        method: &str,
+        params: &serde_json::Value,
+        command_id: Option<&str>,
+    ) -> serde_json::Value {
         let pipe_name = pipe_name.to_string();
         let token = token.to_string();
         let method = method.to_string();
         let params = params.clone();
+        let command_id = command_id.map(str::to_string);
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         std::thread::Builder::new()
             .name("mfctl-contract-client".into())
             .spawn(move || {
-                let result = pipe_request_blocking(&pipe_name, &token, &method, &params);
+                let result = pipe_request_blocking(
+                    &pipe_name,
+                    &token,
+                    &method,
+                    &params,
+                    command_id.as_deref(),
+                );
                 let _ = tx.send(result);
             })
             .expect("启动管道契约客户端失败");
@@ -515,6 +742,7 @@ pub(crate) mod contract_tests {
         token: &str,
         method: &str,
         params: &serde_json::Value,
+        command_id: Option<&str>,
     ) -> serde_json::Value {
         use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
         use windows_sys::Win32::Storage::FileSystem::{
@@ -544,13 +772,16 @@ pub(crate) mod contract_tests {
             std::thread::sleep(std::time::Duration::from_millis(50));
         };
         let outcome = (|| -> Option<serde_json::Value> {
-            let req = json!({
+            let mut request = json!({
                 "id": 1,
                 "token": token,
                 "method": method,
                 "params": params,
-            })
-            .to_string();
+            });
+            if let Some(command_id) = command_id {
+                request["command_id"] = json!(command_id);
+            }
+            let req = request.to_string();
             let mut out = req.into_bytes();
             out.push(b'\n');
             let mut written = 0u32;
@@ -685,6 +916,42 @@ pub(crate) mod contract_tests {
         });
     }
 
+    #[test]
+    fn settlement_payload_cannot_persist_its_capability_token() {
+        with_pipe_server(|server| {
+            let registered = registered_run_in(Some(server.orchestrators.clone()));
+            let run = &registered.run;
+            let token = &run.capability_token;
+            let pipe = pipe_name_for_current_process();
+            for params in [
+                json!({"summary": format!("leak:{token}")}),
+                json!({"summary":"ok", "output":{"nested": token}}),
+            ] {
+                let response = pipe_request(&pipe, token, "step.complete", &params);
+                assert_response_has_no_token(&response, token);
+                assert_eq!(response["ok"], json!(false));
+                assert!(response["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("认证材料"));
+            }
+            let failure = pipe_request(
+                &pipe,
+                token,
+                "step.fail",
+                &json!({"reason": format!("failure {token}")}),
+            );
+            assert_response_has_no_token(&failure, token);
+            assert_eq!(failure["ok"], json!(false));
+            assert!(registered
+                .orch
+                .store
+                .run_view(run.id)
+                .unwrap()
+                .is_some_and(|current| current.outcome.is_none()));
+        });
+    }
+
     /// 契约:令牌路由 —— 空令牌与未知令牌拒绝;A 项目令牌只结算 A 的
     /// run,绝不影响 B 项目(结算目标由令牌唯一决定)。
     #[test]
@@ -731,6 +998,12 @@ pub(crate) mod contract_tests {
             );
             assert_response_has_no_token(&resp, &run_a.capability_token);
             assert_eq!(resp["ok"], json!(true), "A 令牌结算 A run: {resp}");
+            let result = resp["result"].as_str().unwrap_or_default();
+            assert!(result.contains(&run_a.public_handle));
+            assert!(
+                !result.contains("run #"),
+                "wire 不得暴露 Store rowid:{result}"
+            );
             assert_eq!(
                 wait_run_outcome(&orch_a, run_a.id).as_deref(),
                 Some("complete")
@@ -777,6 +1050,123 @@ pub(crate) mod contract_tests {
                     .unwrap_or_default()
                     .contains("已结算"),
                 "结算后错误: {late}"
+            );
+        });
+    }
+
+    /// 契约:settlement 必须经 Core kernel 命令链落库 —— 结算后
+    /// Project Store 出现 applied+finalized 的 command receipt,目标
+    /// aggregate 是该 Agent Run,且 receipt 文本不含令牌。
+    #[test]
+    fn mfctl_wire_settlement_leaves_kernel_command_receipt() {
+        with_pipe_server(|server| {
+            let registered = registered_run_in(Some(server.orchestrators.clone()));
+            let run = &registered.run;
+            let pipe = pipe_name_for_current_process();
+
+            let resp = pipe_request(
+                &pipe,
+                &run.capability_token,
+                "step.complete",
+                &json!({ "summary": "kernel 链路" }),
+            );
+            assert_eq!(resp["ok"], json!(true), "结算必须成功: {resp}");
+            assert_eq!(
+                wait_run_outcome(&registered.orch, run.id).as_deref(),
+                Some("complete")
+            );
+
+            let receipt = registered
+                .orch
+                .store
+                .with_conn(|conn| -> anyhow::Result<(String, String, Option<String>)> {
+                    Ok(conn.query_row(
+                        "SELECT state, aggregate_handle, finalized_at FROM command_receipt",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )?)
+                })
+                .expect("读取 command receipt");
+            assert_eq!(receipt.0, "applied", "settlement receipt 必须已收口");
+            assert_eq!(receipt.1, run.public_handle, "目标必须是该 Agent Run");
+            assert!(receipt.2.is_some());
+            assert!(
+                !format!("{receipt:?}").contains(&run.capability_token),
+                "receipt 不得包含令牌"
+            );
+        });
+    }
+
+    /// 契约:Core 未装配时 settlement fail-closed,绝不回退直写路径。
+    #[test]
+    fn mfctl_wire_settlement_fails_closed_without_core() {
+        let routing = PipeRouting { run_control: None };
+        let rejected = dispatch(
+            "step.complete",
+            "mft-any-token",
+            &json!({ "summary": "s" }),
+            None,
+            &Arc::new(routing),
+        );
+        assert_eq!(
+            rejected,
+            Err("Core 未装配,结算不可用".to_owned()),
+            "无 Core 时必须拒绝结算"
+        );
+    }
+
+    /// 契约:可选 command_id —— 非法格式稳定拒绝;合法 UUIDv7 与
+    /// 省略(旧客户端)都能正常结算。
+    #[test]
+    fn mfctl_wire_command_id_is_optional_but_validated() {
+        with_pipe_server(|server| {
+            let registered = registered_run_in(Some(server.orchestrators.clone()));
+            let run = &registered.run;
+            let token = &run.capability_token;
+            let pipe = pipe_name_for_current_process();
+
+            let invalid = pipe_request_with_command_id(
+                &pipe,
+                token,
+                "step.complete",
+                &json!({ "summary": "s" }),
+                Some("not-a-uuid"),
+            );
+            assert_response_has_no_token(&invalid, token);
+            assert_eq!(
+                invalid["ok"],
+                json!(false),
+                "非法 command_id 必须拒绝: {invalid}"
+            );
+            assert!(
+                invalid["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("command_id"),
+                "command_id 错误: {invalid}"
+            );
+            assert!(
+                registered
+                    .orch
+                    .store
+                    .run_view(run.id)
+                    .unwrap()
+                    .is_some_and(|r| r.outcome.is_none()),
+                "非法 command_id 不得结算"
+            );
+
+            let valid = pipe_request_with_command_id(
+                &pipe,
+                token,
+                "step.complete",
+                &json!({ "summary": "带命令 id" }),
+                Some(&uuid::Uuid::now_v7().to_string()),
+            );
+            assert_response_has_no_token(&valid, token);
+            assert_eq!(valid["ok"], json!(true), "合法 command_id 结算: {valid}");
+            assert_eq!(
+                wait_run_outcome(&registered.orch, run.id).as_deref(),
+                Some("complete")
             );
         });
     }

@@ -38,7 +38,7 @@ fn migrated_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
         &[("w1", "工作流一", &graph_json(&two_node_workflow()))],
     );
     let store = Store::open(&db).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 7);
+    assert_eq!(store.schema_version().unwrap(), PROJECT_SCHEMA_VERSION);
     drop(store);
     (tmp, db)
 }
@@ -537,7 +537,7 @@ fn v6_upgrade_backs_up_once_and_reopen_is_stable() {
     let (manifest_path, manifest) = sole_manifest(&backup_dir);
     assert_eq!(manifest["store_kind"], "project");
     assert_eq!(manifest["from_version"], 6, "备份必须是 v6 迁移前快照");
-    assert_eq!(manifest["to_version"], 7);
+    assert_eq!(manifest["to_version"], PROJECT_SCHEMA_VERSION);
     assert_eq!(manifest["complete"], true);
     let backup_db = manifest_path.parent().unwrap().join("backup.db");
     assert_eq!(user_version_of(&backup_db), 6, "备份停留在迁移前版本");
@@ -560,7 +560,7 @@ fn v6_upgrade_backs_up_once_and_reopen_is_stable() {
 
     // 重跑已完成迁移:无新备份,全部 handle/revision 稳定
     let store = Store::open(&db).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 7);
+    assert_eq!(store.schema_version().unwrap(), PROJECT_SCHEMA_VERSION);
     assert_eq!(
         migration::published_artifact_dirs(&backup_dir)
             .unwrap()
@@ -589,36 +589,37 @@ fn v6_upgrade_backs_up_once_and_reopen_is_stable() {
     drop(store);
 }
 
-/// current v7 正常打开不产生备份;future v8 fail-closed(与 #16 契约同口径)。
+/// current schema 正常打开不产生备份;future schema fail-closed(与 #16 契约同口径)。
 #[test]
 fn current_v7_opens_without_backup_and_future_v8_fails_closed() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("workflow-v1.db");
     {
         let store = Store::open(&db).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 7);
+        assert_eq!(store.schema_version().unwrap(), PROJECT_SCHEMA_VERSION);
         assert!(
             !migration::backup_dir_for(&db).exists(),
             "全新库初始化不是升级,不备份"
         );
     }
-    // 直接在同一库上伪造 v8:user_version 高于已知版本必须拒绝
+    // 直接在同一库上伪造 future user_version:高于已知版本必须拒绝
     {
         let conn = Connection::open(&db).unwrap();
-        conn.pragma_update(None, "user_version", 8).unwrap();
+        conn.pragma_update(None, "user_version", PROJECT_SCHEMA_VERSION + 1)
+            .unwrap();
     }
     let hash_before = crate::support::sha256_file(&db);
     let schema_before = schema_objects_of(&db);
     let err = match Store::open(&db) {
-        Ok(_) => panic!("v8 库必须 fail-closed"),
+        Ok(_) => panic!("future schema 必须 fail-closed"),
         Err(err) => err,
     };
     assert_eq!(
         migration::error_code(&err),
         Some(migration::CODE_SCHEMA_FUTURE_VERSION),
-        "v8 必须以稳定错误码 fail-closed: {err:#}"
+        "future schema 必须以稳定错误码 fail-closed: {err:#}"
     );
-    assert_eq!(user_version_of(&db), 8);
+    assert_eq!(user_version_of(&db), PROJECT_SCHEMA_VERSION + 1);
     assert_eq!(crate::support::sha256_file(&db), hash_before);
     assert_eq!(schema_objects_of(&db), schema_before);
 }
@@ -639,7 +640,7 @@ fn migrated_fixture_business_projection_matches_committed_golden() {
     assert_eq!(baseline::raw_schema_version(&db).unwrap(), 6);
 
     let store = Store::open(&db).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 7);
+    assert_eq!(store.schema_version().unwrap(), PROJECT_SCHEMA_VERSION);
     let dump = baseline::dump_project(&store).unwrap();
     let expected = std::fs::read_to_string(
         baseline::fixtures_dir()
@@ -779,7 +780,7 @@ fn fault_after_ddl_rolls_back_to_intact_v6() {
         .execute_batch("DROP TRIGGER fault_aggregate_handle;")
         .unwrap();
     let store = Store::open(&db).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 7);
+    assert_eq!(store.schema_version().unwrap(), PROJECT_SCHEMA_VERSION);
     let (nodes, edges, handles): (i64, i64, i64) = {
         let conn = read_only(&db);
         conn.query_row(
@@ -831,7 +832,7 @@ fn fault_after_workflow_handle_backfill_rolls_back() {
         )
         .unwrap();
     let store = Store::open(&db).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 7);
+    assert_eq!(store.schema_version().unwrap(), PROJECT_SCHEMA_VERSION);
     let (nodes, edges): (i64, i64) = {
         let conn = read_only(&db);
         conn.query_row(
@@ -900,7 +901,7 @@ fn fault_mid_identity_backfill_rolls_back() {
             )
             .unwrap();
         let store = Store::open(&db).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 7);
+        assert_eq!(store.schema_version().unwrap(), PROJECT_SCHEMA_VERSION);
         let handles = crate::support::all_persistent_handles(&db);
         // 6 聚合行 + 2 工作流 + a-ok(2 节点 1 边) + z-bad 修复后 1 节点
         assert_eq!(handles.len(), 12, "{label}: 持久对象 handle 计数");
@@ -928,7 +929,7 @@ fn legacy_v1_upgrades_through_chain_with_single_backup() {
     build_legacy_v1_db(&db, &["链式迁移"]);
 
     let store = Store::open(&db).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 7);
+    assert_eq!(store.schema_version().unwrap(), PROJECT_SCHEMA_VERSION);
     let titles: Vec<String> = store
         .list_tasks(false)
         .unwrap()
@@ -939,7 +940,7 @@ fn legacy_v1_upgrades_through_chain_with_single_backup() {
 
     let (_, manifest) = sole_manifest(&migration::backup_dir_for(&db));
     assert_eq!(manifest["from_version"], 1, "备份是 v1 迁移前快照");
-    assert_eq!(manifest["to_version"], 7);
+    assert_eq!(manifest["to_version"], PROJECT_SCHEMA_VERSION);
     for table in [
         "agent_tasks",
         "pipeline_revisions",
@@ -990,11 +991,11 @@ fn legacy_v5_upgrades_through_v6_to_v7_with_single_backup() {
     assert_eq!(user_version_of(&db), 5);
 
     let store = Store::open(&db).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 7);
+    assert_eq!(store.schema_version().unwrap(), PROJECT_SCHEMA_VERSION);
     assert_eq!(store.list_tasks(false).unwrap().len(), 1);
     let (_, manifest) = sole_manifest(&migration::backup_dir_for(&db));
     assert_eq!(manifest["from_version"], 5);
-    assert_eq!(manifest["to_version"], 7);
+    assert_eq!(manifest["to_version"], PROJECT_SCHEMA_VERSION);
     // 全链一次事务:不产生中间 v6 备份
     assert_eq!(
         migration::published_artifact_dirs(&migration::backup_dir_for(&db))

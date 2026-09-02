@@ -5,10 +5,12 @@
 //! - `MF_PIPE`:MonkeyFence 命名管道
 //!
 //! 命令:
-//!   mfctl step complete --summary "..." [--output-json '{"report_path":"..."}']
+//!   mfctl step complete --summary "..." [--output-json '{"report_path":"..."}'] [--command-id <uuidv7>]
 //!   mfctl step fail --reason "..."
 //!   mfctl agent-state <working|waiting|blocked|done>
 //!   mfctl pipeline propose --file draft.json
+//!
+//! `--command-id`(可选,UUIDv7)是幂等键:同 id 重试返回原结果;
 //!
 //! 也可显式传参:--token <T> --pipe <NAME>。协议为 NDJSON 单请求/单响应。
 
@@ -55,6 +57,8 @@ fn run(args: &[String]) -> Result<String> {
             flag_key = Some("file");
         } else if a == "--output-json" {
             flag_key = Some("output-json");
+        } else if a == "--command-id" {
+            flag_key = Some("command-id");
         } else if let Some(v) = a.strip_prefix("--token=") {
             flags.push(("token", v.to_string()));
         } else if let Some(v) = a.strip_prefix("--pipe=") {
@@ -67,6 +71,8 @@ fn run(args: &[String]) -> Result<String> {
             flags.push(("file", v.to_string()));
         } else if let Some(v) = a.strip_prefix("--output-json=") {
             flags.push(("output-json", v.to_string()));
+        } else if let Some(v) = a.strip_prefix("--command-id=") {
+            flags.push(("command-id", v.to_string()));
         } else {
             positional.push(a);
         }
@@ -126,7 +132,13 @@ fn run(args: &[String]) -> Result<String> {
         }
     };
 
-    let response = request_over_pipe(&pipe, &token, method, &params)?;
+    let response = request_over_pipe(
+        &pipe,
+        &token,
+        method,
+        &params,
+        flag("command-id").as_deref(),
+    )?;
     if response
         .get("ok")
         .and_then(|o| o.as_bool())
@@ -149,7 +161,15 @@ fn run(args: &[String]) -> Result<String> {
 }
 
 /// Windows 命名管道客户端:单请求/单响应 NDJSON。
-fn request_over_pipe(pipe_name: &str, token: &str, method: &str, params: &Value) -> Result<Value> {
+/// `command_id` 为可选幂等键(UUIDv7):同 id + 同请求内容由服务端
+/// 返回原结果;省略时每次都是新命令,幂等由 Settlement 语义保证。
+fn request_over_pipe(
+    pipe_name: &str,
+    token: &str,
+    method: &str,
+    params: &Value,
+    command_id: Option<&str>,
+) -> Result<Value> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     let wide: Vec<u16> = pipe_name.encode_utf16().chain(std::iter::once(0)).collect();
     // 服务端逐实例处理请求;客户端可能撞上实例未就绪的窗口(ERROR_FILE_NOT_FOUND/BUSY)→ 重试
@@ -175,7 +195,11 @@ fn request_over_pipe(pipe_name: &str, token: &str, method: &str, params: &Value)
         }
         std::thread::sleep(Duration::from_millis(50));
     };
-    let req = json!({ "id": 1, "token": token, "method": method, "params": params }).to_string();
+    let mut request = json!({ "id": 1, "token": token, "method": method, "params": params });
+    if let Some(command_id) = command_id {
+        request["command_id"] = json!(command_id);
+    }
+    let req = request.to_string();
     let outcome = (|| -> Result<Value> {
         let mut out = req.as_bytes().to_vec();
         out.push(b'\n');

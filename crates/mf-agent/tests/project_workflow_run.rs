@@ -59,6 +59,9 @@ fn project_workflow_record_projects_into_assign_path() {
         "Task.goal 注入 prompt: {prompt}"
     );
     assert!(prompt.contains("做 A"));
+    assert!(prompt.contains("MF_RUN_TOKEN 环境变量"));
+    assert!(!prompt.contains("mfctl --token"));
+    assert!(!prompt.contains("tok"), "prompt 不得内嵌 capability token");
 
     // 运行后恢复:confirm_and_run 派发真实 fixture 会话
     fx.orch.confirm_and_run(task.id).unwrap();

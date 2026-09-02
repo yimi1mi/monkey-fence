@@ -432,9 +432,16 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
     }
 
     fn release(&self, lease: &ExecutionLease) -> Result<()> {
+        anyhow::ensure!(
+            lease.provider == self.id(),
+            "拒绝释放他人提供器({})的租约(本提供器: {})",
+            lease.provider,
+            self.id()
+        );
         let Some(worktrees_root) = &self.worktrees_root else {
             return Ok(()); // 共享目录回退:无需清理
         };
+        anyhow::ensure!(lease.isolated, "worktree 租约必须为隔离租约");
         // 释放前强校验:只清理 .worktrees 下由我们命名的 worktree
         ensure_lease_under_root(worktrees_root, &lease.path)?;
         let name = lease
@@ -445,6 +452,16 @@ impl ExecutionDirectoryProvider for GitWorktreeProvider {
         anyhow::ensure!(
             name.starts_with("mf-run-"),
             "拒绝清理非 mf-run- 前缀目录: {name}"
+        );
+        anyhow::ensure!(
+            lease.id == format!("wt-{name}")
+                && lease
+                    .metadata
+                    .get("worktree")
+                    .and_then(|value| value.as_str())
+                    == Some(name),
+            "worktree 租约静态身份不匹配: {}",
+            lease.id
         );
         let git = Git::open(&self.repo_root)?;
         match git.worktree_remove(name) {
@@ -838,7 +855,7 @@ impl GitWorktreeProvider {
         {
             Ok(pair) => pair,
             Err(e) if expected.is_none() && error_is_path_absent(&e) => {
-                return Ok(desired.is_none())
+                return Ok(desired.is_none());
             }
             Err(e) => return Err(e),
         };

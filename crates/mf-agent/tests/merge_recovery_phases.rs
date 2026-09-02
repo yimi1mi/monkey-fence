@@ -392,12 +392,17 @@ fn merge_conclusion_persist_failure_does_not_release_lease() {
         })
         .unwrap();
 
-    fx.orch
+    let error = fx
+        .orch
         .settle_by_token(
             &token_of_node(&fx.orch, task.id, "solo"),
             Settlement::complete("done"),
         )
-        .unwrap();
+        .expect_err("merge 结论无法持久化时必须把 post-commit 错误返回调用方");
+    assert!(
+        matches!(error, mf_agent::SettleError::Db(_)),
+        "外部 action 错误应保留为可重试的结算错误:{error:?}"
+    );
 
     let leases = fx.orch.store.list_execution_leases(task.id).unwrap();
     assert!(

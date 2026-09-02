@@ -220,17 +220,14 @@ pub struct ProjectHandle {
 /// 只接受完整贡献 ID —— 短 id 无法唯一反查插件包,不得作为新引用。
 pub const DEFAULT_CLI_REFERENCE_PREFIX: &str = "default-cli:";
 
-/// 项目工作流运行的任务标题截断长度(显示用;完整 goal 进 Task.goal)。
-pub const PROJECT_WORKFLOW_TITLE_MAX_CHARS: usize = 80;
-
-/// 一次工作流运行的定位:项目 + 工作流 + 内部 Task/Revision
-/// (UI 据此原子激活项目与任务并进入运行详情)。
+/// 一次工作流运行的 Accepted 定位。Workflow Run 由后台
+/// Operation 创建，所以接受命令时尚不存在 Task/Revision rowid；
+/// UI 只保留稳定 Operation handle，随后从 Core 投影取得真实 Run。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkflowRunTarget {
     pub project_root: PathBuf,
     pub workflow_key: String,
-    pub task_id: i64,
-    pub revision_id: i64,
+    pub operation_handle: mf_kernel::operation::OperationHandle,
 }
 
 /// Orca 式权限物化(自由函数,AppCtx 方法与工作流 resolver 共用):
@@ -466,6 +463,93 @@ fn local_principal() -> String {
         .unwrap_or_else(|_| "local-user".into())
 }
 
+fn kernel_internal(error: anyhow::Error) -> KernelProblem {
+    KernelProblem::Internal(format!("{error:#}"))
+}
+
+/// mfctl pipe 的 capability-token Settlement 路由 adapter(T2d)。
+/// 惰性解析 CoreKernel tracer:Core 未装配或装配失败 fail-closed,
+/// 绝不回退 legacy 直写路径;Weak 引用避免 AppCtx 自持。
+struct AppRunControl {
+    ctx: std::sync::Weak<AppCtx>,
+}
+
+impl mf_kernel::run_control::RunControl for AppRunControl {
+    fn execute_agent_run_by_token(
+        &self,
+        token: &str,
+        command: mf_kernel::run_control::RunControlCommand,
+        command_id: Option<mf_kernel::handles::CommandId>,
+    ) -> Result<mf_kernel::run_control::RunControlOutcome, mf_kernel::run_control::TokenSettleProblem>
+    {
+        use mf_kernel::run_control::TokenSettleProblem;
+        let ctx = self.ctx.upgrade().ok_or_else(|| {
+            TokenSettleProblem::Kernel(KernelProblem::ServiceUnavailable(
+                "Core runtime 已释放".into(),
+            ))
+        })?;
+        let unavailable = |message: &str| {
+            TokenSettleProblem::Kernel(KernelProblem::ServiceUnavailable(message.into()))
+        };
+        match ctx.ensure_kernel_tracer() {
+            Ok(Some(tracer)) => tracer
+                .client
+                .execute_agent_run_by_token(token, command, command_id),
+            Ok(None) => Err(unavailable("CoreKernel runtime 未装配")),
+            Err(error) => Err(TokenSettleProblem::Kernel(error)),
+        }
+    }
+}
+
+/// Hub 后台线程的 Core Kernel 只读投影源(Issue #26):经 AppCtx facade
+/// 读取权威 Snapshot。未装配/未登记时返回 None,Hub 回退旧 Store 扫描
+/// (仅测试回滚模式;生产 tracer 总在且项目在 open_project 时登记)。
+struct KernelProjectionAdapter {
+    app: std::sync::Weak<AppCtx>,
+}
+
+impl crate::project_overview::KernelProjectionSource for KernelProjectionAdapter {
+    fn workspace(
+        &self,
+    ) -> Option<Result<crate::project_overview::KernelWorkspaceReads, KernelProblem>> {
+        let app = self.app.upgrade()?;
+        let root_of_project = app.kernel_project_roots();
+        if root_of_project.is_empty() {
+            return None;
+        }
+        match app.workspace_snapshot_via_kernel() {
+            Some(Ok(envelope)) => match envelope.data {
+                mf_kernel::projection::SnapshotData::Workspace(data) => Some(Ok(
+                    crate::project_overview::KernelWorkspaceReads::new(data, root_of_project),
+                )),
+                _ => Some(Err(KernelProblem::Internal(
+                    "Core 返回了错误的 Snapshot 类型".into(),
+                ))),
+            },
+            Some(Err(error)) => Some(Err(error)),
+            None => None,
+        }
+    }
+
+    fn workflow_run(
+        &self,
+        root: &Path,
+        workflow_run: &mf_kernel::handles::WorkflowRunHandle,
+    ) -> Option<Result<mf_kernel::projection::WorkflowRunSnapshotData, KernelProblem>> {
+        let app = self.app.upgrade()?;
+        match app.workflow_run_snapshot_via_kernel(root, workflow_run) {
+            Some(Ok(envelope)) => match envelope.data {
+                mf_kernel::projection::SnapshotData::WorkflowRun(data) => Some(Ok(data)),
+                _ => Some(Err(KernelProblem::Internal(
+                    "Core 返回了错误的 Snapshot 类型".into(),
+                ))),
+            },
+            Some(Err(error)) => Some(Err(error)),
+            None => None,
+        }
+    }
+}
+
 pub struct AppCtx {
     pub registry: Arc<SessionRegistry>,
     pub plugins: Arc<PluginRegistry>,
@@ -549,15 +633,6 @@ impl AppCtx {
         keep_awake.set_enabled(config.agents.keep_awake);
         let catalog = Arc::new(RwLock::new(ProfileCatalog::default()));
         let orchs: Arc<Mutex<Vec<Arc<Orchestrator>>>> = Arc::new(Mutex::new(Vec::new()));
-        let pipe_server = if start_pipe {
-            let server = PipeServer::start(orchs.clone()).ok();
-            if server.is_none() {
-                log::warn!("mfctl 管道服务启动失败(结算将不可用)");
-            }
-            server
-        } else {
-            None
-        };
         let ctx = Arc::new(AppCtx {
             registry: registry.clone(),
             plugins: plugins.clone(),
@@ -572,17 +647,37 @@ impl AppCtx {
                 plugins: plugins.clone(),
                 limiter: limiter.clone(),
                 keep_awake: keep_awake.clone(),
+                kernel: Arc::new(parking_lot::RwLock::new(None)),
             })),
             projects: Mutex::new(Vec::new()),
             secret_master_key: Mutex::new(None),
-            pipe: Mutex::new(pipe_server),
-            pipe_orchestrators: Some(orchs),
+            pipe: Mutex::new(None),
+            pipe_orchestrators: Some(orchs.clone()),
             kernel: Mutex::new(None),
             kernel_error: Mutex::new(None),
             #[cfg(test)]
             kernel_tracer_enabled: AtomicBool::new(false),
         });
         ctx.refresh_catalog();
+        // mfctl pipe(T2d):settlement 经 AppRunControl 惰性路由到 Core;
+        // 必须在 AppCtx 建成后启动(adapter 持 Weak 引用)。
+        if start_pipe {
+            let run_control: Arc<dyn mf_kernel::run_control::RunControl> =
+                Arc::new(AppRunControl {
+                    ctx: Arc::downgrade(&ctx),
+                });
+            let server = PipeServer::start(Some(run_control)).ok();
+            if server.is_none() {
+                log::warn!("mfctl 管道服务启动失败(结算将不可用)");
+            } else {
+                *ctx.pipe.lock() = server;
+            }
+        }
+        // 总览 Hub 的 Kernel 只读投影源(Issue #26):weak 引用避免循环持有
+        ctx.overview
+            .set_kernel_source(Arc::new(KernelProjectionAdapter {
+                app: Arc::downgrade(&ctx),
+            }));
         ctx
     }
 
@@ -727,6 +822,21 @@ impl AppCtx {
             .and_then(|project| project.kernel_project.clone())
     }
 
+    /// Core 已登记项目的 ProjectStoreHandle → 项目根映射(总览 Hub 的
+    /// Kernel Workspace 投影接线用;只读定位,不含业务事实)。
+    fn kernel_project_roots(&self) -> std::collections::HashMap<String, PathBuf> {
+        self.projects
+            .lock()
+            .iter()
+            .filter_map(|project| {
+                project
+                    .kernel_project
+                    .as_ref()
+                    .map(|handle| (handle.as_str().to_owned(), project.root.clone()))
+            })
+            .collect()
+    }
+
     pub fn dispatch_project_workflow_via_kernel(
         &self,
         command: mf_kernel::kernel::ProjectWorkflowCommand,
@@ -751,6 +861,162 @@ impl AppCtx {
         };
         let project = self.kernel_project_handle(root)?;
         Some(tracer.client.workflow_snapshot(&project, workflow_key))
+    }
+
+    pub fn workspace_snapshot_via_kernel(
+        &self,
+    ) -> Option<Result<mf_kernel::projection::SnapshotEnvelope, KernelProblem>> {
+        let tracer = match self.ensure_kernel_tracer() {
+            Ok(Some(value)) => value,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
+        };
+        Some(tracer.client.workspace_snapshot())
+    }
+
+    pub fn workflow_run_snapshot_via_kernel(
+        &self,
+        root: &Path,
+        workflow_run: &mf_kernel::handles::WorkflowRunHandle,
+    ) -> Option<Result<mf_kernel::projection::SnapshotEnvelope, KernelProblem>> {
+        let tracer = match self.ensure_kernel_tracer() {
+            Ok(Some(value)) => value,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
+        };
+        let project = self.kernel_project_handle(root)?;
+        Some(tracer.client.workflow_run_snapshot(&project, workflow_run))
+    }
+
+    /// Core Workflow Run 只读投影是否可用(tracer 已装配且项目已登记)。
+    /// UI 读路径(`RunMonitorSnapshot::collect_via_kernel`)仅在此为 false
+    /// 时回退旧 Store 投影(测试回滚模式);生产 open_project 成功即恒为
+    /// true——除此之外的读取失败必须 fail-visible,不得静默回退。
+    pub fn workflow_run_projection_ready(&self, root: &Path) -> bool {
+        match self.ensure_kernel_tracer() {
+            Ok(Some(_)) => self.kernel_project_handle(root).is_some(),
+            Ok(None) | Err(_) => false,
+        }
+    }
+
+    pub fn cancel_workflow_run_via_kernel(
+        &self,
+        root: &Path,
+        task_id: i64,
+    ) -> Result<KernelOutcome, KernelProblem> {
+        let tracer = self.required_kernel_tracer()?;
+        let project = self.required_kernel_project(root)?;
+        let orchestrator = self
+            .orchestrator_of(root)
+            .ok_or(KernelProblem::ResourceNotFound)?;
+        let task = orchestrator
+            .store
+            .task_view(task_id)
+            .map_err(kernel_internal)?
+            .ok_or(KernelProblem::ResourceNotFound)?;
+        let handle = mf_kernel::handles::WorkflowRunHandle::parse(task.public_handle)
+            .map_err(|error| KernelProblem::Internal(error.to_string()))?;
+        tracer.client.cancel_workflow_run(&project, &handle)
+    }
+
+    pub fn retry_workflow_step_via_kernel(
+        &self,
+        root: &Path,
+        step_id: i64,
+        mode: mf_agent::RetryMode,
+    ) -> Result<KernelOutcome, KernelProblem> {
+        let tracer = self.required_kernel_tracer()?;
+        let project = self.required_kernel_project(root)?;
+        let orchestrator = self
+            .orchestrator_of(root)
+            .ok_or(KernelProblem::ResourceNotFound)?;
+        let step = orchestrator
+            .store
+            .step_view(step_id)
+            .map_err(kernel_internal)?
+            .ok_or(KernelProblem::ResourceNotFound)?;
+        let task = orchestrator
+            .store
+            .task_view(step.task_id)
+            .map_err(kernel_internal)?
+            .ok_or(KernelProblem::ResourceNotFound)?;
+        let workflow_run = mf_kernel::handles::WorkflowRunHandle::parse(task.public_handle)
+            .map_err(|error| KernelProblem::Internal(error.to_string()))?;
+        let step = mf_kernel::handles::StepHandle::parse(step.public_handle)
+            .map_err(|error| KernelProblem::Internal(error.to_string()))?;
+        tracer
+            .client
+            .retry_workflow_step(&project, &workflow_run, &step, mode)
+    }
+
+    pub fn skip_workflow_step_via_kernel(
+        &self,
+        root: &Path,
+        step_id: i64,
+    ) -> Result<KernelOutcome, KernelProblem> {
+        let tracer = self.required_kernel_tracer()?;
+        let project = self.required_kernel_project(root)?;
+        let orchestrator = self
+            .orchestrator_of(root)
+            .ok_or(KernelProblem::ResourceNotFound)?;
+        let step = orchestrator
+            .store
+            .step_view(step_id)
+            .map_err(kernel_internal)?
+            .ok_or(KernelProblem::ResourceNotFound)?;
+        let task = orchestrator
+            .store
+            .task_view(step.task_id)
+            .map_err(kernel_internal)?
+            .ok_or(KernelProblem::ResourceNotFound)?;
+        let workflow_run = mf_kernel::handles::WorkflowRunHandle::parse(task.public_handle)
+            .map_err(|error| KernelProblem::Internal(error.to_string()))?;
+        let step = mf_kernel::handles::StepHandle::parse(step.public_handle)
+            .map_err(|error| KernelProblem::Internal(error.to_string()))?;
+        tracer
+            .client
+            .skip_workflow_step(&project, &workflow_run, &step)
+    }
+
+    pub fn settle_agent_run_via_kernel(
+        &self,
+        root: &Path,
+        run_id: i64,
+        settlement: mf_agent::Settlement,
+    ) -> Result<KernelOutcome, KernelProblem> {
+        let tracer = self.required_kernel_tracer()?;
+        let project = self.required_kernel_project(root)?;
+        let orchestrator = self
+            .orchestrator_of(root)
+            .ok_or(KernelProblem::ResourceNotFound)?;
+        let run = orchestrator
+            .store
+            .run_view(run_id)
+            .map_err(kernel_internal)?
+            .ok_or(KernelProblem::ResourceNotFound)?;
+        let task = orchestrator
+            .store
+            .task_view(run.task_id)
+            .map_err(kernel_internal)?
+            .ok_or(KernelProblem::ResourceNotFound)?;
+        let workflow_run = mf_kernel::handles::WorkflowRunHandle::parse(task.public_handle)
+            .map_err(|error| KernelProblem::Internal(error.to_string()))?;
+        let agent_run = mf_kernel::handles::AgentRunHandle::parse(run.public_handle)
+            .map_err(|error| KernelProblem::Internal(error.to_string()))?;
+        tracer
+            .client
+            .settle_agent_run(&project, &workflow_run, &agent_run, settlement)
+    }
+
+    fn required_kernel_tracer(&self) -> Result<Arc<KernelTracer>, KernelProblem> {
+        self.ensure_kernel_tracer()?
+            .ok_or_else(|| KernelProblem::ServiceUnavailable("CoreKernel runtime 未装配".into()))
+    }
+
+    fn required_kernel_project(&self, root: &Path) -> Result<ProjectStoreHandle, KernelProblem> {
+        self.kernel_project_handle(root).ok_or_else(|| {
+            KernelProblem::ServiceUnavailable("Project Store 未完成 kernel 登记".into())
+        })
     }
 
     /// 打开的项目数。
@@ -841,6 +1107,11 @@ impl AppCtx {
         // C7:current_pin 与按 pin 解析历史版本的 resolver 在启动
         //(含 held-lease 恢复冲刷、任何调度线程)**之前**注入。
         let (directory, directory_pin) = directory_provider_for(&root, &self.plugins);
+        let instance_resolver = Arc::new(PluginInstanceResolver::new(
+            self.plugins.clone(),
+            self.catalog_store.clone(),
+            self.config.clone(),
+        ));
         let orch = Orchestrator::start_with_routing(
             store,
             root.clone(),
@@ -849,7 +1120,7 @@ impl AppCtx {
             self.catalog.clone(),
             self.limiter.clone(),
             pipe_name_for_current_process(),
-            directory,
+            directory.clone(),
             WorkflowKernel {
                 catalog: self.catalog_store.clone(),
                 pins: Some(Arc::new(PluginHostPins {
@@ -857,14 +1128,10 @@ impl AppCtx {
                 })),
                 // 插件感知实例解析:default-cli:<完整贡献 ID> 保留引用
                 // 在此合成快照;普通实例引用仍走目录库。
-                instance_resolver: Some(Arc::new(PluginInstanceResolver {
-                    plugins: self.plugins.clone(),
-                    catalog: self.catalog_store.clone(),
-                    config: self.config.clone(),
-                })),
+                instance_resolver: Some(instance_resolver.clone()),
             },
             mf_agent::orchestrator::DirectoryRouting {
-                current_pin: directory_pin,
+                current_pin: directory_pin.clone(),
                 resolver: Some(Arc::new(PluginDirectoryResolver {
                     root: root.clone(),
                     plugins: self.plugins.clone(),
@@ -884,6 +1151,42 @@ impl AppCtx {
                 return Err(error);
             }
         };
+        if let (Some(tracer), Some(project)) = (&tracer, &kernel_project) {
+            let port = Arc::new(
+                crate::run_lifecycle_port::OrchestratorRunLifecyclePort::new(orch.clone()),
+            );
+            if let Err(error) = tracer.runtime.register_run_lifecycle_port(project, port) {
+                orch.stop();
+                if let Err(unregister) = tracer.runtime.unregister_project_store(project) {
+                    return Err(anyhow::anyhow!(
+                        "Run lifecycle port 注册失败:{error}; CoreKernel 注销也失败:{unregister}"
+                    ));
+                }
+                return Err(anyhow::anyhow!("Run lifecycle port 注册失败:{error}"));
+            }
+            let start_port = Arc::new(
+                crate::workflow_start_port::OrchestratorWorkflowStartPort::new(
+                    orch.clone(),
+                    adapter_launch::workflow_plugin_index(&self.plugins),
+                    instance_resolver,
+                    &directory,
+                    directory_pin.clone(),
+                ),
+            );
+            if let Err(error) = tracer
+                .runtime
+                .register_workflow_start_port(project, start_port)
+            {
+                tracer.runtime.unregister_run_lifecycle_port(project);
+                orch.stop();
+                if let Err(unregister) = tracer.runtime.unregister_project_store(project) {
+                    return Err(anyhow::anyhow!(
+                        "Workflow Start port 注册失败:{error}; CoreKernel 注销也失败:{unregister}"
+                    ));
+                }
+                return Err(anyhow::anyhow!("Workflow Start port 注册失败:{error}"));
+            }
+        }
         self.projects.lock().push(ProjectHandle {
             root: root.clone(),
             orchestrator: orch.clone(),
@@ -895,7 +1198,9 @@ impl AppCtx {
         Ok(orch)
     }
 
-    /// 关闭项目:停止其任务并移除;PTY 会话按 run 归属杀掉。
+    /// 关闭项目：先 freeze Start/普通命令，再用只能取消该 Project
+    /// Workflow Run 的 close token 执行 durable drain。任一 cancel 失败
+    /// 保持 closing，重试继续 drain；绝不回退 Orchestrator 直写。
     pub fn try_close_project(&self, root: &PathBuf) -> Result<()> {
         let handle = {
             let projects = self.projects.lock();
@@ -905,46 +1210,84 @@ impl AppCtx {
                 .cloned()
         };
         if let Some(h) = handle {
-            // 两阶段关闭：先执行唯一可能因 ProjectionHub Recovering 失败的
-            // prepare；closing 状态拒绝新命令但仍参与 shutdown assessment。
-            // 失败时不触碰 PTY/Task/Orchestrator/UI，可安全重试。
             let tracer = self.kernel.lock().clone();
-            let close_token = match (&tracer, &h.kernel_project) {
-                (Some(tracer), Some(project)) => Some(
-                    tracer
-                        .runtime
-                        .prepare_project_close(project)
-                        .map_err(|error| {
-                            anyhow::anyhow!("CoreKernel 准备关闭 Project 失败:{error}")
-                        })?,
-                ),
-                _ => None,
+            let project = h.kernel_project.clone();
+            let (tracer, project) = match (tracer, project) {
+                (Some(tracer), Some(project)) => (tracer, project),
+                #[cfg(test)]
+                _ => {
+                    // 旧回归 fixture 可显式不装配 Kernel；此处只停止已由
+                    // 测试自行收口的 Orchestrator，不执行业务 mutation。
+                    h.orchestrator.stop();
+                    self.overview.detach(&h.root);
+                    self.projects
+                        .lock()
+                        .retain(|candidate| candidate.root != h.root);
+                    self.sync_pipe_routing();
+                    return Ok(());
+                }
+                #[cfg(not(test))]
+                _ => return Err(anyhow::anyhow!("CoreKernel runtime 未装配，已中止关闭")),
             };
-            // 先快照活动 run(取消后 running_runs 会变空,先取后杀才有效)
-            let active_runs = h.orchestrator.store.running_runs().unwrap_or_default();
-            // 杀掉该项目 run 关联的会话(按项目作用域,不会误杀其他项目)
-            for run in &active_runs {
-                if let Some(sid) = run.session_id {
-                    if let Ok(Some(session)) = h.orchestrator.store.session_view(sid) {
-                        self.registry.kill_session(&session.public_handle);
+
+            // L-CLOSE-FREEZE 先于任何扫描/drain：已 Accepted 但未执行
+            // 的 Start Operation 在此收口，不会在重开 Project 后复活。
+            let close_token = tracer
+                .runtime
+                .prepare_project_close(&project)
+                .map_err(|error| anyhow::anyhow!("CoreKernel 准备关闭 Project 失败:{error}"))?;
+            tracer.runtime.unregister_workflow_start_port(&project);
+
+            let active_workflow_runs = h
+                .orchestrator
+                .tasks()?
+                .into_iter()
+                .filter(|task| {
+                    task.active_revision.is_some()
+                        && matches!(
+                            task.status,
+                            TaskStatus::Ready | TaskStatus::Running | TaskStatus::NeedsYou
+                        )
+                })
+                .map(|task| {
+                    mf_kernel::handles::WorkflowRunHandle::parse(task.public_handle)
+                        .map_err(|error| anyhow::anyhow!("Workflow Run handle 损坏:{error}"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for workflow_run in &active_workflow_runs {
+                let mut last_conflict = None;
+                let mut cancelled = false;
+                for _ in 0..3 {
+                    match tracer
+                        .client
+                        .cancel_workflow_run_for_close(&close_token, workflow_run)
+                    {
+                        Ok(_) => {
+                            cancelled = true;
+                            break;
+                        }
+                        Err(KernelProblem::RevisionConflict) => {
+                            last_conflict = Some(KernelProblem::RevisionConflict)
+                        }
+                        Err(error) => {
+                            return Err(anyhow::anyhow!(
+                                "CoreKernel 取消 Workflow Run {workflow_run} 失败:{error}"
+                            ))
+                        }
                     }
                 }
-            }
-            // 再取消任务(终止调度)
-            if let Ok(tasks) = h.orchestrator.tasks() {
-                for t in tasks {
-                    if matches!(t.status, TaskStatus::Running | TaskStatus::NeedsYou) {
-                        let _ = h.orchestrator.cancel_task(t.id);
-                    }
+                if !cancelled {
+                    return Err(anyhow::anyhow!(
+                        "CoreKernel 取消 Workflow Run {workflow_run} 连续冲突 3 次:{}",
+                        last_conflict.expect("RevisionConflict 分支必已记录")
+                    ));
                 }
             }
+
+            // 全部 durable cancel 已收口，可安全终止 legacy runtime 并关库。
             h.orchestrator.stop();
-            // cancel_task 会 emit 状态事件；保持 drain 到所有取消操作结束，
-            // 避免关闭大型项目时 bounded events_rx 反压当前线程。
             self.overview.detach(&h.root);
-            if let (Some(tracer), Some(token)) = (&tracer, close_token) {
-                tracer.runtime.finalize_project_close(token);
-            }
+            tracer.runtime.finalize_project_close(close_token);
             let mut projects = self.projects.lock();
             if let Some(index) = projects.iter().position(|project| project.root == h.root) {
                 projects.remove(index);
@@ -1141,77 +1484,43 @@ impl AppCtx {
 
     /// ---------- 项目工作流直接运行(ADR 0004 / Task 4) ----------
 
-    /// 从项目工作流直接发起运行:读 Project Workflow → 创建 Task →
-    /// 投影为临时模板版本 → 编译冻结 Revision → confirm_and_run。
-    /// - 标题取 goal 第一非空行(截断显示长度),完整 goal 写入 Task.goal;
-    /// - 编译/pin/确认失败回滚刚建的 Draft Task,不留孤儿;
-    /// - 调度启动后的运行期错误保留 Task/Revision 交给 Needs You;
-    /// - 不把项目工作流自动保存成全局模板。
+    /// 从项目工作流发起可恢复 Start Operation。本适配层只做
+    /// root/key → opaque Project/Workflow 定位；Task/Revision 的创建、冻结、
+    /// 调度与失败补偿全部归 Core 后台 Operation 所有。
     pub fn run_project_workflow(
         &self,
         root: &Path,
         workflow_key: &str,
         goal: &str,
     ) -> Result<WorkflowRunTarget> {
-        let orch = self
-            .orchestrator_of(root)
-            .ok_or_else(|| anyhow::anyhow!("项目未打开: {}", root.display()))?;
-        let record = orch
-            .store
-            .load_project_workflow(workflow_key)?
-            .ok_or_else(|| anyhow::anyhow!("项目工作流 `{workflow_key}` 不存在"))?;
         let goal = goal.trim();
         anyhow::ensure!(!goal.is_empty(), "运行目标不能为空");
-        let title: String = goal
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .unwrap_or_default()
-            .chars()
-            .take(PROJECT_WORKFLOW_TITLE_MAX_CHARS)
-            .collect();
-        anyhow::ensure!(!title.is_empty(), "运行目标不能为空");
-        let task = orch.create_task(&title, goal)?;
-        // 投影为临时模板版本:不写目录库(不保存为全局模板),
-        // 并行风险开关沿用项目工作流的持久化值。
-        let version = WorkflowTemplateVersion {
-            version_id: 0,
-            template_key: format!("project-workflow/{workflow_key}"),
-            version: 1,
-            nodes: record.nodes.clone(),
-            created_at: String::new(),
+        let tracer = self
+            .required_kernel_tracer()
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let project = self
+            .required_kernel_project(root)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let outcome = tracer
+            .client
+            .start_workflow_run(&project, workflow_key, goal)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let KernelOutcome::Accepted { operation_handle } = outcome else {
+            return Err(anyhow::anyhow!(
+                "CoreKernel Workflow Start 未返回 Accepted Operation"
+            ));
         };
-        let index = adapter_launch::workflow_plugin_index(&self.plugins);
-        let run = || -> Result<i64> {
-            let rev =
-                orch.assign_workflow(task.id, &version, &index, record.allow_unsafe_parallel)?;
-            orch.confirm_and_run(task.id)?;
-            Ok(rev.id)
-        };
-        match run() {
-            Ok(revision_id) => {
-                self.overview.request_refresh();
-                Ok(WorkflowRunTarget {
-                    project_root: root.to_path_buf(),
-                    workflow_key: workflow_key.to_string(),
-                    task_id: task.id,
-                    revision_id,
-                })
-            }
-            Err(e) => {
-                // 尚未开始调度(无 Agent Run):删除刚建的 Draft Task
-                if let Err(discard) = orch.discard_task(task.id) {
-                    log::warn!("项目工作流运行失败后清理 Draft 任务失败: {discard:#}");
-                }
-                Err(e)
-            }
-        }
+        self.overview.request_refresh();
+        Ok(WorkflowRunTarget {
+            project_root: root.to_path_buf(),
+            workflow_key: workflow_key.to_string(),
+            operation_handle,
+        })
     }
 
     /// ---------- Secret 管理(设计 §8:明文只在 Secret Store 内) ----------
 
     fn secret_store(&self) -> Result<mf_plugins::builtin_secret_store::BuiltinSecretStore> {
-        use mf_agent::secrets::SecretStore as _;
         let _ = &self.secret_master_key; // 见下:覆盖时用确定性密钥
         if let Some(key) = *self.secret_master_key.lock() {
             mf_plugins::builtin_secret_store::BuiltinSecretStore::with_master_key(
@@ -1363,6 +1672,261 @@ mod agent_launch_selection_tests {
         assert!(prompt.is_none(), "空白目标不得注入提示");
         apply_task_goal(&mut prompt, "修复登录超时");
         assert_eq!(prompt.as_deref(), Some("修复登录超时"));
+    }
+}
+
+#[cfg(test)]
+mod run_lifecycle_kernel_tests {
+    use super::*;
+    use mf_agent::{PipelineDraft, ProjectWorkflowDraft, SessionPolicy, StepDraft, StepStatus};
+    use mf_kernel::command::ServiceIdempotencyKey;
+    use mf_kernel::handles::{ClientId, Principal};
+
+    #[test]
+    fn open_project_registers_real_run_lifecycle_port_and_retry_writes_through_kernel() {
+        let ctx = AppCtx::with_catalog_for_tests(mf_agent::CatalogStore::memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let service =
+            mf_kernel::project_registry::ServiceStore::open(&tmp.path().join("service-v1.db"))
+                .unwrap();
+        let (runtime, client) = mf_kernel::kernel::InProcessKernelRuntime::for_test(
+            service,
+            ServiceIdempotencyKey::for_test(vec![0x63; 32]).unwrap(),
+            ClientId::parse("gpui-run-client").unwrap(),
+            Principal::parse("gpui-run-user").unwrap(),
+        )
+        .unwrap();
+        ctx.install_kernel_tracer_for_tests(runtime, client);
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let orchestrator = ctx.open_project(root.clone()).unwrap();
+        let task = orchestrator.store.create_task("run", "goal").unwrap();
+        orchestrator
+            .store
+            .create_draft_revision(
+                task.id,
+                &PipelineDraft {
+                    steps: vec![StepDraft {
+                        key: "work".into(),
+                        title: "work".into(),
+                        instructions: "do it".into(),
+                        agent_profile: "instance".into(),
+                        session_policy: SessionPolicy::Fresh,
+                        deps: vec![],
+                    }],
+                },
+            )
+            .unwrap();
+        orchestrator.store.activate_revision(task.id).unwrap();
+        let step = orchestrator.store.task_steps(task.id).unwrap()[0].clone();
+        orchestrator
+            .store
+            .set_step_status(step.id, StepStatus::Failed)
+            .unwrap();
+
+        assert!(matches!(
+            ctx.retry_workflow_step_via_kernel(&root, step.id, mf_agent::RetryMode::FreshSession,),
+            Ok(KernelOutcome::RunApplied { .. })
+        ));
+        assert_eq!(
+            orchestrator
+                .store
+                .step_view(step.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            StepStatus::Ready
+        );
+        assert_eq!(
+            orchestrator.store.next_attempt_session(step.id).unwrap(),
+            Some(mf_agent::NextAttemptSession::fresh())
+        );
+        ctx.try_close_project(&root).unwrap();
+    }
+
+    #[test]
+    fn close_cancel_failure_keeps_project_open_without_direct_mutation() {
+        let ctx = AppCtx::with_catalog_for_tests(mf_agent::CatalogStore::memory().unwrap());
+        let tmp = tempfile::tempdir().unwrap();
+        let service =
+            mf_kernel::project_registry::ServiceStore::open(&tmp.path().join("service-close.db"))
+                .unwrap();
+        let (runtime, client) = mf_kernel::kernel::InProcessKernelRuntime::for_test(
+            service,
+            ServiceIdempotencyKey::for_test(vec![0x65; 32]).unwrap(),
+            ClientId::parse("gpui-close-client").unwrap(),
+            Principal::parse("gpui-close-user").unwrap(),
+        )
+        .unwrap();
+        ctx.install_kernel_tracer_for_tests(runtime, client);
+        let root = tmp.path().join("close-project");
+        std::fs::create_dir_all(&root).unwrap();
+        let orchestrator = ctx.open_project(root.clone()).unwrap();
+        let task = orchestrator.store.create_task("run", "goal").unwrap();
+        orchestrator
+            .store
+            .create_draft_revision(
+                task.id,
+                &PipelineDraft {
+                    steps: vec![StepDraft {
+                        key: "work".into(),
+                        title: "work".into(),
+                        instructions: "do it".into(),
+                        agent_profile: "instance".into(),
+                        session_policy: SessionPolicy::Fresh,
+                        deps: vec![],
+                    }],
+                },
+            )
+            .unwrap();
+        orchestrator.store.activate_revision(task.id).unwrap();
+        orchestrator
+            .store
+            .set_task_status(task.id, TaskStatus::Running)
+            .unwrap();
+        let step = orchestrator.store.task_steps(task.id).unwrap()[0].clone();
+        orchestrator
+            .store
+            .set_step_status(step.id, StepStatus::Running)
+            .unwrap();
+        orchestrator
+            .store
+            .create_run(task.id, step.id, step.revision_id, None)
+            .unwrap();
+
+        let tracer = ctx.kernel.lock().clone().unwrap();
+        let project = ctx.projects.lock()[0].kernel_project.clone().unwrap();
+        tracer.runtime.unregister_run_lifecycle_port(&project);
+        let error = ctx.try_close_project(&root).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("run_lifecycle_port_not_registered"),
+            "close 必须原样上报 Core cancel 失败:{error:#}"
+        );
+        assert_eq!(ctx.project_count(), 1, "cancel 失败必须保持项目打开");
+        assert_eq!(
+            orchestrator
+                .store
+                .task_view(task.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            TaskStatus::Running,
+            "不得回退 Orchestrator 直写取消"
+        );
+        let workflow_run = mf_kernel::handles::WorkflowRunHandle::parse(
+            orchestrator
+                .store
+                .task_view(task.id)
+                .unwrap()
+                .unwrap()
+                .public_handle,
+        )
+        .unwrap();
+        assert!(matches!(
+            tracer.client.cancel_workflow_run(&project, &workflow_run),
+            Err(KernelProblem::ResourceNotFound)
+        ));
+        let close = tracer.runtime.prepare_project_close(&project).unwrap();
+        tracer
+            .runtime
+            .register_run_lifecycle_port_for_close(
+                &close,
+                Arc::new(
+                    crate::run_lifecycle_port::OrchestratorRunLifecyclePort::new(
+                        orchestrator.clone(),
+                    ),
+                ),
+            )
+            .unwrap();
+        ctx.try_close_project(&root)
+            .expect("closing 项目应能重试 durable drain");
+        assert_eq!(ctx.project_count(), 0);
+    }
+
+    #[test]
+    fn open_project_registers_workflow_start_port_and_background_worker() {
+        let catalog = mf_agent::CatalogStore::memory().unwrap();
+        let instance = catalog
+            .create_agent_instance(mf_agent::AgentInstanceDraft {
+                name: "Start mock".into(),
+                agent_type: "mock".into(),
+                scope: mf_agent::InstanceScope::User,
+                project_key: None,
+                enabled: true,
+                run_mode: mf_agent::RunMode::OneShot,
+                executable: "mock".into(),
+                argv: Vec::new(),
+                env: Vec::new(),
+                config: serde_json::json!({}),
+                execution_contract: serde_json::json!({"completion":"manual"}),
+                sealed_secret_ids: Vec::new(),
+            })
+            .unwrap();
+        let ctx = AppCtx::with_catalog_for_tests(catalog);
+        let tmp = tempfile::tempdir().unwrap();
+        let service =
+            mf_kernel::project_registry::ServiceStore::open(&tmp.path().join("service-start.db"))
+                .unwrap();
+        let (runtime, client) = mf_kernel::kernel::InProcessKernelRuntime::for_test(
+            service,
+            ServiceIdempotencyKey::for_test(vec![0x64; 32]).unwrap(),
+            ClientId::parse("gpui-start-client").unwrap(),
+            Principal::parse("gpui-start-user").unwrap(),
+        )
+        .unwrap();
+        ctx.install_kernel_tracer_for_tests(runtime, client);
+        let root = tmp.path().join("start-project");
+        std::fs::create_dir_all(&root).unwrap();
+        let orchestrator = ctx.open_project(root.clone()).unwrap();
+        orchestrator
+            .store
+            .save_project_workflow(&ProjectWorkflowDraft {
+                key: "wf-start".into(),
+                name: "Start".into(),
+                nodes: vec![mf_agent::WorkflowNodeDraft {
+                    key: "work".into(),
+                    title: "work".into(),
+                    instructions: "do it".into(),
+                    agent_instance_id: instance.id,
+                    deps: Vec::new(),
+                }],
+                allow_unsafe_parallel: false,
+            })
+            .unwrap();
+        let accepted = ctx
+            .run_project_workflow(&root, "wf-start", "后台启动")
+            .unwrap();
+        assert!(accepted.operation_handle.as_str().starts_with("op_"));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while orchestrator.tasks().unwrap().is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let tasks = orchestrator.tasks().unwrap();
+        assert_eq!(tasks.len(), 1, "后台 worker 应从 durable plan 创建唯一 Run");
+        assert_eq!(tasks[0].goal, "后台启动");
+        // 第二个 Accepted Start 与 close 故意紧邻：freeze 要么等它
+        // 完成并随后 cancel，要么把未执行 Operation 终结为
+        // project_closing；绝不得在重开后复活创建新 Run。
+        ctx.run_project_workflow(&root, "wf-start", "与关闭竞态")
+            .unwrap();
+        ctx.try_close_project(&root).unwrap();
+        let closed_count = orchestrator.tasks().unwrap().len();
+        let reopened = ctx.open_project(root.clone()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let reopened_tasks = reopened.tasks().unwrap();
+        assert_eq!(
+            reopened_tasks.len(),
+            closed_count,
+            "未完成 Start Operation 不得在重开后恢复创建 Run"
+        );
+        assert!(reopened_tasks.iter().all(|task| !matches!(
+            task.status,
+            TaskStatus::Ready | TaskStatus::Running | TaskStatus::NeedsYou
+        )));
+        ctx.try_close_project(&root).unwrap();
     }
 }
 

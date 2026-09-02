@@ -359,6 +359,18 @@ impl RuntimeHost for RecordingHost {
             .lock()
             .push((run_handle.to_string(), answer.to_string()));
     }
+    fn supports_question_bound_answers(&self) -> bool {
+        true
+    }
+    fn answer_question_bound(
+        &self,
+        _question_id: i64,
+        run_handle: &str,
+        answer: &str,
+    ) -> anyhow::Result<()> {
+        self.answer_question(run_handle, answer);
+        Ok(())
+    }
     fn launch_ad_hoc(&self, _spec: mf_agent::AdHocLaunchSpec) -> anyhow::Result<()> {
         Ok(())
     }

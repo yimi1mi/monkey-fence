@@ -146,6 +146,8 @@ str_enum!(RunMode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskView {
     pub id: i64,
+    pub public_handle: String,
+    pub revision: i64,
     pub title: String,
     pub goal: String,
     pub status: TaskStatus,
@@ -160,6 +162,7 @@ pub struct TaskView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RevisionView {
     pub id: i64,
+    pub public_handle: String,
     pub task_id: i64,
     pub revision: i64,
     pub status: RevisionStatus,
@@ -169,6 +172,8 @@ pub struct RevisionView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepView {
     pub id: i64,
+    pub public_handle: String,
+    pub revision: i64,
     pub revision_id: i64,
     pub task_id: i64,
     pub step_key: String,
@@ -184,6 +189,22 @@ pub struct StepView {
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
     pub deps: Vec<i64>,
+}
+
+/// Core Snapshot 在单个 Project transaction 中读取的 Workflow Run
+/// 权威源数据；只含领域视图，不含 capability token 之外的新协议形状。
+#[derive(Debug, Clone)]
+pub struct WorkflowRunProjectionSource {
+    pub task: TaskView,
+    pub active_revision: Option<RevisionView>,
+    pub steps: Vec<StepView>,
+    pub run_steps: Vec<StepView>,
+    pub runs: Vec<RunView>,
+    pub sessions: Vec<SessionView>,
+    pub open_questions: Vec<StepQuestionView>,
+    pub handoffs: Vec<HandoffRow>,
+    pub execution_leases: Vec<ExecutionLeaseRow>,
+    pub pending_merges: Vec<PendingMergeRow>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,7 +226,7 @@ pub struct SessionView {
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RunView {
     pub id: i64,
     /// 持久、不透明的运行身份；不得由项目路径或数据库行号派生。
@@ -224,7 +245,60 @@ pub struct RunView {
     pub ended_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl std::fmt::Debug for RunView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunView")
+            .field("id", &self.id)
+            .field("public_handle", &self.public_handle)
+            .field("revision", &self.revision)
+            .field("task_id", &self.task_id)
+            .field("step_id", &self.step_id)
+            .field("revision_id", &self.revision_id)
+            .field("session_id", &self.session_id)
+            .field("status", &self.status)
+            .field("agent_state", &self.agent_state)
+            .field("capability_token", &"<redacted>")
+            .field("outcome", &self.outcome)
+            .field(
+                "outcome_payload",
+                &self.outcome_payload.as_ref().map(|_| "<redacted>"),
+            )
+            .field("started_at", &self.started_at)
+            .field("ended_at", &self.ended_at)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod run_view_sensitive_debug_tests {
+    use super::*;
+
+    #[test]
+    fn run_debug_redacts_capability_and_payload() {
+        let sentinel = "mft-never-print-run-secret";
+        let run = RunView {
+            id: 1,
+            public_handle: "run_handle".into(),
+            revision: 0,
+            task_id: 2,
+            step_id: 3,
+            revision_id: 4,
+            session_id: None,
+            status: RunStatus::Running,
+            agent_state: AgentState::Idle,
+            capability_token: sentinel.into(),
+            outcome: Some("complete".into()),
+            outcome_payload: Some(format!("payload:{sentinel}")),
+            started_at: String::new(),
+            ended_at: None,
+        };
+        let debug = format!("{run:?}");
+        assert!(!debug.contains(sentinel), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StepQuestionView {
     pub id: i64,
     pub task_id: i64,
@@ -234,6 +308,65 @@ pub struct StepQuestionView {
     pub answer: Option<String>,
     pub status: String,
     pub created_at: String,
+}
+
+impl std::fmt::Debug for StepQuestionView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StepQuestionView")
+            .field("id", &self.id)
+            .field("task_id", &self.task_id)
+            .field("step_id", &self.step_id)
+            .field("run_id", &self.run_id)
+            .field("question", &self.question)
+            .field("answer", &self.answer.as_ref().map(|_| "<redacted>"))
+            .field("status", &self.status)
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+/// `question_answer_deliveries` 行:question-bound 回答两阶段投递的
+/// 持久账本(Issue #26)。待投递 `answer` 明文只允许在本记录(项目库私有表)
+/// 与投递调用之间流转;`status='delivered'` 后 Store 会把本记录的明文置空。
+/// 确认后的回答审计值保存在 `step_questions.answer`，同属 Project Store
+/// 私有数据，不能进入事件/Snapshot/日志。
+/// Debug 一律脱敏,不得把答案带进日志/错误链。
+#[derive(Clone)]
+pub struct AnswerDeliveryRecord {
+    pub question_id: i64,
+    pub task_id: i64,
+    pub step_id: Option<i64>,
+    pub run_id: i64,
+    pub run_handle: String,
+    /// accept 时刻 `agent_runs.revision`(nonce 绑定的 CAS 锚点,审计用)。
+    pub run_revision: i64,
+    pub nonce: String,
+    pub answer: String,
+    pub status: String,
+}
+
+impl std::fmt::Debug for AnswerDeliveryRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AnswerDeliveryRecord")
+            .field("question_id", &self.question_id)
+            .field("task_id", &self.task_id)
+            .field("step_id", &self.step_id)
+            .field("run_id", &self.run_id)
+            .field("run_handle", &self.run_handle)
+            .field("run_revision", &self.run_revision)
+            .field("nonce", &self.nonce)
+            .field("answer", &"<redacted>")
+            .field("status", &self.status)
+            .finish()
+    }
+}
+
+/// [`crate::store::Store::confirm_answer_delivery`] 的收口结果。
+/// `already_confirmed=true` 表示 durable 幂等重放(此前已确认)。
+#[derive(Debug, Clone)]
+pub struct AnswerDeliveryConfirm {
+    pub question: StepQuestionView,
+    pub already_confirmed: bool,
 }
 
 /// 离散 CLI 会话视图:挂在 Task 下但不属于 Pipeline Revision,
@@ -439,7 +572,13 @@ pub enum SchedulerEvent {
     SessionUpdated(SessionView),
     AdHocSessionUpdated(AdHocSessionView),
     QuestionOpened(StepQuestionView),
-    QuestionAnswered(StepQuestionView),
+    /// 只发布回答已确认这一事实，绝不把回答明文放进事件。
+    QuestionAnswered {
+        question_id: i64,
+        task_id: i64,
+        step_id: Option<i64>,
+        run_id: Option<i64>,
+    },
     /// 运行日志/终端输出摘要(推移给详情视图)。
     Log {
         run_id: i64,

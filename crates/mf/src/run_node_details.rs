@@ -67,7 +67,6 @@ impl<'a> From<(&'a RunView, &'a StepView)> for RunNodeDetails {
         );
         match (run.status, step.status) {
             (RunStatus::Running, StepStatus::Running) => {
-                actions.push(RunAction::Continue);
                 actions.push(RunAction::Cancel);
             }
             (RunStatus::Interrupted, _) => {

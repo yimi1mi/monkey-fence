@@ -1,9 +1,13 @@
-//! 统一项目总览快照 + Orchestrator Event Hub。
+//! 统一项目总览快照 + Orchestrator Event Hub(Issue #26 只读投影迁移)。
 //!
 //! - 每个 GUI Orchestrator 的 `events_rx` 在 attach 后由专职线程持续 drain,
 //!   保证状态事件(`send` 阻塞语义)永远不会因 UI 不消费而堵塞调度。
 //! - 事件不逐条投影:置 dirty 标记 → 后台整体重建真实快照 → revision +1,
 //!   整体替换发布,UI 不会观察到半更新项目集合。
+//! - Workflow Run / 「需要你」业务事实来自 Core Kernel Workspace Snapshot
+//!   (生产路径);Store 只读定位提供 rowid/时间戳等 UI 接线身份,与
+//!   cancel/retry/settle 写路径的 handle 解析同一模式。Core 未装配
+//!   (测试回滚模式)时回退旧 Store 扫描投影。
 //! - TaskSidebar 与 AgentWorkspace 消费同一份 revisioned snapshot,
 //!   不再各自轮询数据库。
 
@@ -11,13 +15,63 @@ use crate::runtime_host::SessionRegistry;
 use mf_agent::model::*;
 use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
 use mf_agent::pipeline::PipelineDraft;
+use mf_kernel::handles::WorkflowRunHandle;
 use mf_plugins::PluginRegistry;
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Core Kernel 权威 Workspace 读投影 + Project Store handle → 项目根映射。
+pub(crate) struct KernelWorkspaceReads {
+    data: mf_kernel::projection::WorkspaceSnapshotData,
+    root_of_project: HashMap<String, PathBuf>,
+}
+
+impl KernelWorkspaceReads {
+    pub(crate) fn new(
+        data: mf_kernel::projection::WorkspaceSnapshotData,
+        root_of_project: HashMap<String, PathBuf>,
+    ) -> Self {
+        Self {
+            data,
+            root_of_project,
+        }
+    }
+
+    /// 项目根 → 该项目 Workflow Run 摘要(未登记项目返回空)。
+    fn summaries_by_root(
+        &self,
+        root: &Path,
+    ) -> Vec<&mf_kernel::projection::WorkflowRunSummarySnapshot> {
+        self.data
+            .projects
+            .iter()
+            .filter(|project| {
+                self.root_of_project
+                    .get(project.project.as_str())
+                    .is_some_and(|registered| registered == root)
+            })
+            .flat_map(|project| project.workflow_runs.iter())
+            .collect()
+    }
+}
+
+/// Core Kernel 只读投影接缝:Hub 后台线程经它读取权威 Snapshot。
+/// AppCtx 装配后注入;`None` = Core 未装配(测试回滚模式),Hub 回退
+/// 旧 Store 扫描投影。
+pub(crate) trait KernelProjectionSource: Send + Sync {
+    fn workspace(&self) -> Option<Result<KernelWorkspaceReads, mf_kernel::kernel::KernelProblem>>;
+    fn workflow_run(
+        &self,
+        root: &Path,
+        workflow_run: &WorkflowRunHandle,
+    ) -> Option<
+        Result<mf_kernel::projection::WorkflowRunSnapshotData, mf_kernel::kernel::KernelProblem>,
+    >;
+}
 
 /// 注意力桶:Agent 卡片的全局看板分列。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -236,6 +290,67 @@ pub fn attention_for_task(
     })
 }
 
+/// Kernel Workflow Run 摘要 → UI「需要你」投影(纯函数;Issue #26)。
+/// Kernel 的 `reason_count` 是直接可操作原因数(纯 blocked 后代不计);
+/// 已取消/已归档运行不产生徽标;一个运行最多一项(徽标按运行数计数)。
+pub(crate) fn attention_from_summary(
+    project_root: &Path,
+    summary: &mf_kernel::projection::WorkflowRunSummarySnapshot,
+    task_id: i64,
+    focus_step_id: Option<i64>,
+) -> Option<WorkflowRunAttention> {
+    if summary.reason_count == 0 {
+        return None;
+    }
+    let status = TaskStatus::parse(&summary.status)?;
+    if matches!(status, TaskStatus::Cancelled | TaskStatus::Archived) {
+        return None;
+    }
+    Some(WorkflowRunAttention {
+        project_root: project_root.to_path_buf(),
+        task_id,
+        task_title: summary.title.clone(),
+        reason_count: summary.reason_count,
+        focus_step_id,
+    })
+}
+
+/// Kernel 需要你原因 kind → 展示文本(措辞与 run_node_details 口径一致)。
+fn reason_text(kind: &str, step_title: Option<&str>) -> String {
+    let title = step_title.unwrap_or("节点");
+    match kind {
+        "needs-input" => format!("步骤「{title}」等待输入"),
+        "awaiting-outcome" => format!("步骤「{title}」等待人工结算"),
+        "failed" => format!("步骤「{title}」失败,需要重试/跳过/结算"),
+        "interrupted" => format!("步骤「{title}」运行中断,需人工判定"),
+        "open-question" => "存在待回答的问题".into(),
+        "merge-conflict" => format!("步骤「{title}」存在合并冲突,需人工处理"),
+        other => format!("步骤「{title}」需要处理:{other}"),
+    }
+}
+
+/// Kernel 摘要 → TaskView(业务事实取 Kernel;身份/时间戳等 Kernel
+/// 未投影的字段由 Store 只读定位行补齐)。
+fn task_view_from_summary(
+    summary: &mf_kernel::projection::WorkflowRunSummarySnapshot,
+    join: &TaskView,
+) -> TaskView {
+    TaskView {
+        id: join.id,
+        public_handle: summary.workflow_run.as_str().to_owned(),
+        revision: i64::try_from(summary.revision.revision).unwrap_or(join.revision),
+        title: summary.title.clone(),
+        goal: join.goal.clone(),
+        status: TaskStatus::parse(&summary.status).unwrap_or(join.status),
+        paused: summary.paused,
+        unread: summary.unread,
+        active_revision: join.active_revision,
+        revision_count: join.revision_count,
+        created_at: join.created_at.clone(),
+        updated_at: join.updated_at.clone(),
+    }
+}
+
 /// 唯一发布物:revision 单调递增,内容整体替换。
 pub struct ProjectOverviewSnapshot {
     pub revision: u64,
@@ -256,6 +371,8 @@ pub struct HubCtx {
     pub plugins: Arc<PluginRegistry>,
     pub limiter: Arc<GlobalLimiter>,
     pub keep_awake: Arc<crate::runtime_host::KeepAwake>,
+    /// Core Kernel 只读投影源(None = 未装配:测试回滚模式走旧扫描)。
+    pub kernel: Arc<RwLock<Option<Arc<dyn KernelProjectionSource>>>>,
 }
 
 struct Attachment {
@@ -388,6 +505,36 @@ impl ProjectOverviewHub {
         let _ = self.notify.0.try_send(());
     }
 
+    /// 注入 Core Kernel 只读投影源(AppCtx 装配后、open_project 前调用)。
+    pub fn set_kernel_source(&self, source: Arc<dyn KernelProjectionSource>) {
+        *self.ctx.kernel.write() = Some(source);
+    }
+
+    /// 读取 Core Workspace 权威投影。`None` 只允许测试回滚模式使用；
+    /// 生产 rebuild 对缺源 fail-visible，不得回退 Store 运行事实。
+    fn read_kernel_workspace(&self) -> Option<KernelWorkspaceReads> {
+        let source = self.ctx.kernel.read().clone()?;
+        match source.workspace() {
+            Some(Ok(reads)) => Some(reads),
+            Some(Err(error)) => {
+                log::error!("Core Workspace 快照读取失败,总览不发布旧运行事实: {error}");
+                None
+            }
+            None => None,
+        }
+    }
+
+    fn kernel_workflow_run(
+        &self,
+        root: &Path,
+        workflow_run: &WorkflowRunHandle,
+    ) -> Option<
+        Result<mf_kernel::projection::WorkflowRunSnapshotData, mf_kernel::kernel::KernelProblem>,
+    > {
+        let source = self.ctx.kernel.read().clone()?;
+        source.workflow_run(root, workflow_run)
+    }
+
     /// UI 唯一读取口:revision 更新时返回整体快照。
     pub fn snapshot_if_new(&self, last_revision: u64) -> Option<Arc<ProjectOverviewSnapshot>> {
         let snap = self.current();
@@ -399,6 +546,8 @@ impl ProjectOverviewHub {
     }
 
     /// 重建全部项目的真实快照(后台线程执行;GPUI render 不做 SQLite 查询)。
+    /// Workflow Run / 「需要你」事实 kernel-first:Core Workspace Snapshot
+    /// 为权威;Core 未装配(测试回滚模式)时使用旧 Store 扫描口径。
     fn rebuild(&self) {
         let orchs: Vec<(PathBuf, Arc<Orchestrator>)> = {
             let state = self.state.lock();
@@ -408,6 +557,7 @@ impl ProjectOverviewHub {
                 .map(|(r, a)| (r.clone(), a.orchestrator.clone()))
                 .collect()
         };
+        let kernel_ws = self.read_kernel_workspace();
         let mut projects = Vec::new();
         let mut agent_cards = Vec::new();
         let mut attention_runs = Vec::new();
@@ -416,120 +566,25 @@ impl ProjectOverviewHub {
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_else(|| root.display().to_string());
-            let tasks = orch.tasks().unwrap_or_default();
-            let running = orch.store.running_runs().unwrap_or_default();
             let sessions = orch.sessions().unwrap_or_default();
-            let mut task_cards = Vec::new();
-            let mut task_titles: HashMap<i64, String> = HashMap::new();
-            for t in &tasks {
-                task_titles.insert(t.id, t.title.clone());
-                let active_runs = running.iter().filter(|r| r.task_id == t.id).count();
-                let open_questions = orch
-                    .store
-                    .open_questions(Some(t.id))
-                    .map(|q| q.len())
-                    .unwrap_or(0);
-                let steps = orch.store.task_steps(t.id).unwrap_or_default();
-                let runs = orch.store.list_runs_of_task(t.id).unwrap_or_default();
-                let reasons: Vec<String> = steps
-                    .iter()
-                    .flat_map(|s| crate::run_node_details::needs_you_reasons(s, None))
-                    .collect();
-                let _ = &runs;
-                task_cards.push(TaskCardOverview {
-                    task: t.clone(),
-                    active_runs,
-                    open_questions,
-                    needs_you_reasons: reasons,
-                });
-                // 运行级「需要你」(Task 7):每运行(内部 Task)最多一项,
-                // 徽标按运行数计数,不按被阻塞节点数
-                let latest_run_by_step: HashMap<i64, RunView> =
-                    runs.iter().fold(HashMap::new(), |mut acc, r| {
-                        let entry = acc.entry(r.step_id).or_insert(r.clone());
-                        if r.id > entry.id {
-                            *entry = r.clone();
-                        }
-                        acc
-                    });
-                let sessions_by_id: HashMap<i64, &SessionView> = sessions
-                    .iter()
-                    .map(|session| (session.id, session))
-                    .collect();
-                let unavailable_session_steps: HashSet<i64> = latest_run_by_step
-                    .iter()
-                    .filter_map(|(step_id, run)| {
-                        if run.status != RunStatus::Running {
-                            return None;
-                        }
-                        let session_id = run.session_id?;
-                        let unavailable = match sessions_by_id.get(&session_id) {
-                            None => true,
-                            Some(session) => {
-                                session.status == SessionStatus::Dead
-                                    || (session.status == SessionStatus::Idle
-                                        && session.runtime != "http"
-                                        && !self.ctx.registry.session_alive(&session.public_handle))
-                            }
-                        };
-                        unavailable.then_some(*step_id)
-                    })
-                    .collect();
-                let pending_merges = orch
-                    .store
-                    .list_pending_merges(Some(t.id))
-                    .unwrap_or_default();
-                let has_merge_conflict = pending_merges.iter().any(|row| !row.conflicts.is_empty());
-                let mut merge_conflict_step_ids: HashSet<i64> = HashSet::new();
-                if has_merge_conflict {
-                    let batches = orch
-                        .store
-                        .list_merge_batches_for_recovery()
-                        .unwrap_or_default();
-                    for batch in batches
-                        .iter()
-                        .filter(|batch| batch.task_id == t.id && batch.status == "needs_user")
+            let (task_cards, mut project_attention, task_titles) = match &kernel_ws {
+                Some(reads) => self.kernel_task_cards(root, orch, reads),
+                None => {
+                    #[cfg(test)]
                     {
-                        let step_key = batch
-                            .join_step_key
-                            .strip_prefix("__single__:")
-                            .unwrap_or(&batch.join_step_key);
-                        if let Some(step) = steps.iter().find(|step| step.step_key == step_key) {
-                            merge_conflict_step_ids.insert(step.id);
-                        }
+                        self.legacy_task_cards(root, orch, &sessions)
                     }
-                    // 兼容没有 merge_batches 的旧投影：租约 metadata 仍带来源 step_key。
-                    if merge_conflict_step_ids.is_empty() {
-                        for row in &pending_merges {
-                            let step_key = row
-                                .lease
-                                .metadata
-                                .get("step_key")
-                                .and_then(|value| value.as_str());
-                            if let Some(step) = step_key
-                                .and_then(|key| steps.iter().find(|step| step.step_key == key))
-                            {
-                                merge_conflict_step_ids.insert(step.id);
-                            }
-                        }
+                    #[cfg(not(test))]
+                    {
+                        log::error!(
+                            "Core Workspace 快照不可用,项目 `{}` 的运行事实保持空白",
+                            root.display()
+                        );
+                        (Vec::new(), Vec::new(), HashMap::new())
                     }
                 }
-                let has_unmapped_merge_conflict =
-                    has_merge_conflict && merge_conflict_step_ids.is_empty();
-                if let Some(mut attention) = attention_for_task(
-                    t,
-                    &steps,
-                    &latest_run_by_step,
-                    &unavailable_session_steps,
-                    &merge_conflict_step_ids,
-                    has_unmapped_merge_conflict,
-                    open_questions,
-                ) {
-                    attention.project_root = root.clone();
-                    attention.task_title = t.title.clone();
-                    attention_runs.push(attention);
-                }
-            }
+            };
+            attention_runs.append(&mut project_attention);
             let active_sessions = sessions
                 .iter()
                 .filter(|s| {
@@ -539,6 +594,7 @@ impl ProjectOverviewHub {
                     )
                 })
                 .count();
+            let card_task_ids: Vec<i64> = task_cards.iter().map(|card| card.task.id).collect();
             projects.push(ProjectOverview {
                 root: root.clone(),
                 name: project_name.clone(),
@@ -546,10 +602,12 @@ impl ProjectOverviewHub {
                 active_sessions,
             });
 
-            // Agent 卡片(与旧 poll_snapshot 相同的聚合规则)
+            // Agent 卡片(旧看板;会话域事实 + 终端 tail/alive 来自 Registry,
+            // 含不属于任何 Workflow Run 的离散会话,不经 Kernel 投影)
+            let running = orch.store.running_runs().unwrap_or_default();
             let mut all_runs = running.clone();
-            for t in &tasks {
-                for r in orch.runs_of_task(t.id).unwrap_or_default() {
+            for task_id in card_task_ids {
+                for r in orch.runs_of_task(task_id).unwrap_or_default() {
                     if !all_runs.iter().any(|x| x.id == r.id) {
                         all_runs.push(r);
                     }
@@ -621,6 +679,239 @@ impl ProjectOverviewHub {
             attention_runs,
             attention_run_count,
         });
+    }
+
+    /// Kernel Workspace 投影 → 运行卡片 + 「需要你」(Issue #26)。
+    /// 状态/标题/未读/原因数/焦点节点/活动 run 数全部来自 Kernel Snapshot;
+    /// Store 只读定位(`*_view_by_handle`)提供 rowid/时间戳等接线身份。
+    /// 无 Revision 的普通 Draft Task 不在 Kernel Workflow Run 投影内,
+    /// 仍按任务列表补齐(侧栏语义不变)。
+    fn kernel_task_cards(
+        &self,
+        root: &Path,
+        orch: &Arc<Orchestrator>,
+        reads: &KernelWorkspaceReads,
+    ) -> (
+        Vec<TaskCardOverview>,
+        Vec<WorkflowRunAttention>,
+        HashMap<i64, String>,
+    ) {
+        let mut cards = Vec::new();
+        let mut attentions = Vec::new();
+        let mut titles: HashMap<i64, String> = HashMap::new();
+        for summary in reads.summaries_by_root(root) {
+            let Some(join) = orch
+                .store
+                .task_view_by_handle(summary.workflow_run.as_str())
+                .ok()
+                .flatten()
+            else {
+                log::warn!(
+                    "Kernel Workflow Run {} 无 Store 身份行,跳过",
+                    summary.workflow_run
+                );
+                continue;
+            };
+            titles.insert(join.id, summary.title.clone());
+            // 原因明细仅在有直接原因时按需读取,避免每次重建 N 次快照
+            let (needs_you_reasons, open_questions) = if summary.reason_count > 0 {
+                self.kernel_reason_projection(root, orch, summary)
+            } else {
+                (Vec::new(), 0)
+            };
+            let focus_step_id = summary.focus_step.as_ref().and_then(|step| {
+                orch.store
+                    .step_view_by_handle(step.as_str())
+                    .ok()
+                    .flatten()
+                    .map(|view| view.id)
+            });
+            if let Some(attention) = attention_from_summary(root, summary, join.id, focus_step_id) {
+                attentions.push(attention);
+            }
+            cards.push(TaskCardOverview {
+                task: task_view_from_summary(summary, &join),
+                active_runs: summary.active_agent_runs,
+                open_questions,
+                needs_you_reasons,
+            });
+        }
+        // 草稿任务(无 Pipeline Revision)不是 Workflow Run,不经 Kernel 投影
+        for task in orch.tasks().unwrap_or_default() {
+            if task.revision_count == 0 {
+                titles.insert(task.id, task.title.clone());
+                cards.push(TaskCardOverview {
+                    task,
+                    active_runs: 0,
+                    open_questions: 0,
+                    needs_you_reasons: Vec::new(),
+                });
+            }
+        }
+        // 与旧侧栏顺序一致(id 倒序)
+        cards.sort_by_key(|card| std::cmp::Reverse(card.task.id));
+        (cards, attentions, titles)
+    }
+
+    /// 按 Kernel Workflow Run 快照取原因明细文本 + 待答问题数。
+    fn kernel_reason_projection(
+        &self,
+        root: &Path,
+        orch: &Arc<Orchestrator>,
+        summary: &mf_kernel::projection::WorkflowRunSummarySnapshot,
+    ) -> (Vec<String>, usize) {
+        match self.kernel_workflow_run(root, &summary.workflow_run) {
+            Some(Ok(data)) => {
+                let open_questions = data.open_questions.len();
+                let reasons = data
+                    .needs_you_reasons
+                    .iter()
+                    .map(|reason| {
+                        let title = reason
+                            .step
+                            .as_ref()
+                            .and_then(|step| {
+                                orch.store.step_view_by_handle(step.as_str()).ok().flatten()
+                            })
+                            .map(|view| view.title);
+                        reason_text(&reason.kind, title.as_deref())
+                    })
+                    .collect();
+                (reasons, open_questions)
+            }
+            Some(Err(error)) => {
+                log::error!("Core Workflow Run 快照读取失败,原因明细缺省: {error}");
+                (Vec::new(), 0)
+            }
+            None => (Vec::new(), 0),
+        }
+    }
+
+    /// 回退投影(无 Core Kernel 源;测试回滚模式):原 Store 扫描口径不变。
+    fn legacy_task_cards(
+        &self,
+        root: &Path,
+        orch: &Arc<Orchestrator>,
+        sessions: &[SessionView],
+    ) -> (
+        Vec<TaskCardOverview>,
+        Vec<WorkflowRunAttention>,
+        HashMap<i64, String>,
+    ) {
+        let tasks = orch.tasks().unwrap_or_default();
+        let running = orch.store.running_runs().unwrap_or_default();
+        let mut task_cards = Vec::new();
+        let mut task_titles: HashMap<i64, String> = HashMap::new();
+        let mut attentions = Vec::new();
+        for t in &tasks {
+            task_titles.insert(t.id, t.title.clone());
+            let active_runs = running.iter().filter(|r| r.task_id == t.id).count();
+            let open_questions = orch
+                .store
+                .open_questions(Some(t.id))
+                .map(|q| q.len())
+                .unwrap_or(0);
+            let steps = orch.store.task_steps(t.id).unwrap_or_default();
+            let runs = orch.store.list_runs_of_task(t.id).unwrap_or_default();
+            let reasons: Vec<String> = steps
+                .iter()
+                .flat_map(|s| crate::run_node_details::needs_you_reasons(s, None))
+                .collect();
+            task_cards.push(TaskCardOverview {
+                task: t.clone(),
+                active_runs,
+                open_questions,
+                needs_you_reasons: reasons,
+            });
+            // 运行级「需要你」(Task 7):每运行(内部 Task)最多一项,
+            // 徽标按运行数计数,不按被阻塞节点数
+            let latest_run_by_step: HashMap<i64, RunView> =
+                runs.iter().fold(HashMap::new(), |mut acc, r| {
+                    let entry = acc.entry(r.step_id).or_insert(r.clone());
+                    if r.id > entry.id {
+                        *entry = r.clone();
+                    }
+                    acc
+                });
+            let sessions_by_id: HashMap<i64, &SessionView> = sessions
+                .iter()
+                .map(|session| (session.id, session))
+                .collect();
+            let unavailable_session_steps: HashSet<i64> = latest_run_by_step
+                .iter()
+                .filter_map(|(step_id, run)| {
+                    if run.status != RunStatus::Running {
+                        return None;
+                    }
+                    let session_id = run.session_id?;
+                    let unavailable = match sessions_by_id.get(&session_id) {
+                        None => true,
+                        Some(session) => {
+                            session.status == SessionStatus::Dead
+                                || (session.status == SessionStatus::Idle
+                                    && session.runtime != "http"
+                                    && !self.ctx.registry.session_alive(&session.public_handle))
+                        }
+                    };
+                    unavailable.then_some(*step_id)
+                })
+                .collect();
+            let pending_merges = orch
+                .store
+                .list_pending_merges(Some(t.id))
+                .unwrap_or_default();
+            let has_merge_conflict = pending_merges.iter().any(|row| !row.conflicts.is_empty());
+            let mut merge_conflict_step_ids: HashSet<i64> = HashSet::new();
+            if has_merge_conflict {
+                let batches = orch
+                    .store
+                    .list_merge_batches_for_recovery()
+                    .unwrap_or_default();
+                for batch in batches
+                    .iter()
+                    .filter(|batch| batch.task_id == t.id && batch.status == "needs_user")
+                {
+                    let step_key = batch
+                        .join_step_key
+                        .strip_prefix("__single__:")
+                        .unwrap_or(&batch.join_step_key);
+                    if let Some(step) = steps.iter().find(|step| step.step_key == step_key) {
+                        merge_conflict_step_ids.insert(step.id);
+                    }
+                }
+                // 兼容没有 merge_batches 的旧投影：租约 metadata 仍带来源 step_key。
+                if merge_conflict_step_ids.is_empty() {
+                    for row in &pending_merges {
+                        let step_key = row
+                            .lease
+                            .metadata
+                            .get("step_key")
+                            .and_then(|value| value.as_str());
+                        if let Some(step) =
+                            step_key.and_then(|key| steps.iter().find(|step| step.step_key == key))
+                        {
+                            merge_conflict_step_ids.insert(step.id);
+                        }
+                    }
+                }
+            }
+            let has_unmapped_merge_conflict =
+                has_merge_conflict && merge_conflict_step_ids.is_empty();
+            if let Some(mut attention) = attention_for_task(
+                t,
+                &steps,
+                &latest_run_by_step,
+                &unavailable_session_steps,
+                &merge_conflict_step_ids,
+                has_unmapped_merge_conflict,
+                open_questions,
+            ) {
+                attention.project_root = root.to_path_buf();
+                attention.task_title = t.title.clone();
+                attentions.push(attention);
+            }
+        }
+        (task_cards, attentions, task_titles)
     }
 }
 

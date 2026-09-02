@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-pub const PROJECT_SCHEMA_VERSION: i64 = 7;
+pub const PROJECT_SCHEMA_VERSION: i64 = 10;
 pub const CATALOG_SCHEMA_VERSION: i64 = 1;
 /// Catalog v2 使用独立文件与独立版本链，不能复用 v1 的 user_version
 /// 含义，否则 pre-Bridge 旧程序可能把新库当作 v1 打开。
@@ -82,7 +82,7 @@ pub fn upgrade_project(conn: &mut Connection, target: i64) -> Result<()> {
             |row| row.get(0),
         )?;
         log::info!(
-            "migration_identity_backfill store=project schema_version=7 aggregate_handles={} workflows={} nodes_created={} edges_created={} nodes_removed={} edges_removed={} outbox_depth={}",
+            "migration_identity_backfill store=project schema_version=9 aggregate_handles={} workflows={} nodes_created={} edges_created={} nodes_removed={} edges_removed={} outbox_depth={}",
             stats.aggregate_handles,
             stats.identity.workflows,
             stats.identity.identity.nodes_created,
@@ -129,7 +129,26 @@ fn apply_project_chain(
         tx.execute_batch(PROJECT_SCHEMA_V6_DELTA)?;
     }
     if from < 7 && to >= 7 {
-        return Ok(Some(backfill_project_v7(tx)?));
+        let stats = backfill_project_v7(tx)?;
+        if to >= 8 {
+            tx.execute_batch(PROJECT_SCHEMA_V8_DELTA)?;
+        }
+        if to >= 9 {
+            tx.execute_batch(PROJECT_SCHEMA_V9_DELTA)?;
+        }
+        if to >= 10 {
+            tx.execute_batch(PROJECT_SCHEMA_V10_DELTA)?;
+        }
+        return Ok(Some(stats));
+    }
+    if to >= 8 {
+        tx.execute_batch(PROJECT_SCHEMA_V8_DELTA)?;
+    }
+    if to >= 9 {
+        tx.execute_batch(PROJECT_SCHEMA_V9_DELTA)?;
+    }
+    if to >= 10 {
+        tx.execute_batch(PROJECT_SCHEMA_V10_DELTA)?;
     }
     Ok(None)
 }
@@ -832,6 +851,207 @@ CREATE INDEX IF NOT EXISTS idx_workflow_node_identity_handle
     ON workflow_node_identity(workflow_handle);
 CREATE INDEX IF NOT EXISTS idx_workflow_edge_identity_handle
     ON workflow_edge_identity(workflow_handle);
+";
+
+/// v8:一次性的 retry 会话意图必须与 Project Store 同生共死。
+/// dispatch 创建 Agent Run 的同一事务 CAS 消费该行，禁止 post-commit
+/// 重放把已消费的 ContinueSession/FreshSession 再写回进程内状态。
+pub const PROJECT_SCHEMA_V8_DELTA: &str = "
+CREATE TABLE IF NOT EXISTS step_next_attempt_sessions (
+    step_id INTEGER PRIMARY KEY REFERENCES steps(id) ON DELETE CASCADE,
+    mode TEXT NOT NULL CHECK(mode IN ('fresh','continue')),
+    session_id INTEGER REFERENCES agent_sessions(id),
+    created_at TEXT NOT NULL,
+    CHECK((mode='fresh' AND session_id IS NULL) OR (mode='continue' AND session_id IS NOT NULL))
+);
+";
+
+/// v9:question-bound 回答的两阶段持久投递(Issue #26)。
+/// Respond 的 L-CMD 事务只把回答记入本私有表(状态 `pending`),
+/// question/Step/Task 维持 open/needs-input;post-commit action 以
+/// `(question_id, run_id, run_handle, nonce)` 寻址投递,宿主确认后
+/// 的收口事务才 CAS 置 `delivered` 并清空 answer 明文,随后把
+/// question 推进到 answered。
+///
+/// 威胁模型:待投递 answer 明文只允许存在于本表;`delivered` 后本表
+/// 即置 NULL。确认后的审计副本仍按既有领域模型保存在
+/// `step_questions.answer`；两处都位于同一个本地项目 SQLite 文件、同一
+/// 信任域，均不得进入 Kernel 事件 JSON、投影 outbox、Snapshot、日志、
+/// Debug 或错误链。
+pub const PROJECT_SCHEMA_V9_DELTA: &str = "
+CREATE TABLE IF NOT EXISTS question_answer_deliveries (
+    question_id INTEGER PRIMARY KEY REFERENCES step_questions(id) ON DELETE CASCADE,
+    task_id INTEGER NOT NULL,
+    step_id INTEGER,
+    run_id INTEGER NOT NULL,
+    run_handle TEXT NOT NULL,
+    run_revision INTEGER NOT NULL,
+    nonce TEXT NOT NULL UNIQUE,
+    -- pending 窗口内必有值;delivered 收口时置 NULL 清除明文。
+    answer TEXT,
+    status TEXT NOT NULL CHECK(status IN ('pending','delivered')),
+    created_at TEXT NOT NULL,
+    delivered_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_question_answer_deliveries_status
+    ON question_answer_deliveries(status);
+";
+
+/// v10:Workflow Run Cancel 的 durable fence/saga。
+/// `reserve` 是取消的线性化点；外部 stop 不持 SQLite transaction。
+/// fence 活跃期间触发器拒绝同一 Task 的关键运行写，finalizer 在同一个
+/// IMMEDIATE transaction 中先切到 `finalizing`，再应用最终领域状态。
+pub const PROJECT_SCHEMA_V10_DELTA: &str = "
+CREATE TABLE IF NOT EXISTS run_cancel_fence (
+    command_id TEXT PRIMARY KEY,
+    task_id INTEGER NOT NULL REFERENCES agent_tasks(id),
+    state TEXT NOT NULL CHECK(state IN ('reserved','stopping','outcomes','finalizing','finalized')),
+    targets_json TEXT NOT NULL,
+    expected_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    finalized_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_run_cancel_fence_active_task
+    ON run_cancel_fence(task_id) WHERE state!='finalized';
+CREATE TABLE IF NOT EXISTS run_cancel_target (
+    command_id TEXT NOT NULL REFERENCES run_cancel_fence(command_id) ON DELETE CASCADE,
+    run_id INTEGER NOT NULL,
+    run_handle TEXT NOT NULL,
+    run_revision INTEGER NOT NULL,
+    state TEXT NOT NULL CHECK(state IN ('pending','stopping','confirmed','unconfirmed')),
+    PRIMARY KEY(command_id, run_id),
+    UNIQUE(command_id, run_handle)
+);
+CREATE INDEX IF NOT EXISTS idx_run_cancel_target_state
+    ON run_cancel_target(command_id, state);
+
+CREATE TRIGGER IF NOT EXISTS fence_agent_tasks_update
+BEFORE UPDATE ON agent_tasks
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_agent_tasks_delete
+BEFORE DELETE ON agent_tasks
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_steps_insert
+BEFORE INSERT ON steps
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=NEW.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_steps_delete
+BEFORE DELETE ON steps
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_steps_update
+BEFORE UPDATE ON steps
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_agent_runs_delete
+BEFORE DELETE ON agent_runs
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_agent_runs_insert
+BEFORE INSERT ON agent_runs
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=NEW.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_agent_sessions_delete
+BEFORE DELETE ON agent_sessions
+WHEN EXISTS(
+    SELECT 1 FROM agent_runs r JOIN run_cancel_fence f ON f.task_id=r.task_id
+    WHERE r.session_id=OLD.id AND f.state IN ('reserved','stopping','outcomes')
+)
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_agent_runs_update
+BEFORE UPDATE ON agent_runs
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_execution_leases_delete
+BEFORE DELETE ON execution_leases
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+
+CREATE TRIGGER IF NOT EXISTS fence_pipeline_revisions_update
+BEFORE UPDATE ON pipeline_revisions
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_pipeline_revisions_insert
+BEFORE INSERT ON pipeline_revisions
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=NEW.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_pipeline_revisions_delete
+BEFORE DELETE ON pipeline_revisions
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_step_next_attempt_sessions_write
+BEFORE INSERT ON step_next_attempt_sessions
+WHEN EXISTS(SELECT 1 FROM steps s JOIN run_cancel_fence f ON f.task_id=s.task_id WHERE s.id=NEW.step_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_step_next_attempt_sessions_update
+BEFORE UPDATE ON step_next_attempt_sessions
+WHEN EXISTS(SELECT 1 FROM steps s JOIN run_cancel_fence f ON f.task_id=s.task_id WHERE s.id=OLD.step_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_step_next_attempt_sessions_delete
+BEFORE DELETE ON step_next_attempt_sessions
+WHEN EXISTS(SELECT 1 FROM steps s JOIN run_cancel_fence f ON f.task_id=s.task_id WHERE s.id=OLD.step_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_pending_merges_write
+BEFORE INSERT ON pending_merges
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=NEW.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_pending_merges_update
+BEFORE UPDATE ON pending_merges
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_pending_merges_delete
+BEFORE DELETE ON pending_merges
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_merge_batches_update
+BEFORE UPDATE ON merge_batches
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_merge_batches_insert
+BEFORE INSERT ON merge_batches
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=NEW.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_merge_batches_delete
+BEFORE DELETE ON merge_batches
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_join_deferrals_insert
+BEFORE INSERT ON join_deferrals
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=NEW.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_join_deferrals_update
+BEFORE UPDATE ON join_deferrals
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_join_deferrals_delete
+BEFORE DELETE ON join_deferrals
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_handoffs_insert
+BEFORE INSERT ON handoffs
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=NEW.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_step_questions_insert
+BEFORE INSERT ON step_questions
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=NEW.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_agent_sessions_update
+BEFORE UPDATE ON agent_sessions
+WHEN EXISTS(
+    SELECT 1 FROM agent_runs r JOIN run_cancel_fence f ON f.task_id=r.task_id
+    WHERE r.session_id=OLD.id AND f.state IN ('reserved','stopping','outcomes')
+)
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_execution_leases_insert
+BEFORE INSERT ON execution_leases
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=NEW.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
+CREATE TRIGGER IF NOT EXISTS fence_execution_leases_update
+BEFORE UPDATE ON execution_leases
+WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.task_id AND f.state IN ('reserved','stopping','outcomes'))
+BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
 ";
 
 /// v7 handle 列 ALTER(经 has_column 守卫幂等;残缺库缺表跳过)。

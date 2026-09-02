@@ -14,6 +14,8 @@ use std::path::PathBuf;
 fn step(id: i64, key: &str, status: StepStatus) -> mf_agent::StepView {
     mf_agent::StepView {
         id,
+        public_handle: format!("step-{id}"),
+        revision: 1,
         revision_id: 1,
         task_id: 1,
         step_key: key.into(),
@@ -53,6 +55,8 @@ fn run(id: i64, step_id: i64, status: RunStatus) -> RunView {
 fn task(status: TaskStatus) -> TaskView {
     TaskView {
         id: 1,
+        public_handle: "run-1".into(),
+        revision: 1,
         title: "运行".into(),
         goal: String::new(),
         status,
@@ -468,4 +472,97 @@ fn attention_count_flows_to_workspace_tabs(cx: &mut gpui::TestAppContext) {
         assert_eq!(aw.attention_run_count, 0, "统一快照口径清零徽标");
         let _ = &attention;
     });
+}
+
+// ---------- Issue #26:「需要你」事实迁到 Core Kernel 摘要 ----------
+
+fn kernel_summary(
+    status: &str,
+    reason_count: usize,
+    focus: Option<&str>,
+) -> mf_kernel::projection::WorkflowRunSummarySnapshot {
+    mf_kernel::projection::WorkflowRunSummarySnapshot {
+        workflow_run: mf_kernel::handles::WorkflowRunHandle::parse(
+            "018f1e61-a197-7b4d-8f4e-6f4e6f4e6f41",
+        )
+        .unwrap(),
+        revision: mf_kernel::projection::ScalarRevision { revision: 3 },
+        title: "运行".into(),
+        status: status.into(),
+        paused: false,
+        unread: false,
+        needs_you: status == "needs-you",
+        reason_count,
+        focus_step: focus.map(|handle| mf_kernel::handles::StepHandle::parse(handle).unwrap()),
+        active_agent_runs: 0,
+    }
+}
+
+/// Kernel 摘要 → 「需要你」:reason_count>0 即命中;一个运行最多一项;
+/// focus_step 由 Kernel 给出优先处理节点 handle(UI 侧 join 回 rowid)。
+#[test]
+fn kernel_summary_maps_to_single_attention_per_run() {
+    let root = PathBuf::from("D:/p");
+    let summary = kernel_summary("running", 2, Some("018f1e61-a197-7b4d-8f4e-6f4e6f4e6f42"));
+    let attention = crate::project_overview::attention_from_summary(&root, &summary, 7, Some(11))
+        .expect("Kernel 直接原因必须产生徽标");
+    assert_eq!(attention.task_id, 7);
+    assert_eq!(attention.reason_count, 2);
+    assert_eq!(attention.focus_step_id, Some(11));
+    assert_eq!(attention.task_title, "运行");
+
+    // 无直接原因 → 无徽标(即使 Task 状态机仍在 needs-you 也不凭状态计数)
+    assert!(
+        crate::project_overview::attention_from_summary(
+            &root,
+            &kernel_summary("needs-you", 0, None),
+            7,
+            None
+        )
+        .is_none(),
+        "Kernel reason_count 为 0 不得产生徽标"
+    );
+}
+
+/// 已取消/已归档运行不产生徽标(Kernel 会为终态运行计算历史原因数,
+/// UI 必须按运行状态过滤)。
+#[test]
+fn kernel_attention_excludes_cancelled_and_archived_runs() {
+    let root = PathBuf::from("D:/p");
+    for status in ["cancelled", "archived"] {
+        assert!(
+            crate::project_overview::attention_from_summary(
+                &root,
+                &kernel_summary(status, 3, None),
+                7,
+                None
+            )
+            .is_none(),
+            "{status} 运行不得产生徽标"
+        );
+    }
+}
+
+/// Kernel 摘要驱动的跨项目徽标:两个运行(不同项目)各一项,
+/// 徽标计数 = 运行数(不按被阻塞节点数)。
+#[test]
+fn kernel_attention_badge_counts_runs_across_projects() {
+    let roots = [PathBuf::from("D:/a"), PathBuf::from("D:/b")];
+    let attentions: Vec<_> = roots
+        .iter()
+        .enumerate()
+        .filter_map(|(index, root)| {
+            crate::project_overview::attention_from_summary(
+                root,
+                &kernel_summary("needs-you", 1, None),
+                index as i64,
+                None,
+            )
+        })
+        .collect();
+    assert_eq!(attentions.len(), 2, "徽标按运行数计数");
+    assert_eq!(
+        attentions.iter().map(|a| a.task_id).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
 }

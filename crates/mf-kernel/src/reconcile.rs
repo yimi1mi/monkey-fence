@@ -29,8 +29,8 @@ use crate::command::{finish_intent_tx, intent_tx, CommandProblem, IntentState, T
 use crate::handles::CommandId;
 use crate::limits::RetentionLimits;
 use crate::operation::{
-    mark_reconciling, open_operations, reconcile_operation, OperationHandle, OperationOutcome,
-    StepId,
+    mark_reconciling_except_resumable_workflow_start, open_operations, operation_of,
+    reconcile_operation, steps_of, OperationHandle, OperationOutcome, StepId,
 };
 use crate::project_registry::ServiceStore;
 use chrono::{DateTime, Utc};
@@ -129,7 +129,7 @@ pub(crate) fn reconcile_startup(
     let mut report = ReconcileReport::default();
     let _gate = service.command_gate();
     reconcile_intents(service, targets, &mut report)?;
-    mark_reconciling(service).map_err(op_problem)?;
+    mark_reconciling_except_resumable_workflow_start(service).map_err(op_problem)?;
     reconcile_operations(service, targets, &mut report)?;
     for target in targets {
         let marked = mark_outbox_reconciled(target, now)?;
@@ -266,6 +266,20 @@ fn reconcile_operations(
     report: &mut ReconcileReport,
 ) -> Result<(), CommandProblem> {
     for handle in open_operations(service).map_err(op_problem)? {
+        // legacy/外部 operation 可能带旧 progress_json 形状。先以新协议的
+        // operation_step 凭证判别，避免仅为读取 kind 就反序列化旧 progress
+        // 并把本应 skip 的行升级成启动失败。
+        if steps_of(service, &handle).map_err(op_problem)?.is_empty() {
+            report.operations_skipped += 1;
+            continue;
+        }
+        let record = operation_of(service, &handle).map_err(op_problem)?;
+        if record.kind.as_str() == crate::workflow_start::WORKFLOW_START_OPERATION_KIND {
+            // 生产 Workflow Start worker 会从 durable payload + step receipts
+            // 恢复；通用 reconcile 不把尚未执行的 effect 误判为 revoked。
+            report.operations_skipped += 1;
+            continue;
+        }
         let outcome = match reconcile_operation(service, &handle, targets) {
             Ok(outcome) => outcome,
             Err(crate::operation::OperationProblem::TargetStoreMismatch(_)) => {
@@ -294,12 +308,35 @@ pub(crate) fn mark_outbox_reconciled(
     now: DateTime<Utc>,
 ) -> Result<usize, CommandProblem> {
     let mark = format!("{OUTBOX_RECONCILED_PREFIX}{}", now.to_rfc3339());
-    target.with_conn(|conn| {
-        conn.execute(
-            "UPDATE projection_outbox SET published_at=?1 WHERE published_at IS NULL",
-            [&mark],
-        )
-        .map_err(internal)
+    target.with_tx(|tx| {
+        let mut stmt = tx
+            .prepare(
+                "SELECT outbox_id,event_json FROM projection_outbox
+                 WHERE published_at IS NULL ORDER BY outbox_id",
+            )
+            .map_err(internal)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(internal)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal)?;
+        drop(stmt);
+        let mut marked = 0usize;
+        for (outbox_id, event_json) in rows {
+            if crate::run_lifecycle::event_has_pending_run_actions(&event_json) {
+                continue;
+            }
+            marked += tx
+                .execute(
+                    "UPDATE projection_outbox SET published_at=?1
+                     WHERE outbox_id=?2 AND published_at IS NULL",
+                    params![mark, outbox_id],
+                )
+                .map_err(internal)?;
+        }
+        Ok(marked)
     })
 }
 

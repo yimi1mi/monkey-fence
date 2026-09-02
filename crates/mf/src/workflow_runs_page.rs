@@ -4,7 +4,8 @@
 //! - 左侧过滤:需要你 / 运行中 / 最近完成;
 //! - 只把存在 Pipeline Revision 的 Task 投影为工作流运行;
 //! - 选中 attention 项时定位 RunMonitor 到优先处理节点;
-//! - 徽标/计数完全来自统一 overview 快照(attention_runs),
+//! - 徽标/计数完全来自统一 overview 快照(attention_runs),运行事实由
+//!   Hub 经 Core Kernel Workspace Snapshot 投影(Issue #26 只读迁移),
 //!   运行完成或人工动作后由事件 → 重建统一更新,不手工减计数。
 
 use crate::project_overview::{ProjectOverviewSnapshot, WorkflowRunAttention};

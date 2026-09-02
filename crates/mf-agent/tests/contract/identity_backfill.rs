@@ -9,6 +9,7 @@
 //! 全部基于 tempfile fixture。
 
 use crate::support::{build_v6_project_db, graph_json, is_uuid_v7, read_only};
+use mf_agent::schema::PROJECT_SCHEMA_VERSION;
 use mf_agent::store::Store;
 use rusqlite::Connection;
 use std::collections::BTreeMap;
@@ -95,7 +96,7 @@ fn backfill_counts_and_mappings_are_exact() {
     );
 
     let store = Store::open(&db).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 7);
+    assert_eq!(store.schema_version().unwrap(), PROJECT_SCHEMA_VERSION);
     drop(store);
 
     let identity = backfilled(&db);
@@ -282,7 +283,7 @@ fn fresh_database_lands_on_v7_with_meta_singleton() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("workflow-v1.db");
     let store = Store::open(&db).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 7);
+    assert_eq!(store.schema_version().unwrap(), PROJECT_SCHEMA_VERSION);
     let conn = Connection::open(&db).unwrap();
     let (meta, nodes, edges): (i64, i64, i64) = conn
         .query_row(

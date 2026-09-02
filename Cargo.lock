@@ -2441,6 +2441,7 @@ dependencies = [
  "tempfile",
  "toml 0.8.23",
  "unicode-segmentation",
+ "uuid",
  "windows-sys 0.59.0",
  "zeroize",
 ]
@@ -2574,10 +2575,12 @@ dependencies = [
  "crossbeam-channel",
  "log",
  "mf-agent",
+ "mf-kernel",
  "parking_lot",
  "serde",
  "serde_json",
  "tempfile",
+ "uuid",
  "windows-sys 0.59.0",
 ]
 

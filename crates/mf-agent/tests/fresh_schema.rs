@@ -3,6 +3,7 @@
 //! 旧 v1 库按链升级且数据保留。
 
 use mf_agent::catalog_store::CatalogStore;
+use mf_agent::migration;
 use mf_agent::schema::PROJECT_SCHEMA_VERSION;
 use mf_agent::store::Store;
 use rusqlite::Connection;
@@ -18,6 +19,16 @@ fn project_schema_starts_at_current_version_without_legacy_tables() {
         tables.contains(&"merge_batches".to_string()),
         "v2 起包含 join 批持久状态表: {tables:?}"
     );
+    assert!(
+        tables.contains(&"step_next_attempt_sessions".to_string()),
+        "v8 包含下一 attempt 会话意图表: {tables:?}"
+    );
+    assert!(
+        tables.contains(&"question_answer_deliveries".to_string()),
+        "v9 包含 question-bound 回答两阶段投递表: {tables:?}"
+    );
+    assert!(tables.contains(&"run_cancel_fence".to_string()));
+    assert!(tables.contains(&"run_cancel_target".to_string()));
 }
 
 #[test]
@@ -68,6 +79,8 @@ fn legacy_v1_database_is_migrated_with_data_intact() {
     let tables = store.table_names().unwrap();
     assert!(tables.contains(&"merge_batches".to_string()));
     assert!(tables.contains(&"join_deferrals".to_string()));
+    assert!(tables.contains(&"step_next_attempt_sessions".to_string()));
+    assert!(tables.contains(&"question_answer_deliveries".to_string()));
     let columns = store
         .with_conn(|c| {
             let mut stmt = c.prepare("PRAGMA table_info(merge_batches)")?;
@@ -100,6 +113,144 @@ fn future_schema_version_is_rejected() {
         format!("{err:#}").contains("高于程序支持"),
         "错误必须明示版本不兼容: {err:#}"
     );
+}
+
+#[test]
+fn v7_database_migrates_to_v8_with_backup_and_retry_intent_table() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("workflow-v1.db");
+    {
+        let mut conn = Connection::open(&db).unwrap();
+        mf_agent::schema::upgrade_project(&mut conn, 7).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            7
+        );
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='step_next_attempt_sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0, "v7 起点不得提前带入 v8 DDL");
+    }
+
+    let store = Store::open(&db).unwrap();
+    assert_eq!(store.schema_version().unwrap(), PROJECT_SCHEMA_VERSION);
+    assert!(store
+        .table_names()
+        .unwrap()
+        .contains(&"step_next_attempt_sessions".to_string()));
+    let artifacts = migration::published_artifact_dirs(&migration::backup_dir_for(&db)).unwrap();
+    assert_eq!(artifacts.len(), 1, "7→8 恰发布一个 pre-migration backup");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(artifacts[0].join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["from_version"], 7);
+    assert_eq!(manifest["to_version"], PROJECT_SCHEMA_VERSION);
+}
+
+/// v8 库升级到 v9 必须带来 question-bound 回答两阶段投递表,
+/// 且发布 pre-migration backup(Issue #26)。
+#[test]
+fn v8_database_migrates_to_v9_with_question_delivery_table() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("workflow-v1.db");
+    {
+        let mut conn = Connection::open(&db).unwrap();
+        mf_agent::schema::upgrade_project(&mut conn, 8).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            8
+        );
+        let table_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type='table' AND name='question_answer_deliveries'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0, "v8 起点不得提前带入 v9 DDL");
+    }
+
+    let store = Store::open(&db).unwrap();
+    assert_eq!(store.schema_version().unwrap(), PROJECT_SCHEMA_VERSION);
+    assert!(store
+        .table_names()
+        .unwrap()
+        .contains(&"question_answer_deliveries".to_string()));
+    let artifacts = migration::published_artifact_dirs(&migration::backup_dir_for(&db)).unwrap();
+    assert_eq!(artifacts.len(), 1, "8→9 恰发布一个 pre-migration backup");
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(artifacts[0].join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["from_version"], 8);
+    assert_eq!(manifest["to_version"], PROJECT_SCHEMA_VERSION);
+    // 投递表结构契约:question 主键 + nonce 唯一 + pending/delivered 状态机。
+    let columns = store
+        .with_conn(|c| {
+            let mut stmt = c.prepare("PRAGMA table_info(question_answer_deliveries)")?;
+            let names = stmt
+                .query_map([], |r| r.get::<_, String>(1))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(names)
+        })
+        .unwrap();
+    for expected in [
+        "question_id",
+        "run_id",
+        "run_handle",
+        "run_revision",
+        "nonce",
+        "answer",
+        "status",
+    ] {
+        assert!(
+            columns.contains(&expected.to_string()),
+            "投递表缺列 {expected}: {columns:?}"
+        );
+    }
+}
+
+#[test]
+fn v9_database_migrates_to_v10_with_cancel_fence_and_backup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("workflow-v1.db");
+    {
+        let mut conn = Connection::open(&db).unwrap();
+        mf_agent::schema::upgrade_project(&mut conn, 9).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            9
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='run_cancel_fence'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+    let store = Store::open(&db).unwrap();
+    assert_eq!(store.schema_version().unwrap(), PROJECT_SCHEMA_VERSION);
+    assert!(store
+        .table_names()
+        .unwrap()
+        .contains(&"run_cancel_fence".into()));
+    let artifacts = migration::published_artifact_dirs(&migration::backup_dir_for(&db)).unwrap();
+    assert_eq!(artifacts.len(), 1);
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(artifacts[0].join("manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(manifest["from_version"], 9);
+    assert_eq!(manifest["to_version"], 10);
 }
 
 #[test]

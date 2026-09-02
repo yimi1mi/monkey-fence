@@ -1,13 +1,16 @@
 //! Run Monitor 的 DAG 状态投影与渲染宿主(UI 计划 Task 4;设计 §11.4)。
 //!
-//! 复用 Pipeline 页的任务/步骤数据,把 RunNodeDetails 的动作
-//! (继续/重试/跳过/结算/取消)接到 Orchestrator;
+//! Issue #26 只读迁移:节点/运行/会话/Handoff/租约/待决冲突等业务事实
+//! 来自 Core Kernel 的 WorkflowRunSnapshot(Store 只读定位提供 rowid/
+//! 时间戳等接线身份)。legacy Store 回退只在 `cfg(test)` 编译，生产
+//! Core 未装配时 fail-visible，绝不维持第二事实源。
 
 pub use crate::run_node_details::{needs_you_reasons, RunAction, RunNodeDetails};
 
-use mf_agent::model::{ExecutionLeaseRow, HandoffRow, RunView, SessionView, Settlement, StepView};
+use mf_agent::model::{HandoffRow, RunView, SessionView, Settlement, StepView};
 use mf_agent::orchestrator::Orchestrator;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 /// Run Monitor 视图数据(一次任务的投影):
@@ -20,12 +23,23 @@ pub struct RunMonitorSnapshot {
     pub sessions: Vec<SessionView>,
     /// 每个步骤最近一次 Handoff(含 files/verification/output)。
     pub handoffs: Vec<HandoffRow>,
-    /// 任务的执行租约(路径/提供器/持有状态)。
-    pub leases: Vec<ExecutionLeaseRow>,
+    /// 任务的执行租约(Kernel 投影不含目录路径)。
+    pub leases: Vec<RunLeaseView>,
     /// 待决汇合冲突(持久化行投影;空 = 无冲突)。
     pub pending_conflicts: Vec<String>,
     /// 手工结算输入缓冲(空 = 未输入)。
     pub settle_input: String,
+}
+
+/// 执行租约的 UI 投影:Kernel `ExecutionLeaseSnapshot` 只暴露提供器/
+/// 隔离/状态,目录路径与 metadata 不越过 Core。
+#[derive(Debug, Clone)]
+pub struct RunLeaseView {
+    pub step_id: i64,
+    pub run_id: Option<i64>,
+    pub provider: String,
+    pub isolated: bool,
+    pub status: String,
 }
 
 /// 结构化 output 的显示文本(I12):除 null 外的任意合法 JSON
@@ -50,7 +64,8 @@ impl RunMonitorSnapshot {
         }
     }
 
-    /// 从 Orchestrator 收集完整投影(Store 查询 + 待决冲突)。
+    /// 从 Orchestrator 收集完整投影(回退路径:无 Core Kernel 源的测试
+    /// 回滚模式使用;生产读经 [`Self::collect_via_kernel`])。
     pub fn collect(orch: &Arc<Orchestrator>, task_id: i64) -> RunMonitorSnapshot {
         let steps = orch.store.task_steps(task_id).unwrap_or_default();
         let runs = orch.store.list_runs_of_task(task_id).unwrap_or_default();
@@ -79,7 +94,16 @@ impl RunMonitorSnapshot {
         let leases = orch
             .store
             .list_execution_leases(task_id)
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .into_iter()
+            .map(|row| RunLeaseView {
+                step_id: row.step_id,
+                run_id: row.run_id,
+                provider: row.provider,
+                isolated: row.isolated,
+                status: row.status,
+            })
+            .collect();
         let pending_conflicts = orch.pending_merge_conflicts(task_id);
         RunMonitorSnapshot {
             steps,
@@ -90,6 +114,54 @@ impl RunMonitorSnapshot {
             pending_conflicts,
             settle_input: String::new(),
         }
+    }
+
+    /// 经 Core Kernel 读取一次 Workflow Run 的权威投影(Issue #26)。
+    /// Step/Run/Session 状态、Handoff、冲突与原因等业务事实全部来自
+    /// `WorkflowRunSnapshotData`;Store 只读定位(`*_view_by_handle`)提供
+    /// rowid/时间戳/能力令牌等 UI 接线身份,与 cancel/retry/settle 写路径
+    /// 的 handle 解析同一模式。
+    ///
+    /// - `None`:仅当 Core 未装配或项目未登记(测试回滚模式)→ 调用方回退
+    ///   旧投影;生产 open_project 成功后此分支不可达;
+    /// - `Some(Err(..))`:Core 投影链上的读取/解析失败(生产 fail-visible,
+    ///   不回退)。
+    pub fn collect_via_kernel(
+        app: &crate::app_ctx::AppCtx,
+        root: &Path,
+        task_id: i64,
+    ) -> Option<Result<RunMonitorSnapshot, String>> {
+        let orch = app.orchestrator_of(root)?;
+        // Core 可用性先于一切数据读取:None 只表示回滚模式,生产不会
+        // 因数据问题(Store 错误/handle 损坏)悄悄降级到旧 Store 投影。
+        if !app.workflow_run_projection_ready(root) {
+            return None;
+        }
+        let task = match orch.store.task_view(task_id) {
+            Ok(Some(task)) => task,
+            // 任务不存在:新旧投影一致为空,回退由调用方兜底
+            Ok(None) => return None,
+            Err(error) => return Some(Err(format!("Store 只读定位失败:{error}"))),
+        };
+        let handle = match mf_kernel::handles::WorkflowRunHandle::parse(task.public_handle.clone())
+        {
+            Ok(handle) => handle,
+            Err(error) => return Some(Err(format!("Workflow Run handle 损坏:{error}"))),
+        };
+        let envelope = match app.workflow_run_snapshot_via_kernel(root, &handle) {
+            // 可用性已验证;此处 None 只可能是关闭竞态,按回退处理
+            None => return None,
+            Some(result) => result,
+        }
+        .map_err(|error| format!("{error}"));
+        let data = match envelope {
+            Ok(envelope) => match envelope.data {
+                mf_kernel::projection::SnapshotData::WorkflowRun(data) => data,
+                _ => return Some(Err("Core 返回了错误的 Snapshot 类型".into())),
+            },
+            Err(error) => return Some(Err(error)),
+        };
+        Some(join_kernel_snapshot(&orch, task_id, data).map_err(|error| format!("{error:#}")))
     }
 
     /// 每个步骤的最新 run 详情(按 step_key;附 Session/Handoff/租约投影)。
@@ -131,9 +203,12 @@ impl RunMonitorSnapshot {
                         .rev()
                         .find(|l| l.run_id == Some(run.id) || l.step_id == step.id)
                     {
+                        // Kernel 租约投影不含目录路径(不越过 Core)
                         extras.lease = Some(format!(
-                            "{} {} [{}]",
-                            lease.provider, lease.path, lease.status
+                            "{} [{}]{}",
+                            lease.provider,
+                            lease.status,
+                            if lease.isolated { " · 隔离" } else { "" }
                         ));
                     }
                 }
@@ -166,6 +241,180 @@ impl RunMonitorSnapshot {
             .find(|session| session.id == session_id)?;
         Some((session_id, run.id, session.runtime == "http"))
     }
+}
+
+/// Kernel Workflow Run 快照 → RunMonitorSnapshot(自由函数)。
+/// 业务事实(状态/标题/未读/Handoff/冲突/租约状态)取自 Kernel;
+/// rowid/时间戳/能力令牌等 Kernel 未投影的接线字段由 Store 只读定位补齐。
+fn join_kernel_snapshot(
+    orch: &Arc<Orchestrator>,
+    task_id: i64,
+    data: mf_kernel::projection::WorkflowRunSnapshotData,
+) -> anyhow::Result<RunMonitorSnapshot> {
+    use mf_agent::model::{AgentState, RunStatus, SessionStatus, StepStatus};
+    use mf_kernel::handles::{AgentRunHandle, AgentSessionHandle, StepHandle};
+
+    // Store 只读定位:handle → 身份行(时间戳/rowid/能力令牌)
+    let mut steps_by_handle: HashMap<String, StepView> = orch
+        .store
+        .task_steps(task_id)?
+        .into_iter()
+        .map(|step| (step.public_handle.clone(), step))
+        .collect();
+    // Agent Run 可能引用旧 Revision 的历史 Step:补齐身份行
+    for run in &data.agent_runs {
+        if !steps_by_handle.contains_key(run.step.as_str()) {
+            if let Some(view) = orch
+                .store
+                .step_view_by_handle(run.step.as_str())
+                .ok()
+                .flatten()
+            {
+                steps_by_handle.insert(view.public_handle.clone(), view);
+            }
+        }
+    }
+    let runs_by_handle: HashMap<String, RunView> = orch
+        .store
+        .list_runs_of_task(task_id)?
+        .into_iter()
+        .map(|run| (run.public_handle.clone(), run))
+        .collect();
+    let sessions_by_handle: HashMap<String, SessionView> = orch
+        .store
+        .list_sessions()?
+        .into_iter()
+        .map(|session| (session.public_handle.clone(), session))
+        .collect();
+    let step_id_of = |handle: &StepHandle| steps_by_handle.get(handle.as_str()).map(|s| s.id);
+    let run_id_of = |handle: &AgentRunHandle| runs_by_handle.get(handle.as_str()).map(|r| r.id);
+    let session_id_of =
+        |handle: &AgentSessionHandle| sessions_by_handle.get(handle.as_str()).map(|s| s.id);
+
+    let steps = data
+        .steps
+        .iter()
+        .map(|snapshot| {
+            let identity = steps_by_handle.get(snapshot.step.as_str());
+            StepView {
+                id: identity.map(|s| s.id).unwrap_or(0),
+                public_handle: snapshot.step.as_str().to_owned(),
+                revision: i64::try_from(snapshot.revision.revision).unwrap_or(0),
+                revision_id: identity.map(|s| s.revision_id).unwrap_or(0),
+                task_id,
+                step_key: snapshot.key.clone(),
+                title: snapshot.title.clone(),
+                instructions: snapshot.instructions.clone(),
+                agent_profile: snapshot.agent_instance_ref.clone(),
+                session_policy: snapshot.session_policy.clone(),
+                status: StepStatus::parse(&snapshot.status)
+                    .or(identity.map(|s| s.status))
+                    .unwrap_or(StepStatus::Pending),
+                attempts: snapshot.attempts,
+                auto_retry: snapshot.auto_retry,
+                result: snapshot.result.clone(),
+                started_at: identity.and_then(|s| s.started_at.clone()),
+                ended_at: identity.and_then(|s| s.ended_at.clone()),
+                deps: snapshot
+                    .dependencies
+                    .iter()
+                    .filter_map(step_id_of)
+                    .collect(),
+            }
+        })
+        .collect();
+    let runs = data
+        .agent_runs
+        .iter()
+        .map(|snapshot| {
+            let identity = runs_by_handle.get(snapshot.agent_run.as_str());
+            RunView {
+                id: identity.map(|r| r.id).unwrap_or(0),
+                public_handle: snapshot.agent_run.as_str().to_owned(),
+                revision: i64::try_from(snapshot.revision.revision).unwrap_or(0),
+                task_id,
+                step_id: step_id_of(&snapshot.step).unwrap_or(0),
+                revision_id: identity.map(|r| r.revision_id).unwrap_or(0),
+                session_id: snapshot.agent_session.as_ref().and_then(session_id_of),
+                status: RunStatus::parse(&snapshot.status)
+                    .or(identity.map(|r| r.status))
+                    .unwrap_or(RunStatus::Running),
+                agent_state: AgentState::parse(&snapshot.agent_state)
+                    .or(identity.map(|r| r.agent_state))
+                    .unwrap_or(AgentState::Idle),
+                // UI 投影不持有认证材料；所有动作经 opaque handles +
+                // Core command 路由，capability token 只存在于 Runtime env。
+                capability_token: String::new(),
+                outcome: snapshot.outcome.clone(),
+                outcome_payload: snapshot.outcome_payload.clone(),
+                started_at: identity.map(|r| r.started_at.clone()).unwrap_or_default(),
+                ended_at: identity.and_then(|r| r.ended_at.clone()),
+            }
+        })
+        .collect();
+    let sessions = data
+        .agent_sessions
+        .iter()
+        .map(|snapshot| {
+            let identity = sessions_by_handle.get(snapshot.agent_session.as_str());
+            SessionView {
+                id: identity.map(|s| s.id).unwrap_or(0),
+                public_handle: snapshot.agent_session.as_str().to_owned(),
+                revision: i64::try_from(snapshot.revision.revision).unwrap_or(0),
+                session_key: identity.and_then(|s| s.session_key.clone()),
+                runtime: snapshot.runtime.clone(),
+                agent_profile: identity
+                    .map(|s| s.agent_profile.clone())
+                    .unwrap_or_default(),
+                title: snapshot.title.clone(),
+                status: SessionStatus::parse(&snapshot.status)
+                    .or(identity.map(|s| s.status))
+                    .unwrap_or(SessionStatus::Idle),
+                last_instruction: identity.and_then(|s| s.last_instruction.clone()),
+                last_reply: identity.and_then(|s| s.last_reply.clone()),
+                unread: snapshot.unread,
+                created_at: identity.map(|s| s.created_at.clone()).unwrap_or_default(),
+                updated_at: identity.map(|s| s.updated_at.clone()).unwrap_or_default(),
+            }
+        })
+        .collect();
+    let handoffs = data
+        .handoffs
+        .iter()
+        .enumerate()
+        .map(|(index, snapshot)| HandoffRow {
+            // Kernel Handoff 投影不含行号;展示只按 step/run 归属使用
+            id: i64::try_from(index + 1).unwrap_or(0),
+            step_id: snapshot.step.as_ref().and_then(step_id_of),
+            run_id: snapshot.agent_run.as_ref().and_then(run_id_of),
+            handoff: snapshot.handoff.clone(),
+        })
+        .collect();
+    let leases = data
+        .execution_leases
+        .iter()
+        .map(|lease| RunLeaseView {
+            step_id: step_id_of(&lease.step).unwrap_or(0),
+            run_id: lease.agent_run.as_ref().and_then(run_id_of),
+            provider: lease.provider.clone(),
+            isolated: lease.isolated,
+            status: lease.status.clone(),
+        })
+        .collect();
+    let pending_conflicts = data
+        .pending_merges
+        .iter()
+        .flat_map(|pending| pending.conflicts.iter().cloned())
+        .collect();
+    Ok(RunMonitorSnapshot {
+        steps,
+        runs,
+        sessions,
+        handoffs,
+        leases,
+        pending_conflicts,
+        settle_input: String::new(),
+    })
 }
 
 fn placeholder_run() -> RunView {
@@ -208,48 +457,63 @@ pub fn requires_confirmation(action: &RunAction) -> bool {
 pub fn confirmation_prompt(action: &RunAction) -> String {
     match action {
         RunAction::Skip => "确认跳过该节点?跳过后本步骤不再执行,产出被放弃。".into(),
-        RunAction::Cancel => "确认取消该运行?将终止 Agent 进程并释放执行租约(不可恢复)。".into(),
+        RunAction::Cancel => {
+            "确认取消整个 Workflow Run?将终止全部活动 Agent 并释放执行租约(不可恢复)。".into()
+        }
         _ => "确认执行该操作?".into(),
     }
 }
 
-/// 执行动作(接线 Orchestrator;返回用户可见结果)。
-pub fn execute_action(
-    orch: &Arc<mf_agent::Orchestrator>,
+/// 经 CoreKernel 取消 Workflow Run,对 `RevisionConflict` 做有界重读重试。
+///
+/// 已知窗口:cancel 的 prepare 阶段会停止进程(mf-agent
+/// `prepare_cancel_runs`)→ RuntimeEvent::Exit → `enter_awaiting_outcome`
+/// 可能在命令 L-CMD 复验之前推进 run revision,使首次 CAS 失败。取消的
+/// 用户语义是收敛到 Cancelled,按乐观并发惯例重读快照重试;根因
+/// (client 在 prepare 之后未随命令重读 expected)在 mf-kernel facade,
+/// 已登记为跨任务 blocker,不在 UI 层修复。重试不放大冲突:最多 3 次,
+/// 非 CAS 错误原样上抛。
+pub(crate) fn cancel_workflow_run_via_kernel_retrying_conflicts(
+    app: &crate::app_ctx::AppCtx,
+    project: &Path,
+    task_id: i64,
+) -> Result<String, String> {
+    const MAX_ATTEMPTS: usize = 3;
+    let mut conflict: Option<String> = None;
+    for _ in 0..MAX_ATTEMPTS {
+        match app.cancel_workflow_run_via_kernel(project, task_id) {
+            Ok(_) => return Ok("已取消 Workflow Run".to_string()),
+            Err(mf_kernel::kernel::KernelProblem::RevisionConflict) => {
+                conflict = Some("revision_conflict".to_string());
+            }
+            Err(error) => return Err(format!("{error:#}")),
+        }
+    }
+    Err(format!(
+        "取消与并发状态变更冲突(重试 {MAX_ATTEMPTS} 次后仍失败):{}",
+        conflict.expect("RevisionConflict 分支必已记录")
+    ))
+}
+
+fn execute_action_via_kernel(
+    app: &crate::app_ctx::AppCtx,
+    project: &std::path::Path,
+    task_id: i64,
     details: &RunNodeDetails,
     action: &RunAction,
     settle_text: &str,
 ) -> Result<String, String> {
     match action {
-        RunAction::Continue => {
-            let text = if settle_text.trim().is_empty() {
-                "请继续"
-            } else {
-                settle_text
-            };
-            orch.send_prompt(details.run_id, text)
-                .map_err(|e| format!("{e:#}"))?;
-            Ok("已发送提示".into())
-        }
-        RunAction::FreshRetry => orch
-            .retry_step(
-                latest_step_id(orch, details),
+        RunAction::FreshRetry => app
+            .retry_workflow_step_via_kernel(
+                project,
+                details.step_id,
                 mf_agent::RetryMode::FreshSession,
             )
             .map(|_| "已用新会话重试".to_string())
-            .map_err(|e| format!("{e:#}")),
-        RunAction::Skip => orch
-            .skip_step(latest_step_id(orch, details), true)
-            .map(|_| "已跳过".to_string())
-            .map_err(|e| format!("{e:#}")),
+            .map_err(|error| format!("{error:#}")),
         RunAction::Cancel => {
-            if details.run_id == 0 {
-                return Ok("尚未派发,无需取消".into());
-            }
-            // 完整动作:终止进程 + cancelled 结算 + 释放并发槽/租约
-            orch.cancel_run(details.run_id)
-                .map(|_| "已取消(进程终止,租约释放)".to_string())
-                .map_err(|e| format!("{e:#}"))
+            cancel_workflow_run_via_kernel_retrying_conflicts(app, project, task_id)
         }
         RunAction::ManualSettle | RunAction::Settle(_) => {
             let settlement = if settle_text.trim().eq_ignore_ascii_case("fail")
@@ -268,35 +532,24 @@ pub fn execute_action(
                     output: Default::default(),
                 }
             };
-            use mf_agent::orchestrator::Orchestrator;
-            Orchestrator::settle_run(orch, details.run_id, settlement)
+            app.settle_agent_run_via_kernel(project, details.run_id, settlement)
                 .map(|_| "已提交结算".to_string())
-                .map_err(|e| format!("{e:#}"))
+                .map_err(|error| format!("{error:#}"))
         }
+        RunAction::Continue => app
+            .retry_workflow_step_via_kernel(
+                project,
+                details.step_id,
+                mf_agent::RetryMode::ContinueSession,
+            )
+            .map(|_| "已通过 Core 继续会话".to_string())
+            .map_err(|error| format!("{error:#}")),
+        RunAction::Skip => app
+            .skip_workflow_step_via_kernel(project, details.step_id)
+            .map(|_| "已跳过".to_string())
+            .map_err(|error| format!("{error:#}")),
         RunAction::Observe => Ok("继续观察(未知状态不是失败)".into()),
     }
-}
-
-fn latest_step_id(orch: &Arc<mf_agent::Orchestrator>, details: &RunNodeDetails) -> i64 {
-    orch.store
-        .task_steps(details_task(orch, details))
-        .ok()
-        .and_then(|steps| {
-            steps
-                .iter()
-                .find(|s| s.step_key == details.step_key)
-                .map(|s| s.id)
-        })
-        .unwrap_or(0)
-}
-
-fn details_task(orch: &Arc<mf_agent::Orchestrator>, details: &RunNodeDetails) -> i64 {
-    orch.store
-        .run_view(details.run_id)
-        .ok()
-        .flatten()
-        .map(|r| r.task_id)
-        .unwrap_or(0)
 }
 
 // ---------- GPUI 视图(真实 Entity,挂载于 AgentWorkspace) ----------
@@ -318,8 +571,9 @@ pub enum RunMonitorEvent {
 impl EventEmitter<RunMonitorEvent> for RunMonitor {}
 
 /// Run Monitor 页:当前任务的 DAG 运行监控。
-/// 动作全部经完整 Orchestrator(继续/重试/跳过/结算/取消);
-/// 取消会终止进程并释放执行租约。
+/// 读:Workflow Run 业务事实经 Core Kernel Snapshot;写:Run 生命周期
+/// (cancel/retry/settle)经 CoreKernel,终端提示/Skip 仍走 Orchestrator
+/// 的既有内部动作(后续独立命令族迁移)。
 pub struct RunMonitor {
     pub app: Arc<crate::app_ctx::AppCtx>,
     task: Option<(PathBuf, i64)>,
@@ -401,12 +655,32 @@ impl RunMonitor {
             self.snapshot = RunMonitorSnapshot::from_parts(Vec::new(), Vec::new());
             return;
         };
-        let Some(orch) = self.app.orchestrator_of(&root) else {
-            return;
-        };
-        // 完整投影:Session/Handoff/租约/待决冲突(冲突面板 + 节点富显示)
         let input = std::mem::take(&mut self.input);
-        self.snapshot = RunMonitorSnapshot::collect(&orch, task_id);
+        // 完整投影 kernel-first:Core Snapshot 是唯一业务事实源;
+        // None = Core 未装配；测试可保留旧投影做回归对照，生产必须
+        // fail-visible，不能静默回退成第二事实源。
+        self.snapshot = match RunMonitorSnapshot::collect_via_kernel(&self.app, &root, task_id) {
+            Some(Ok(snapshot)) => snapshot,
+            Some(Err(error)) => {
+                log::error!("Core Workflow Run 快照读取失败: {error}");
+                self.status = format!("Core 快照读取失败:{error}");
+                RunMonitorSnapshot::from_parts(Vec::new(), Vec::new())
+            }
+            None => {
+                #[cfg(test)]
+                {
+                    match self.app.orchestrator_of(&root) {
+                        Some(orch) => RunMonitorSnapshot::collect(&orch, task_id),
+                        None => RunMonitorSnapshot::from_parts(Vec::new(), Vec::new()),
+                    }
+                }
+                #[cfg(not(test))]
+                {
+                    self.status = "Core Workflow Run 快照不可用".into();
+                    RunMonitorSnapshot::from_parts(Vec::new(), Vec::new())
+                }
+            }
+        };
         self.input = input;
     }
 
@@ -468,14 +742,26 @@ impl RunMonitor {
             Some(d) => d.clone(),
             None => return,
         };
-        let result = match self.orchestrator() {
-            Some(orch) => execute_action(&orch, &details, &action, &self.input.clone()),
+        let result = match self.task.as_ref() {
+            Some((project, task_id)) => execute_action_via_kernel(
+                &self.app,
+                project,
+                *task_id,
+                &details,
+                &action,
+                &self.input.clone(),
+            ),
             None => Err("项目未打开".into()),
         };
         match result {
             Ok(msg) => self.status = msg,
             Err(e) => self.status = e,
         }
+        // CoreKernel 写路径不产生 Orchestrator 调度事件(Store 写在 L-CMD
+        // 事务内,不经 events_rx):主动 nudge 统一快照重建,运行列表/
+        // 徽标不等待下一个无关事件才更新。失败也 nudge——prepare 阶段的
+        // 进程停止可能已改变事实。
+        self.app.overview.request_refresh();
         self.refresh();
         cx.notify();
     }

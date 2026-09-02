@@ -40,6 +40,7 @@ pub enum CommandType {
     WorkflowRun,
     WorkflowRunCancel,
     WorkflowRetryStep,
+    WorkflowSkipStep,
     WorkflowRespond,
     WorkflowSettle,
     PreviewSessionStart,
@@ -75,6 +76,7 @@ impl CommandType {
             Self::WorkflowRun => "workflow.run",
             Self::WorkflowRunCancel => "workflow.run_cancel",
             Self::WorkflowRetryStep => "workflow.retry_step",
+            Self::WorkflowSkipStep => "workflow.skip_step",
             Self::WorkflowRespond => "workflow.respond",
             Self::WorkflowSettle => "workflow.settle",
             Self::PreviewSessionStart => "preview_session.start",
@@ -294,6 +296,9 @@ impl CommandEnvelope {
     }
 }
 
+/// 跨重启稳定的 service 身份密钥(intent digest HMAC)。Clone 只在进程内
+/// 装配点使用,密钥本身不落盘、不进日志。
+#[derive(Clone)]
 pub struct ServiceIdempotencyKey(Zeroizing<Vec<u8>>);
 
 impl ServiceIdempotencyKey {
@@ -364,6 +369,9 @@ pub(crate) struct ProjectionEffect {
     pub(crate) event_type: Option<String>,
     pub(crate) projection_critical: bool,
     pub(crate) payload: Value,
+    /// 私有 durable action envelope；不进入 mf.event.v1。Kernel 在
+    /// post-commit 投递全部成功后从 event_json 中移除该字段。
+    pub(crate) run_actions: Vec<mf_agent::RunAction>,
 }
 
 impl ProjectionEffect {
@@ -373,6 +381,7 @@ impl ProjectionEffect {
             event_type: None,
             projection_critical: true,
             payload,
+            run_actions: Vec::new(),
         }
     }
 }
@@ -595,6 +604,38 @@ impl CommandCoordinator {
         }
     }
 
+    /// prepare 之前的 receipt probe。只在当前 Controller lease 有效且
+    /// target receipt 与 canonical digest/聚合完全匹配时返回 replay。
+    /// 不检查 expected：已线性化命令的 pre-revision 必然已过期。
+    pub(crate) fn replay_if_applied(
+        &self,
+        envelope: &CommandEnvelope,
+        target: &TargetDatabase,
+        authorizer: &dyn CommandAuthorizer,
+    ) -> Result<Option<CommandOutcome>, CommandProblem> {
+        let digest = envelope.semantic_digest(&self.idempotency_key)?;
+        target.with_tx(|tx| {
+            let _permit = authorizer.acquire(tx, &envelope.lease_check())?;
+            receipt_outcome(tx, envelope, &digest)
+        })
+    }
+
+    /// 与 [`replay_if_applied`] 相同，但 digest 由封闭的上层命令族给出。
+    /// RunControl 使用独立的 `mf.run-control.v1` 语义域；调用方仍不能
+    /// 绕过 target transaction 内的 capability 复验。
+    pub(crate) fn replay_if_applied_with_digest(
+        &self,
+        envelope: &CommandEnvelope,
+        digest: &str,
+        target: &TargetDatabase,
+        authorizer: &dyn CommandAuthorizer,
+    ) -> Result<Option<CommandOutcome>, CommandProblem> {
+        target.with_tx(|tx| {
+            let _permit = authorizer.acquire(tx, &envelope.lease_check())?;
+            receipt_outcome(tx, envelope, digest)
+        })
+    }
+
     /// Integration contract seam; production release 不暴露任意 effect。
     #[cfg(test)]
     pub(crate) fn dispatch_contract<F>(
@@ -657,6 +698,36 @@ impl CommandCoordinator {
         F: FnOnce(&Transaction<'_>) -> Result<EffectOutput, CommandProblem>,
         H: FnOnce(),
     {
+        let digest = envelope.semantic_digest(&self.idempotency_key)?;
+        self.dispatch_internal_with_digest(
+            envelope,
+            &digest,
+            target,
+            authorizer,
+            effect,
+            fault,
+            after_reserve,
+        )
+    }
+
+    /// 封闭命令族可提供自己的稳定 semantic digest，同时继续复用唯一的
+    /// command_intent / target receipt / outbox 协调器。digest 不得包含
+    /// Secret；这一约束由调用它的封闭命令实现与契约测试共同冻结。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_internal_with_digest<F, H>(
+        &self,
+        envelope: &CommandEnvelope,
+        digest: &str,
+        target: &TargetDatabase,
+        authorizer: &dyn CommandAuthorizer,
+        effect: F,
+        fault: Option<FaultPoint>,
+        after_reserve: H,
+    ) -> Result<CommandOutcome, CommandProblem>
+    where
+        F: FnOnce(&Transaction<'_>) -> Result<EffectOutput, CommandProblem>,
+        H: FnOnce(),
+    {
         // 覆盖 reserve intent 提交到第二个 service coordinator transaction
         // 的全部窗口；同一 Store 的 startup reconcile 必须走同一 gate。
         let _command_gate = self.service.command_gate();
@@ -665,8 +736,7 @@ impl CommandCoordinator {
         {
             return Err(CommandProblem::TargetStoreMismatch);
         }
-        let digest = envelope.semantic_digest(&self.idempotency_key)?;
-        let reservation = match self.reserve_intent(envelope, &digest) {
+        let reservation = match self.reserve_intent(envelope, digest) {
             Ok(state) => state,
             Err(CommandProblem::CommandIdReused) => {
                 // 不能让异 digest/target 成为绕过当前 lease 的探测旁路。
@@ -716,7 +786,7 @@ impl CommandCoordinator {
                 let target_result = target.with_tx(|tx| {
                     // 安全 lease/capability 先于 replay；CAS 只约束新 effect。
                     let permit = authorizer.acquire(tx, &envelope.lease_check())?;
-                    if let Some(outcome) = receipt_outcome(tx, envelope, &digest)? {
+                    if let Some(outcome) = receipt_outcome(tx, envelope, digest)? {
                         return Ok((outcome, permit));
                     }
                     if guard_state == IntentState::Applied {
@@ -766,7 +836,7 @@ impl CommandCoordinator {
                         let event_type = projection
                             .event_type
                             .unwrap_or_else(|| envelope.command_type.as_str().to_string());
-                        let event = canonical_json(&serde_json::json!({
+                        let mut event = serde_json::json!({
                             "type": format!("{event_type}.applied"),
                             "aggregate": {
                                 "kind": aggregate.kind.as_str(),
@@ -775,7 +845,17 @@ impl CommandCoordinator {
                             "caused_by_command_id": envelope.command_id.as_str(),
                             "projection_critical": projection.projection_critical,
                             "projection": projection.payload,
-                        }))?;
+                        });
+                        if !projection.run_actions.is_empty() {
+                            event.as_object_mut().expect("event is object").insert(
+                                "run_actions".into(),
+                                serde_json::json!({
+                                    "schema": crate::run_lifecycle::DURABLE_RUN_ACTIONS_SCHEMA,
+                                    "actions": projection.run_actions,
+                                }),
+                            );
+                        }
+                        let event = canonical_json(&event)?;
                         tx.execute(
                             "INSERT INTO projection_outbox(event_json, published_at)
                              VALUES (?1, NULL)",
@@ -1184,7 +1264,7 @@ pub(crate) fn value_has_sensitive_field(value: &Value) -> bool {
     }
 }
 
-fn is_sensitive_key(key: &str) -> bool {
+pub(crate) fn is_sensitive_key(key: &str) -> bool {
     // 与 worker protocol redaction 的分隔符归一口径一致；token 用精确/
     // 后缀规则，避免误伤合法 `max_tokens` / `token_count`。
     let key = key.to_lowercase().replace(['-', ' ', '.'], "_");

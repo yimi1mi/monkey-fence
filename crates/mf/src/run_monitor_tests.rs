@@ -28,6 +28,8 @@ fn run(status: RunStatus, outcome: Option<&str>) -> RunView {
 fn step(status: StepStatus) -> StepView {
     StepView {
         id: 1,
+        public_handle: "step-1".into(),
+        revision: 1,
         revision_id: 1,
         task_id: 1,
         step_key: "build".into(),
@@ -58,10 +60,10 @@ fn unknown_run_offers_observe_settle_or_retry_but_not_success_badge() {
 }
 
 #[test]
-fn running_offers_continue_and_cancel_only() {
+fn running_offers_cancel_but_not_retry_continue() {
     let model = RunNodeDetails::from((&run(RunStatus::Running, None), &step(StepStatus::Running)));
-    assert!(model.actions.contains(&RunAction::Continue));
     assert!(model.actions.contains(&RunAction::Cancel));
+    assert!(!model.actions.contains(&RunAction::Continue));
     assert!(!model.actions.contains(&RunAction::Skip));
     assert!(!model.actions.contains(&RunAction::FreshRetry));
 }
@@ -131,9 +133,111 @@ fn settlement_actions_carry_labels() {
 
 // ---------- 复审阻塞项 8:取消动作 = 终止进程 + 释放租约 ----------
 
+/// 测试助手:直接经 Orchestrator 执行动作(验证完整链;生产 UI 走
+/// `execute_action_via_kernel` 的 CoreKernel 写路径,本函数不进生产文件,
+/// 保证静态审计「UI 文件不得直接调用 Workflow Run mutation」成立)。
+fn execute_action(
+    orch: &std::sync::Arc<mf_agent::Orchestrator>,
+    details: &RunNodeDetails,
+    action: &RunAction,
+    settle_text: &str,
+) -> Result<String, String> {
+    match action {
+        RunAction::Continue => {
+            let text = if settle_text.trim().is_empty() {
+                "请继续"
+            } else {
+                settle_text
+            };
+            orch.send_prompt(details.run_id, text)
+                .map_err(|e| format!("{e:#}"))?;
+            Ok("已发送提示".into())
+        }
+        RunAction::FreshRetry => {
+            let step_id = latest_step_id(orch, details);
+            let result = orch.store.with_tx(|tx| {
+                mf_agent::store::Store::apply_run_mutation_tx(
+                    tx,
+                    mf_agent::run_mutation::RunMutation::Retry {
+                        step_id,
+                        mode: mf_agent::RetryMode::FreshSession,
+                        continue_session_id: None,
+                    },
+                )
+            });
+            match result {
+                Ok(result) => {
+                    for action in result.actions {
+                        orch.execute_durable_run_action(&action)
+                            .map_err(|e| format!("{e:#}"))?;
+                    }
+                    Ok("已用新会话重试".to_string())
+                }
+                Err(error) => Err(format!("{error:#}")),
+            }
+        }
+        RunAction::Skip => orch
+            .skip_step(latest_step_id(orch, details), true)
+            .map(|_| "已跳过".to_string())
+            .map_err(|e| format!("{e:#}")),
+        RunAction::Cancel => {
+            if details.run_id == 0 {
+                return Ok("尚未派发,无需取消".into());
+            }
+            // 完整动作:终止进程 + cancelled 结算 + 释放并发槽/租约
+            orch.cancel_run(details.run_id)
+                .map(|_| "已取消(进程终止,租约释放)".to_string())
+                .map_err(|e| format!("{e:#}"))
+        }
+        RunAction::ManualSettle | RunAction::Settle(_) => {
+            let settlement = if settle_text.trim().eq_ignore_ascii_case("fail")
+                || settle_text.starts_with("失败:")
+            {
+                Settlement::Fail {
+                    reason: settle_text.trim_start_matches("失败:").to_string(),
+                }
+            } else {
+                Settlement::Complete {
+                    summary: if settle_text.trim().is_empty() {
+                        "人工确认完成".into()
+                    } else {
+                        settle_text.to_string()
+                    },
+                    output: Default::default(),
+                }
+            };
+            mf_agent::Orchestrator::settle_run(orch, details.run_id, settlement)
+                .map(|_| "已提交结算".to_string())
+                .map_err(|e| format!("{e:#}"))
+        }
+        RunAction::Observe => Ok("继续观察(未知状态不是失败)".into()),
+    }
+}
+
+fn latest_step_id(orch: &std::sync::Arc<mf_agent::Orchestrator>, details: &RunNodeDetails) -> i64 {
+    orch.store
+        .task_steps(details_task(orch, details))
+        .ok()
+        .and_then(|steps| {
+            steps
+                .iter()
+                .find(|s| s.step_key == details.step_key)
+                .map(|s| s.id)
+        })
+        .unwrap_or(0)
+}
+
+fn details_task(orch: &std::sync::Arc<mf_agent::Orchestrator>, details: &RunNodeDetails) -> i64 {
+    orch.store
+        .run_view(details.run_id)
+        .ok()
+        .flatten()
+        .map(|r| r.task_id)
+        .unwrap_or(0)
+}
+
 #[test]
 fn cancel_action_stops_process_and_releases_lease() {
-    use crate::run_monitor::execute_action;
     use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
     use mf_agent::runtime::{AdHocLaunchSpec, LaunchSpec, RuntimeEvent, RuntimeHost};
     use parking_lot::{Mutex, RwLock};
@@ -254,113 +358,65 @@ fn cancel_action_stops_process_and_releases_lease() {
 }
 
 // ---------- 复审阻塞项 12:Run Monitor 富显示 + 待决冲突可恢复 ----------
+// Issue #26:富显示事实经 Core Kernel WorkflowRunSnapshot(Store 只读定位
+// 提供 rowid 等接线身份)。
 
 #[test]
 fn snapshot_collects_sessions_handoffs_leases_and_conflicts() {
     use crate::run_monitor::RunMonitorSnapshot;
-    use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
-    use mf_agent::runtime::{AdHocLaunchSpec, LaunchSpec, RuntimeEvent, RuntimeHost};
-    use parking_lot::RwLock;
 
-    struct NoopHost;
-    impl RuntimeHost for NoopHost {
-        fn launch_workflow(
-            &self,
-            _spec: mf_agent::runtime::WorkflowLaunchSpec,
-            _events: crossbeam_channel::Sender<(i64, RuntimeEvent)>,
-        ) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn launch(
-            &self,
-            _spec: LaunchSpec,
-            _events: crossbeam_channel::Sender<(i64, RuntimeEvent)>,
-        ) {
-        }
-        fn launch_ad_hoc(&self, _spec: AdHocLaunchSpec) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn send_prompt(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn stop_run(&self, _: &str) -> anyhow::Result<()> {
-            Ok(())
-        }
-        fn kill_session(&self, _: &str) {}
-        fn kill_ad_hoc(&self, _: &str) {}
-        fn answer_question(&self, _: &str, _: &str) {}
-    }
-
-    let dir = tempfile::tempdir().unwrap();
-    let store = mf_agent::Store::open(&dir.path().join("rich.db")).unwrap();
-    let mut index = mf_agent::pipeline::ProfileIndex::default();
-    index.entries.insert(
-        "mock".into(),
-        mf_agent::pipeline::ProfileAvailability {
-            installed: true,
-            enabled: true,
-            detected: true,
-        },
-    );
-    let mut specs = std::collections::HashMap::new();
-    specs.insert(
-        "mock".to_string(),
-        mf_agent::AgentProfileSpec {
-            id: "mock".into(),
-            display_name: "Mock".into(),
-            runtime: mf_agent::RuntimeKind::Http,
-            command: String::new(),
-            args: vec![],
-            env: vec![],
-            permission_args: vec![],
-            provider: None,
-            icon: None,
-            homepage: None,
-            hook: None,
-        },
-    );
-    let orch = Orchestrator::start(
-        store,
-        dir.path().to_path_buf(),
-        mf_agent::Config::default(),
-        std::sync::Arc::new(NoopHost),
-        std::sync::Arc::new(RwLock::new(ProfileCatalog { index, specs })),
-        GlobalLimiter::new(4),
-        "pipe".into(),
-        std::sync::Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx =
+        crate::app_ctx::AppCtx::with_catalog_for_tests(mf_agent::CatalogStore::memory().unwrap());
+    let service =
+        mf_kernel::project_registry::ServiceStore::open(&tmp.path().join("service-v1.db")).unwrap();
+    let (runtime, client) = mf_kernel::kernel::InProcessKernelRuntime::for_test(
+        service,
+        mf_kernel::command::ServiceIdempotencyKey::for_test(vec![0x62; 32]).unwrap(),
+        mf_kernel::handles::ClientId::parse("run-monitor-snapshot-client").unwrap(),
+        mf_kernel::handles::Principal::parse("run-monitor-snapshot-user").unwrap(),
     )
     .unwrap();
-    let task = orch.create_task("富显示", "g").unwrap();
+    ctx.install_kernel_tracer_for_tests(runtime, client);
+    let dir = tmp.path().join("project");
+    std::fs::create_dir_all(&dir).unwrap();
+    let orch = ctx.open_project(dir.clone()).unwrap();
+    let task = orch.store.create_task("富显示", "g").unwrap();
 
     // 造数据:步骤 + run(带会话)+ 租约 + Handoff + 待决冲突
     let step = {
-        orch.save_pipeline(
-            task.id,
-            &mf_agent::PipelineDraft {
-                steps: vec![mf_agent::StepDraft {
-                    key: "build".into(),
-                    title: "构建".into(),
-                    instructions: String::new(),
-                    agent_profile: "mock".into(),
-                    session_policy: mf_agent::SessionPolicy::Fresh,
-                    deps: vec![],
-                }],
-            },
-        )
-        .unwrap();
+        orch.store
+            .create_draft_revision(
+                task.id,
+                &mf_agent::PipelineDraft {
+                    steps: vec![mf_agent::StepDraft {
+                        key: "build".into(),
+                        title: "构建".into(),
+                        instructions: String::new(),
+                        agent_profile: "mock".into(),
+                        session_policy: mf_agent::SessionPolicy::Fresh,
+                        deps: vec![],
+                    }],
+                },
+            )
+            .unwrap();
+        orch.store.activate_revision(task.id).unwrap();
         orch.store.task_steps(task.id).unwrap().remove(0)
     };
     let session = orch
         .store
         .create_session(None, "pty", "mock", "构建")
         .unwrap();
+    orch.store
+        .set_step_status(step.id, mf_agent::StepStatus::Ready)
+        .unwrap();
     let run = orch
         .store
         .dispatch_run(task.id, step.id, step.revision_id, session.id)
         .unwrap();
     let lease = mf_agent::execution_directory::ExecutionLease {
-        id: "lease-1".into(),
-        path: dir.path().join("wt"),
+        id: format!("project-{}-{}", task.id, step.id),
+        path: dir.join("wt"),
         isolated: false,
         provider: "project-dir".into(),
         metadata: serde_json::json!({ "step_key": "build", "task_id": task.id }),
@@ -410,8 +466,10 @@ fn snapshot_collects_sessions_handoffs_leases_and_conflicts() {
         )
         .unwrap();
 
-    let snapshot = RunMonitorSnapshot::collect(&orch, task.id);
-    // 待决冲突可见
+    let snapshot = RunMonitorSnapshot::collect_via_kernel(&ctx, &dir, task.id)
+        .expect("Core 已装配,必须走 Kernel 快照")
+        .expect("Kernel 快照读取成功");
+    // 待决冲突可见(Kernel pending_merges 投影)
     assert!(
         snapshot
             .pending_conflicts
@@ -420,18 +478,34 @@ fn snapshot_collects_sessions_handoffs_leases_and_conflicts() {
         "{:?}",
         snapshot.pending_conflicts
     );
-    // 节点富显示:Session / Handoff(摘要+文件+验证)/ 租约 / 日志引用
+    // 节点富显示:Session / Handoff(摘要+文件+验证)/ 租约(无路径)/ 日志引用
     let details = snapshot.node_details();
     assert_eq!(details.len(), 1);
+    assert_eq!(details[0].step_key, "build");
+    assert_eq!(details[0].step_id, step.id, "Store 只读定位接回 rowid");
+    assert_eq!(details[0].run_id, run.id, "Agent Run rowid 接回");
     let extras = &details[0].extras;
     assert!(extras.session_status.is_some(), "Session 状态必须可见");
     assert_eq!(extras.handoff_summary.as_deref(), Some("构建完成"));
     assert_eq!(extras.handoff_files, vec!["src/main.rs".to_string()]);
-    assert!(extras
-        .lease
-        .as_deref()
-        .unwrap_or("")
-        .contains("project-dir"));
+    assert!(
+        extras
+            .lease
+            .as_deref()
+            .unwrap_or("")
+            .contains("project-dir"),
+        "Kernel 租约投影不含目录路径,提供器必须可见: {:?}",
+        extras.lease
+    );
+    assert!(
+        !extras
+            .lease
+            .as_deref()
+            .unwrap_or("")
+            .contains(&dir.join("wt").display().to_string()),
+        "租约行不得回显隔离目录路径(路径/metadata 不越过 Core): {:?}",
+        extras.lease
+    );
     assert!(
         extras
             .log_ref
@@ -457,7 +531,94 @@ fn snapshot_collects_sessions_handoffs_leases_and_conflicts() {
             .is_empty(),
         "解决后持久化行清空"
     );
-    orch.stop();
+    ctx.try_close_project(&dir).unwrap();
+}
+
+/// Core 未装配(测试回滚模式):collect_via_kernel 返回 None,
+/// 调用方回退旧 Store 投影(refresh 行为不变)。
+#[test]
+fn kernel_absent_falls_back_to_legacy_collect() {
+    use crate::run_monitor::RunMonitorSnapshot;
+
+    let ctx =
+        crate::app_ctx::AppCtx::with_catalog_for_tests(mf_agent::CatalogStore::memory().unwrap());
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("project");
+    std::fs::create_dir_all(&dir).unwrap();
+    let orch = ctx.open_project(dir.clone()).unwrap();
+    let task = orch.store.create_task("回退", "g").unwrap();
+    orch.store
+        .create_draft_revision(
+            task.id,
+            &mf_agent::PipelineDraft {
+                steps: vec![mf_agent::StepDraft {
+                    key: "a".into(),
+                    title: "A".into(),
+                    instructions: String::new(),
+                    agent_profile: "mock".into(),
+                    session_policy: mf_agent::SessionPolicy::Fresh,
+                    deps: vec![],
+                }],
+            },
+        )
+        .unwrap();
+    orch.store.activate_revision(task.id).unwrap();
+
+    assert!(
+        RunMonitorSnapshot::collect_via_kernel(&ctx, &dir, task.id).is_none(),
+        "Core 未装配时必须返回 None(调用方回退旧投影)"
+    );
+    let legacy = RunMonitorSnapshot::collect(&orch, task.id);
+    assert_eq!(legacy.steps.len(), 1, "回退路径仍按旧口径收集步骤");
+    ctx.try_close_project(&dir).unwrap();
+}
+
+/// Core 已装配时,身份链失败必须 fail-visible:Workflow Run handle 损坏
+/// 不得静默回退旧 Store 投影(生产回退仅限「Core 未装配/项目未登记」
+/// 的测试回滚模式)。
+#[test]
+fn kernel_ready_with_corrupt_handle_fails_visible() {
+    use crate::run_monitor::RunMonitorSnapshot;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let ctx =
+        crate::app_ctx::AppCtx::with_catalog_for_tests(mf_agent::CatalogStore::memory().unwrap());
+    let service =
+        mf_kernel::project_registry::ServiceStore::open(&tmp.path().join("service-v1.db")).unwrap();
+    let (runtime, client) = mf_kernel::kernel::InProcessKernelRuntime::for_test(
+        service,
+        mf_kernel::command::ServiceIdempotencyKey::for_test(vec![0x63; 32]).unwrap(),
+        mf_kernel::handles::ClientId::parse("run-monitor-corrupt-client").unwrap(),
+        mf_kernel::handles::Principal::parse("run-monitor-corrupt-user").unwrap(),
+    )
+    .unwrap();
+    ctx.install_kernel_tracer_for_tests(runtime, client);
+    let dir = tmp.path().join("project");
+    std::fs::create_dir_all(&dir).unwrap();
+    let orch = ctx.open_project(dir.clone()).unwrap();
+    let task = orch.store.create_task("损坏", "g").unwrap();
+    orch.store
+        .with_conn(|c| {
+            c.execute(
+                "UPDATE agent_tasks SET public_handle = 'not-a-uuid' WHERE id = ?1",
+                (task.id,),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let outcome = RunMonitorSnapshot::collect_via_kernel(&ctx, &dir, task.id);
+    assert!(
+        matches!(&outcome, Some(Err(_))),
+        "Core 已装配时 handle 损坏必须 Some(Err)(fail-visible,不回退)"
+    );
+    if let Some(Err(message)) = &outcome {
+        assert!(
+            message.contains("handle"),
+            "错误需指明 handle 损坏:{message}"
+        );
+    }
+    ctx.try_close_project(&dir).unwrap();
 }
 
 // ---------- I12:节点富显示包含 artifacts/blockers/recommendations/output ----------
@@ -485,18 +646,12 @@ fn monitor_nodes_surface_artifacts_blockers_recommendations_and_output() {
             raw_log_ref: Some("agent-run:1".into()),
         },
     }];
-    snapshot.leases = vec![ExecutionLeaseRow {
-        task_id: 1,
+    snapshot.leases = vec![crate::run_monitor::RunLeaseView {
         step_id: 1,
         run_id: Some(1),
-        lease_key: "wt-x".into(),
         provider: "worktree".into(),
-        path: "C:/tmp/wt-x".into(),
         isolated: true,
         status: "held".into(),
-        metadata_json: Some("{}".into()),
-        created_at: String::new(),
-        released_at: None,
     }];
     snapshot.sessions = vec![SessionView {
         id: 1,

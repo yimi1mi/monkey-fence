@@ -30,7 +30,9 @@ fn concurrent_commit_and_snapshot_never_expose_new_store_with_old_cursor() {
                 workflow: fixture.workflow.clone(),
             })
             .unwrap();
-        let SnapshotData::Workflow(data) = snapshot.data;
+        let SnapshotData::Workflow(data) = snapshot.data else {
+            panic!("expected workflow snapshot")
+        };
         assert_eq!(
             snapshot.cursor.through_seq,
             data.revisions.presentation_revision - 1,
@@ -45,7 +47,9 @@ fn concurrent_commit_and_snapshot_never_expose_new_store_with_old_cursor() {
             workflow: fixture.workflow.clone(),
         })
         .unwrap();
-    let SnapshotData::Workflow(data) = snapshot.data;
+    let SnapshotData::Workflow(data) = snapshot.data else {
+        panic!("expected workflow snapshot")
+    };
     assert_eq!(data.revisions.presentation_revision, 41);
     assert_eq!(snapshot.cursor.through_seq, 40);
 }
@@ -72,7 +76,9 @@ fn target_commit_then_failure_rotates_epoch_before_snapshot_can_observe_commit()
             workflow: fixture.workflow.clone(),
         })
         .unwrap();
-    let SnapshotData::Workflow(data) = snapshot.data;
+    let SnapshotData::Workflow(data) = snapshot.data else {
+        panic!("expected workflow snapshot")
+    };
     assert_eq!(data.name, "committed-before-crash");
     assert_ne!(snapshot.cursor.stream_epoch, old_cursor.stream_epoch);
     assert_eq!(snapshot.cursor.through_seq, 0);

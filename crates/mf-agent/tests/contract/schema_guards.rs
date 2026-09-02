@@ -15,18 +15,20 @@ use mf_agent::schema::{CATALOG_SCHEMA_VERSION, PROJECT_SCHEMA_VERSION};
 use mf_agent::store::Store;
 use rusqlite::Connection;
 
-/// Project 库 `user_version = 8`(> 7):打开拒绝、错误码稳定、库不动。
+/// Project 库 `user_version = PROJECT_SCHEMA_VERSION + 1`:打开拒绝、
+/// 错误码稳定、库不动。
 #[test]
 fn project_future_version_fails_closed_without_side_effects() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("workflow-v1.db");
     {
         let conn = Connection::open(&db).unwrap();
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "CREATE TABLE agent_tasks (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
              INSERT INTO agent_tasks (id, title) VALUES (1, 'future-marker');
-             PRAGMA user_version = 8;",
-        )
+             PRAGMA user_version = {};",
+            PROJECT_SCHEMA_VERSION + 1
+        ))
         .unwrap();
     }
     let hash_before = sha256_file(&db);
@@ -38,7 +40,7 @@ fn project_future_version_fails_closed_without_side_effects() {
     );
 
     let err = match Store::open(&db) {
-        Ok(_) => panic!("v8 项目库必须 fail-closed"),
+        Ok(_) => panic!("未来版本项目库必须 fail-closed"),
         Err(err) => err,
     };
     assert_eq!(
@@ -53,7 +55,7 @@ fn project_future_version_fails_closed_without_side_effects() {
             known,
         }) => {
             assert_eq!(*store, StoreKind::Project);
-            assert_eq!(*found, 8);
+            assert_eq!(*found, PROJECT_SCHEMA_VERSION + 1);
             assert_eq!(*known, PROJECT_SCHEMA_VERSION);
         }
         other => panic!("必须是 FutureVersion 判别值: {other:?}"),
@@ -64,7 +66,11 @@ fn project_future_version_fails_closed_without_side_effects() {
         hash_before,
         "拒绝路径不得改写数据库文件字节"
     );
-    assert_eq!(user_version_of(&db), 8, "user_version 不变");
+    assert_eq!(
+        user_version_of(&db),
+        PROJECT_SCHEMA_VERSION + 1,
+        "user_version 不变"
+    );
     assert_eq!(
         journal_mode_of(&db),
         "delete",

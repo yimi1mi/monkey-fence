@@ -58,7 +58,12 @@ impl ExecutionDirectoryProvider for PluginProjectDirectoryProvider {
         Ok(MergeOutcome::NotRequired)
     }
 
-    fn release(&self, _lease: &ExecutionLease) -> Result<()> {
+    fn release(&self, lease: &ExecutionLease) -> Result<()> {
+        anyhow::ensure!(
+            lease.provider == self.id() && !lease.isolated && lease.id.starts_with("proj-"),
+            "拒绝释放非 project-dir 插件租约: {}",
+            lease.id
+        );
         Ok(())
     }
 }

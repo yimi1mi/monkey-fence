@@ -12,7 +12,7 @@ use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
 use mf_agent::pipeline::{PipelineDraft, SessionPolicy, StepDraft};
 use mf_agent::runtime::{LaunchSpec, RuntimeEvent, RuntimeHost};
 use mf_agent::store::Store;
-use mf_agent::{AdHocLaunchSpec, RetryMode};
+use mf_agent::AdHocLaunchSpec;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -473,6 +473,76 @@ fn lease_persisted_and_launch_runs_in_lease_directory() {
     fixture.complete_one_run();
     let leases = fixture.orch.store.list_execution_leases(task.id).unwrap();
     assert_eq!(leases[0].status, "released");
+    fixture.orch.stop();
+}
+
+#[test]
+fn release_replays_after_provider_success_before_db_mark() {
+    let fixture = Fixture::single_step();
+    let task_id = fixture.run_task();
+    let run = fixture
+        .orch
+        .store
+        .list_runs_of_task(task_id)
+        .unwrap()
+        .into_iter()
+        .find(|run| run.status == RunStatus::Running)
+        .unwrap();
+    let lease_id = fixture.provider.acquired_ids().remove(0);
+    fixture
+        .orch
+        .store
+        .with_conn(|connection| {
+            connection.execute_batch(
+                "CREATE TRIGGER fail_release_mark
+                 BEFORE UPDATE OF status ON execution_leases
+                 WHEN NEW.status = 'released'
+                 BEGIN SELECT RAISE(ABORT, 'injected release mark failure'); END;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    let error = fixture
+        .orch
+        .settle_by_token(
+            &fixture.token_of_only_step(),
+            Settlement::Fail {
+                reason: "fail".into(),
+            },
+        )
+        .unwrap_err();
+    assert!(
+        format!("{error:?}").contains("injected release mark failure"),
+        "DB mark 失败必须上抛: {error:?}"
+    );
+    assert_eq!(fixture.provider.released_ids(), vec![lease_id.clone()]);
+    assert_eq!(
+        fixture.orch.store.list_execution_leases(task_id).unwrap()[0].status,
+        "held",
+        "外部成功但 DB mark 失败时必须保留可重放状态"
+    );
+
+    fixture
+        .orch
+        .store
+        .with_conn(|connection| {
+            connection.execute_batch("DROP TRIGGER fail_release_mark;")?;
+            Ok(())
+        })
+        .unwrap();
+    fixture.orch.release_run_resources(run.id).unwrap();
+    assert_eq!(
+        fixture.provider.released_ids(),
+        vec![lease_id.clone(), lease_id.clone()],
+        "durable action 重放必须以同一 lease identity 重试 provider"
+    );
+    assert_eq!(
+        fixture.orch.store.list_execution_leases(task_id).unwrap()[0].status,
+        "released"
+    );
+    fixture.orch.release_run_resources(run.id).unwrap();
+    assert_eq!(fixture.provider.released_ids().len(), 2);
     fixture.orch.stop();
 }
 

@@ -129,6 +129,9 @@ pub fn plan_of(steps: Vec<SagaStepPlan>) -> OperationPlan {
     OperationPlan {
         kind: OperationKind::parse(SAGA_KIND).unwrap(),
         steps,
+        // 纯测试 saga 无 durable payload;Workflow Start 由
+        // compile_workflow_start_plan 携带。
+        payload: None,
     }
 }
 

@@ -226,7 +226,10 @@ fn same_command_id_and_digest_retries_without_replaying_effect() {
     let KernelOutcome::Applied {
         revisions,
         replayed,
-    } = second;
+    } = second
+    else {
+        panic!("workflow.rename 必须返回 workflow Applied outcome");
+    };
     assert!(replayed, "同 id 同 digest 重试必须命中 receipt 幂等重放");
     assert_eq!(
         revisions,
@@ -287,7 +290,9 @@ fn snapshot_and_event_carry_same_final_revision() {
             workflow: fixture.workflow.clone(),
         })
         .unwrap();
-    let SnapshotData::Workflow(data) = snapshot.data;
+    let SnapshotData::Workflow(data) = snapshot.data else {
+        panic!("expected workflow snapshot")
+    };
     assert_eq!(data.name, "展示名");
     assert_eq!(
         data.revisions,

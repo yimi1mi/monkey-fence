@@ -46,6 +46,7 @@ notify.workspace = true
 mf-kernel = { workspace = true, features = ["test-support"] }
 toml.workspace = true
 tempfile = "3"
+uuid.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 
 [build-dependencies]

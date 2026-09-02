@@ -115,6 +115,8 @@ fn release_removes_worktree_directory() {
 
     provider.release(&lease).unwrap();
     assert!(!lease.path.exists(), "释放后目录应被清理");
+    provider.release(&lease).unwrap();
+    assert!(!lease.path.exists(), "同一 lease identity 重复释放必须幂等");
 
     // 清理后可以再次创建同名
     let again = provider.acquire(&fx.ctx(2, "build", 2)).unwrap();

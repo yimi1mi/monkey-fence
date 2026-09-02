@@ -217,6 +217,18 @@ fn run_requested_opens_composer_and_submit_activates_task(cx: &mut gpui::TestApp
     let catalog = mf_agent::CatalogStore::memory().unwrap();
     let ctx = crate::app_ctx::AppCtx::with_catalog_for_tests(catalog);
     let project = tempfile::tempdir().unwrap();
+    let service = mf_kernel::project_registry::ServiceStore::open(
+        &project.path().join("service-agent-workspace.db"),
+    )
+    .unwrap();
+    let (runtime, client) = mf_kernel::kernel::InProcessKernelRuntime::for_test(
+        service,
+        mf_kernel::command::ServiceIdempotencyKey::for_test(vec![0x72; 32]).unwrap(),
+        mf_kernel::handles::ClientId::parse("agent-workspace-start").unwrap(),
+        mf_kernel::handles::Principal::parse("agent-workspace-user").unwrap(),
+    )
+    .unwrap();
+    ctx.install_kernel_tracer_for_tests(runtime, client);
     let orch = ctx.open_project(project.path().to_path_buf()).unwrap();
     // 可运行工作流(cmd.exe 实例,进程退出即完成)
     let instance = ctx
@@ -276,7 +288,11 @@ fn run_requested_opens_composer_and_submit_activates_task(cx: &mut gpui::TestApp
             "成功后切到 Runs"
         );
     });
-    // Task 真实创建且开始调度
+    // Accepted 后 Task 由后台 Operation 真实创建并开始调度
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while orch.store.list_tasks(false).unwrap().is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let tasks = orch.store.list_tasks(false).unwrap();
     assert_eq!(tasks.len(), 1);
     assert_eq!(tasks[0].title, "从工作流直接运行");

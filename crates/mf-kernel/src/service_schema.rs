@@ -17,7 +17,7 @@ use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 /// service 库 schema 版本(新库新版本链,从 v1 起)。
-pub const SERVICE_SCHEMA_VERSION: i64 = 3;
+pub const SERVICE_SCHEMA_VERSION: i64 = 4;
 
 /// 稳定错误码:与主规格 §7.5 problem code `schema_future_version` 对齐。
 pub const CODE_SCHEMA_FUTURE_VERSION: &str = "schema_future_version";
@@ -201,6 +201,27 @@ CREATE INDEX IF NOT EXISTS idx_operation_step_state
     ON operation_step(operation_handle, state);
 ";
 
+/// RunControl capability authority/index。令牌只以 keyed HMAC 落盘；
+/// `project_handle` / `agent_run_handle` 均是 opaque handle。冲突映射不
+/// 猜测 winner，而是持久进入 `quarantined`，供 resolve 稳定返回多命中。
+pub const SERVICE_SCHEMA_V4_DELTA: &str = "
+CREATE TABLE IF NOT EXISTS run_capability (
+    token_hmac TEXT NOT NULL PRIMARY KEY,
+    project_handle TEXT NOT NULL
+        REFERENCES project_registry(project_handle),
+    agent_run_handle TEXT NOT NULL,
+    state TEXT NOT NULL
+        CHECK(state IN ('active', 'settled', 'revoked', 'quarantined')),
+    issued_at TEXT NOT NULL,
+    revoked_at TEXT,
+    UNIQUE(project_handle, agent_run_handle)
+);
+CREATE INDEX IF NOT EXISTS idx_run_capability_project_state
+    ON run_capability(project_handle, state);
+CREATE INDEX IF NOT EXISTS idx_run_capability_agent_run
+    ON run_capability(agent_run_handle);
+";
+
 /// 与 DDL 配套的 singleton 种子行(初始化事务内与 DDL 同事务执行)。
 /// `meta.instance_id` 是该 service 库的持久实例身份(建库时生成一次,
 /// 重开不变);`root_state` 建库即 `mode=off`(§3.4:Core 启动强制 off)。
@@ -218,7 +239,7 @@ pub(crate) fn seed_singletons(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// 当前版本(v3)精确指纹:V1 全量 + V2/V3 delta。
+/// 当前版本(v4)精确指纹:V1 全量 + V2/V3/V4 delta。
 pub(crate) fn service_schema_ready(conn: &Connection) -> Result<bool> {
     service_schema_version_ready(conn, SERVICE_SCHEMA_VERSION)
 }
@@ -232,6 +253,11 @@ pub(crate) fn service_schema_v2_ready(conn: &Connection) -> Result<bool> {
     service_schema_version_ready(conn, 2)
 }
 
+/// 既有 v3 库升级前的完整性校验指纹。
+pub(crate) fn service_schema_v3_ready(conn: &Connection) -> Result<bool> {
+    service_schema_version_ready(conn, 3)
+}
+
 /// 指定历史版本的完整 DDL 指纹(逐版本链式应用;同为该 user_version 的
 /// 其他/残缺 SQLite 文件不得被误当成 service 库,静默接受)。
 fn service_schema_version_ready(conn: &Connection, version: i64) -> Result<bool> {
@@ -242,6 +268,9 @@ fn service_schema_version_ready(conn: &Connection, version: i64) -> Result<bool>
     }
     if version >= 3 {
         expected.execute_batch(SERVICE_SCHEMA_V3_DELTA)?;
+    }
+    if version >= 4 {
+        expected.execute_batch(SERVICE_SCHEMA_V4_DELTA)?;
     }
     Ok(schema_fingerprint(conn)? == schema_fingerprint(&expected)?)
 }

@@ -8,12 +8,15 @@
 //! F10:生产构造**必须**携带完整插件 pin 与宿主授权的项目根
 //! (`new_production`);acquire/merge/release 逐租约验证提供器身份、
 //! pin、路径边界与租约 ID;worker 返回的租约 metadata 必须是 JSON
-//! object(无结构 = 无法盖章归属,拒绝)。
+//! object(无结构 = 无法盖章归属,拒绝)。`dir.release`
+//! 必须以 `lease.id` 幂等，`dir.discard_baselines` 必须以
+//! `task_id` 幂等；宿主会在 worker 已成功、Core 落库前崩溃时重放。
 
 use crate::worker::WorkerClient;
 use anyhow::{Context as _, Result};
 use mf_agent::execution_directory::{
-    ensure_lease_under_root, ExecutionDirectoryProvider, ExecutionLease, LeaseContext, MergeOutcome,
+    ensure_lease_under_root, ExecutionDirectoryProvider, ExecutionLease, LeaseContext,
+    MergeOutcome, RunActionDeliveryKey,
 };
 use mf_agent::workflow::PluginSourcePin;
 use serde_json::Value;
@@ -107,6 +110,80 @@ impl WorkerDirectoryProvider {
         &self.pin
     }
 
+    fn merge_impl(
+        &self,
+        delivery: Option<&RunActionDeliveryKey>,
+        leases: &[ExecutionLease],
+    ) -> Result<MergeOutcome> {
+        for lease in leases {
+            self.validate_existing_lease(lease)
+                .with_context(|| format!("汇合批租约 `{}` 校验失败", lease.id))?;
+        }
+        let mut params = serde_json::json!({ "leases": leases });
+        if let Some(key) = delivery {
+            params["delivery_key"] = serde_json::to_value(key)?;
+        }
+        let result = self
+            .transport
+            .request("dir.merge", params)
+            .context("目录提供器 worker merge 失败")?;
+        let kind = result
+            .get("type")
+            .and_then(Value::as_str)
+            .context("worker 返回的汇合结果缺 type")?;
+        match kind {
+            "merged" => Ok(MergeOutcome::Merged),
+            "not_required" => Ok(MergeOutcome::NotRequired),
+            "needs_user" => {
+                let conflicts: Vec<String> = result
+                    .get("conflicts")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|c| c.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(MergeOutcome::NeedsUser { conflicts })
+            }
+            other => anyhow::bail!("worker 返回未知汇合结果 type: {other}"),
+        }
+    }
+
+    fn release_impl(
+        &self,
+        delivery: Option<&RunActionDeliveryKey>,
+        lease: &ExecutionLease,
+    ) -> Result<()> {
+        self.validate_existing_lease_static(lease)?;
+        if lease.path.exists() {
+            self.validate_existing_lease_path_identity(lease)?;
+        }
+        let mut params = serde_json::json!({ "lease": lease });
+        if let Some(key) = delivery {
+            params["delivery_key"] = serde_json::to_value(key)?;
+        }
+        self.transport
+            .request("dir.release", params)
+            .context("目录提供器 worker release 失败")?;
+        Ok(())
+    }
+
+    fn discard_baselines_impl(
+        &self,
+        delivery: Option<&RunActionDeliveryKey>,
+        task_id: i64,
+    ) -> Result<()> {
+        let mut params = serde_json::json!({ "task_id": task_id });
+        if let Some(key) = delivery {
+            params["delivery_key"] = serde_json::to_value(key)?;
+        }
+        self.transport
+            .request("dir.discard_baselines", params)
+            .context("目录提供器 worker discard_baselines 失败")?;
+        Ok(())
+    }
+
     /// I8/F10:校验 worker 返回的租约协议边界。
     /// - provider 身份必须与解析层一致(伪造拒绝);
     /// - 路径必须在**宿主授权根**内(拒绝绝对越界/盘符/前缀相似/
@@ -181,7 +258,7 @@ impl WorkerDirectoryProvider {
     /// F10:merge/release 的逐租约身份校验 —— 提供器一致、路径在授权根
     /// 内、租约 ID 合法、携带 pin 时与本提供器一致;任一不符整批拒绝,
     /// 绝不把他人提供器/越界路径的租约发给 worker。
-    fn validate_existing_lease(&self, lease: &ExecutionLease) -> Result<()> {
+    fn validate_existing_lease_static(&self, lease: &ExecutionLease) -> Result<()> {
         anyhow::ensure!(
             lease.provider == self.full_contribution_id,
             "拒绝处理他人提供器({})的租约(本提供器: {})",
@@ -221,6 +298,15 @@ impl WorkerDirectoryProvider {
             "租约 provider_pin({claimed:?})与本提供器({:?})不一致,拒绝",
             self.pin
         );
+        lease
+            .metadata
+            .get("host_directory_identity")
+            .and_then(|v| v.as_str())
+            .context("租约缺少宿主目录身份，拒绝 path-based 复用")?;
+        Ok(())
+    }
+
+    fn validate_existing_lease_path_identity(&self, lease: &ExecutionLease) -> Result<()> {
         let expected_identity = lease
             .metadata
             .get("host_directory_identity")
@@ -232,6 +318,11 @@ impl WorkerDirectoryProvider {
             "租约目录对象身份已变化(可能被 symlink/junction 替换)，拒绝"
         );
         Ok(())
+    }
+
+    fn validate_existing_lease(&self, lease: &ExecutionLease) -> Result<()> {
+        self.validate_existing_lease_static(lease)?;
+        self.validate_existing_lease_path_identity(lease)
     }
 
     /// 从 Plugin Host 解析结果构造(Worker 工厂 → 启动 worker 进程)。
@@ -379,60 +470,41 @@ impl ExecutionDirectoryProvider for WorkerDirectoryProvider {
     }
 
     fn merge(&self, leases: &[ExecutionLease]) -> Result<MergeOutcome> {
-        // F10:逐租约校验后才发给 worker
-        for lease in leases {
-            self.validate_existing_lease(lease)
-                .with_context(|| format!("汇合批租约 `{}` 校验失败", lease.id))?;
-        }
-        let params = serde_json::json!({ "leases": leases });
-        let result = self
-            .transport
-            .request("dir.merge", params)
-            .context("目录提供器 worker merge 失败")?;
-        let kind = result
-            .get("type")
-            .and_then(Value::as_str)
-            .context("worker 返回的汇合结果缺 type")?;
-        match kind {
-            "merged" => Ok(MergeOutcome::Merged),
-            "not_required" => Ok(MergeOutcome::NotRequired),
-            "needs_user" => {
-                let conflicts: Vec<String> = result
-                    .get("conflicts")
-                    .and_then(Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|c| c.as_str().map(str::to_string))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                Ok(MergeOutcome::NeedsUser { conflicts })
-            }
-            other => anyhow::bail!("worker 返回未知汇合结果 type: {other}"),
-        }
+        self.merge_impl(None, leases)
+    }
+
+    fn merge_for_delivery(
+        &self,
+        delivery: &RunActionDeliveryKey,
+        leases: &[ExecutionLease],
+    ) -> Result<MergeOutcome> {
+        self.merge_impl(Some(delivery), leases)
     }
 
     fn release(&self, lease: &ExecutionLease) -> Result<()> {
-        anyhow::ensure!(
-            lease.provider == self.full_contribution_id,
-            "拒绝释放他人提供器({})的租约(本提供器: {})",
-            lease.provider,
-            self.full_contribution_id
-        );
-        // F10:同源校验(pin/根/ID)
-        self.validate_existing_lease(lease)?;
-        let params = serde_json::json!({ "lease": lease });
-        self.transport
-            .request("dir.release", params)
-            .context("目录提供器 worker release 失败")?;
-        Ok(())
+        // release 会在外部删除成功、Core 落库前崩溃时重放。
+        // 因此始终复验 provider/pin/根/ID 等静态身份；目录仍存在时
+        // 额外复验对象身份，已不存在则继续向幂等 dir.release 重放。
+        self.release_impl(None, lease)
+    }
+
+    fn release_for_delivery(
+        &self,
+        delivery: &RunActionDeliveryKey,
+        lease: &ExecutionLease,
+    ) -> Result<()> {
+        self.release_impl(Some(delivery), lease)
     }
 
     fn discard_task_baselines(&self, task_id: i64) -> Result<()> {
-        let params = serde_json::json!({ "task_id": task_id });
-        self.transport
-            .request("dir.discard_baselines", params)
-            .context("目录提供器 worker discard_baselines 失败")?;
-        Ok(())
+        self.discard_baselines_impl(None, task_id)
+    }
+
+    fn discard_task_baselines_for_delivery(
+        &self,
+        delivery: &RunActionDeliveryKey,
+        task_id: i64,
+    ) -> Result<()> {
+        self.discard_baselines_impl(Some(delivery), task_id)
     }
 }

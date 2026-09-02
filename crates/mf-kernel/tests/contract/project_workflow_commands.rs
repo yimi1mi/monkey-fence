@@ -119,7 +119,9 @@ fn move_and_viewport_only_advance_presentation() {
             workflow: f.workflow.clone(),
         })
         .unwrap();
-    let crate::projection::SnapshotData::Workflow(data) = snapshot.data;
+    let crate::projection::SnapshotData::Workflow(data) = snapshot.data else {
+        panic!("expected workflow snapshot")
+    };
     assert_eq!(data.nodes[0].position, Some((10.0, 20.0)));
     assert_eq!(
         data.viewport,

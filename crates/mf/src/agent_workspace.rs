@@ -281,7 +281,8 @@ impl AgentWorkspace {
         cx.notify();
     }
 
-    /// Composer 提交(Enter):运行 → 激活 Task → 切到 Runs。
+    /// Composer 提交(Enter):Core 接受 Start Operation 后立即切到
+    /// Runs；真实 Workflow Run 由后台完成后进入权威投影。
     pub(crate) fn submit_run_composer(&mut self, cx: &mut Context<Self>) {
         let Some(composer) = self.run_composer.clone() else {
             return;
@@ -315,12 +316,7 @@ impl AgentWorkspace {
             result.ok()
         });
         if let Some(target) = outcome {
-            // 原子激活项目 + Task(不分别改 Workspace 的项目/Task 字段)
-            let (pid, _) = normalize_project_path(&target.project_root);
-            cx.emit(AgentWorkspaceEvent::Activate(ActivationTarget::Task {
-                project: pid,
-                task_id: target.task_id,
-            }));
+            self.status_message = format!("工作流运行已接受({})", target.operation_handle);
             self.run_composer = None;
             self.view = WorkspaceView::Runs;
         }
@@ -530,29 +526,11 @@ impl AgentWorkspace {
         cx.notify();
     }
 
-    fn confirm_and_run(&mut self, cx: &mut Context<Self>) {
-        let Some((_, task_id)) = self.selected_task.clone() else {
-            return;
-        };
-        let Some(orch) = self.orchestrator() else {
-            return;
-        };
-        if self.dirty {
-            let draft = PipelineDraft {
-                steps: self.draft.clone(),
-            };
-            if let Err(e) = orch.save_pipeline(task_id, &draft) {
-                self.status_message = format!("{e:#}");
-                cx.notify();
-                return;
-            }
-            self.dirty = false;
-        }
-        match orch.confirm_and_run(task_id) {
-            Ok(_) => self.status_message = "已确认并开始运行".into(),
-            Err(e) => self.status_message = format!("{e:#}"),
-        }
-        self.refresh_pipeline_state();
+    fn reject_legacy_confirm_and_run(&mut self, cx: &mut Context<Self>) {
+        // Task-local Pipeline 无法无损映射为 Project Workflow Start。
+        // 在 Core 提供显式迁移命令前该入口退役，不保存草稿、
+        // 不创建 Revision，更不回退 Orchestrator 启动。
+        self.status_message = "Task-local 确认运行入口已退役；请从项目工作流发起 Core Start".into();
         cx.notify();
     }
 
@@ -606,7 +584,7 @@ impl AgentWorkspace {
     }
 
     fn task_action(&mut self, action: &str, cx: &mut Context<Self>) {
-        let Some((_, task_id)) = self.selected_task.clone() else {
+        let Some((project, task_id)) = self.selected_task.clone() else {
             return;
         };
         let Some(orch) = self.orchestrator() else {
@@ -615,9 +593,18 @@ impl AgentWorkspace {
         let result = match action {
             "pause" => orch.pause_task(task_id).map(|_| "已暂停".to_string()),
             "resume" => orch.resume_task(task_id).map(|_| "已继续".to_string()),
-            "cancel" => orch.cancel_task(task_id).map(|_| "已终止".to_string()),
+            // 经 CoreKernel 取消:CAS 冲突(prepare 停进程 → exit →
+            // awaiting-outcome 推进 revision)按乐观并发惯例有界重试
+            "cancel" => crate::run_monitor::cancel_workflow_run_via_kernel_retrying_conflicts(
+                &self.app, &project, task_id,
+            )
+            .map_err(anyhow::Error::msg),
             _ => Ok(String::new()),
         };
+        // CoreKernel 写路径不产生 Orchestrator 调度事件:统一快照需显式 nudge
+        if action == "cancel" {
+            self.app.overview.request_refresh();
+        }
         self.status_message = result.unwrap_or_else(|e| format!("{e:#}"));
         self.refresh_pipeline_state();
         cx.notify();
@@ -630,29 +617,58 @@ impl AgentWorkspace {
         profile: Option<&str>,
         cx: &mut Context<Self>,
     ) {
-        let Some(orch) = self.orchestrator() else {
-            return;
-        };
-        let default_profile = self.default_step_profile();
+        let project = self
+            .selected_task
+            .as_ref()
+            .map(|(project, _)| project.clone());
         let result: std::result::Result<String, String> = match action {
-            "retry" => orch
-                .retry_step(step_id, mf_agent::RetryMode::FreshSession)
-                .map(|_| "已重试".into())
-                .map_err(|e| format!("{e:#}")),
-            "skip" => orch
-                .skip_step(step_id, true)
-                .map(|_| "已跳过".into())
-                .map_err(|e| format!("{e:#}")),
-            "replace" => orch
-                .replace_agent(step_id, profile.unwrap_or(&default_profile))
-                .map(|_| "已替换 Agent(新 Revision)".into())
-                .map_err(|e| format!("{e:#}")),
-            "retry-continue" => orch
-                .retry_step(step_id, mf_agent::RetryMode::ContinueSession)
-                .map(|_| "已继续会话重试".into())
-                .map_err(|e| format!("{e:#}")),
+            "retry" => project
+                .as_ref()
+                .ok_or_else(|| "未选择项目".to_string())
+                .and_then(|project| {
+                    self.app
+                        .retry_workflow_step_via_kernel(
+                            project,
+                            step_id,
+                            mf_agent::RetryMode::FreshSession,
+                        )
+                        .map_err(|e| format!("{e:#}"))
+                })
+                .map(|_| "已重试".into()),
+            "skip" => project
+                .as_ref()
+                .ok_or_else(|| "未选择项目".to_string())
+                .and_then(|project| {
+                    self.app
+                        .skip_workflow_step_via_kernel(project, step_id)
+                        .map_err(|e| format!("{e:#}"))
+                })
+                .map(|_| "已跳过".into()),
+            // 已运行 Step 的 Agent 替换会产生新 Revision，属于领域写。
+            // Kernel 尚无对应命令时必须 fail-closed，不可回退直写。
+            "replace" => Err(format!(
+                "CoreKernel 尚未提供运行中 Step 的 Agent 替换命令，已拒绝替换({})",
+                profile.unwrap_or("未指定 Agent")
+            )),
+            "retry-continue" => project
+                .as_ref()
+                .ok_or_else(|| "未选择项目".to_string())
+                .and_then(|project| {
+                    self.app
+                        .retry_workflow_step_via_kernel(
+                            project,
+                            step_id,
+                            mf_agent::RetryMode::ContinueSession,
+                        )
+                        .map_err(|e| format!("{e:#}"))
+                })
+                .map(|_| "已继续会话重试".into()),
             _ => Ok(String::new()),
         };
+        // CoreKernel 写路径不产生 Orchestrator 调度事件:统一快照需显式 nudge
+        if matches!(action, "retry" | "retry-continue" | "skip") {
+            self.app.overview.request_refresh();
+        }
         self.status_message = result.unwrap_or_default();
         self.dirty = false;
         self.refresh_pipeline_state();
@@ -661,32 +677,54 @@ impl AgentWorkspace {
 
     /// 手工结算:run id 是各项目数据库行号,必须按项目路由(不能扫第一个命中的库)。
     fn settle_run(&mut self, project: &PathBuf, run_id: i64, ok: bool, cx: &mut Context<Self>) {
-        if let Some(orch) = self.app.orchestrator_of(project) {
-            let settlement = if ok {
-                Settlement::Complete {
-                    summary: "人工判定成功".into(),
-                    output: Default::default(),
-                }
-            } else {
-                Settlement::Fail {
-                    reason: "人工判定失败".into(),
-                }
-            };
-            let _ = orch.settle_run(run_id, settlement);
-        }
+        let settlement = if ok {
+            Settlement::Complete {
+                summary: "人工判定成功".into(),
+                output: Default::default(),
+            }
+        } else {
+            Settlement::Fail {
+                reason: "人工判定失败".into(),
+            }
+        };
+        let _ = self
+            .app
+            .settle_agent_run_via_kernel(project, run_id, settlement);
+        // 结算的 Store 写在 CoreKernel L-CMD 事务内,不经 events_rx;
+        // post-commit 动作虽然会发调度事件,统一快照不依赖其时序,显式 nudge
+        self.app.overview.request_refresh();
         cx.notify();
     }
 
-    fn send_prompt_to_run(
-        &mut self,
-        project: &PathBuf,
-        run_id: i64,
-        text: &str,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(orch) = self.app.orchestrator_of(project) {
-            let _ = orch.send_prompt(run_id, text);
-        }
+    fn continue_run_via_kernel(&mut self, project: &PathBuf, run_id: i64, cx: &mut Context<Self>) {
+        let result = self
+            .app
+            .orchestrator_of(project)
+            .ok_or_else(|| "项目未打开".to_string())
+            .and_then(|orchestrator| {
+                orchestrator
+                    .store
+                    .run_view(run_id)
+                    .map_err(|error| format!("Run 定位失败:{error:#}"))?
+                    .ok_or_else(|| "Agent Run 不存在".to_string())
+            })
+            .and_then(|run| {
+                if run.status != RunStatus::AwaitingOutcome {
+                    return Err("只有待结算 Run 可经 Core 继续既有会话".to_string());
+                }
+                self.app
+                    .retry_workflow_step_via_kernel(
+                        project,
+                        run.step_id,
+                        mf_agent::RetryMode::ContinueSession,
+                    )
+                    .map_err(|error| error.to_string())
+            });
+        self.status_message = match result {
+            Ok(_) => "已通过 Core 继续会话".into(),
+            Err(error) => format!("继续会话失败:{error}"),
+        };
+        self.app.overview.request_refresh();
         cx.notify();
     }
 
@@ -1263,7 +1301,7 @@ impl AgentWorkspace {
             "确认并运行",
             crate::theme::Theme::success(),
             |ws, _, _, cx| {
-                ws.confirm_and_run(cx);
+                ws.reject_legacy_confirm_and_run(cx);
             },
         ));
         match task.status {
@@ -2196,75 +2234,74 @@ impl AgentWorkspace {
                     ),
             )
             .child(body)
-            .child(
-                div()
-                    .id("overlay-input")
-                    .h(px(36.))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .border_t_1()
-                    .border_color(rgb(crate::theme::Theme::border()))
-                    .child(
-                        div()
-                            .id("ov-input-box")
-                            .flex_1()
-                            .h(px(24.))
-                            .px_2()
-                            .flex()
-                            .items_center()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(
-                                if self.active_field == Field::PromptInput
-                                    && self.focus_handle.is_focused(window)
-                                {
-                                    crate::theme::Theme::accent()
-                                } else {
-                                    crate::theme::Theme::border()
-                                },
-                            ))
-                            .text_size(crate::theme::ui_px(11.))
-                            .cursor_pointer()
-                            .on_click(cx.listener(|ws: &mut AgentWorkspace, _, window, cx| {
-                                ws.active_field = Field::PromptInput;
-                                window.focus(&ws.focus_handle, cx);
-                                cx.notify();
-                            }))
-                            .child(if self.overlay_input.is_empty() {
-                                div()
-                                    .text_color(rgb(crate::theme::Theme::fg_faint()))
-                                    .child(if is_terminal {
-                                        "输入发送到终端(终端本身支持键盘直通)…"
+            .when(awaiting, |container| {
+                container.child(
+                    div()
+                        .id("overlay-input")
+                        .h(px(36.))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .border_t_1()
+                        .border_color(rgb(crate::theme::Theme::border()))
+                        .child(
+                            div()
+                                .id("ov-input-box")
+                                .flex_1()
+                                .h(px(24.))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(
+                                    if self.active_field == Field::PromptInput
+                                        && self.focus_handle.is_focused(window)
+                                    {
+                                        crate::theme::Theme::accent()
                                     } else {
-                                        "输入发送给 Agent…"
-                                    })
-                            } else {
-                                div()
-                                    .text_color(rgb(crate::theme::Theme::fg()))
-                                    .child(self.overlay_input.clone())
-                            }),
-                    )
-                    .child({
-                        let ov_project_send = project.clone();
-                        small_btn(
-                            cx,
-                            "ov-send",
-                            "发送",
-                            crate::theme::Theme::accent(),
-                            move |ws: &mut AgentWorkspace, _, _, cx| {
-                                if let Some(rid) = run_id {
-                                    if !ws.overlay_input.trim().is_empty() {
-                                        let text = ws.overlay_input.clone();
-                                        ws.send_prompt_to_run(&ov_project_send, rid, &text, cx);
+                                        crate::theme::Theme::border()
+                                    },
+                                ))
+                                .text_size(crate::theme::ui_px(11.))
+                                .cursor_pointer()
+                                .on_click(cx.listener(|ws: &mut AgentWorkspace, _, window, cx| {
+                                    ws.active_field = Field::PromptInput;
+                                    window.focus(&ws.focus_handle, cx);
+                                    cx.notify();
+                                }))
+                                .child(if self.overlay_input.is_empty() {
+                                    div()
+                                        .text_color(rgb(crate::theme::Theme::fg_faint()))
+                                        .child(if is_terminal {
+                                            "终端键盘输入在终端内直通…"
+                                        } else {
+                                            "继续当前会话(经 Core)…"
+                                        })
+                                } else {
+                                    div()
+                                        .text_color(rgb(crate::theme::Theme::fg()))
+                                        .child(self.overlay_input.clone())
+                                }),
+                        )
+                        .child({
+                            let ov_project_send = project.clone();
+                            small_btn(
+                                cx,
+                                "ov-send",
+                                "继续",
+                                crate::theme::Theme::accent(),
+                                move |ws: &mut AgentWorkspace, _, _, cx| {
+                                    if let Some(rid) = run_id {
+                                        ws.continue_run_via_kernel(&ov_project_send, rid, cx);
                                         ws.overlay_input.clear();
                                     }
-                                }
-                            },
-                        )
-                    }),
-            )
+                                },
+                            )
+                        }),
+                )
+            })
             .into_any_element()
     }
 }
@@ -2481,24 +2518,21 @@ impl Render for AgentWorkspace {
                     if editing(Field::PromptInput) {
                         match ev.keystroke.key.as_str() {
                             "enter" => {
-                                if !ws.overlay_input.trim().is_empty() {
-                                    let rid = match &ws.overlay {
-                                        Some(Overlay::Transcript {
-                                            project, run_id, ..
-                                        }) => Some((project.clone(), *run_id)),
-                                        Some(Overlay::Terminal {
-                                            project,
-                                            run_id: Some(run_id),
-                                            ..
-                                        }) => Some((project.clone(), *run_id)),
-                                        _ => None,
-                                    };
-                                    if let Some((project, rid)) = rid {
-                                        let text = ws.overlay_input.clone();
-                                        ws.send_prompt_to_run(&project, rid, &text, cx);
-                                    }
-                                    ws.overlay_input.clear();
+                                let rid = match &ws.overlay {
+                                    Some(Overlay::Transcript {
+                                        project, run_id, ..
+                                    }) => Some((project.clone(), *run_id)),
+                                    Some(Overlay::Terminal {
+                                        project,
+                                        run_id: Some(run_id),
+                                        ..
+                                    }) => Some((project.clone(), *run_id)),
+                                    _ => None,
+                                };
+                                if let Some((project, rid)) = rid {
+                                    ws.continue_run_via_kernel(&project, rid, cx);
                                 }
+                                ws.overlay_input.clear();
                             }
                             "backspace" => {
                                 ws.overlay_input.pop();

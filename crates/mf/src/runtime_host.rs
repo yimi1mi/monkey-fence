@@ -107,12 +107,24 @@ impl PtySession {
     }
 }
 
+/// HTTP Runtime 一次 ask_human 的待答槽:同时记录发起提问的 run 与
+/// Orchestrator 持久化后回填的 question 行;投递必须两者都匹配,
+/// 否则视为"无法证明接收者仍是原问题"而 fail-closed。
+struct PendingQuestion {
+    run_handle: String,
+    /// `step_questions` 行号;None = Question 事件尚未被 Orchestrator
+    /// 持久化/回填(此窗口内投递一律拒绝,宁可拒绝不可误投)。
+    question_id: Option<i64>,
+    tx: Sender<String>,
+}
+
 struct HttpSession {
     session_id: i64,
     transcript: Mutex<Vec<(String, String)>>,
     alive: AtomicBool,
-    /// 等待用户回答的 ask_human 通道。
-    answer_tx: Mutex<Option<Sender<String>>>,
+    /// 等待用户回答的 ask_human 待答槽(question-bound 身份见
+    /// [`PendingQuestion`])。
+    pending: Mutex<Option<PendingQuestion>>,
     /// 终止信号。
     cancel: AtomicBool,
     /// 工具循环线程的**真实结束**确认(循环退出、事件已上报后置位)。
@@ -178,6 +190,11 @@ pub struct SessionRegistry {
     sessions: Mutex<HashMap<String, SessionInner>>,
     /// `agent_runs.public_handle -> agent_sessions.public_handle`。
     run_sessions: Mutex<HashMap<String, String>>,
+    /// question-bound 回答的投递账本:`step_questions.id -> 已投递答案`。
+    /// 只存在于进程内存:不写日志、不进 Snapshot/事件、不持久化;
+    /// 核心重启后连同会话一起消失 —— 重启后的旧投递动作因无存活会话
+    /// 天然 fail-closed(spec:live 会话 lost/Needs You)。
+    question_deliveries: Mutex<HashMap<i64, String>>,
     config: Mutex<mf_agent::Config>,
     /// stop 等待真实终止确认的时限(生产 10s;测试可调短)。
     stop_confirm_timeout: parking_lot::RwLock<std::time::Duration>,
@@ -188,6 +205,7 @@ impl SessionRegistry {
         Arc::new(SessionRegistry {
             sessions: Mutex::new(HashMap::new()),
             run_sessions: Mutex::new(HashMap::new()),
+            question_deliveries: Mutex::new(HashMap::new()),
             config: Mutex::new(config),
             stop_confirm_timeout: parking_lot::RwLock::new(std::time::Duration::from_secs(10)),
         })
@@ -343,7 +361,7 @@ impl SessionRegistry {
                 // 循环线程**真正结束**(事件已上报、生命周期收口),
                 // 未确认前不得返回 Ok → 调用方不释放执行租约
                 h.cancel.store(true, Ordering::SeqCst);
-                h.answer_tx.lock().take();
+                h.pending.lock().take();
                 if h.wait_terminated(*self.stop_confirm_timeout.read()) {
                     if let Some(handle) = h.join.lock().take() {
                         let _ = handle.join();
@@ -458,7 +476,7 @@ impl SessionRegistry {
             SessionInner::Http(h) => {
                 h.cancel.store(true, Ordering::SeqCst);
                 h.alive.store(false, Ordering::SeqCst);
-                h.answer_tx.lock().take(); // 唤醒阻塞中的 ask_human
+                h.pending.lock().take(); // 唤醒阻塞中的 ask_human
             }
         }
     }
@@ -528,8 +546,124 @@ impl SessionRegistry {
     fn http_answer(&self, session_handle: &str, answer: &str) {
         let sessions = self.sessions.lock();
         if let Some(SessionInner::Http(h)) = sessions.get(session_handle) {
-            if let Some(tx) = h.answer_tx.lock().take() {
-                let _ = tx.send(answer.to_string());
+            if let Some(slot) = h.pending.lock().take() {
+                let _ = slot.tx.send(answer.to_string());
+            }
+        }
+    }
+
+    /// Orchestrator 持久化 question 行后回填绑定:把 run 当前等待中的
+    /// ask_human 待答槽打上 question 行号。尽力而为的关联通知
+    /// (失败仅告警);真正的 fail-closed 校验在
+    /// [`SessionRegistry::answer_question_bound`]。
+    pub(crate) fn bind_pending_question(&self, run_handle: &str, question_id: i64) {
+        let Some(session_handle) = self.run_sessions.lock().get(run_handle).cloned() else {
+            log::warn!("question {question_id} 绑定待答槽失败:run `{run_handle}` 无会话绑定");
+            return;
+        };
+        let Some(inner) = self.sessions.lock().get(&session_handle).cloned() else {
+            log::warn!("question {question_id} 绑定待答槽失败:会话 `{session_handle}` 已摘除");
+            return;
+        };
+        let SessionInner::Http(h) = inner else {
+            return; // PTY 会话没有 ask_human 待答槽
+        };
+        let mut pending = h.pending.lock();
+        match pending.as_mut() {
+            Some(slot) if slot.run_handle == run_handle => {
+                slot.question_id = Some(question_id);
+            }
+            Some(slot) => {
+                log::warn!(
+                    "question {question_id} 绑定待答槽失败:槽属于 run `{}`,不是 `{run_handle}`",
+                    slot.run_handle
+                );
+            }
+            None => {
+                log::warn!(
+                    "question {question_id} 绑定待答槽失败:run `{run_handle}` 当前没有待答槽"
+                );
+            }
+        }
+    }
+
+    /// question-bound 回答投递(Issue #26 Respond 子任务):
+    /// - 必须命中"该 run 当前等待的正是该 question"的待答槽;
+    /// - 同 question 同答案重放幂等(账本命中,不再注入第二次输入);
+    /// - 同 question 异答案、错误 run、槽位已换到新题、无存活会话
+    ///   (含核心重启后注册表为空)一律稳定拒绝,绝不回退 legacy
+    ///   run 级 answer。
+    /// 账本只记进程内存,答案明文不写日志、不进 Snapshot/事件、不持久化。
+    pub(crate) fn answer_question_bound(
+        &self,
+        question_id: i64,
+        run_handle: &str,
+        answer: &str,
+    ) -> Result<()> {
+        let session_handle = self
+            .run_sessions
+            .lock()
+            .get(run_handle)
+            .cloned()
+            .ok_or_else(|| {
+                anyhow!(
+                    "run `{run_handle}` 没有存活会话绑定(会话已结束或核心已重启):\
+                     无法证明接收者仍是 question {question_id} 的原问题,拒绝投递(fail-closed)"
+                )
+            })?;
+        let inner = self
+            .sessions
+            .lock()
+            .get(&session_handle)
+            .cloned()
+            .ok_or_else(|| anyhow!("run `{run_handle}` 绑定的会话已摘除:拒绝投递(fail-closed)"))?;
+        let SessionInner::Http(h) = inner else {
+            anyhow::bail!(
+                "run `{run_handle}` 的会话不是 HTTP Runtime:question-bound 回答\
+                 只能投递给 ask_human 待答通道"
+            );
+        };
+        // 待答槽 + 账本在同一临界区内校验并消费:并发重放里只有一个
+        // 线程能真正发送,其余按账本幂等返回或被拒绝。
+        let mut pending = h.pending.lock();
+        if let Some(delivered) = self.question_deliveries.lock().get(&question_id) {
+            if delivered == answer {
+                return Ok(()); // 同 id 同答案:幂等重放,不再注入
+            }
+            anyhow::bail!("question {question_id} 已投递过不同答案:拒绝冲突重放");
+        }
+        let slot = pending.as_ref().ok_or_else(|| {
+            anyhow!(
+                "run `{run_handle}` 当前没有等待中的问题:question {question_id} \
+                 无法投递(fail-closed)"
+            )
+        })?;
+        anyhow::ensure!(
+            slot.run_handle == run_handle,
+            "待答槽属于 run `{}`,不是 `{run_handle}`",
+            slot.run_handle
+        );
+        anyhow::ensure!(
+            slot.question_id == Some(question_id),
+            "run `{run_handle}` 正在等待 question {:?}(另一次提问),不是 {question_id}:\
+             拒绝把旧答案投给新问题(fail-closed)",
+            slot.question_id
+        );
+        let tx = slot.tx.clone();
+        match tx.send(answer.to_string()) {
+            Ok(()) => {
+                self.question_deliveries
+                    .lock()
+                    .insert(question_id, answer.to_string());
+                *pending = None; // 待答槽已消费
+                Ok(())
+            }
+            Err(_) => {
+                // 接收端(工具循环线程)已消失:通道关闭,绝不假装投递成功
+                *pending = None;
+                anyhow::bail!(
+                    "question {question_id} 投递失败:HTTP 工具循环已不再等待该问题(通道关闭)"
+                )
             }
         }
     }
@@ -1473,7 +1607,7 @@ fn launch_http(registry: &SessionRegistry, spec: &LaunchSpec, events: Sender<(i6
         session_id: spec.session_id,
         transcript: Mutex::new(vec![("user".into(), spec.prompt.clone())]),
         alive: AtomicBool::new(true),
-        answer_tx: Mutex::new(None),
+        pending: Mutex::new(None),
         cancel: AtomicBool::new(false),
         term: TermSignal::new(),
         join: Mutex::new(None),
@@ -1519,6 +1653,7 @@ fn run_http_turn_async(
     let instructions = spec.prompt.clone();
     let max_iterations = registry.config.lock().engine.max_iterations;
     let title = spec.step_title.clone();
+    let run_handle = spec.run_handle.clone();
     let cancel = session.clone();
     let join_session = session.clone();
     let handle = std::thread::Builder::new()
@@ -1529,6 +1664,7 @@ fn run_http_turn_async(
                 &instructions,
                 &workdir,
                 &title,
+                &run_handle,
                 max_iterations,
                 &session,
                 &events2,
@@ -1573,6 +1709,7 @@ fn run_http_turn(
     instructions: &str,
     workdir: &Path,
     title: &str,
+    run_handle: &str,
     max_iterations: usize,
     session: &Arc<HttpSession>,
     events: &Sender<(i64, RuntimeEvent)>,
@@ -1780,9 +1917,18 @@ fn run_http_turn(
                 }
                 "ask_human" => {
                     let question = arg_str("question");
-                    let _ = events.send((run_id, RuntimeEvent::Question(question)));
+                    // 先登记带 run 身份的待答槽,再广播 Question 事件:
+                    // Orchestrator 持久化 question 行后会立刻回填绑定,
+                    // 此顺序保证回填一定看得见这个槽(先发事件则可能
+                    // 绑定到上一题超时残留的旧槽)。替换旧槽也顺带
+                    // 丢弃超时未答的历史槽,旧答案不再有可命中的通道。
                     let (tx, rx) = crossbeam_channel::bounded::<String>(1);
-                    *session.answer_tx.lock() = Some(tx);
+                    *session.pending.lock() = Some(PendingQuestion {
+                        run_handle: run_handle.to_string(),
+                        question_id: None,
+                        tx,
+                    });
+                    let _ = events.send((run_id, RuntimeEvent::Question(question)));
                     // 分片可取消等待:stop(通道摘除/cancel)立即唤醒,
                     // 不再 6 小时盲等阻塞停止确认
                     match session.wait_answer(&rx, std::time::Duration::from_secs(6 * 3600)) {
@@ -1940,6 +2086,27 @@ impl RuntimeHost for RuntimeHostImpl {
         if let Some(session_handle) = self.registry.session_of_run(run_handle) {
             self.registry.http_answer(&session_handle, answer);
         }
+    }
+
+    fn bind_open_question(&self, run_handle: &str, question_id: i64) {
+        self.registry.bind_pending_question(run_handle, question_id);
+    }
+
+    fn supports_question_bound_answers(&self) -> bool {
+        // SessionRegistry 为 HTTP Runtime 维护 pending-question 身份
+        // (run + question 双绑定)与投递账本,可证明"当前等待的正是
+        // 该 question";PTY 会话没有 ask_human 通道,投递路径会拒绝。
+        true
+    }
+
+    fn answer_question_bound(
+        &self,
+        question_id: i64,
+        run_handle: &str,
+        answer: &str,
+    ) -> Result<()> {
+        self.registry
+            .answer_question_bound(question_id, run_handle, answer)
     }
 
     fn is_session_alive(&self, session_handle: &str) -> bool {
@@ -2275,7 +2442,7 @@ mod tests {
                 session_id: id,
                 transcript: Mutex::new(Vec::new()),
                 alive: AtomicBool::new(true),
-                answer_tx: Mutex::new(None),
+                pending: Mutex::new(None),
                 cancel: AtomicBool::new(false),
                 term: TermSignal::new(),
                 join: Mutex::new(None),
@@ -2718,7 +2885,7 @@ mod tests {
             session_id: 11,
             transcript: Mutex::new(Vec::new()),
             alive: AtomicBool::new(true),
-            answer_tx: Mutex::new(None),
+            pending: Mutex::new(None),
             cancel: AtomicBool::new(false),
             term: TermSignal::new(),
             join: Mutex::new(None),
@@ -2751,7 +2918,7 @@ mod tests {
             session_id: 12,
             transcript: Mutex::new(Vec::new()),
             alive: AtomicBool::new(true),
-            answer_tx: Mutex::new(None),
+            pending: Mutex::new(None),
             cancel: AtomicBool::new(false),
             term: TermSignal::new(),
             join: Mutex::new(None),
@@ -2773,7 +2940,7 @@ mod tests {
             session_id: 15,
             transcript: Mutex::new(Vec::new()),
             alive: AtomicBool::new(true),
-            answer_tx: Mutex::new(None),
+            pending: Mutex::new(None),
             cancel: AtomicBool::new(false),
             term: TermSignal::new(),
             join: Mutex::new(None),
@@ -2810,13 +2977,17 @@ mod tests {
             session_id: 13,
             transcript: Mutex::new(Vec::new()),
             alive: AtomicBool::new(true),
-            answer_tx: Mutex::new(None),
+            pending: Mutex::new(None),
             cancel: AtomicBool::new(false),
             term: TermSignal::new(),
             join: Mutex::new(None),
         });
         let (tx, rx) = crossbeam_channel::bounded::<String>(1);
-        *session.answer_tx.lock() = Some(tx);
+        *session.pending.lock() = Some(PendingQuestion {
+            run_handle: "run-wait".into(),
+            question_id: Some(1),
+            tx,
+        });
         let s2 = session.clone();
         let waiter = std::thread::spawn(move || {
             s2.wait_answer(&rx, std::time::Duration::from_secs(6 * 3600))
@@ -2824,7 +2995,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(150));
         let started = std::time::Instant::now();
         session.cancel.store(true, Ordering::SeqCst);
-        session.answer_tx.lock().take(); // stop_run 的唤醒动作
+        session.pending.lock().take(); // stop_run 的唤醒动作
         let answer = waiter.join().expect("等待必须被唤醒并返回");
         assert!(answer.is_none(), "停止后不得返回用户回答");
         assert!(
@@ -3005,6 +3176,303 @@ mod tests {
         assert_eq!(
             size_c, size_d,
             "孙进程死后执行目录文件必须停止增长(size {size_c}→{size_d})"
+        );
+    }
+}
+
+/// Issue #26 Respond 子任务:question-bound nonce 与幂等投递的契约测试。
+/// 全部走 `RuntimeHost` trait 入口,不触碰注册表私有路径。
+#[cfg(test)]
+mod question_bound_answer_tests {
+    use super::*;
+
+    type AnswerRx = crossbeam_channel::Receiver<String>;
+
+    /// 构造注册表 + 一个带待答槽的 HTTP 会话(run↔session 已绑定,
+    /// 槽位身份为 `(run_handle, question_id)`),返回投递接收端。
+    fn registry_with_pending(
+        run_handle: &str,
+        question_id: Option<i64>,
+    ) -> (Arc<SessionRegistry>, Arc<RuntimeHostImpl>, AnswerRx) {
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        let (tx, rx) = crossbeam_channel::bounded::<String>(1);
+        let session = Arc::new(HttpSession {
+            session_id: 1,
+            transcript: Mutex::new(Vec::new()),
+            alive: AtomicBool::new(true),
+            pending: Mutex::new(Some(PendingQuestion {
+                run_handle: run_handle.to_string(),
+                question_id,
+                tx,
+            })),
+            cancel: AtomicBool::new(false),
+            term: TermSignal::new(),
+            join: Mutex::new(None),
+        });
+        let session_handle = format!("session-{run_handle}");
+        registry.register(&session_handle, SessionInner::Http(session));
+        registry.bind_run(run_handle, &session_handle);
+        let host = RuntimeHostImpl::new(registry.clone());
+        (registry, host, rx)
+    }
+
+    fn replace_pending(
+        registry: &SessionRegistry,
+        session_handle: &str,
+        run_handle: &str,
+        question_id: Option<i64>,
+    ) -> AnswerRx {
+        let (tx, rx) = crossbeam_channel::bounded::<String>(1);
+        let inner = registry
+            .sessions
+            .lock()
+            .get(session_handle)
+            .cloned()
+            .expect("会话必须存在");
+        let SessionInner::Http(h) = inner else {
+            panic!("必须是 HTTP 会话");
+        };
+        *h.pending.lock() = Some(PendingQuestion {
+            run_handle: run_handle.to_string(),
+            question_id,
+            tx,
+        });
+        rx
+    }
+
+    fn assert_empty(rx: &AnswerRx, what: &str) {
+        match rx.recv_timeout(std::time::Duration::from_millis(120)) {
+            Ok(leaked) => panic!("{what}不应收到输入,却得到 `{leaked}`"),
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {}
+        }
+    }
+
+    #[test]
+    fn host_supports_question_bound_answers() {
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        let host = RuntimeHostImpl::new(registry);
+        assert!(host.supports_question_bound_answers());
+    }
+
+    #[test]
+    fn same_question_same_answer_replays_without_second_input() {
+        // q1 同答案重放一次:第一次真正投递,重放幂等 Ok 且不再注入。
+        let (_registry, host, rx) = registry_with_pending("run-q1", Some(11));
+        host.answer_question_bound(11, "run-q1", "yes")
+            .expect("首次投递必须成功");
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            "yes"
+        );
+        for _ in 0..2 {
+            host.answer_question_bound(11, "run-q1", "yes")
+                .expect("同 id 同答案重放必须幂等 Ok");
+        }
+        assert_empty(&rx, "重放不得产生第二次输入");
+    }
+
+    #[test]
+    fn same_question_conflicting_answer_is_stably_rejected() {
+        let (_registry, host, rx) = registry_with_pending("run-q1", Some(11));
+        host.answer_question_bound(11, "run-q1", "yes").unwrap();
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            "yes"
+        );
+        for _ in 0..2 {
+            let err = host
+                .answer_question_bound(11, "run-q1", "no")
+                .expect_err("同 id 异答案必须稳定拒绝");
+            assert!(format!("{err:#}").contains("冲突"), "{err:#}");
+        }
+        assert_empty(&rx, "冲突答案不得注入");
+    }
+
+    #[test]
+    fn q1_action_never_lands_on_q2_slot() {
+        // q1 从未投递、槽位已被 q2 替换(超时后 runtime 发起下一题):
+        // 旧 action 必须被拒绝,q2 通道不得被污染;q2 自己的投递不受影响。
+        let (registry, host, _rx1) = registry_with_pending("run-q", Some(1));
+        let rx2 = replace_pending(&registry, "session-run-q", "run-q", Some(2));
+        let err = host
+            .answer_question_bound(1, "run-q", "yes")
+            .expect_err("q1 action 不得投给 q2");
+        assert!(
+            format!("{err:#}").contains("拒绝把旧答案投给新问题"),
+            "{err:#}"
+        );
+        assert_empty(&rx2, "q2 通道不得被 q1 的答案污染");
+        host.answer_question_bound(2, "run-q", "second")
+            .expect("q2 的正确投递必须成功");
+        assert_eq!(
+            rx2.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            "second"
+        );
+    }
+
+    #[test]
+    fn q1_replay_after_q2_pending_stays_noop() {
+        // q1 已投递成功,runtime 解除阻塞后发起了 q2:
+        // q1 同答案重放按账本幂等 Ok,绝不触碰 q2 通道。
+        let (registry, host, rx1) = registry_with_pending("run-q", Some(1));
+        host.answer_question_bound(1, "run-q", "yes").unwrap();
+        assert_eq!(
+            rx1.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            "yes"
+        );
+        let rx2 = replace_pending(&registry, "session-run-q", "run-q", Some(2));
+        host.answer_question_bound(1, "run-q", "yes")
+            .expect("已投递问题的同答案重放必须幂等 Ok");
+        assert_empty(&rx2, "q1 重放不得把输入带给 q2");
+    }
+
+    #[test]
+    fn unbound_slot_window_rejects_delivery() {
+        // Question 事件已发出但 Orchestrator 尚未回填 question 绑定的窗口:
+        // 无法证明等待的正是该题 → 拒绝(宁可拒绝,不可误投)。
+        let (_registry, host, rx) = registry_with_pending("run-q", None);
+        let err = host
+            .answer_question_bound(9, "run-q", "yes")
+            .expect_err("未绑定窗口必须 fail-closed");
+        assert!(
+            format!("{err:#}").contains("拒绝把旧答案投给新问题"),
+            "{err:#}"
+        );
+        assert_empty(&rx, "未绑定窗口不得注入");
+    }
+
+    #[test]
+    fn wrong_run_is_rejected_even_with_live_session() {
+        // q1 属于 run A;同一注册表里 run B 有自己的会话与待答槽:
+        // 以 B 的名义投 q1 必须被拒绝,两个通道都不得被污染。
+        let (_reg_a, host_a, rx_a) = registry_with_pending("run-a", Some(1));
+        // host_a 的注册表同时登记 run-b:给它一个绑到 q2 的槽
+        let registry = host_a.registry.clone();
+        let (tx_b, rx_b) = crossbeam_channel::bounded::<String>(1);
+        let session_b = Arc::new(HttpSession {
+            session_id: 2,
+            transcript: Mutex::new(Vec::new()),
+            alive: AtomicBool::new(true),
+            pending: Mutex::new(Some(PendingQuestion {
+                run_handle: "run-b".into(),
+                question_id: Some(2),
+                tx: tx_b,
+            })),
+            cancel: AtomicBool::new(false),
+            term: TermSignal::new(),
+            join: Mutex::new(None),
+        });
+        registry.register("session-b", SessionInner::Http(session_b));
+        registry.bind_run("run-b", "session-b");
+
+        let err = host_a
+            .answer_question_bound(1, "run-b", "yes")
+            .expect_err("错误 run 必须被拒绝");
+        assert!(
+            format!("{err:#}").contains("run `run-b` 正在等待 question Some(2)"),
+            "{err:#}"
+        );
+        assert_empty(&rx_a, "run A 的通道不得被污染");
+        assert_empty(&rx_b, "run B 的通道不得被污染");
+
+        // run-b 没有 q1 这个问题;run-a 才是 q1 的归属,仍可正常投递
+        host_a
+            .answer_question_bound(1, "run-a", "answer-a")
+            .expect("正确归属的投递必须成功");
+        assert_eq!(
+            rx_a.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            "answer-a"
+        );
+    }
+
+    #[test]
+    fn no_live_sender_fails_closed() {
+        // 无 live sender 两种形态:run 从未绑定;核心重启后注册表为空。
+        let registry = SessionRegistry::new(mf_agent::Config::default());
+        let host = RuntimeHostImpl::new(registry);
+        let err = host
+            .answer_question_bound(1, "run-gone", "yes")
+            .expect_err("无绑定必须拒绝");
+        assert!(format!("{err:#}").contains("没有存活会话绑定"), "{err:#}");
+        assert!(format!("{err:#}").contains("fail-closed"), "{err:#}");
+    }
+
+    #[test]
+    fn closed_receiver_channel_fails_closed_without_faking_success() {
+        // 槽位在、绑定对,但工具循环线程已消失(rx dropped):
+        // 绝不假装投递成功。
+        let (registry, host, rx) = registry_with_pending("run-q", Some(1));
+        drop(rx); // 接收端先退出
+        let err = host
+            .answer_question_bound(1, "run-q", "yes")
+            .expect_err("通道关闭必须显式失败");
+        assert!(format!("{err:#}").contains("不再等待该问题"), "{err:#}");
+        assert!(session_pending_cleared(&registry, "session-run-q"));
+    }
+
+    fn session_pending_cleared(registry: &SessionRegistry, session_handle: &str) -> bool {
+        let inner = registry
+            .sessions
+            .lock()
+            .get(session_handle)
+            .cloned()
+            .expect("会话必须存在");
+        let SessionInner::Http(h) = inner else {
+            panic!("必须是 HTTP 会话");
+        };
+        let cleared = h.pending.lock().is_none();
+        cleared
+    }
+
+    #[test]
+    fn concurrent_duplicate_delivery_produces_single_input() {
+        // 并发重复投递(durable outbox 重放 + UI 同时提交):
+        // 全部 Ok,但 rx 只收到一次输入。
+        let (_registry, host, rx) = registry_with_pending("run-q", Some(1));
+        let mut joins = Vec::new();
+        for _ in 0..8 {
+            let host = host.clone();
+            joins.push(std::thread::spawn(move || {
+                host.answer_question_bound(1, "run-q", "yes")
+                    .expect("并发重放必须全部 Ok(幂等)");
+            }));
+        }
+        for join in joins {
+            join.join().expect("线程不得 panic");
+        }
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            "yes"
+        );
+        assert_empty(&rx, "并发重放只允许一次输入");
+    }
+
+    #[test]
+    fn bind_open_question_correlates_only_the_waiting_run() {
+        // Orchestrator 持久化后的回填绑定:只有槽位所属 run 能绑定成功;
+        // 错误 run 的回填不得污染槽位,随后投递仍 fail-closed。
+        let (_registry, host, rx) = registry_with_pending("run-a", None);
+        // run-b 也绑定到同一会话(会话复用场景):以 run-b 名义回填
+        // 必须命中"槽位属于 run-a"的守卫,不得污染
+        host.registry.bind_run("run-b", "session-run-a");
+        host.bind_open_question("run-b", 7);
+        assert_empty(&rx, "未绑定成功的窗口不得注入");
+        let err = host
+            .answer_question_bound(7, "run-a", "yes")
+            .expect_err("槽位仍指向未绑定,必须拒绝");
+        assert!(
+            format!("{err:#}").contains("拒绝把旧答案投给新问题"),
+            "{err:#}"
+        );
+        // 正确 run 的回填后即可投递
+        host.bind_open_question("run-a", 7);
+        host.answer_question_bound(7, "run-a", "yes")
+            .expect("回填后投递必须成功");
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap(),
+            "yes"
         );
     }
 }

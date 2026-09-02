@@ -1,6 +1,6 @@
 //! T1d 契约(Issue #19):service-v1.db schema。
 //!
-//! 覆盖:§3.4 全部 8 张表与列形状、singleton 种子(meta/root_state)、
+//! 覆盖:service authority 全部表与列形状、singleton 种子(meta/root_state)、
 //! 唯一约束与 CHECK、future-version fail-closed 无副作用、重开稳定性、
 //! 当前用户 ACL。全部使用 tempfile fixture,不触碰真实用户目录。
 
@@ -11,7 +11,8 @@ use crate::support::{
 use mf_kernel::project_registry::{ProjectStatus, ServiceStore};
 use mf_kernel::service_schema::{
     error_code, guard_future_version, ServiceSchemaError, CODE_SCHEMA_FUTURE_VERSION,
-    SERVICE_SCHEMA_V1, SERVICE_SCHEMA_V2_DELTA, SERVICE_SCHEMA_V3_DELTA, SERVICE_SCHEMA_VERSION,
+    SERVICE_SCHEMA_V1, SERVICE_SCHEMA_V2_DELTA, SERVICE_SCHEMA_V3_DELTA, SERVICE_SCHEMA_V4_DELTA,
+    SERVICE_SCHEMA_VERSION,
 };
 use rusqlite::{params, Connection};
 
@@ -21,7 +22,7 @@ fn service_db(tmp: &tempfile::TempDir) -> std::path::PathBuf {
     tmp.path().join("service-v1.db")
 }
 
-/// 全新库:恰好 §3.4 的 8 张表 + v3 的 operation_step,user_version=
+/// 全新库:基础表 + operation_step + run_capability,user_version=
 /// 当前版本,重开不产生多余 schema 对象。
 #[test]
 fn fresh_service_db_has_exactly_spec_tables() {
@@ -41,6 +42,7 @@ fn fresh_service_db_has_exactly_spec_tables() {
         "operation_step",
         "project_registry",
         "root_state",
+        "run_capability",
     ];
     assert_eq!(table_names_of(&db), expected.to_vec());
     drop(store);
@@ -164,7 +166,7 @@ fn service_v1_upgrades_to_current_after_verified_backup() {
 /// 备份是 v2;只知 v2 的旧 bundle 对 v3 库 fail-closed(回滚走
 /// side-by-side/备份,而不是旧二进制直开)。
 #[test]
-fn service_v2_upgrades_to_v3_preserving_operation_rows() {
+fn service_v2_upgrades_to_current_preserving_operation_rows() {
     let tmp = tempfile::tempdir().unwrap();
     let db = service_db(&tmp);
     {
@@ -206,7 +208,7 @@ fn service_v2_upgrades_to_v3_preserving_operation_rows() {
     }
     let backup_dir = mf_agent::migration::backup_dir_for(&db);
     let store = ServiceStore::open(&db).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 3);
+    assert_eq!(store.schema_version().unwrap(), SERVICE_SCHEMA_VERSION);
     // 旧数据逐行保留(旧代码语义不被 v3 迁移改写)。
     let (state, problem): (String, Option<String>) = read_only(&db)
         .query_row(
@@ -248,7 +250,7 @@ fn service_v2_upgrades_to_v3_preserving_operation_rows() {
     assert!(format!("{err:#}").contains("schema_future_version"));
     match err.downcast_ref::<ServiceSchemaError>() {
         Some(ServiceSchemaError::FutureVersion { found, known }) => {
-            assert_eq!((*found, *known), (3, 2));
+            assert_eq!((*found, *known), (SERVICE_SCHEMA_VERSION, 2));
         }
         other => panic!("必须是 FutureVersion 判别值: {other:?}"),
     }
@@ -256,6 +258,59 @@ fn service_v2_upgrades_to_v3_preserving_operation_rows() {
     let objects_before = schema_objects_of(&db);
     conn.execute_batch(SERVICE_SCHEMA_V3_DELTA).unwrap();
     assert_eq!(schema_objects_of(&db), objects_before);
+}
+
+/// v3→v4 必须先备份；既有 registry/operation_step 行保持原样，只新增
+/// 空 capability authority。
+#[test]
+fn service_v3_upgrades_to_v4_preserving_existing_rows() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = service_db(&tmp);
+    {
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(SERVICE_SCHEMA_V1).unwrap();
+        conn.execute_batch(SERVICE_SCHEMA_V2_DELTA).unwrap();
+        conn.execute_batch(SERVICE_SCHEMA_V3_DELTA).unwrap();
+        conn.execute(
+            "INSERT INTO meta(id, instance_id, schema_version, owner_epoch)
+             VALUES(1, '018f0000-0000-7000-8000-000000000003', 3, 7)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO root_state(id, mode, root_epoch) VALUES(1, 'off', 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO project_registry
+             (project_handle, public_id, canonical_root, display_path, registered_at, status)
+             VALUES('proj_keep', 'pub_keep', '/keep', '/keep', '2026-09-01', 'registered')",
+            [],
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+    }
+    let backup_dir = mf_agent::migration::backup_dir_for(&db);
+    drop(ServiceStore::open(&db).unwrap());
+    assert_eq!(user_version_of(&db), 4);
+    assert_eq!(counts_of(&db, "run_capability"), 0);
+    let project: String = read_only(&db)
+        .query_row("SELECT project_handle FROM project_registry", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(project, "proj_keep");
+    let artifacts = mf_agent::migration::published_artifact_dirs(&backup_dir).unwrap();
+    assert_eq!(artifacts.len(), 1);
+    let backup = artifacts[0].join("backup.db");
+    assert_eq!(user_version_of(&backup), 3);
+    assert!(!table_names_of(&backup).contains(&"run_capability".to_owned()));
+
+    let conn = Connection::open(&db).unwrap();
+    let before = schema_objects_of(&db);
+    conn.execute_batch(SERVICE_SCHEMA_V4_DELTA).unwrap();
+    assert_eq!(schema_objects_of(&db), before);
 }
 
 fn counts_of(db: &std::path::Path, table: &str) -> i64 {
@@ -505,6 +560,82 @@ fn operation_step_shape_and_constraints() {
     assert_eq!(counts_of(&db, "operation_step"), 0);
 }
 
+/// v4 capability authority 只保存 keyed HMAC/opaque handles，并以两个
+/// UNIQUE 约束和状态 CHECK 封住歧义写入。
+#[test]
+fn run_capability_shape_and_constraints() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = service_db(&tmp);
+    drop(ServiceStore::open(&db).unwrap());
+
+    assert_eq!(
+        column_names_of(&db, "run_capability"),
+        vec![
+            "token_hmac",
+            "project_handle",
+            "agent_run_handle",
+            "state",
+            "issued_at",
+            "revoked_at",
+        ]
+    );
+    assert_unique_index(&db, "run_capability", &["token_hmac"]);
+    assert_unique_index(
+        &db,
+        "run_capability",
+        &["project_handle", "agent_run_handle"],
+    );
+
+    let conn = Connection::open(&db).unwrap();
+    conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+    conn.execute(
+        "INSERT INTO project_registry
+         (project_handle, public_id, canonical_root, display_path, registered_at, status)
+         VALUES('proj_cap', 'pub_cap', '/cap', '/cap', '2026-09-01', 'registered')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO run_capability
+         (token_hmac, project_handle, agent_run_handle, state, issued_at)
+         VALUES('h1', 'proj_cap', 'run_a', 'active', '2026-09-01')",
+        [],
+    )
+    .unwrap();
+    assert!(conn
+        .execute(
+            "INSERT INTO run_capability
+             (token_hmac, project_handle, agent_run_handle, state, issued_at)
+             VALUES('h1', 'proj_cap', 'run_b', 'active', '2026-09-01')",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "INSERT INTO run_capability
+             (token_hmac, project_handle, agent_run_handle, state, issued_at)
+             VALUES('h2', 'proj_cap', 'run_a', 'active', '2026-09-01')",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "INSERT INTO run_capability
+             (token_hmac, project_handle, agent_run_handle, state, issued_at)
+             VALUES('h3', 'proj_cap', 'run_c', 'bogus', '2026-09-01')",
+            [],
+        )
+        .is_err());
+    assert!(conn
+        .execute(
+            "INSERT INTO run_capability
+             (token_hmac, project_handle, agent_run_handle, state, issued_at)
+             VALUES('h4', 'missing', 'run_d', 'active', '2026-09-01')",
+            [],
+        )
+        .is_err());
+}
+
 /// `audit`/`durable_feature`/`migration_marker` 列形状。
 #[test]
 fn remaining_tables_shape_matches_spec() {
@@ -582,7 +713,7 @@ fn project_registry_status_check_rejects_unknown_values() {
     assert!(insert("bogus").is_err(), "status CHECK 必须拒绝未知值");
 }
 
-/// future guard:`user_version = 4`(> 3)打开拒绝,稳定错误码,库不动
+/// future guard:高于当前版本时打开拒绝,稳定错误码,库不动
 /// (字节不变、无 DDL、无 journal 模式改写、无 sidecar)。
 #[test]
 fn future_version_fails_closed_without_side_effects() {
@@ -590,11 +721,12 @@ fn future_version_fails_closed_without_side_effects() {
     let db = service_db(&tmp);
     {
         let conn = Connection::open(&db).unwrap();
-        conn.execute_batch(
+        conn.execute_batch(&format!(
             "CREATE TABLE future_marker (id INTEGER PRIMARY KEY, note TEXT NOT NULL);
-             INSERT INTO future_marker (id, note) VALUES (1, 'v3-data');
-             PRAGMA user_version = 4;",
-        )
+             INSERT INTO future_marker (id, note) VALUES (1, 'future-data');
+             PRAGMA user_version = {};",
+            SERVICE_SCHEMA_VERSION + 1
+        ))
         .unwrap();
     }
     let hash_before = sha256_file(&db);
@@ -612,7 +744,7 @@ fn future_version_fails_closed_without_side_effects() {
     );
     match err.downcast_ref::<ServiceSchemaError>() {
         Some(ServiceSchemaError::FutureVersion { found, known }) => {
-            assert_eq!(*found, 4);
+            assert_eq!(*found, SERVICE_SCHEMA_VERSION + 1);
             assert_eq!(*known, SERVICE_SCHEMA_VERSION);
         }
         other => panic!("必须是 FutureVersion 判别值: {other:?}"),
@@ -623,7 +755,11 @@ fn future_version_fails_closed_without_side_effects() {
         hash_before,
         "拒绝路径不得改写数据库文件字节"
     );
-    assert_eq!(user_version_of(&db), 4, "user_version 不变");
+    assert_eq!(
+        user_version_of(&db),
+        SERVICE_SCHEMA_VERSION + 1,
+        "user_version 不变"
+    );
     assert_eq!(
         journal_mode_of(&db),
         "delete",
@@ -644,7 +780,7 @@ fn future_version_fails_closed_without_side_effects() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(note, "v3-data", "既有数据不动");
+    assert_eq!(note, "future-data", "既有数据不动");
 }
 
 /// 同为 user_version=1 的其他/残缺 SQLite 文件不能被静默当成

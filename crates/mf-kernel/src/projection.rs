@@ -14,9 +14,13 @@
 //! (`{type, aggregate, caused_by_command_id, projection}`);本模块在
 //! publication 时把它编译为对外的 `mf.event.v1` envelope(§5.4)。
 
-use crate::handles::{AggregateKind, AggregateRef, ServerInstanceId, StreamEpoch, WorkflowHandle};
+use crate::handles::{
+    AgentRunHandle, AgentSessionHandle, AggregateKind, AggregateRef, ServerInstanceId, StepHandle,
+    StreamEpoch, WorkflowHandle, WorkflowRunHandle,
+};
 use crate::journal::EventJournal;
 use crate::kernel::KernelProblem;
+use crate::operation::{OperationHandle, OperationProgress};
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
@@ -101,9 +105,17 @@ pub struct EventEnvelope {
 /// Snapshot 查询(当前 workflow tracer；Workspace 快照随完整投影扩展)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotQuery {
+    Workspace,
     Workflow {
         project: crate::handles::ProjectStoreHandle,
         workflow: WorkflowHandle,
+    },
+    WorkflowRun {
+        project: crate::handles::ProjectStoreHandle,
+        workflow_run: WorkflowRunHandle,
+    },
+    Operation {
+        operation: OperationHandle,
     },
 }
 
@@ -141,9 +153,181 @@ pub struct WorkflowSnapshotEdge {
     pub downstream_node_handle: String,
 }
 
+/// Workflow Run 权威投影。Task/Pipeline Revision 仍是 Project Store
+/// 内部承载；Web/legacy UI 只看到持久 handle、revision 与领域状态。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkflowRunSnapshotData {
+    pub workflow_run: WorkflowRunHandle,
+    pub revision: ScalarRevision,
+    pub title: String,
+    pub goal: String,
+    pub status: String,
+    pub paused: bool,
+    pub unread: bool,
+    /// 「需要你」是 Workflow Run 的一个投影，不建立第二套状态机。
+    pub needs_you: bool,
+    pub pipeline_revision: Option<PipelineRevisionSnapshot>,
+    pub steps: Vec<WorkflowRunStepSnapshot>,
+    pub agent_runs: Vec<AgentRunSnapshot>,
+    pub agent_sessions: Vec<AgentSessionSnapshot>,
+    pub open_questions: Vec<OpenQuestionSnapshot>,
+    pub handoffs: Vec<HandoffSnapshot>,
+    pub execution_leases: Vec<ExecutionLeaseSnapshot>,
+    pub pending_merges: Vec<PendingMergeSnapshot>,
+    pub needs_you_reasons: Vec<NeedsYouReasonSnapshot>,
+    pub reason_count: usize,
+    pub focus_step: Option<StepHandle>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PipelineRevisionSnapshot {
+    pub handle: String,
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    pub number: u64,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkflowRunStepSnapshot {
+    pub step: StepHandle,
+    pub revision: ScalarRevision,
+    pub key: String,
+    pub title: String,
+    pub instructions: String,
+    pub agent_instance_ref: String,
+    pub session_policy: String,
+    pub status: String,
+    pub attempts: i32,
+    pub auto_retry: i32,
+    pub result: Option<String>,
+    pub dependencies: Vec<StepHandle>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AgentRunSnapshot {
+    pub agent_run: AgentRunHandle,
+    pub revision: ScalarRevision,
+    pub step: StepHandle,
+    pub agent_session: Option<AgentSessionHandle>,
+    pub status: String,
+    pub agent_state: String,
+    pub outcome: Option<String>,
+    pub outcome_payload: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AgentSessionSnapshot {
+    pub agent_session: AgentSessionHandle,
+    pub revision: ScalarRevision,
+    pub title: String,
+    pub runtime: String,
+    pub status: String,
+    pub unread: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OpenQuestionSnapshot {
+    /// Core 内部 command correlation；不序列化到 Web Snapshot，避免暴露
+    /// Project Store rowid。Legacy facade 只用它把用户在某次 Snapshot
+    /// 看到的 q1 固定进 Respond command，防止延迟命令命中后来的 q2。
+    #[serde(skip_serializing)]
+    pub(crate) question_id: i64,
+    pub step: Option<StepHandle>,
+    pub agent_run: Option<AgentRunHandle>,
+    pub question: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HandoffSnapshot {
+    pub step: Option<StepHandle>,
+    pub agent_run: Option<AgentRunHandle>,
+    pub handoff: mf_agent::handoff::Handoff,
+}
+
+/// Execution Lease 只投影 UI 所需状态；目录 path/metadata 不越过 Core。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExecutionLeaseSnapshot {
+    pub step: StepHandle,
+    pub agent_run: Option<AgentRunHandle>,
+    pub provider: String,
+    pub isolated: bool,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PendingMergeSnapshot {
+    pub step: Option<StepHandle>,
+    pub conflicts: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NeedsYouReasonSnapshot {
+    pub kind: String,
+    pub step: Option<StepHandle>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkspaceSnapshotData {
+    pub projects: Vec<WorkspaceProjectSnapshot>,
+    pub active_workflow_runs: usize,
+    pub needs_you_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkspaceProjectSnapshot {
+    pub project: crate::handles::ProjectStoreHandle,
+    pub display_name: String,
+    pub workflow_runs: Vec<WorkflowRunSummarySnapshot>,
+    pub active_agent_sessions: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkflowRunSummarySnapshot {
+    pub workflow_run: WorkflowRunHandle,
+    pub revision: ScalarRevision,
+    pub title: String,
+    pub status: String,
+    pub paused: bool,
+    pub unread: bool,
+    pub needs_you: bool,
+    pub reason_count: usize,
+    pub focus_step: Option<StepHandle>,
+    pub active_agent_runs: usize,
+}
+
+/// service-v1 中 Operation saga 的稳定读投影。只暴露 opaque identity、
+/// 状态与 receipt 结果，不暴露 frozen payload/路径/凭据。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OperationSnapshotData {
+    pub operation: OperationHandle,
+    pub kind: String,
+    pub state: String,
+    pub progress: OperationProgress,
+    /// Workflow Start 一类产出 Workflow Run 的 Operation 的最终结果句柄;
+    /// 从已生效 forward step 的 target receipt 提取,无则 None。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workflow_run: Option<crate::handles::WorkflowRunHandle>,
+    pub steps: Vec<OperationStepSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct OperationStepSnapshot {
+    pub index: usize,
+    pub role: String,
+    pub state: String,
+    pub target_store: String,
+    pub aggregate: String,
+    pub compensates: Option<usize>,
+    pub result: Value,
+    pub problem_code: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum SnapshotData {
+    Workspace(WorkspaceSnapshotData),
     Workflow(WorkflowSnapshotData),
+    WorkflowRun(WorkflowRunSnapshotData),
+    Operation(OperationSnapshotData),
 }
 
 /// `mf.snapshot.v1`(§7.3):cursor 与事件流同 barrier 读取。
@@ -198,6 +382,19 @@ impl ProjectionHub {
         let _barrier = self.publication.lock();
         self.journal.ensure_configured()?;
         self.recover_poisoned(targets)?;
+        action(self)
+    }
+
+    /// Durable run actions 的恢复临界区。它与普通 L-PUBLISH 共用
+    /// barrier，但允许进入 run-action blocked target 执行幂等重投。
+    pub(crate) fn linearize_run_actions<T>(
+        &self,
+        targets: &[crate::command::TargetDatabase],
+        action: impl FnOnce(&Self) -> Result<T, KernelProblem>,
+    ) -> Result<T, KernelProblem> {
+        let _barrier = self.publication.lock();
+        self.journal.ensure_configured()?;
+        self.journal.recover_for_run_actions(targets)?;
         action(self)
     }
 
@@ -268,6 +465,14 @@ impl ProjectionHub {
         self.journal.abort_publication(target)
     }
 
+    pub(crate) fn block_for_run_actions(&self, target: &crate::command::TargetDatabase) {
+        self.journal.block_for_run_actions(target);
+    }
+
+    pub(crate) fn clear_run_action_block(&self, target: &crate::command::TargetDatabase) {
+        self.journal.clear_run_action_block(target);
+    }
+
     pub(crate) fn recover_poisoned(
         &self,
         targets: &[crate::command::TargetDatabase],
@@ -284,6 +489,9 @@ pub(crate) fn compile_event(
     event_json: &str,
 ) -> Result<EventEnvelope, String> {
     let value: Value = serde_json::from_str(event_json).map_err(|e| e.to_string())?;
+    if value.get("run_actions").is_some() {
+        return Err("outbox 仍有未投递 run actions".into());
+    }
     let store_type = value
         .get("type")
         .and_then(Value::as_str)
@@ -507,6 +715,7 @@ fn aggregate_kind_from_str(value: &str) -> Result<AggregateKind, String> {
         "project_workflow" => Ok(AggregateKind::ProjectWorkflow),
         "workflow_run" => Ok(AggregateKind::WorkflowRun),
         "step" => Ok(AggregateKind::Step),
+        "agent_run" => Ok(AggregateKind::AgentRun),
         "agent_session" => Ok(AggregateKind::AgentSession),
         "agent_instance" => Ok(AggregateKind::AgentInstance),
         "provider_profile" => Ok(AggregateKind::ProviderProfile),

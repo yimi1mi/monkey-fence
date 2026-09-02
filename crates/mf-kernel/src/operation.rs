@@ -306,10 +306,13 @@ impl SagaStepPlan {
 }
 
 /// 完整 saga 计划:forward 步按序执行;compensate 步引用其回滚的 forward。
+/// `payload` 是 worker 重建 effects 所需的 durable frozen payload(canonical
+/// JSON,随 `saga_state` 落盘);无 payload 的 saga(如纯测试 fixture)为 None。
 #[derive(Debug, Clone, PartialEq)]
 pub struct OperationPlan {
     pub kind: OperationKind,
     pub steps: Vec<SagaStepPlan>,
+    pub payload: Option<String>,
 }
 
 impl OperationPlan {
@@ -359,6 +362,8 @@ impl OperationPlan {
     }
 
     /// 冻结为 `operation.saga_state` 的 canonical JSON(排序稳定,幂等比对)。
+    /// durable payload 一并嵌入:重启后 worker 只凭 service 行即可重建
+    /// effects,不依赖任何内存闭包。
     #[allow(dead_code)] // 经 accept 使用;accept 属 dark seam。
     fn frozen_json(&self) -> Result<String, OperationProblem> {
         let steps: Vec<Value> = self
@@ -376,12 +381,19 @@ impl OperationPlan {
                 })
             })
             .collect();
-        canonical_json(&serde_json::json!({
+        let mut plan = serde_json::json!({
             "schema": OPERATION_STEP_SCHEMA,
             "kind": self.kind.as_str(),
             "steps": steps,
-        }))
-        .map_err(|error| OperationProblem::Internal(error.to_string()))
+        });
+        if let Some(payload) = &self.payload {
+            let value: Value = serde_json::from_str(payload)
+                .map_err(|error| OperationProblem::Internal(error.to_string()))?;
+            plan.as_object_mut()
+                .expect("plan json is object")
+                .insert("payload".to_string(), value);
+        }
+        canonical_json(&plan).map_err(|error| OperationProblem::Internal(error.to_string()))
     }
 }
 
@@ -549,6 +561,9 @@ pub struct StepRecord {
     pub target_store: String,
     pub aggregate: String,
     pub semantic_digest: String,
+    /// canonical expected revisions(`canonical_expected_revisions` 输出;
+    /// worker 重建 plan 时恢复 CAS 前提)。
+    pub expected_json: String,
     pub compensates: Option<usize>,
     pub state: StepState,
     pub result: Value,
@@ -936,7 +951,9 @@ impl OperationCoordinator {
 
     /// 执行 saga:forward 按序,失败进入 compensation;全程以 durable
     /// receipt/step 状态推进,已 succeeded 的 step 跳过 effect(幂等 resume)。
-    /// 重启后的恢复不走这里——reconcile 只读 receipt 终结,不重放业务写。
+    /// 通用 Operation 重启恢复不走这里——reconcile 只读 receipt 终结；
+    /// 唯一例外是持有完整 durable payload/effect 编译器的 Workflow Start，
+    /// 由其专用 worker 重新进入此方法，已提交 effect 仍由 receipt 跳过。
     pub(crate) fn run(
         &self,
         handle: &OperationHandle,
@@ -955,31 +972,37 @@ impl OperationCoordinator {
         let _gate = self.service.command_gate();
         let identity = self.load_identity(handle)?;
         self.verify_plan(handle, plan)?;
+        let resume_state = operation_of(&self.service, handle)?.state;
         let mut effects: Vec<Option<StepEffect>> = effects.into_iter().map(Some).collect();
         let take_effect = |effects: &mut Vec<Option<StepEffect>>, index: usize| {
             effects[index].take().ok_or_else(|| {
                 OperationProblem::PlanConflict(format!("step {index} 的 effect 已被消费"))
             })
         };
-        for index in 0..plan.steps.len() {
-            if plan.steps[index].role != StepRole::Forward {
-                continue;
-            }
-            let outcome = self.execute_step(
-                handle,
-                index,
-                &plan.steps[index],
-                &identity,
-                targets,
-                authorizer,
-                take_effect(&mut effects, index)?,
-                fault,
-            )?;
-            if fault == Some(OperationFaultPoint::AfterStepFinalized(index)) {
-                return Err(OperationProblem::FaultInjected("after_step_finalized"));
-            }
-            if matches!(outcome, StepExecution::Failed) {
-                break;
+        // durable resumable Operation 在进程退出时可能已进入 compensating；
+        // 该状态只继续补偿，绝不重新进入 forward（forward receipt 虽能挡住
+        // effect，但状态机本身也必须保持单向）。
+        if resume_state != OperationState::Compensating {
+            for index in 0..plan.steps.len() {
+                if plan.steps[index].role != StepRole::Forward {
+                    continue;
+                }
+                let outcome = self.execute_step(
+                    handle,
+                    index,
+                    &plan.steps[index],
+                    &identity,
+                    targets,
+                    authorizer,
+                    take_effect(&mut effects, index)?,
+                    fault,
+                )?;
+                if fault == Some(OperationFaultPoint::AfterStepFinalized(index)) {
+                    return Err(OperationProblem::FaultInjected("after_step_finalized"));
+                }
+                if matches!(outcome, StepExecution::Failed) {
+                    break;
+                }
             }
         }
         // 决策循环只读 durable step 状态(不含内存计数)。
@@ -1210,7 +1233,7 @@ impl OperationCoordinator {
                         let event_type = projection
                             .event_type
                             .unwrap_or_else(|| step.command_type.as_str().to_string());
-                        let event = canonical_json(&serde_json::json!({
+                        let mut event = serde_json::json!({
                             "type": format!("{event_type}.applied"),
                             "aggregate": {
                                 "kind": aggregate.kind.as_str(),
@@ -1225,7 +1248,20 @@ impl OperationCoordinator {
                             },
                             "projection_critical": projection.projection_critical,
                             "projection": projection.payload,
-                        }))?;
+                        });
+                        // step 产生的 durable RunAction(如 Workflow Start 的
+                        // DispatchReady)与单命令链同一 envelope:L-PUBLISH 前由
+                        // 调用方经 RunLifecyclePort 投递并移除私有字段。
+                        if !projection.run_actions.is_empty() {
+                            event.as_object_mut().expect("event is object").insert(
+                                "run_actions".to_string(),
+                                serde_json::json!({
+                                    "schema": crate::run_lifecycle::DURABLE_RUN_ACTIONS_SCHEMA,
+                                    "actions": projection.run_actions,
+                                }),
+                            );
+                        }
+                        let event = canonical_json(&event)?;
                         tx.execute(
                             "INSERT INTO projection_outbox(event_json, published_at)
                              VALUES (?1, NULL)",
@@ -1442,6 +1478,33 @@ pub(crate) fn operation_of(
         .map_err(problem_from_anyhow)
 }
 
+/// 读取 accept 时冻结的 durable payload(worker 重建 effects 的唯一依据)。
+/// `saga_state.payload` 缺失 → None;存在但解析失败 → fail-closed。
+#[allow(dead_code)] // Workflow Start worker 由调度循环/契约测试驱动。
+pub(crate) fn durable_payload(
+    service: &Arc<ServiceStore>,
+    handle: &OperationHandle,
+) -> Result<Option<Value>, OperationProblem> {
+    let raw = service
+        .with_conn(|conn| {
+            conn.query_row(
+                "SELECT saga_state FROM operation WHERE operation_handle=?1",
+                [handle.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal_sql)?
+            .ok_or_else(|| anyhow::Error::new(OperationProblem::OperationNotFound))
+        })
+        .map_err(problem_from_anyhow)?;
+    let state: Value =
+        serde_json::from_str(&raw).map_err(|e| OperationProblem::Internal(e.to_string()))?;
+    Ok(state
+        .get("payload")
+        .cloned()
+        .filter(|value| !value.is_null()))
+}
+
 #[allow(dead_code)] // Dark seam until the T2 CoreKernel tracer.
 fn command_id_of(
     service: &Arc<ServiceStore>,
@@ -1490,6 +1553,61 @@ pub(crate) fn open_operations(
         .map_err(problem_from_anyhow)
 }
 
+/// Project freeze 期间终结尚未完成的指定类型 Operation。
+///
+/// freeze 已阻止新的 target effect；与该 target 关联且仍处于
+/// accepted/running/compensating/reconciling 的 Operation 进入 NeedsYou，
+/// 使其不会在 Project 重开后被当作未完成工作重放。终态与
+/// command intent 在同一 service 事务内收口。
+pub(crate) fn fail_open_operations_for_target(
+    service: &Arc<ServiceStore>,
+    operation_kind: &str,
+    target_store: &str,
+    problem_code: &'static str,
+) -> Result<Vec<OperationHandle>, OperationProblem> {
+    service
+        .with_tx(|tx| {
+            let rows = {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT DISTINCT o.operation_handle,o.command_id
+                         FROM operation o
+                         JOIN operation_step s ON s.operation_handle=o.operation_handle
+                         WHERE o.kind=?1
+                           AND o.state NOT IN ('completed','needs_you')
+                           AND s.target_store=?2
+                         ORDER BY o.operation_handle",
+                    )
+                    .map_err(internal_sql)?;
+                let rows = stmt
+                    .query_map(params![operation_kind, target_store], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .map_err(internal_sql)?
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(internal_sql)?;
+                rows
+            };
+            let mut closed = Vec::with_capacity(rows.len());
+            for (raw_handle, command_id) in rows {
+                let handle = OperationHandle::parse(raw_handle)
+                    .map_err(|error| OperationProblem::Internal(error.to_string()))?;
+                finalize_tx(
+                    tx,
+                    &handle,
+                    &command_id,
+                    &TerminalKind::NeedsYou {
+                        code: problem_code,
+                        step_index: None,
+                    },
+                )?;
+                closed.push(handle);
+            }
+            Ok(closed)
+        })
+        .map_err(problem_from_anyhow)
+}
+
 /// 重启 reconcile 专用:把未终结 operation 推进为 `reconciling`
 /// (附录 B)。幂等;返回推进数量。调用方须持有 command_gate。
 #[allow(dead_code)] // Dark seam until the T2 CoreKernel tracer.
@@ -1501,6 +1619,30 @@ pub(crate) fn mark_reconciling(service: &Arc<ServiceStore>) -> Result<usize, Ope
                     "UPDATE operation SET state='reconciling', updated_at=?1
                      WHERE state IN ('accepted','running','compensating')",
                     [chrono::Utc::now().to_rfc3339()],
+                )
+                .map_err(internal_sql)?;
+            Ok(changed)
+        })
+        .map_err(problem_from_anyhow)
+}
+
+/// 与 [`mark_reconciling`] 相同，但保留能够从 durable payload 重建业务
+/// effect 的 Workflow Start。其它 Operation 仍严格遵循「重启只读 receipt
+/// 终结、绝不重放」的 fail-closed 契约。
+pub(crate) fn mark_reconciling_except_resumable_workflow_start(
+    service: &Arc<ServiceStore>,
+) -> Result<usize, OperationProblem> {
+    service
+        .with_tx(|tx| {
+            let changed = tx
+                .execute(
+                    "UPDATE operation SET state='reconciling', updated_at=?1
+                     WHERE state IN ('accepted','running','compensating')
+                       AND kind <> ?2",
+                    params![
+                        chrono::Utc::now().to_rfc3339(),
+                        crate::workflow_start::WORKFLOW_START_OPERATION_KIND,
+                    ],
                 )
                 .map_err(internal_sql)?;
             Ok(changed)
@@ -1989,6 +2131,7 @@ type StepRow = (
     String,
     String,
     String,
+    String,
     Option<i64>,
     String,
     String,
@@ -2003,6 +2146,7 @@ fn parse_step_row(row: StepRow) -> Result<StepRecord, OperationProblem> {
         target_store,
         aggregate,
         digest,
+        expected_json,
         compensates,
         state,
         result_json,
@@ -2016,6 +2160,7 @@ fn parse_step_row(row: StepRow) -> Result<StepRecord, OperationProblem> {
         target_store,
         aggregate,
         semantic_digest: digest,
+        expected_json,
         compensates: compensates
             .map(usize::try_from)
             .transpose()
@@ -2028,7 +2173,7 @@ fn parse_step_row(row: StepRow) -> Result<StepRecord, OperationProblem> {
 }
 
 const STEP_COLUMNS: &str = "step_index, role, step_id, target_store, aggregate, semantic_digest,
-                           compensates, state, result_json, problem_code";
+                           expected_json, compensates, state, result_json, problem_code";
 
 fn step_tx(
     conn: &Connection,
@@ -2082,6 +2227,7 @@ fn map_step_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRow> {
         row.get(7)?,
         row.get(8)?,
         row.get(9)?,
+        row.get(10)?,
     ))
 }
 

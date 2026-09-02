@@ -106,6 +106,9 @@ struct JournalInner {
     /// publication 失败且 outbox 无法当场 reconciled 时禁止新 epoch 发布；
     /// 下次调用必须先收口旧 outbox。
     poisoned_targets: HashSet<String>,
+    /// Store 已提交但 private run actions 尚未全部投递。这类
+    /// poison 绝不能用普通 reconciled 标记清除，否则会永久丢 action。
+    run_action_blocked_targets: HashSet<String>,
     resyncs: u64,
 }
 
@@ -248,6 +251,7 @@ impl EventJournal {
                 protocol_rotations: 0,
                 evicted: 0,
                 poisoned_targets: HashSet::new(),
+                run_action_blocked_targets: HashSet::new(),
                 resyncs: 0,
             }),
         }
@@ -529,10 +533,47 @@ impl EventJournal {
         rotate_and_reconcile(&mut inner, target, Utc::now(), RotationReason::Publication)
     }
 
+    /// Store commit 已发生而 durable run action 尚未完成：旋转 epoch，
+    /// 但保留 outbox pending，阻止 Snapshot/普通 publication。
+    pub(crate) fn block_for_run_actions(&self, target: &TargetDatabase) {
+        let mut inner = self.inner.lock();
+        rotate_epoch(&mut inner, RotationReason::Publication);
+        inner
+            .run_action_blocked_targets
+            .insert(target.store_key().to_string());
+    }
+
+    pub(crate) fn clear_run_action_block(&self, target: &TargetDatabase) {
+        self.inner
+            .lock()
+            .run_action_blocked_targets
+            .remove(target.store_key());
+    }
+
+    /// Run action recovery 在 publication barrier 内可越过自身的 block，
+    /// 但仍必须先收口其它普通 publication poison。
+    pub(crate) fn recover_for_run_actions(
+        &self,
+        targets: &[TargetDatabase],
+    ) -> Result<(), KernelProblem> {
+        let mut inner = self.inner.lock();
+        Self::recover_publication_poisoned(&mut inner, targets)
+    }
+
     /// 全局 Recovering phase：所有故障 target 的旧 outbox 都收口后，
     /// 才允许新 epoch 继续发布或返回 Snapshot。
     pub(crate) fn recover_poisoned(&self, targets: &[TargetDatabase]) -> Result<(), KernelProblem> {
         let mut inner = self.inner.lock();
+        if !inner.run_action_blocked_targets.is_empty() {
+            return Err(KernelProblem::ResyncRequired);
+        }
+        Self::recover_publication_poisoned(&mut inner, targets)
+    }
+
+    fn recover_publication_poisoned(
+        inner: &mut JournalInner,
+        targets: &[TargetDatabase],
+    ) -> Result<(), KernelProblem> {
         if inner.poisoned_targets.is_empty() {
             return Ok(());
         }
@@ -555,7 +596,11 @@ impl EventJournal {
     /// 任一步失败都旋转 epoch，旧客户端确定 resync。
     pub(crate) fn publish_pending(&self, target: &TargetDatabase) -> Result<(), KernelProblem> {
         let mut inner = self.inner.lock();
-        if !inner.poisoned_targets.is_empty() {
+        if !inner.poisoned_targets.is_empty()
+            || inner
+                .run_action_blocked_targets
+                .contains(target.store_key())
+        {
             return Err(KernelProblem::ResyncRequired);
         }
         let (pending_count, pending_bytes): (i64, i64) = target
@@ -887,11 +932,31 @@ fn mark_all_pending_reconciled(
     );
     target
         .with_tx(|tx| {
-            tx.execute(
-                "UPDATE projection_outbox SET published_at=?1 WHERE published_at IS NULL",
-                [&reconciled],
-            )
-            .map_err(|error| CommandProblem::Internal(error.to_string()))?;
+            let mut stmt = tx
+                .prepare(
+                    "SELECT outbox_id,event_json FROM projection_outbox
+                     WHERE published_at IS NULL ORDER BY outbox_id",
+                )
+                .map_err(|error| CommandProblem::Internal(error.to_string()))?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })
+                .map_err(|error| CommandProblem::Internal(error.to_string()))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| CommandProblem::Internal(error.to_string()))?;
+            drop(stmt);
+            for (outbox_id, event_json) in rows {
+                if crate::run_lifecycle::event_has_pending_run_actions(&event_json) {
+                    continue;
+                }
+                tx.execute(
+                    "UPDATE projection_outbox SET published_at=?1
+                     WHERE outbox_id=?2 AND published_at IS NULL",
+                    rusqlite::params![reconciled, outbox_id],
+                )
+                .map_err(|error| CommandProblem::Internal(error.to_string()))?;
+            }
             Ok(())
         })
         .map_err(|error| {

@@ -1,10 +1,12 @@
 //! 工作流运行 Composer 与 `AppCtx::run_project_workflow`(ADR 0004 / Task 4):
-//! 空 goal 拒绝、成功路径创建 Task/Revision 并开始调度、编译失败不留孤儿
-//! Task、单/多节点同一 API、goal 进入 prompt 构造链。
+//! 空 goal 拒绝、成功路径立即返回 Accepted Operation，后台创建
+//! Task/Revision 并开始调度；单/多节点共用同一 Core Start API。
 
 use crate::app_ctx::{AppCtx, WorkflowRunTarget};
 use crate::workflow_run_composer::WorkflowRunComposerState;
 use mf_agent::workflow::{ProjectWorkflowDraft, WorkflowNodeDraft};
+use mf_kernel::command::ServiceIdempotencyKey;
+use mf_kernel::handles::{ClientId, Principal};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,6 +20,27 @@ fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(50));
     }
     cond()
+}
+
+fn wait_for_new_task(
+    orchestrator: &Arc<mf_agent::Orchestrator>,
+    before: usize,
+) -> mf_agent::TaskView {
+    assert!(
+        wait_until(Duration::from_secs(20), || orchestrator
+            .store
+            .list_tasks(false)
+            .map(|tasks| tasks.len() > before)
+            .unwrap_or(false)),
+        "等待 Start Operation 创建 Workflow Run 超时"
+    );
+    orchestrator
+        .store
+        .list_tasks(false)
+        .unwrap()
+        .into_iter()
+        .max_by_key(|task| task.id)
+        .expect("Start Operation 已创建 Task")
 }
 
 fn node(key: &str, deps: &[&str]) -> WorkflowNodeDraft {
@@ -55,6 +78,17 @@ fn setup_with_workflow(nodes: Vec<WorkflowNodeDraft>) -> (Arc<AppCtx>, tempfile:
         })
         .unwrap();
     let project = tempfile::tempdir().unwrap();
+    let service =
+        mf_kernel::project_registry::ServiceStore::open(&project.path().join("service-v1.db"))
+            .unwrap();
+    let (runtime, client) = mf_kernel::kernel::InProcessKernelRuntime::for_test(
+        service,
+        ServiceIdempotencyKey::for_test(vec![0x71; 32]).unwrap(),
+        ClientId::parse("workflow-composer").unwrap(),
+        Principal::parse("workflow-composer-user").unwrap(),
+    )
+    .unwrap();
+    ctx.install_kernel_tracer_for_tests(runtime, client);
     let orch = ctx.open_project(project.path().to_path_buf()).unwrap();
     orch.store
         .save_project_workflow(&ProjectWorkflowDraft {
@@ -114,12 +148,15 @@ fn submit_success_and_error_manage_state() {
             Ok(WorkflowRunTarget {
                 project_root: root.clone(),
                 workflow_key: key.to_string(),
-                task_id: 7,
-                revision_id: 3,
+                operation_handle: mf_kernel::operation::OperationHandle::parse(format!(
+                    "op_{}",
+                    uuid::Uuid::now_v7()
+                ))
+                .unwrap(),
             })
         })
         .unwrap();
-    assert_eq!(target.task_id, 7);
+    assert!(target.operation_handle.as_str().starts_with("op_"));
     assert!(!state.is_submitting());
 
     state.set_goal("再次运行");
@@ -149,27 +186,26 @@ fn run_project_workflow_creates_task_revision_and_starts_scheduling() {
         .expect("运行项目工作流");
     assert_eq!(target.workflow_key, "wf-e2e");
     assert_eq!(target.project_root, project.path().to_path_buf());
+    assert!(target.operation_handle.as_str().starts_with("op_"));
     let orch = ctx.orchestrator_of(project.path()).unwrap();
+    let task = wait_for_new_task(&orch, before);
     // Task 创建:标题取第一非空行,完整 goal 保留
-    let task = orch.store.task_view(target.task_id).unwrap().unwrap();
     assert_eq!(task.title, "发布前检查");
     assert_eq!(task.goal, goal);
     // Revision 冻结且已激活,调度启动(真实派发)
-    assert!(target.revision_id > 0);
+    let revision_id = task
+        .active_revision
+        .expect("Start Operation 已激活 Revision");
     assert!(
         wait_until(Duration::from_secs(20), || orch
             .store
-            .list_runs_of_task(target.task_id)
+            .list_runs_of_task(task.id)
             .map(|runs| !runs.is_empty())
             .unwrap_or(false)),
         "等待真实派发超时"
     );
     // goal 进入节点 prompt 构造链(build_workflow_prompt 引用 task.goal)
-    let snapshot = orch
-        .store
-        .revision_snapshot(target.revision_id)
-        .unwrap()
-        .unwrap();
+    let snapshot = orch.store.revision_snapshot(revision_id).unwrap().unwrap();
     let prompt = mf_agent::orchestrator::build_workflow_prompt(
         &task,
         &snapshot.nodes[0],
@@ -189,14 +225,13 @@ fn run_project_workflow_creates_task_revision_and_starts_scheduling() {
         "项目工作流不得自动晋升全局模板: {templates:?}"
     );
     // 清理真实进程并停止
-    for r in orch.store.list_runs_of_task(target.task_id).unwrap() {
+    for r in orch.store.list_runs_of_task(task.id).unwrap() {
         if let Some(sid) = r.session_id {
             if let Some(session) = orch.store.session_view(sid).unwrap() {
                 ctx.registry.kill_session(&session.public_handle);
             }
         }
     }
-    orch.stop();
     ctx.close_project(&project.path().to_path_buf());
 }
 
@@ -241,22 +276,22 @@ fn single_and_multi_node_workflows_use_the_same_api() {
         .run_project_workflow(project.path(), "wf-e2e", "两步工作流")
         .expect("多节点同一 API 运行");
     let orch = ctx.orchestrator_of(project.path()).unwrap();
-    let snapshot = orch
-        .store
-        .revision_snapshot(target.revision_id)
-        .unwrap()
-        .unwrap();
+    let task = wait_for_new_task(&orch, 0);
+    let revision_id = task
+        .active_revision
+        .expect("Start Operation 已激活 Revision");
+    let snapshot = orch.store.revision_snapshot(revision_id).unwrap().unwrap();
     assert_eq!(snapshot.nodes.len(), 2);
-    let steps = orch.store.task_steps(target.task_id).unwrap();
+    let steps = orch.store.task_steps(task.id).unwrap();
     assert_eq!(steps.len(), 2, "两个节点都投影为 Step");
-    for r in orch.store.list_runs_of_task(target.task_id).unwrap() {
+    for r in orch.store.list_runs_of_task(task.id).unwrap() {
         if let Some(sid) = r.session_id {
             if let Some(session) = orch.store.session_view(sid).unwrap() {
                 ctx.registry.kill_session(&session.public_handle);
             }
         }
     }
-    orch.stop();
+    assert!(target.operation_handle.as_str().starts_with("op_"));
     ctx.close_project(&project.path().to_path_buf());
 }
 
@@ -267,12 +302,12 @@ fn missing_workflow_or_project_are_stable_errors() {
         .run_project_workflow(project.path(), "ghost-wf", "目标")
         .err()
         .unwrap();
-    assert!(format!("{err:#}").contains("不存在"));
+    assert!(format!("{err:#}").contains("resource_not_found"));
     let err = ctx
         .run_project_workflow(Path::new("D:/not-opened"), "wf-e2e", "目标")
         .err()
         .unwrap();
-    assert!(format!("{err:#}").contains("项目未打开"));
+    assert!(format!("{err:#}").contains("Project Store 未完成 kernel 登记"));
     let orch = ctx.orchestrator_of(project.path()).unwrap();
     orch.stop();
     ctx.close_project(&project.path().to_path_buf());

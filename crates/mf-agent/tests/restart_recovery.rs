@@ -2,6 +2,9 @@
 //! 存活会话重连、未结算等待确认、丢失进程 interrupted(绝不判失败)、
 //! 未知状态保持执行租约、人工结算通道保留。
 
+#[path = "common/run_lifecycle.rs"]
+mod run_lifecycle;
+
 use crossbeam_channel::Sender;
 use mf_agent::model::*;
 use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
@@ -316,10 +319,7 @@ fn interrupted_run_can_still_be_settled_manually() {
 #[test]
 fn interrupted_run_supports_fresh_retry() {
     let fx = recover_fixture(false, None);
-    let step = fx
-        .orch
-        .retry_step(fx.step_id, RetryMode::FreshSession)
-        .unwrap();
+    let step = run_lifecycle::retry_step(&fx.orch, fx.step_id, RetryMode::FreshSession).unwrap();
     assert_eq!(step.status, StepStatus::Ready);
     fx.orch.stop();
 }

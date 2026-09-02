@@ -17,6 +17,8 @@ mod diff_view;
 mod editor;
 mod file_index;
 mod file_tree;
+#[cfg(test)]
+mod kernel_projection_audit_tests;
 mod navigation;
 mod pipe_server;
 mod plugin_contribution_view;
@@ -29,6 +31,7 @@ mod quick_open;
 #[cfg(test)]
 mod quick_open_input_tests;
 mod review_e2e_tests;
+mod run_lifecycle_port;
 mod run_monitor;
 #[cfg(test)]
 mod run_monitor_gpui_tests;
@@ -63,6 +66,7 @@ mod workflow_run_composer;
 #[cfg(test)]
 mod workflow_run_composer_tests;
 mod workflow_runs_page;
+mod workflow_start_port;
 mod workspace;
 #[cfg(test)]
 mod workspace_interaction_tests;
@@ -588,10 +592,19 @@ mod v2_tests {
         Arc::new(parking_lot::RwLock::new(ProfileCatalog { index, specs }))
     }
 
-    fn start_orch(root: &std::path::Path) -> Arc<Orchestrator> {
-        let store = Store::open(&root.join(".mf-agent/orchestration.db")).unwrap();
-        Orchestrator::start(
-            store,
+    /// T2d:settlement 经共享测试 Core 登记(同生产 open_project 链:
+    /// runtime 打开权威 Store → Orchestrator 借用 → 注册 lifecycle port)。
+    /// guard Drop 时注销,防止已删除库进入令牌路由扫描。
+    fn start_orch(
+        root: &std::path::Path,
+    ) -> (
+        Arc<Orchestrator>,
+        crate::pipe_server::contract_tests::KernelProjectGuard,
+    ) {
+        let core = crate::pipe_server::contract_tests::shared_kernel_core();
+        let kernel_project = core.runtime.open_project(root).unwrap();
+        let orch = Orchestrator::start(
+            kernel_project.legacy_store(),
             root.to_path_buf(),
             mf_agent::Config::default(),
             RuntimeHostImpl::new(SessionRegistry::new(mf_agent::Config::default())),
@@ -600,14 +613,27 @@ mod v2_tests {
             pipe_name_for_current_process(),
             std::sync::Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default()),
         )
-        .unwrap()
+        .unwrap();
+        core.runtime
+            .register_run_lifecycle_port(
+                kernel_project.handle(),
+                std::sync::Arc::new(crate::pipe_server::contract_tests::PipeOrchestratorPort {
+                    orchestrator: orch.clone(),
+                }),
+            )
+            .unwrap();
+        let guard = crate::pipe_server::contract_tests::KernelProjectGuard::new(
+            core.runtime.clone(),
+            kernel_project.handle().clone(),
+        );
+        (orch, guard)
     }
 
-    /// mfctl 命名管道端到端:step.complete / 错误令牌 / agent.state / pipeline.propose。
+    /// mfctl 命令管道端到端:step.complete / 错误令牌 / agent.state / pipeline.propose。
     #[test]
     fn mfctl_pipe_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        let orch = start_orch(tmp.path());
+        let (orch, _kernel) = start_orch(tmp.path());
         let task = orch.create_task("管道测试", "").unwrap();
         orch.save_pipeline(
             task.id,

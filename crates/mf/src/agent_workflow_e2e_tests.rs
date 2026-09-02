@@ -1079,9 +1079,11 @@ fn node_session_injects_capability_token_and_pipe_into_cli_env() {
         "prompt(goal)必须作为尾参传递(以长度前缀避免落盘 token): {} 字节",
         prompt.len()
     );
+    assert!(prompt.contains("MF_RUN_TOKEN 环境变量"));
+    assert!(!prompt.contains("mfctl --token"));
     assert!(
-        prompt.contains("[MF_RUN_TOKEN]"),
-        "记录层必须脱敏 prompt 中的能力令牌"
+        !prompt.contains("[MF_RUN_TOKEN]"),
+        "prompt 本身不得再携带需由记录层脱敏的能力令牌"
     );
     let launch_raw = std::fs::read_to_string(chain.record.path().join("launch.json")).unwrap();
     assert!(
@@ -1375,6 +1377,18 @@ fn project_workflow_first_run_loop_e2e(cx: &mut gpui::TestAppContext) {
 
     // 1) 打开项目,不创建任何 Task
     let project = tempfile::tempdir().unwrap();
+    let service = mf_kernel::project_registry::ServiceStore::open(
+        &project.path().join("service-first-run.db"),
+    )
+    .unwrap();
+    let (runtime, client) = mf_kernel::kernel::InProcessKernelRuntime::for_test(
+        service,
+        mf_kernel::command::ServiceIdempotencyKey::for_test(vec![0x73; 32]).unwrap(),
+        mf_kernel::handles::ClientId::parse("workflow-first-run").unwrap(),
+        mf_kernel::handles::Principal::parse("workflow-first-run-user").unwrap(),
+    )
+    .unwrap();
+    ctx.install_kernel_tracer_for_tests(runtime, client);
     let orch = ctx.open_project(project.path().to_path_buf()).unwrap();
     assert!(orch.store.list_tasks(false).unwrap().is_empty());
 
@@ -1460,6 +1474,14 @@ fn project_workflow_first_run_loop_e2e(cx: &mut gpui::TestAppContext) {
             "运行后进入 Runs"
         );
     });
+    assert!(
+        e2e_wait(Duration::from_secs(20), || orch
+            .store
+            .list_tasks(false)
+            .map(|tasks| tasks.len() == 1)
+            .unwrap_or(false)),
+        "Accepted Operation 必须在后台创建唯一 Workflow Run"
+    );
     let tasks = orch.store.list_tasks(false).unwrap();
     assert_eq!(tasks.len(), 1, "自动创建且仅创建一个 Task");
     let task_id = tasks[0].id;

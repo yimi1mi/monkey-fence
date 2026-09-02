@@ -496,6 +496,187 @@ mod pinned_adapter_tests {
     }
 }
 
+// ---------- Issue #27:短别名影子化防护(工作流编译 → 冻结 pin 全链) ----------
+
+mod short_alias_shadow_tests {
+    use crate::adapter_launch::workflow_plugin_index;
+    use crate::adapter_launch::{resolve_adapter_for_pin, resolve_agent_type_pin};
+    use mf_agent::workflow::{WorkflowNodeDraft, WorkflowSnapshot, WorkflowTemplateVersion};
+    use mf_agent::workflow_compiler::CompileInput;
+    use mf_agent::{AgentInstanceSnapshot, CompileError, RunMode, WorkflowCompiler};
+    use mf_plugins::install::InstallSource;
+    use mf_plugins::PluginHost;
+
+    /// 带内置合成插件的宿主(临时插件根 + 内存目录库,不碰真实安装目录)。
+    fn host_with_builtins() -> (std::sync::Arc<PluginHost>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        (
+            PluginHost::load_at_with_catalog(
+                tmp.path().to_path_buf(),
+                mf_agent::CatalogStore::memory().unwrap(),
+                &mf_agent::Config::default(),
+                &[],
+            ),
+            tmp,
+        )
+    }
+
+    /// 安装第三方插件(完整贡献 ID = `{publisher}.{id}.{agent_id}`);
+    /// 只安装不启用 —— enable 会持久化锁文件,后续 install 会按锁文件
+    /// 重载内存状态,多包场景须装完再统一 enable。
+    fn install(host: &PluginHost, publisher: &str, id: &str, agent_id: &str) -> String {
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(
+            src.path().join("monkeyfence-plugin.toml"),
+            format!(
+                r#"[manifest]
+version = 2
+publisher = "{publisher}"
+id = "{id}"
+name = "{publisher}.{id} shadow fixture"
+version_str = "0.1.0"
+description = "short-alias shadow fixture"
+
+[[agent_types]]
+id = "{agent_id}"
+name = "{agent_id} Agent"
+adapter = "generic-command"
+command = "{agent_id}"
+modes = ["interactive", "oneshot"]
+"#
+            ),
+        )
+        .unwrap();
+        let resolved = host
+            .install_package(
+                src.path(),
+                InstallSource::Local {
+                    path: src.path().display().to_string(),
+                },
+            )
+            .expect("安装 fixture 不应失败");
+        resolved.full_id
+    }
+
+    /// 装完多个包后统一启用(规避 enable→install 的锁重载时序)。
+    fn enable_all(host: &PluginHost, full_ids: &[&str]) {
+        for full_id in full_ids {
+            host.enable(full_id, true).expect("启用 fixture 不应失败");
+        }
+    }
+
+    fn instance(agent_type: &str) -> AgentInstanceSnapshot {
+        AgentInstanceSnapshot {
+            id: "inst-alias".into(),
+            name: "别名实例".into(),
+            agent_type: agent_type.into(),
+            version: 1,
+            enabled: true,
+            run_mode: RunMode::OneShot,
+            executable: agent_type.into(),
+            argv: vec![],
+            env: vec![],
+            config: serde_json::json!({}),
+            execution_contract: serde_json::json!({}),
+            sealed_secret_ids: vec![],
+            external_config: false,
+        }
+    }
+
+    /// 单节点工作流经真实编译器编译(生产索引 workflow_plugin_index 注入)。
+    fn compile_one(
+        host: &std::sync::Arc<PluginHost>,
+        agent_type: &str,
+    ) -> Result<WorkflowSnapshot, Vec<CompileError>> {
+        let template = WorkflowTemplateVersion {
+            version_id: 1,
+            template_key: "alias-shadow-test".into(),
+            version: 1,
+            nodes: vec![WorkflowNodeDraft {
+                key: "n1".into(),
+                title: "节点".into(),
+                instructions: String::new(),
+                agent_instance_id: "inst-alias".into(),
+                deps: vec![],
+            }],
+            created_at: String::new(),
+        };
+        let inst = instance(agent_type);
+        let index = workflow_plugin_index(host);
+        WorkflowCompiler::new().compile(CompileInput {
+            template: &template,
+            directory_provider_isolates: true,
+            allow_unsafe_shared_directory: false,
+            agent_type_plugins: &index,
+            resolve_instance: &|_| Ok(inst.clone()),
+            directory_provider: None,
+        })
+    }
+
+    /// 旧实例快照的 legacy 短 id `codex` 在 aaa.codex.codex 存在时,
+    /// 编译冻结的 pin 必须指向内置 monkeyfence.codex(不被字典序更靠前的
+    /// 第三方影子化),派发期按该 pin 解析到内置适配器。
+    #[test]
+    fn builtin_codex_short_alias_pins_builtin_package_under_shadow_attempt() {
+        let (host, _tmp) = host_with_builtins();
+        let aaa = install(&host, "aaa", "codex", "codex");
+        enable_all(&host, &[&aaa]);
+
+        let snapshot = compile_one(&host, "codex").expect("内置短别名必须可编译");
+        let pin = snapshot.nodes[0].plugin.as_ref().expect("pin 必须冻结");
+        assert_eq!(pin.full_id, "monkeyfence.codex");
+        assert_eq!(pin.contribution_id, "monkeyfence.codex.codex");
+
+        // 第三方完整贡献 ID 始终精确可用,且指向自己的包
+        let index = workflow_plugin_index(&host);
+        let third = index
+            .get("aaa.codex.codex")
+            .expect("第三方完整贡献 ID 必须可用");
+        assert_eq!(third.full_id, "aaa.codex");
+
+        // 派发期按冻结 pin 解析:内置 codex 适配器
+        let adapter = resolve_adapter_for_pin(&host, Some(pin), "codex").unwrap();
+        assert_eq!(adapter.id(), "codex");
+    }
+
+    /// 两个第三方同短别名(x/y 各贡献 foo)时,foo 在编译器处稳定拒绝
+    /// (plugin-missing,错误确定且重复一致),完整贡献 ID 正常编译冻结;
+    /// 薄层单点解析给出歧义错误并要求完整贡献 ID。
+    #[test]
+    fn compiler_stably_rejects_ambiguous_short_alias_and_accepts_full_ids() {
+        let (host, _tmp) = host_with_builtins();
+        let x = install(&host, "x", "tools", "foo"); // x.tools.foo
+        let y = install(&host, "y", "tools", "foo"); // y.tools.foo
+        enable_all(&host, &[&x, &y]);
+
+        // 短别名 foo:索引不含它 → 编译器稳定拒绝(两次错误完全一致)
+        let e1 = compile_one(&host, "foo").unwrap_err();
+        let e2 = compile_one(&host, "foo").unwrap_err();
+        assert_eq!(e1, e2, "歧义短别名的编译拒绝必须稳定");
+        assert!(
+            e1.iter().any(|e| e.code == "plugin-missing"),
+            "应按 plugin-missing 稳定拒绝: {e1:?}"
+        );
+
+        // 完整贡献 ID:编译冻结,pin 冻结包身份 + 完整贡献身份
+        for full in ["x.tools.foo", "y.tools.foo"] {
+            let snapshot = compile_one(&host, full).expect("完整贡献 ID 必须可编译");
+            let pin = snapshot.nodes[0].plugin.as_ref().expect("pin 必须冻结");
+            assert_eq!(pin.contribution_id, full);
+        }
+
+        // 薄层 re-export 的单点解析:歧义错误列出候选并要求完整贡献 ID
+        let err = resolve_agent_type_pin(&host, "foo")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("歧义") && err.contains("完整贡献 ID"), "{err}");
+        assert!(
+            err.contains("x.tools.foo") && err.contains("y.tools.foo"),
+            "{err}"
+        );
+    }
+}
+
 // ---------- 完整贡献 ID + 结构化 secret_env(I5/I6)----------
 
 #[test]
@@ -608,4 +789,92 @@ fn editor_resolves_type_info_by_full_contribution_id() {
         draft.agent_type, "acme.tools.super-agent",
         "编辑页导出的 agent_type 必须是完整贡献 ID"
     );
+}
+
+// ---------- LaunchPlan 迁移等价(Issue #27:GPUI 薄层 ↔ mf-plugins 生产链) ----------
+
+mod launch_migration_equivalence_tests {
+    use crate::adapter_launch::compile_instance_launch as gpui_compile;
+    use mf_agent::{AgentInstanceSnapshot, RunMode};
+    use mf_plugins::adapter_launch::compile_instance_launch as plugin_compile;
+    use mf_plugins::PluginHost;
+
+    fn host() -> (std::sync::Arc<PluginHost>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        (PluginHost::empty_at(tmp.path().to_path_buf()), tmp)
+    }
+
+    fn instance() -> AgentInstanceSnapshot {
+        AgentInstanceSnapshot {
+            id: "inst_eq".into(),
+            name: "等价实例".into(),
+            agent_type: "generic-command".into(),
+            version: 3,
+            enabled: true,
+            run_mode: RunMode::OneShot,
+            executable: "demo-cli".into(),
+            argv: vec!["--fast".into()],
+            env: vec![("MF_EQ".into(), "1".into())],
+            config: serde_json::json!({}),
+            execution_contract: serde_json::json!({"input": "argv", "completion": "process-exit"}),
+            sealed_secret_ids: vec![],
+            external_config: false,
+        }
+    }
+
+    /// 同一输入分别走旧路径(crate::adapter_launch 薄兼容)与新生产链
+    /// (mf_plugins::adapter_launch typed 编译):编译产物逐字段一致,
+    /// 迁移不改变任何启动语义;typed 冻结身份是新增强,不进入旧出口。
+    #[test]
+    fn gpui_thin_adapter_matches_mf_plugins_chain() {
+        let (host, _tmp) = host();
+        let catalog = mf_agent::CatalogStore::memory().unwrap();
+        let run_temp = std::env::temp_dir().join("mf-launch-eq-run");
+        let workdir = std::env::temp_dir().join("mf-launch-eq-work");
+        let (inst, pin): (
+            AgentInstanceSnapshot,
+            Option<mf_agent::workflow::PluginSourcePin>,
+        ) = (instance(), None);
+
+        let legacy = gpui_compile(
+            &host,
+            &catalog,
+            &inst,
+            pin.as_ref(),
+            run_temp.clone(),
+            workdir.clone(),
+            Some("do it".into()),
+            "tok-eq",
+            false,
+            None,
+        )
+        .unwrap();
+        let typed = plugin_compile(
+            &host,
+            &catalog,
+            &inst,
+            pin.as_ref(),
+            run_temp.clone(),
+            workdir.clone(),
+            Some("do it".into()),
+            "tok-eq",
+            false,
+            None,
+        )
+        .unwrap();
+        let frozen = typed.plan();
+
+        assert_eq!(legacy.run_temp, frozen.run_temp);
+        assert_eq!(legacy.executable, frozen.executable);
+        assert_eq!(legacy.argv, frozen.argv);
+        assert_eq!(legacy.env, frozen.env);
+        assert_eq!(legacy.cwd, frozen.cwd);
+        assert_eq!(legacy.uses_shell, frozen.uses_shell);
+        assert_eq!(legacy.temp_files, frozen.temp_files);
+
+        // typed 冻结身份只存在于新出口,旧 LaunchPlan 不携带
+        assert_eq!(typed.provenance().agent_instance_id, "inst_eq");
+        assert_eq!(typed.provenance().agent_instance_revision, 3);
+        assert_eq!(typed.provenance().adapter_id, "generic-command");
+    }
 }

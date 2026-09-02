@@ -930,3 +930,71 @@ fn release_validates_lease_identity() {
     wrong_pin.metadata["provider_pin"]["version"] = serde_json::json!("9.9.9");
     assert!(provider.release(&wrong_pin).is_err(), "pin 不符必须拒绝");
 }
+
+#[test]
+fn worker_release_replays_when_lease_path_is_already_missing() {
+    struct MissingPathTransport {
+        acquire_reply: Value,
+        calls: Mutex<Vec<String>>,
+    }
+    impl DirectoryWorkerTransport for MissingPathTransport {
+        fn request(&self, method: &str, _params: Value) -> anyhow::Result<Value> {
+            self.calls.lock().unwrap().push(method.to_string());
+            match method {
+                "dir.acquire" => Ok(self.acquire_reply.clone()),
+                "dir.release" => Ok(Value::Null),
+                other => anyhow::bail!("未知方法: {other}"),
+            }
+        }
+    }
+    struct SharedMissingPath(std::sync::Arc<MissingPathTransport>);
+    impl DirectoryWorkerTransport for SharedMissingPath {
+        fn request(&self, method: &str, params: Value) -> anyhow::Result<Value> {
+            self.0.request(method, params)
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let lease_path = root.path().join("wt-removed");
+    std::fs::create_dir(&lease_path).unwrap();
+    let transport = std::sync::Arc::new(MissingPathTransport {
+        acquire_reply: serde_json::json!({
+            "id": "lease-removed",
+            "path": lease_path,
+            "isolated": true,
+            "provider": "third.party.wt",
+            "metadata": { "step_key": "a" }
+        }),
+        calls: Mutex::new(Vec::new()),
+    });
+    let provider = WorkerDirectoryProvider::new_production(
+        "third.party.wt",
+        "worktree",
+        true,
+        Box::new(SharedMissingPath(transport.clone())),
+        mf_agent::workflow::PluginSourcePin {
+            full_id: "third.party".into(),
+            version: "2.0.0".into(),
+            content_hash: "hash-missing-path".into(),
+            contribution_id: "third.party.wt".into(),
+        },
+        root.path().to_path_buf(),
+    )
+    .unwrap();
+    let lease = provider.acquire(&f10_ctx(root.path())).unwrap();
+    std::fs::remove_dir(&lease.path).unwrap();
+
+    provider.release(&lease).unwrap();
+    provider.release(&lease).unwrap();
+    assert_eq!(
+        *transport.calls.lock().unwrap(),
+        vec!["dir.acquire", "dir.release", "dir.release"]
+    );
+
+    let mut wrong_pin = lease;
+    wrong_pin.metadata["provider_pin"]["version"] = serde_json::json!("9.9.9");
+    assert!(
+        provider.release(&wrong_pin).is_err(),
+        "路径不存在时仍必须保持静态 pin 身份校验"
+    );
+}

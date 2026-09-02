@@ -77,7 +77,91 @@ fn make_hub() -> Arc<ProjectOverviewHub> {
         plugins,
         limiter: GlobalLimiter::new(4),
         keep_awake: Arc::new(crate::runtime_host::KeepAwake::new()),
+        kernel: Arc::new(RwLock::new(None)),
     }))
+}
+
+/// 测试装配:AppCtx + CoreKernel tracer + 打开临时项目(全部经 tempfile,
+/// 不触碰用户真实 ~/.monkeyfence)。
+fn kernel_ctx(
+    tmp: &std::path::Path,
+) -> (
+    Arc<crate::app_ctx::AppCtx>,
+    std::path::PathBuf,
+    Arc<Orchestrator>,
+) {
+    let ctx = crate::app_ctx::AppCtx::with_catalog_for_tests(
+        mf_agent::CatalogStore::memory().expect("内存目录库初始化不可能失败"),
+    );
+    let service =
+        mf_kernel::project_registry::ServiceStore::open(&tmp.join("service-v1.db")).unwrap();
+    let (runtime, client) = mf_kernel::kernel::InProcessKernelRuntime::for_test(
+        service,
+        mf_kernel::command::ServiceIdempotencyKey::for_test(vec![0x61; 32]).unwrap(),
+        mf_kernel::handles::ClientId::parse("overview-hub-client").unwrap(),
+        mf_kernel::handles::Principal::parse("overview-hub-user").unwrap(),
+    )
+    .unwrap();
+    ctx.install_kernel_tracer_for_tests(runtime, client);
+    let root = tmp.join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let orch = ctx.open_project(root.clone()).unwrap();
+    (ctx, root, orch)
+}
+
+/// 造一次工作流运行:失败根因 + 两个纯 blocked 后代(Kernel 只计直接原因)。
+fn seed_failed_run_with_blocked_descendants(orch: &Arc<Orchestrator>) -> (i64, i64) {
+    use mf_agent::pipeline::{PipelineDraft, SessionPolicy, StepDraft};
+    let task = orch.store.create_task("运行", "goal").unwrap();
+    orch.store
+        .create_draft_revision(
+            task.id,
+            &PipelineDraft {
+                steps: vec![
+                    StepDraft {
+                        key: "build".into(),
+                        title: "构建".into(),
+                        instructions: String::new(),
+                        agent_profile: "inst".into(),
+                        session_policy: SessionPolicy::Fresh,
+                        deps: vec![],
+                    },
+                    StepDraft {
+                        key: "test".into(),
+                        title: "测试".into(),
+                        instructions: String::new(),
+                        agent_profile: "inst".into(),
+                        session_policy: SessionPolicy::Fresh,
+                        deps: vec!["build".into()],
+                    },
+                    StepDraft {
+                        key: "report".into(),
+                        title: "报告".into(),
+                        instructions: String::new(),
+                        agent_profile: "inst".into(),
+                        session_policy: SessionPolicy::Fresh,
+                        deps: vec!["build".into()],
+                    },
+                ],
+            },
+        )
+        .unwrap();
+    orch.store.activate_revision(task.id).unwrap();
+    let steps = orch.store.task_steps(task.id).unwrap();
+    let build = steps.iter().find(|s| s.step_key == "build").unwrap();
+    orch.store
+        .set_step_status(build.id, mf_agent::StepStatus::Failed)
+        .unwrap();
+    for step in steps.iter().filter(|s| s.step_key != "build") {
+        orch.store
+            .set_step_status(step.id, mf_agent::StepStatus::Blocked)
+            .unwrap();
+    }
+    // 模拟 Orchestrator 状态机:直接原因出现 → 运行进入 Needs You
+    orch.store
+        .set_task_status(task.id, mf_agent::TaskStatus::NeedsYou)
+        .unwrap();
+    (task.id, build.id)
 }
 
 /// 事件驱动等待 revision ≥ min(带超时,不做无语义 sleep 断言)。
@@ -259,4 +343,222 @@ fn dropping_last_hub_reference_stops_background_ownership() {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(weak.upgrade().is_none(), "rebuilder 线程不能永久强持有 Hub");
+}
+
+// ---------- Issue #26:总览读取迁到 Core Kernel Snapshot ----------
+
+/// Core Workspace Snapshot 驱动总览重建:一次失败根因 + 两个纯 blocked
+/// 后代 → 一个运行最多一项「需要你」,reason_count 只计直接原因,
+/// focus 定位失败根因;卡片状态/标题等事实来自 Kernel 摘要。
+#[test]
+fn kernel_workspace_snapshot_feeds_attention_and_run_cards() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ctx, root, orch) = kernel_ctx(tmp.path());
+    let (task_id, build_step_id) = seed_failed_run_with_blocked_descendants(&orch);
+
+    ctx.overview.request_refresh();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let snap = ctx.overview.current();
+        let attention = snap
+            .attention_runs
+            .iter()
+            .find(|a| a.project_root == root && a.task_id == task_id);
+        if let Some(attention) = attention {
+            assert_eq!(
+                attention.reason_count, 1,
+                "纯 blocked 后代不计入 Kernel 原因数"
+            );
+            assert_eq!(attention.focus_step_id, Some(build_step_id));
+            assert_eq!(snap.attention_run_count, 1, "一个运行最多贡献一个徽标");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Kernel Workspace 快照必须驱动「需要你」投影"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+
+    // 运行卡片事实来自 Kernel 摘要(标题/状态/未读),身份 rowid 可接线
+    let snap = ctx.overview.current();
+    let project = snap
+        .projects
+        .iter()
+        .find(|p| p.root == root)
+        .expect("项目必须在快照中");
+    let card = project
+        .tasks
+        .iter()
+        .find(|card| card.task.id == task_id)
+        .expect("工作流运行必须投影为任务卡片");
+    assert_eq!(card.task.title, "运行");
+    assert_eq!(card.task.status, mf_agent::TaskStatus::NeedsYou);
+    assert_eq!(card.active_runs, 0);
+    assert!(
+        card.needs_you_reasons.iter().any(|r| r.contains("构建")),
+        "Kernel 原因明细必须带步骤标题: {:?}",
+        card.needs_you_reasons
+    );
+    ctx.try_close_project(&root).unwrap();
+}
+
+/// 原因消除后重算即消失(统一快照口径,无手工减计数)。
+#[test]
+fn kernel_attention_clears_after_reason_resolved() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ctx, root, orch) = kernel_ctx(tmp.path());
+    let (task_id, build_step_id) = seed_failed_run_with_blocked_descendants(&orch);
+
+    // 等待初始徽标出现
+    ctx.overview.request_refresh();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !ctx
+        .overview
+        .current()
+        .attention_runs
+        .iter()
+        .any(|a| a.task_id == task_id)
+    {
+        assert!(std::time::Instant::now() < deadline, "初始徽标必须出现");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+
+    // 处理唯一直接原因:失败节点改为成功 + 任务收敛
+    orch.store
+        .set_step_status(build_step_id, mf_agent::StepStatus::Succeeded)
+        .unwrap();
+    for step in orch.store.task_steps(task_id).unwrap() {
+        if step.step_key != "build" {
+            orch.store
+                .set_step_status(step.id, mf_agent::StepStatus::Succeeded)
+                .unwrap();
+        }
+    }
+    orch.store
+        .set_task_status(task_id, mf_agent::TaskStatus::Succeeded)
+        .unwrap();
+    ctx.overview.request_refresh();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while ctx
+        .overview
+        .current()
+        .attention_runs
+        .iter()
+        .any(|a| a.task_id == task_id)
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "唯一直接原因处理后徽标必须清零"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    ctx.try_close_project(&root).unwrap();
+}
+
+/// 无 Core tracer(测试回滚模式):Hub 回退旧 Store 扫描投影,行为不变。
+#[test]
+fn hub_without_kernel_source_falls_back_to_legacy_scan() {
+    let ctx =
+        crate::app_ctx::AppCtx::with_catalog_for_tests(mf_agent::CatalogStore::memory().unwrap());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let orch = ctx.open_project(root.clone()).unwrap();
+    let (task_id, _) = seed_failed_run_with_blocked_descendants(&orch);
+
+    ctx.overview.request_refresh();
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let snap = ctx.overview.current();
+        if snap
+            .attention_runs
+            .iter()
+            .any(|a| a.project_root == root && a.task_id == task_id)
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "回退路径(旧扫描)必须继续产生「需要你」投影"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    ctx.try_close_project(&root).unwrap();
+}
+
+/// Kernel Snapshot reason → 文案映射(Issue #26):run 级
+/// awaiting-outcome / interrupted 原因也必须带步骤标题呈现,
+/// 措辞与 run_node_details 口径一致(风险2:判定为收口而非回归,
+/// 此处钉住映射不回退)。
+#[test]
+fn kernel_reason_copy_maps_run_level_kinds_with_step_title() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (ctx, root, orch) = kernel_ctx(tmp.path());
+    let task = orch.store.create_task("运行", "g").unwrap();
+    orch.store
+        .create_draft_revision(
+            task.id,
+            &mf_agent::pipeline::PipelineDraft {
+                steps: vec![mf_agent::pipeline::StepDraft {
+                    key: "build".into(),
+                    title: "构建".into(),
+                    instructions: String::new(),
+                    agent_profile: "inst".into(),
+                    session_policy: mf_agent::SessionPolicy::Fresh,
+                    deps: vec![],
+                }],
+            },
+        )
+        .unwrap();
+    orch.store.activate_revision(task.id).unwrap();
+    let step = orch.store.task_steps(task.id).unwrap().remove(0);
+    orch.store
+        .set_step_status(step.id, mf_agent::StepStatus::Ready)
+        .unwrap();
+    let session = orch
+        .store
+        .create_session(None, "pty", "inst", "构建")
+        .unwrap();
+    let run = orch
+        .store
+        .dispatch_run(task.id, step.id, step.revision_id, session.id)
+        .unwrap();
+
+    let wait_for_reason = |fragment: &str| {
+        ctx.overview.request_refresh();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let snap = ctx.overview.current();
+            let card = snap
+                .projects
+                .iter()
+                .find(|p| p.root == root)
+                .and_then(|p| p.tasks.iter().find(|c| c.task.id == task.id));
+            if let Some(card) = card {
+                if card.needs_you_reasons.iter().any(|r| r.contains(fragment)) {
+                    return;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Kernel 原因文案必须包含「{fragment}」"
+            );
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    };
+
+    // run 级 awaiting-outcome(进程退出未结算)
+    orch.store
+        .set_run_status(run.id, mf_agent::RunStatus::AwaitingOutcome)
+        .unwrap();
+    wait_for_reason("步骤「构建」等待人工结算");
+
+    // run 级 interrupted(重启恢复)
+    orch.store
+        .set_run_status(run.id, mf_agent::RunStatus::Interrupted)
+        .unwrap();
+    wait_for_reason("步骤「构建」运行中断");
+
+    ctx.try_close_project(&root).unwrap();
 }

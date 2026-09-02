@@ -26,9 +26,14 @@ mod platform_acl;
 pub mod project_registry;
 pub mod projection;
 pub mod reconcile;
+pub mod run_control;
+pub mod run_lifecycle;
+mod run_projection;
 pub mod service_schema;
 pub mod shutdown;
 pub mod singleton;
+pub mod workflow_start;
+mod workspace_projection;
 
 // Command contracts 需要 crate-private target effect seam；源文件仍位于
 // `tests/contract/`，作为 lib unit module 编译，release test 同样覆盖。
@@ -63,6 +68,9 @@ mod multistore_crash_recovery;
 #[path = "../tests/contract/operation_saga.rs"]
 mod operation_saga;
 #[cfg(test)]
+#[path = "../tests/contract/operation_snapshot.rs"]
+mod operation_snapshot;
+#[cfg(test)]
 #[path = "../tests/contract/project_workflow_commands.rs"]
 mod project_workflow_commands;
 #[cfg(test)]
@@ -71,3 +79,18 @@ mod projection_support;
 #[cfg(test)]
 #[path = "../tests/contract/retention_gc.rs"]
 mod retention_gc;
+#[cfg(test)]
+#[path = "../tests/contract/run_control.rs"]
+mod run_control_contract;
+#[cfg(test)]
+#[path = "../tests/contract/workflow_run_commands.rs"]
+mod workflow_run_commands;
+#[cfg(test)]
+#[path = "../tests/contract/workflow_run_snapshot.rs"]
+mod workflow_run_snapshot;
+#[cfg(test)]
+#[path = "../tests/contract/workflow_start_operation.rs"]
+mod workflow_start_operation;
+#[cfg(test)]
+#[path = "../tests/contract/workspace_snapshot.rs"]
+mod workspace_snapshot;

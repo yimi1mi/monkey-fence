@@ -311,7 +311,11 @@ impl WorkflowCanvas {
             if let Some(result) = self.app.workflow_snapshot_via_kernel(&root, key) {
                 match result {
                     Ok(snapshot) => {
-                        let mf_kernel::projection::SnapshotData::Workflow(data) = snapshot.data;
+                        let mf_kernel::projection::SnapshotData::Workflow(data) = snapshot.data
+                        else {
+                            self.save_error = Some("Core 返回了错误的 Snapshot 类型".into());
+                            return;
+                        };
                         let nodes: Vec<_> = data
                             .nodes
                             .iter()
@@ -716,8 +720,7 @@ impl WorkflowCanvas {
             .as_ref()
             .and_then(|root| self.app.rename_workflow_via_kernel(root, &key, name));
         match via_kernel {
-            Some(Ok(outcome)) => {
-                let mf_kernel::kernel::KernelOutcome::Applied { revisions, .. } = outcome;
+            Some(Ok(mf_kernel::kernel::KernelOutcome::Applied { revisions, .. })) => {
                 self.save_error = None;
                 self.workflow_name = name.to_string();
                 self.reload_workflows();
@@ -725,6 +728,15 @@ impl WorkflowCanvas {
                     "已重命名「{name}」(presentation r{})",
                     revisions.presentation_revision
                 );
+            }
+            Some(Ok(
+                mf_kernel::kernel::KernelOutcome::RunApplied { .. }
+                | mf_kernel::kernel::KernelOutcome::Accepted { .. },
+            )) => {
+                let message = "重命名返回了错误的 Run outcome".to_string();
+                self.load_workflow(&key);
+                self.status = message.clone();
+                self.save_error = Some(message);
             }
             Some(Err(problem)) => {
                 let message = format!("重命名失败({}): {problem}", problem.code());

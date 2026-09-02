@@ -10,6 +10,17 @@ fn run_monitor_confirm_gate_first_click_holds_and_confirm_executes_once(
     let catalog_dir = tempfile::tempdir().unwrap();
     let catalog = mf_agent::CatalogStore::open(&catalog_dir.path().join("catalog.db")).unwrap();
     let ctx = crate::app_ctx::AppCtx::with_parts_opt(mf_agent::Config::default(), catalog, false);
+    let service =
+        mf_kernel::project_registry::ServiceStore::open(&catalog_dir.path().join("service-v1.db"))
+            .unwrap();
+    let (runtime, client) = mf_kernel::kernel::InProcessKernelRuntime::for_test(
+        service,
+        mf_kernel::command::ServiceIdempotencyKey::for_test(vec![0x64; 32]).unwrap(),
+        mf_kernel::handles::ClientId::parse("run-monitor-client").unwrap(),
+        mf_kernel::handles::Principal::parse("run-monitor-user").unwrap(),
+    )
+    .unwrap();
+    ctx.install_kernel_tracer_for_tests(runtime, client);
     let project = tempfile::tempdir().unwrap();
     let orch = ctx.open_project(project.path().to_path_buf()).unwrap();
     let task = orch.create_task("确认门", "g").unwrap();
@@ -171,6 +182,33 @@ fn run_monitor_confirm_gate_first_click_holds_and_confirm_executes_once(
     ctx.close_project(&project.path().to_path_buf());
 }
 
+/// 项目关闭后刷新:投影清空且不 panic——关闭竞态不得残留跨项目事实,
+/// 也不得把「项目已不在」误报为 Core 错误(回退分支静默为空)。
+#[gpui::test]
+fn monitor_refresh_survives_project_close(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    let catalog = mf_agent::CatalogStore::memory().unwrap();
+    let ctx = crate::app_ctx::AppCtx::with_catalog_for_tests(catalog);
+    let project = tempfile::tempdir().unwrap();
+    let orch = ctx.open_project(project.path().to_path_buf()).unwrap();
+    let task = orch.store.create_task("关闭竞态", "g").unwrap();
+
+    let monitor = cx.new(|cx| crate::run_monitor::RunMonitor::new(ctx.clone(), cx));
+    cx.update_entity(&monitor, |m, cx| {
+        m.set_task(Some((project.path().to_path_buf(), task.id)), cx)
+    });
+    ctx.close_project(&project.path().to_path_buf());
+    cx.update_entity(&monitor, |m, cx| {
+        m.refresh_snapshot(cx);
+        assert_eq!(m.snapshot_node_count(), 0, "关闭后的项目不得残留投影");
+        assert!(
+            m.status_text().is_empty(),
+            "项目关闭走回退为空,不是 Core 错误: {}",
+            m.status_text()
+        );
+    });
+}
+
 fn wait_until_std(timeout: std::time::Duration, mut cond: impl FnMut() -> bool) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
@@ -180,4 +218,65 @@ fn wait_until_std(timeout: std::time::Duration, mut cond: impl FnMut() -> bool) 
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     cond()
+}
+
+/// Issue #26:RunMonitor 刷新经 Core Kernel WorkflowRunSnapshot 取业务事实
+/// (Store 只读定位接回 rowid),节点状态/标题与权威投影一致。
+#[gpui::test]
+fn monitor_refresh_reads_facts_from_kernel_snapshot(cx: &mut gpui::TestAppContext) {
+    use gpui::AppContext as _;
+    let catalog_dir = tempfile::tempdir().unwrap();
+    let catalog = mf_agent::CatalogStore::open(&catalog_dir.path().join("catalog.db")).unwrap();
+    let ctx = crate::app_ctx::AppCtx::with_parts_opt(mf_agent::Config::default(), catalog, false);
+    let service =
+        mf_kernel::project_registry::ServiceStore::open(&catalog_dir.path().join("service-v1.db"))
+            .unwrap();
+    let (runtime, client) = mf_kernel::kernel::InProcessKernelRuntime::for_test(
+        service,
+        mf_kernel::command::ServiceIdempotencyKey::for_test(vec![0x65; 32]).unwrap(),
+        mf_kernel::handles::ClientId::parse("run-monitor-kernel-client").unwrap(),
+        mf_kernel::handles::Principal::parse("run-monitor-kernel-user").unwrap(),
+    )
+    .unwrap();
+    ctx.install_kernel_tracer_for_tests(runtime, client);
+    let project = tempfile::tempdir().unwrap();
+    let orch = ctx.open_project(project.path().to_path_buf()).unwrap();
+    let task = orch.store.create_task("内核快照", "g").unwrap();
+    orch.store
+        .create_draft_revision(
+            task.id,
+            &mf_agent::PipelineDraft {
+                steps: vec![mf_agent::StepDraft {
+                    key: "a".into(),
+                    title: "节点A".into(),
+                    instructions: String::new(),
+                    agent_profile: "inst".into(),
+                    session_policy: mf_agent::SessionPolicy::Fresh,
+                    deps: vec![],
+                }],
+            },
+        )
+        .unwrap();
+    orch.store.activate_revision(task.id).unwrap();
+    let step = orch.store.task_steps(task.id).unwrap().remove(0);
+    orch.store
+        .set_step_status(step.id, mf_agent::StepStatus::NeedsInput)
+        .unwrap();
+
+    let monitor = cx.new(|cx| crate::run_monitor::RunMonitor::new(ctx.clone(), cx));
+    cx.update_entity(&monitor, |m, cx| {
+        m.set_task(Some((project.path().to_path_buf(), task.id)), cx)
+    });
+    let details = cx.read_entity(&monitor, |m, _| m.node_details_for_test());
+    assert_eq!(details.len(), 1, "Kernel 快照必须投影出节点");
+    assert_eq!(details[0].step_key, "a");
+    assert_eq!(details[0].step_id, step.id, "Store 只读定位接回 rowid");
+    assert_eq!(
+        details[0].step_status,
+        mf_agent::StepStatus::NeedsInput,
+        "节点状态来自 Kernel WorkflowRunSnapshot"
+    );
+
+    orch.stop();
+    ctx.close_project(&project.path().to_path_buf());
 }

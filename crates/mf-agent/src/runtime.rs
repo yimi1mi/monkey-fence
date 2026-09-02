@@ -26,7 +26,7 @@ impl RuntimeKind {
 }
 
 /// 解析后的 Agent Profile 执行规格(由插件注册表 + 用户覆盖合成)。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct AgentProfileSpec {
     pub id: String,
     pub display_name: String,
@@ -47,6 +47,25 @@ pub struct AgentProfileSpec {
     /// 状态钩子配置(写入本地 Agent 配置的命名空间条目)。
     #[serde(default)]
     pub hook: Option<HookSpec>,
+}
+
+impl std::fmt::Debug for AgentProfileSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let env_keys = self.env.iter().map(|(key, _)| key).collect::<Vec<_>>();
+        f.debug_struct("AgentProfileSpec")
+            .field("id", &self.id)
+            .field("display_name", &self.display_name)
+            .field("runtime", &self.runtime)
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("env_keys", &env_keys)
+            .field("permission_args", &self.permission_args)
+            .field("provider", &self.provider.as_ref().map(|_| "<configured>"))
+            .field("icon", &self.icon)
+            .field("homepage", &self.homepage)
+            .field("hook", &self.hook)
+            .finish()
+    }
 }
 
 /// 状态钩子:Agent 插件上报 working/waiting/blocked/done 的机制。
@@ -85,7 +104,7 @@ pub struct AgentTypeDescriptor {
 }
 
 /// 一次 Agent Run 的启动规格。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LaunchSpec {
     /// 项目根只描述项目归属；运行时注册表不得用路径寻址。
     pub project_root: PathBuf,
@@ -109,10 +128,36 @@ pub struct LaunchSpec {
     pub workdir: PathBuf,
 }
 
+impl std::fmt::Debug for LaunchSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchSpec")
+            .field("project_root", &self.project_root)
+            .field("run_id", &self.run_id)
+            .field("run_handle", &self.run_handle)
+            .field("step_id", &self.step_id)
+            .field("task_id", &self.task_id)
+            .field("session_id", &self.session_id)
+            .field("session_handle", &self.session_handle)
+            .field("session_key", &self.session_key)
+            .field("attach_existing_session", &self.attach_existing_session)
+            .field("profile", &self.profile)
+            .field("step_title", &self.step_title)
+            .field("prompt", &"<redacted>")
+            .field("capability_token", &"<redacted>")
+            .field("pipe_name", &self.pipe_name)
+            .field(
+                "mfctl_hint",
+                &self.mfctl_hint.as_ref().map(|_| "<configured>"),
+            )
+            .field("workdir", &self.workdir)
+            .finish()
+    }
+}
+
 /// 离散 CLI 会话启动规格(设计 §4.7 / §10):挂在 Task 下,
 /// 但没有 Step / Agent Run / 结算令牌,不参与 Task 成功判定。
 /// 宿主以 `(project, session_id)` 路由,session_id 是 ad_hoc_sessions 行号。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AdHocLaunchSpec {
     pub task_id: i64,
     pub session_id: i64,
@@ -134,10 +179,27 @@ pub struct AdHocLaunchSpec {
     pub events: crossbeam_channel::Sender<TaggedRuntimeEvent>,
 }
 
+impl std::fmt::Debug for AdHocLaunchSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdHocLaunchSpec")
+            .field("task_id", &self.task_id)
+            .field("session_id", &self.session_id)
+            .field("title", &self.title)
+            .field("run_mode", &self.run_mode)
+            .field("plan", &"<redacted-launch-plan>")
+            .field("run_temp", &self.run_temp)
+            .field("workdir", &self.workdir)
+            .field("display_session_id", &self.display_session_id)
+            .field("display_session_handle", &self.display_session_handle)
+            .field("events", &"<channel>")
+            .finish()
+    }
+}
+
 /// 工作流 Step 派发规格(设计 §6.1):Orchestrator 从冻结 Revision
 /// 取出 Agent Instance 快照,交由宿主侧真实 Agent Adapter 编译 LaunchPlan
 /// 后启动。宿主不得改写 `run_temp`(可信物化根由调度器提供)。
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct WorkflowLaunchSpec {
     /// 项目根只描述归属；worktree 租约路径只作进程 cwd。
     pub project_root: PathBuf,
@@ -166,6 +228,36 @@ pub struct WorkflowLaunchSpec {
     pub workdir: PathBuf,
     /// 可信 run-temp(临时文件物化根)。
     pub run_temp: PathBuf,
+}
+
+impl std::fmt::Debug for WorkflowLaunchSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkflowLaunchSpec")
+            .field("project_root", &self.project_root)
+            .field("run_id", &self.run_id)
+            .field("run_handle", &self.run_handle)
+            .field("step_id", &self.step_id)
+            .field("task_id", &self.task_id)
+            .field("session_id", &self.session_id)
+            .field("session_handle", &self.session_handle)
+            .field("session_key", &self.session_key)
+            .field("attach_existing_session", &self.attach_existing_session)
+            .field("node_key", &self.node_key)
+            .field("step_title", &self.step_title)
+            .field("instance_id", &self.instance.id)
+            .field("agent_type", &self.instance.agent_type)
+            .field("plugin", &self.plugin)
+            .field("prompt", &"<redacted>")
+            .field("capability_token", &"<redacted>")
+            .field("pipe_name", &self.pipe_name)
+            .field(
+                "mfctl_hint",
+                &self.mfctl_hint.as_ref().map(|_| "<configured>"),
+            )
+            .field("workdir", &self.workdir)
+            .field("run_temp", &self.run_temp)
+            .finish()
+    }
 }
 
 /// Runtime → Orchestrator 事件。
@@ -237,10 +329,84 @@ pub trait RuntimeHost: Send + Sync {
     fn kill_ad_hoc(&self, display_session_handle: &str);
     /// 回答 Agent 的提问(阻塞等待中的 HTTP Runtime)。
     fn answer_question(&self, run_handle: &str, answer: &str);
+    /// Orchestrator 持久化 question 行之后立即回填:把 run 当前等待中的
+    /// ask_human 待答槽绑定到具体 question,使 question-bound 投递可以
+    /// 验证"等待的正是这一题"。这是尽力而为的关联通知;真正的
+    /// fail-closed 边界在 [`RuntimeHost::answer_question_bound`]。
+    /// 默认 no-op:不支持 question-bound 回答的宿主无需实现。
+    fn bind_open_question(&self, run_handle: &str, question_id: i64) {
+        let _ = (run_handle, question_id);
+    }
+    /// 是否能把回答绑定到具体的持久 question，并以该 question 为幂等键。
+    /// 默认拒绝：只支持 legacy `(run, answer)` 的宿主无法排除旧 action 在
+    /// 重启后命中同一 run 的下一题。
+    fn supports_question_bound_answers(&self) -> bool {
+        false
+    }
+    /// question-bound 回答。实现必须验证当前等待的正是 `question_id`，且同
+    /// id 重放不产生第二次输入；无法证明时返回错误，不得回退到
+    /// [`RuntimeHost::answer_question`]。
+    fn answer_question_bound(
+        &self,
+        question_id: i64,
+        run_handle: &str,
+        answer: &str,
+    ) -> Result<()> {
+        let _ = (question_id, run_handle, answer);
+        anyhow::bail!("question-bound answer unsupported")
+    }
     /// 宿主是否能确认会话仍存活(重启恢复用)。
     /// 默认 false(无法确认 = 未知状态,绝不推断为失败)。
     fn is_session_alive(&self, session_handle: &str) -> bool {
         let _ = session_handle;
         false
+    }
+}
+
+#[cfg(test)]
+mod sensitive_debug_tests {
+    use super::*;
+
+    #[test]
+    fn launch_and_profile_debug_never_expose_token_prompt_or_env_values() {
+        let sentinel = "mft-never-print-this-secret";
+        let profile = AgentProfileSpec {
+            id: "profile".into(),
+            display_name: "Profile".into(),
+            runtime: RuntimeKind::Pty,
+            command: "agent".into(),
+            args: Vec::new(),
+            env: vec![("API_KEY".into(), sentinel.into())],
+            permission_args: Vec::new(),
+            provider: None,
+            icon: None,
+            homepage: None,
+            hook: None,
+        };
+        let profile_debug = format!("{profile:?}");
+        assert!(!profile_debug.contains(sentinel), "{profile_debug}");
+        assert!(profile_debug.contains("API_KEY"), "{profile_debug}");
+
+        let spec = LaunchSpec {
+            project_root: PathBuf::from("project"),
+            run_id: 1,
+            run_handle: "run_handle".into(),
+            step_id: 2,
+            task_id: 3,
+            session_id: 4,
+            session_handle: "session_handle".into(),
+            session_key: None,
+            attach_existing_session: false,
+            profile,
+            step_title: "step".into(),
+            prompt: format!("prompt includes {sentinel}"),
+            capability_token: sentinel.into(),
+            pipe_name: "pipe".into(),
+            mfctl_hint: Some(format!("hint {sentinel}")),
+            workdir: PathBuf::from("work"),
+        };
+        let debug = format!("{spec:?}");
+        assert!(!debug.contains(sentinel), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
     }
 }

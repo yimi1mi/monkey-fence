@@ -23,6 +23,7 @@ pub mod observability;
 pub mod orchestrator;
 pub mod pipeline;
 pub mod provider;
+pub mod run_mutation;
 pub mod runtime;
 pub mod schema;
 pub mod secrets;
@@ -50,10 +51,11 @@ pub use config::{
 pub use handoff::Handoff;
 pub use migration::{error_code, BackupManifest, MigrationError, StoreKind};
 pub use model::{
-    AdHocSessionView, AgentState, InstanceScope, RevisionAxis, RevisionConflict, RevisionStatus,
-    RunMode, RunStatus, SchedulerEvent, SessionStatus, SettleError, SettleOutcome, Settlement,
-    StepQuestionView, StepStatus, StepView, TaskStatus, TaskView, WorkflowEdgeIdentityRow,
-    WorkflowNodeIdentityRow, WorkflowPresentationState,
+    AdHocSessionView, AgentState, AnswerDeliveryConfirm, AnswerDeliveryRecord, InstanceScope,
+    RevisionAxis, RevisionConflict, RevisionStatus, RunMode, RunStatus, SchedulerEvent,
+    SessionStatus, SettleError, SettleOutcome, Settlement, StepQuestionView, StepStatus, StepView,
+    TaskStatus, TaskView, WorkflowEdgeIdentityRow, WorkflowNodeIdentityRow,
+    WorkflowPresentationState,
 };
 pub use model::{RetryMode, RetryPolicy};
 pub use orchestrator::{
@@ -61,6 +63,10 @@ pub use orchestrator::{
     WorkflowPluginPins,
 };
 pub use pipeline::{PipelineDraft, ProfileIndex, SessionPolicy, StepDraft};
+pub use run_mutation::{
+    CancelFenceRecord, CancelFenceTarget, CancelFenceTargetState, NextAttemptSession, RunAction,
+    RunMutation, RunMutationOutput, RunMutationResult, RunStopOutcome, RunStopResult,
+};
 pub use runtime::{
     AdHocLaunchSpec, AgentProfileSpec, AgentTypeDescriptor, HookSpec, LaunchSpec, RuntimeEvent,
     RuntimeHost, RuntimeKind,

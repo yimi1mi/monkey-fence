@@ -3,11 +3,13 @@
 //! - 清单与校验:`manifest`(v2 贡献词汇表)
 //! - 安装/锁文件/内容寻址包:`install`
 //! - 内置合成插件(CLI Agent / API Provider / 技能):`builtin`
+//! - Agent launch 编译(typed LaunchPlan 冻结出口):`adapter_launch`
 //! - 状态钩子写入:`hooks`
 //! - 后台 worker NDJSON 协议:`worker`
 //! - 运行时宿主(发现/授权/解析/运行期 pin):`host::PluginHost`
 //! - 类型化贡献查找:`contribution_registry`
 
+pub mod adapter_launch;
 pub mod builtin;
 pub mod builtin_secret_store;
 pub mod claude_adapter;

@@ -21,6 +21,8 @@
 mod baseline;
 #[allow(dead_code)]
 mod common;
+#[path = "common/run_lifecycle.rs"]
+mod run_lifecycle;
 
 use common::*;
 use mf_agent::model::*;
@@ -213,14 +215,12 @@ impl World {
             .into_iter()
             .next()
             .expect("必须存在待回答问题");
-        self.orch.answer_question(question.id, answer).unwrap();
+        run_lifecycle::answer_question(&self.orch, question.id, answer).unwrap();
     }
 
     fn retry_fresh(&self, task_id: i64, key: &str) -> StepView {
         let step_id = self.step(task_id, key).id;
-        self.orch
-            .retry_step(step_id, RetryMode::FreshSession)
-            .unwrap()
+        run_lifecycle::retry_step(&self.orch, step_id, RetryMode::FreshSession).unwrap()
     }
 
     // ---- 等待 / 读取 ----

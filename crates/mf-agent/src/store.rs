@@ -300,6 +300,20 @@ pub(crate) fn new_public_handle() -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
+/// question-bound 回答投递的一次性 nonce:绑定 question identity、
+/// run identity 与 accept 时刻 run revision(CAS 锚点),尾部 UUIDv7
+/// 保证唯一。投递执行端必须要求它与私有投递表中的 nonce 严格相等,
+/// 防止陈旧 action 在崩溃重放时命中别的接受轮次(不能只按 run 寻址)。
+fn answer_delivery_nonce(question_id: i64, run: &RunView) -> String {
+    format!(
+        "q{}:r{}:rev{}:{}",
+        question_id,
+        run.id,
+        run.revision,
+        new_public_handle()
+    )
+}
+
 /// 将工作流图的 node/edge identity 与 `nodes` 对齐(同事务):
 /// - 既有 `(workflow_handle, node_key)` 保留原 handle(稳定);
 /// - 新节点/新连线生成新 UUIDv7 handle;
@@ -424,6 +438,881 @@ pub(crate) fn sync_workflow_identity_tx_with_stats(
 }
 
 impl Store {
+    /// 在已完成 controller/expected/scope 复验的同一事务中建立 Cancel fence。
+    /// 同 command 重放返回既有 targets；同 Task 的其它 command 被 UNIQUE(task_id)
+    /// fail-closed 拒绝。这里不执行任何 Runtime 副作用。
+    pub fn reserve_cancel_fence_tx(
+        tx: &rusqlite::Transaction,
+        command_id: &str,
+        task_id: i64,
+        targets: &[(i64, String, i64)],
+    ) -> Result<Vec<crate::run_mutation::CancelFenceTarget>> {
+        use crate::run_mutation::{CancelFenceTarget, CancelFenceTargetState};
+        let existing: Option<i64> = tx
+            .query_row(
+                "SELECT task_id FROM run_cancel_fence WHERE command_id=?1",
+                [command_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing_task) = existing {
+            anyhow::ensure!(
+                existing_task == task_id,
+                "cancel command_id 已用于其它 Task"
+            );
+        } else {
+            let targets_json = serde_json::to_string(
+                &targets
+                    .iter()
+                    .map(|(_, handle, revision)| {
+                        serde_json::json!({
+                            "run_handle": handle,
+                            "run_revision": revision,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            )?;
+            let initial_state = if targets.is_empty() {
+                "outcomes"
+            } else {
+                "reserved"
+            };
+            let (workflow_run, workflow_run_revision): (String, i64) = tx.query_row(
+                "SELECT public_handle,revision FROM agent_tasks WHERE id=?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let steps = {
+                let mut stmt = tx.prepare(
+                    "SELECT public_handle,revision FROM steps
+                     WHERE revision_id=(SELECT active_revision FROM agent_tasks WHERE id=?1)
+                       AND status NOT IN ('succeeded','failed','skipped','cancelled') ORDER BY id",
+                )?;
+                let rows = stmt
+                    .query_map([task_id], |row| {
+                        Ok(serde_json::json!({
+                            "handle": row.get::<_, String>(0)?,
+                            "revision": row.get::<_, i64>(1)?,
+                        }))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            let sessions = {
+                let mut stmt = tx.prepare(
+                    "SELECT DISTINCT s.public_handle,s.revision
+                     FROM agent_runs r JOIN agent_sessions s ON s.id=r.session_id
+                     WHERE r.task_id=?1 AND r.status IN ('running','awaiting-outcome') ORDER BY s.id",
+                )?;
+                let rows = stmt
+                    .query_map([task_id], |row| {
+                        Ok(serde_json::json!({
+                            "handle": row.get::<_, String>(0)?,
+                            "revision": row.get::<_, i64>(1)?,
+                        }))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            let expected_json = serde_json::to_string(&serde_json::json!({
+                "workflow_run": workflow_run,
+                "workflow_run_revision": workflow_run_revision,
+                "steps": steps,
+                "agent_runs": targets.iter().map(|(_, handle, revision)| serde_json::json!({
+                    "handle": handle,
+                    "revision": revision,
+                })).collect::<Vec<_>>(),
+                "agent_sessions": sessions,
+            }))?;
+            tx.execute(
+                "INSERT INTO run_cancel_fence(command_id,task_id,state,targets_json,expected_json,created_at)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![command_id, task_id, initial_state, targets_json, expected_json, now()],
+            )
+            .map_err(|error| {
+                if error.to_string().contains("run_cancel_fence.task_id") {
+                    anyhow::anyhow!("Workflow Run 已被另一个 Cancel command fenced")
+                } else {
+                    error.into()
+                }
+            })?;
+            for (run_id, run_handle, run_revision) in targets {
+                tx.execute(
+                    "INSERT INTO run_cancel_target(command_id,run_id,run_handle,run_revision,state)
+                     VALUES(?1,?2,?3,?4,'pending')",
+                    params![command_id, run_id, run_handle, run_revision],
+                )?;
+            }
+        }
+        let mut stmt = tx.prepare(
+            "SELECT run_id,run_handle,run_revision,state FROM run_cancel_target
+             WHERE command_id=?1 ORDER BY run_id",
+        )?;
+        let rows = stmt
+            .query_map([command_id], |row| {
+                let state: String = row.get(3)?;
+                let state = match state.as_str() {
+                    "pending" => CancelFenceTargetState::Pending,
+                    "stopping" => CancelFenceTargetState::Stopping,
+                    "confirmed" => CancelFenceTargetState::Confirmed,
+                    "unconfirmed" => CancelFenceTargetState::Unconfirmed,
+                    _ => return Err(rusqlite::Error::InvalidQuery),
+                };
+                Ok(CancelFenceTarget {
+                    run_id: row.get(0)?,
+                    run_handle: row.get(1)?,
+                    run_revision: row.get(2)?,
+                    state,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn active_cancel_fences(&self) -> Result<Vec<crate::run_mutation::CancelFenceRecord>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT command_id,task_id,expected_json FROM run_cancel_fence
+                 WHERE state!='finalized' ORDER BY created_at,command_id",
+            )?;
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok(crate::run_mutation::CancelFenceRecord {
+                        command_id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        expected_json: row.get(2)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// 领取一个尚未停止的 target。`stopping` 只会由 crash recovery 重试，
+    /// 正常并发调用不会重复领取 pending target。
+    pub fn claim_cancel_target_tx(
+        tx: &rusqlite::Transaction,
+        command_id: &str,
+        run_id: i64,
+    ) -> Result<bool> {
+        let changed = tx.execute(
+            "UPDATE run_cancel_target SET state='stopping'
+             WHERE command_id=?1 AND run_id=?2 AND state='pending'",
+            params![command_id, run_id],
+        )?;
+        if changed == 1 {
+            tx.execute(
+                "UPDATE run_cancel_fence SET state='stopping'
+                 WHERE command_id=?1 AND state='reserved'",
+                [command_id],
+            )?;
+        }
+        Ok(changed == 1)
+    }
+
+    pub fn record_cancel_outcome_tx(
+        tx: &rusqlite::Transaction,
+        command_id: &str,
+        run_id: i64,
+        outcome: crate::run_mutation::RunStopOutcome,
+    ) -> Result<()> {
+        let state = match outcome {
+            crate::run_mutation::RunStopOutcome::Confirmed => "confirmed",
+            crate::run_mutation::RunStopOutcome::Unconfirmed => "unconfirmed",
+        };
+        let changed = tx.execute(
+            "UPDATE run_cancel_target SET state=?3
+             WHERE command_id=?1 AND run_id=?2 AND state='stopping'",
+            params![command_id, run_id, state],
+        )?;
+        anyhow::ensure!(changed == 1, "cancel target outcome CAS 冲突");
+        tx.execute(
+            "UPDATE run_cancel_fence SET state='outcomes'
+             WHERE command_id=?1 AND NOT EXISTS(
+                 SELECT 1 FROM run_cancel_target
+                 WHERE command_id=?1 AND state IN ('pending','stopping')
+             )",
+            [command_id],
+        )?;
+        Ok(())
+    }
+
+    /// finalizer 的同一 IMMEDIATE transaction 内打开 trigger gate。
+    pub fn begin_cancel_finalize_tx(
+        tx: &rusqlite::Transaction,
+        command_id: &str,
+    ) -> Result<Vec<crate::run_mutation::RunStopResult>> {
+        let changed = tx.execute(
+            "UPDATE run_cancel_fence SET state='finalizing'
+             WHERE command_id=?1 AND state='outcomes'
+               AND NOT EXISTS(SELECT 1 FROM run_cancel_target WHERE command_id=?1 AND state NOT IN ('confirmed','unconfirmed'))",
+            [command_id],
+        )?;
+        anyhow::ensure!(changed == 1, "cancel fence 尚未取得全部 stop outcome");
+        let mut stmt = tx.prepare(
+            "SELECT run_id,state FROM run_cancel_target WHERE command_id=?1 ORDER BY run_id",
+        )?;
+        let outcomes = stmt
+            .query_map([command_id], |row| {
+                let state: String = row.get(1)?;
+                Ok(crate::run_mutation::RunStopResult {
+                    run_id: row.get(0)?,
+                    outcome: if state == "confirmed" {
+                        crate::run_mutation::RunStopOutcome::Confirmed
+                    } else {
+                        crate::run_mutation::RunStopOutcome::Unconfirmed
+                    },
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(outcomes)
+    }
+
+    pub fn finish_cancel_fence_tx(tx: &rusqlite::Transaction, command_id: &str) -> Result<()> {
+        let changed = tx.execute(
+            "UPDATE run_cancel_fence SET state='finalized',finalized_at=?2
+             WHERE command_id=?1 AND state='finalizing'",
+            params![command_id, now()],
+        )?;
+        anyhow::ensure!(changed == 1, "cancel fence finalize CAS 冲突");
+        Ok(())
+    }
+
+    /// 在调用方已经持有的 Project Store transaction 中执行 Run 生命周期写入。
+    /// 不开启/提交/回滚事务，也不触碰 RuntimeHost、目录提供器或事件总线。
+    pub fn apply_run_mutation_tx(
+        tx: &rusqlite::Transaction,
+        mutation: crate::run_mutation::RunMutation,
+    ) -> Result<crate::run_mutation::RunMutationResult> {
+        use crate::run_mutation::{RunAction, RunMutation, RunMutationOutput, RunMutationResult};
+        match mutation {
+            RunMutation::Start { task_id } => {
+                let ts = now();
+                let draft: Option<i64> = tx.query_row(
+                    "SELECT id FROM pipeline_revisions WHERE task_id=?1 AND status='draft' ORDER BY revision DESC LIMIT 1",
+                    params![task_id], |r| r.get(0)).optional()?;
+                if let Some(rev_id) = draft {
+                    tx.execute("UPDATE pipeline_revisions SET status='superseded' WHERE task_id=?1 AND status='active'", params![task_id])?;
+                    tx.execute(
+                        "UPDATE pipeline_revisions SET status='active' WHERE id=?1",
+                        params![rev_id],
+                    )?;
+                    tx.execute("UPDATE agent_tasks SET active_revision=?2, status='running', paused=0, updated_at=?3, revision=revision+1 WHERE id=?1", params![task_id, rev_id, ts])?;
+                    Self::promote_ready_tx(tx, rev_id)?;
+                } else {
+                    let changed = tx.execute(
+                        "UPDATE agent_tasks SET status='running', paused=0, updated_at=?2, revision=revision+1 WHERE id=?1 AND active_revision IS NOT NULL AND status NOT IN ('succeeded','failed','cancelled','archived')",
+                        params![task_id, ts])?;
+                    anyhow::ensure!(
+                        changed == 1,
+                        "任务 {task_id} 不存在、没有可运行 revision 或已终态"
+                    );
+                }
+                let task = Self::task_view_by_id(tx, task_id)?
+                    .ok_or_else(|| anyhow::anyhow!("任务 {task_id} 不存在"))?;
+                Ok(RunMutationResult {
+                    output: RunMutationOutput::Started(task),
+                    actions: vec![RunAction::DispatchReady { task_id }],
+                })
+            }
+            RunMutation::Cancel { task_id, run_stops } => {
+                Self::task_view_by_id(tx, task_id)?
+                    .ok_or_else(|| anyhow::anyhow!("Workflow Run {task_id} 不存在"))?;
+                let active_run_ids = {
+                    let mut stmt = tx.prepare(
+                        "SELECT id FROM agent_runs WHERE task_id=?1 AND status IN ('running','awaiting-outcome') ORDER BY id",
+                    )?;
+                    let ids = stmt
+                        .query_map(params![task_id], |row| row.get::<_, i64>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    ids
+                };
+                let stop_count = run_stops.len();
+                let stops = run_stops
+                    .into_iter()
+                    .map(|stop| (stop.run_id, stop.outcome))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                anyhow::ensure!(
+                    stops.len() == stop_count
+                        && stops.len() == active_run_ids.len()
+                        && active_run_ids
+                            .iter()
+                            .all(|run_id| stops.contains_key(run_id)),
+                    "Workflow Run {task_id} 的停止结果必须与事务内全部 active Agent Run 完全一致"
+                );
+                let ts = now();
+                let mut actions = Vec::new();
+                let mut has_unconfirmed = false;
+                for run_id in active_run_ids {
+                    match stops[&run_id] {
+                        crate::run_mutation::RunStopOutcome::Confirmed => {
+                            tx.execute(
+                                "UPDATE agent_runs SET status='cancelled',ended_at=?2,revision=revision+1
+                                 WHERE id=?1 AND status IN ('running','awaiting-outcome')",
+                                params![run_id, ts],
+                            )?;
+                            actions.push(RunAction::ReleaseRunResources { run_id });
+                        }
+                        crate::run_mutation::RunStopOutcome::Unconfirmed => {
+                            has_unconfirmed = true;
+                            tx.execute(
+                                "UPDATE agent_runs SET status='interrupted',ended_at=?2,revision=revision+1
+                                 WHERE id=?1 AND status IN ('running','awaiting-outcome')",
+                                params![run_id, ts],
+                            )?;
+                            // 与既有 Orchestrator cancel 契约一致：释放并发槽，
+                            // 但保留仍可能写隔离目录的 execution lease。
+                            actions.push(RunAction::ReleaseRunSlot { run_id });
+                        }
+                    }
+                }
+                if has_unconfirmed {
+                    tx.execute(
+                        "UPDATE agent_tasks SET status='needs-you',unread=1,updated_at=?2,revision=revision+1
+                         WHERE id=?1 AND status NOT IN ('succeeded','failed','cancelled','archived')",
+                        params![task_id, ts],
+                    )?;
+                    let task = Self::task_view_by_id(tx, task_id)?.unwrap();
+                    return Ok(RunMutationResult {
+                        output: RunMutationOutput::CancelNeedsYou(task),
+                        actions,
+                    });
+                }
+                tx.execute("UPDATE steps SET status='cancelled',ended_at=?2,updated_at=?2,revision=revision+1 WHERE revision_id=(SELECT active_revision FROM agent_tasks WHERE id=?1) AND status NOT IN ('succeeded','failed','skipped','cancelled')",params![task_id,ts])?;
+                tx.execute("UPDATE pipeline_revisions SET status='cancelled' WHERE id=(SELECT active_revision FROM agent_tasks WHERE id=?1) AND status='active'",[task_id])?;
+                tx.execute("UPDATE agent_tasks SET status='cancelled',paused=0,updated_at=?2,revision=revision+1 WHERE id=?1",params![task_id,ts])?;
+                let task = Self::task_view_by_id(tx, task_id)?.unwrap();
+                actions.push(RunAction::ReleaseTaskResources { task_id });
+                Ok(RunMutationResult {
+                    output: RunMutationOutput::Cancelled(task),
+                    actions,
+                })
+            }
+            RunMutation::Retry {
+                step_id,
+                mode,
+                continue_session_id,
+            } => {
+                let step = Self::revision_steps_by_id(
+                    tx,
+                    tx.query_row(
+                        "SELECT revision_id FROM steps WHERE id=?1",
+                        params![step_id],
+                        |r| r.get(0),
+                    )?,
+                )?
+                .into_iter()
+                .find(|s| s.id == step_id)
+                .ok_or_else(|| anyhow::anyhow!("Step {step_id} 不存在"))?;
+                anyhow::ensure!(
+                    matches!(
+                        step.status,
+                        StepStatus::Failed
+                            | StepStatus::Blocked
+                            | StepStatus::Cancelled
+                            | StepStatus::AwaitingOutcome
+                    ),
+                    "仅失败/阻塞/待结算的 Step 可以重试"
+                );
+                let deps_ok = step.deps.iter().all(|id| {
+                    tx.query_row("SELECT status FROM steps WHERE id=?1", params![id], |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .map(|s| s == "succeeded" || s == "skipped")
+                    .unwrap_or(false)
+                });
+                anyhow::ensure!(deps_ok, "上游依赖尚未成功/跳过;请先重试失败的上游节点");
+                let (next_mode, next_session_id) = match mode {
+                    RetryMode::FreshSession => ("fresh", None),
+                    RetryMode::ContinueSession => (
+                        "continue",
+                        Some(continue_session_id.ok_or_else(|| {
+                            anyhow::anyhow!("ContinueSession 缺少已确认存活的 session")
+                        })?),
+                    ),
+                };
+                let active_run_id = tx
+                    .query_row(
+                        "SELECT id FROM agent_runs WHERE step_id=?1 AND status IN ('running','awaiting-outcome') ORDER BY id DESC LIMIT 1",
+                        params![step_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                tx.execute("UPDATE agent_runs SET status='cancelled', ended_at=?2, revision=revision+1 WHERE step_id=?1 AND status IN ('running','awaiting-outcome')", params![step_id, now()])?;
+                tx.execute(
+                    "UPDATE steps SET status='ready', ended_at=NULL, updated_at=?2, revision=revision+1 WHERE id=?1",
+                    params![step_id, now()],
+                )?;
+                tx.execute(
+                    "INSERT INTO step_next_attempt_sessions(step_id,mode,session_id,created_at)
+                     VALUES (?1,?2,?3,?4)
+                     ON CONFLICT(step_id) DO UPDATE SET
+                         mode=excluded.mode,session_id=excluded.session_id,created_at=excluded.created_at",
+                    params![step_id, next_mode, next_session_id, now()],
+                )?;
+                tx.execute(
+                    "UPDATE agent_tasks
+                     SET status=CASE WHEN status IN ('draft','ready','failed','needs-you') THEN 'running' ELSE status END,
+                         paused=0, updated_at=?2, revision=revision+1
+                     WHERE id=?1 AND (status IN ('draft','ready','failed','needs-you') OR paused<>0)",
+                    params![step.task_id, now()],
+                )?;
+                let updated = Self::revision_steps_by_id(tx, step.revision_id)?
+                    .into_iter()
+                    .find(|s| s.id == step_id)
+                    .unwrap();
+                let mut actions = Vec::new();
+                if let Some(run_id) = active_run_id {
+                    actions.push(RunAction::ReleaseRunSlot { run_id });
+                }
+                actions.push(RunAction::DispatchReady {
+                    task_id: step.task_id,
+                });
+                Ok(RunMutationResult {
+                    output: RunMutationOutput::Retried(updated),
+                    actions,
+                })
+            }
+            RunMutation::Skip { step_id } => {
+                let step = Self::step_view_by_id_tx(tx, step_id)?
+                    .ok_or_else(|| anyhow::anyhow!("Step {step_id} 不存在"))?;
+                let task = Self::task_view_by_id(tx, step.task_id)?
+                    .ok_or_else(|| anyhow::anyhow!("Workflow Run {} 不存在", step.task_id))?;
+                anyhow::ensure!(
+                    task.active_revision == Some(step.revision_id),
+                    "只能跳过当前 Pipeline Revision 的 Step"
+                );
+                anyhow::ensure!(
+                    matches!(step.status, StepStatus::Failed | StepStatus::Blocked),
+                    "仅失败或阻塞的 Step 可以跳过"
+                );
+                let active_runs: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM agent_runs
+                     WHERE step_id=?1 AND status IN ('running','awaiting-outcome')",
+                    params![step_id],
+                    |row| row.get(0),
+                )?;
+                anyhow::ensure!(
+                    active_runs == 0,
+                    "Step 仍有 active Agent Run；必须先取消或结算后再跳过"
+                );
+                let ts = now();
+                let changed = tx.execute(
+                    "UPDATE steps SET status='skipped',ended_at=?2,updated_at=?2,
+                         revision=revision+1
+                     WHERE id=?1 AND status IN ('failed','blocked')",
+                    params![step_id, ts],
+                )?;
+                anyhow::ensure!(changed == 1, "Step 状态已变化，跳过 CAS 冲突");
+                Self::promote_ready_tx(tx, step.revision_id)?;
+
+                let steps = Self::revision_steps_by_id(tx, step.revision_id)?;
+                let all_terminal = steps.iter().all(|value| value.status.terminal());
+                let all_success = all_terminal
+                    && steps.iter().all(|value| {
+                        matches!(value.status, StepStatus::Succeeded | StepStatus::Skipped)
+                    });
+                let pending_merges: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM pending_merges WHERE task_id=?1",
+                    params![step.task_id],
+                    |row| row.get(0),
+                )?;
+                let held_leases: i64 = tx.query_row(
+                    "SELECT COUNT(*) FROM execution_leases
+                     WHERE task_id=?1 AND status='held'",
+                    params![step.task_id],
+                    |row| row.get(0),
+                )?;
+                let has_pending_resources = pending_merges != 0 || held_leases != 0;
+                let next_task_status = if has_pending_resources {
+                    // 外部 merge/release 的结果不在本 L-CMD receipt 内；
+                    // fail-closed 保持 NeedsYou，绝不能提前让下游调度。
+                    TaskStatus::NeedsYou
+                } else if all_success {
+                    TaskStatus::Succeeded
+                } else if all_terminal {
+                    TaskStatus::Failed
+                } else {
+                    TaskStatus::Running
+                };
+                tx.execute(
+                    "UPDATE agent_tasks SET status=?2,paused=0,unread=?3,
+                         updated_at=?4,revision=revision+1 WHERE id=?1",
+                    params![
+                        step.task_id,
+                        next_task_status.as_str(),
+                        i64::from(matches!(
+                            next_task_status,
+                            TaskStatus::Failed | TaskStatus::NeedsYou
+                        )),
+                        ts
+                    ],
+                )?;
+                let updated_step = Self::step_view_by_id_tx(tx, step_id)?.unwrap();
+                let updated_task = Self::task_view_by_id(tx, step.task_id)?.unwrap();
+                let actions = vec![RunAction::AfterSkip {
+                    task_id: step.task_id,
+                }];
+                Ok(RunMutationResult {
+                    output: RunMutationOutput::Skipped {
+                        task: updated_task,
+                        step: updated_step,
+                    },
+                    actions,
+                })
+            }
+            RunMutation::Respond {
+                question_id,
+                answer,
+            } => {
+                let q = Self::question_view_by_id(tx, question_id)?
+                    .ok_or_else(|| anyhow::anyhow!("问题 {question_id} 不存在"))?;
+                // 两阶段(有 runtime 绑定):accept 只落私有投递表,
+                // question 保持 open、Step 保持 needs-input;宿主投递
+                // 确认(confirm_answer_delivery)后才推进到 answered/running。
+                // 已终态 answered:同答案幂等、异答案稳定冲突。
+                if q.status != "open" {
+                    if q.status == "answered" && q.answer.as_deref() == Some(answer.as_str()) {
+                        return Ok(RunMutationResult {
+                            output: RunMutationOutput::Responded(q),
+                            actions: Vec::new(),
+                        });
+                    }
+                    anyhow::bail!("问题 {question_id} 已记录回答:拒绝冲突重放");
+                }
+                // 已有待投递回答:同答案幂等(重发同一 nonce 的 action,
+                // 供崩溃后的 outbox/命令重试补投),异答案稳定冲突。
+                if let Some(delivery) = Self::answer_delivery_by_question_tx(tx, question_id)? {
+                    if delivery.answer != answer {
+                        anyhow::bail!("问题 {question_id} 已有待投递回答:拒绝冲突重放");
+                    }
+                    let actions = vec![RunAction::AnswerRuntime {
+                        question_id,
+                        run_id: delivery.run_id,
+                        run_handle: delivery.run_handle.clone(),
+                        nonce: delivery.nonce.clone(),
+                    }];
+                    return Ok(RunMutationResult {
+                        output: RunMutationOutput::Responded(q),
+                        actions,
+                    });
+                }
+                // 无 runtime 绑定:没有外部投递副作用,单相直接终态。
+                let Some(run_id) = q.run_id else {
+                    let ts = now();
+                    tx.execute(
+                        "UPDATE step_questions SET answer=?2, status='answered', answered_at=?3 WHERE id=?1 AND status='open'",
+                        params![question_id, answer, ts],
+                    )?;
+                    if let Some(step_id) = q.step_id {
+                        tx.execute(
+                            "UPDATE steps SET status='running', updated_at=?2, revision=revision+1 WHERE id=?1 AND status='needs-input'",
+                            params![step_id, ts],
+                        )?;
+                    }
+                    Self::clear_task_attention_if_settled_tx(tx, q.task_id, &ts)?;
+                    let answered = Self::question_view_by_id(tx, question_id)?.unwrap();
+                    return Ok(RunMutationResult {
+                        output: RunMutationOutput::Responded(answered),
+                        actions: Vec::new(),
+                    });
+                };
+                // 有 runtime 绑定:必须能解析 run 身份,否则 fail-closed
+                // (绝不能在没有可寻址投递目标时假记录成功)。
+                let run = Self::run_view_by_id_tx(tx, run_id)?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "问题 {question_id} 绑定的 Agent Run {run_id} 不存在:拒绝回答(fail-closed)"
+                    )
+                })?;
+                let nonce = answer_delivery_nonce(question_id, &run);
+                tx.execute(
+                    "INSERT INTO question_answer_deliveries
+                         (question_id,task_id,step_id,run_id,run_handle,run_revision,nonce,answer,status,created_at)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'pending',?9)",
+                    params![
+                        question_id,
+                        q.task_id,
+                        q.step_id,
+                        run.id,
+                        run.public_handle,
+                        run.revision,
+                        nonce,
+                        answer,
+                        now()
+                    ],
+                )?;
+                // Accept 本身是一个权威的 Agent Run 状态变化：虽然运行仍在
+                // needs-input，revision 必须前进，使 Kernel 能把不含明文的
+                // AnswerRuntime action 与同一事务产生的 Run 投影/outbox 原子
+                // 持久化。否则 action 没有可承载投影，L-CMD 会整体回滚。
+                let advanced = tx.execute(
+                    "UPDATE agent_runs SET revision=revision+1
+                     WHERE id=?1 AND revision=?2",
+                    params![run.id, run.revision],
+                )?;
+                anyhow::ensure!(
+                    advanced == 1,
+                    "问题 {question_id} 绑定的 Agent Run revision 已变化:拒绝回答(fail-closed)"
+                );
+                let actions = vec![RunAction::AnswerRuntime {
+                    question_id,
+                    run_id: run.id,
+                    run_handle: run.public_handle.clone(),
+                    nonce,
+                }];
+                Ok(RunMutationResult {
+                    output: RunMutationOutput::Responded(q),
+                    actions,
+                })
+            }
+            RunMutation::Settle { run_id, settlement } => {
+                let run = Self::run_view_by_id_tx(tx, run_id)?.ok_or(SettleError::UnknownToken)?;
+                if let Some(existing) = &run.outcome {
+                    if existing == settlement.kind_str() {
+                        let actions = matches!(settlement, Settlement::Complete { .. })
+                            .then(|| RunAction::AfterSettlement {
+                                run_id,
+                                settlement: settlement.clone(),
+                            })
+                            .into_iter()
+                            .collect();
+                        return Ok(RunMutationResult {
+                            output: RunMutationOutput::Settled {
+                                run,
+                                already_applied: true,
+                            },
+                            actions,
+                        });
+                    }
+                    return Err(SettleError::Conflict {
+                        existing: existing.clone(),
+                        attempted: settlement.kind_str().into(),
+                    }
+                    .into());
+                }
+                if !matches!(
+                    run.status,
+                    RunStatus::Running | RunStatus::AwaitingOutcome | RunStatus::Interrupted
+                ) {
+                    return Err(SettleError::RunNotActive(run.status).into());
+                }
+                let ts = now();
+                let applied = tx.execute(
+                    "UPDATE agent_runs SET status=?2, outcome=?3, outcome_payload=?4, ended_at=?5, revision=revision+1
+                     WHERE id=?1 AND outcome IS NULL
+                       AND status IN ('running','awaiting-outcome','interrupted')",
+                    params![
+                        run_id,
+                        settlement.result_status().as_str(),
+                        settlement.kind_str(),
+                        settlement.payload(),
+                        ts
+                    ],
+                )?;
+                if applied == 0 {
+                    let fresh =
+                        Self::run_view_by_id_tx(tx, run_id)?.ok_or(SettleError::UnknownToken)?;
+                    if fresh.outcome.as_deref() == Some(settlement.kind_str()) {
+                        return Ok(RunMutationResult {
+                            output: RunMutationOutput::Settled {
+                                run: fresh,
+                                already_applied: true,
+                            },
+                            actions: vec![],
+                        });
+                    }
+                    return Err(SettleError::Conflict {
+                        existing: fresh.outcome.unwrap_or_default(),
+                        attempted: settlement.kind_str().into(),
+                    }
+                    .into());
+                }
+                let step_key: String = tx.query_row(
+                    "SELECT step_key FROM steps WHERE id=?1",
+                    params![run.step_id],
+                    |r| r.get(0),
+                )?;
+                let step_id = tx.query_row("SELECT s.id FROM steps s JOIN agent_tasks t ON t.active_revision=s.revision_id WHERE t.id=?1 AND s.step_key=?2", params![run.task_id, step_key], |r| r.get(0)).optional()?.unwrap_or(run.step_id);
+                tx.execute("UPDATE steps SET status=?2, result=?3, ended_at=?4, updated_at=?4, revision=revision+1 WHERE id=?1 AND status NOT IN ('succeeded','failed','skipped','cancelled')", params![step_id, settlement.step_status().as_str(), settlement.payload(), ts])?;
+                let actions = match &settlement {
+                    Settlement::Complete { output, .. } => {
+                        let handoff = crate::handoff::Handoff {
+                            status: "complete".into(),
+                            summary: settlement.payload().into(),
+                            output: output.clone(),
+                            raw_log_ref: Some(format!("agent-run:{run_id}")),
+                            ..Default::default()
+                        };
+                        tx.execute("INSERT INTO handoffs (task_id,step_id,run_id,handoff_json,created_at) VALUES (?1,?2,?3,?4,?5)", params![run.task_id, step_id, run_id, serde_json::to_string(&handoff)?, ts])?;
+
+                        vec![RunAction::AfterSettlement {
+                            run_id,
+                            settlement: settlement.clone(),
+                        }]
+                    }
+                    Settlement::Fail { .. } => {
+                        let (attempts, auto_retry): (i32, i32) = tx.query_row(
+                            "SELECT attempts, auto_retry FROM steps WHERE id=?1",
+                            params![step_id],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        )?;
+                        if attempts <= auto_retry {
+                            tx.execute(
+                                "UPDATE steps SET status='ready', ended_at=NULL, updated_at=?2,
+                                    revision=revision+1 WHERE id=?1 AND status='failed'",
+                                params![step_id, ts],
+                            )?;
+                            tx.execute(
+                                "UPDATE agent_tasks SET status='running', paused=0, updated_at=?2,
+                                    revision=revision+1 WHERE id=?1
+                                    AND status IN ('ready','failed','needs-you')",
+                                params![run.task_id, ts],
+                            )?;
+                            vec![
+                                RunAction::ReleaseRunSlot { run_id },
+                                RunAction::DispatchReady {
+                                    task_id: run.task_id,
+                                },
+                            ]
+                        } else {
+                            Self::block_descendants_tx(tx, step_id)?;
+                            tx.execute(
+                                "UPDATE agent_tasks SET status='needs-you', unread=1,
+                                    updated_at=?2, revision=revision+1 WHERE id=?1
+                                    AND status NOT IN ('succeeded','failed','cancelled','archived')",
+                                params![run.task_id, ts],
+                            )?;
+                            vec![
+                                RunAction::ReleaseRunResources { run_id },
+                                RunAction::FlushCompletedJoinBatches {
+                                    task_id: run.task_id,
+                                },
+                            ]
+                        }
+                    }
+                };
+                let run = Self::run_view_by_id_tx(tx, run_id)?.unwrap();
+                Ok(RunMutationResult {
+                    output: RunMutationOutput::Settled {
+                        run,
+                        already_applied: false,
+                    },
+                    actions,
+                })
+            }
+            RunMutation::ReportState { run_id, state } => {
+                let run = Self::run_view_by_id_tx(tx, run_id)?
+                    .ok_or_else(|| anyhow::anyhow!("Agent Run {run_id} 不存在"))?;
+                anyhow::ensure!(run.outcome.is_none(), "Agent Run 已结算,拒绝状态上报");
+                anyhow::ensure!(
+                    matches!(
+                        run.status,
+                        RunStatus::Running | RunStatus::AwaitingOutcome | RunStatus::Interrupted
+                    ),
+                    "Agent Run 已不在活动状态({})",
+                    run.status
+                );
+                let ts = now();
+                tx.execute(
+                    "UPDATE agent_runs SET agent_state=?2, revision=revision+1 WHERE id=?1",
+                    params![run_id, state.as_str()],
+                )?;
+                let mut session_changed = false;
+                if let Some(session_id) = run.session_id {
+                    let session_state = match state {
+                        AgentState::Starting => "starting",
+                        AgentState::Working => "working",
+                        AgentState::Waiting => "waiting",
+                        AgentState::BlockedState => "blocked",
+                        AgentState::Done => "done",
+                        AgentState::Idle => "idle",
+                        AgentState::Dead => "dead",
+                    };
+                    session_changed = tx.execute(
+                        "UPDATE agent_sessions SET status=?2,updated_at=?3,revision=revision+1
+                         WHERE id=?1 AND status<>?2",
+                        params![session_id, session_state, ts],
+                    )? == 1;
+                }
+                let awaiting = matches!(state, AgentState::Done | AgentState::Dead);
+                let mut actions = Vec::new();
+                if awaiting {
+                    tx.execute(
+                        "UPDATE agent_runs SET status='awaiting-outcome',ended_at=NULL,revision=revision+1
+                         WHERE id=?1 AND outcome IS NULL
+                           AND status IN ('running','interrupted')",
+                        params![run_id],
+                    )?;
+                    tx.execute(
+                        "UPDATE steps SET status='awaiting-outcome',updated_at=?2,revision=revision+1
+                         WHERE id=?1 AND status NOT IN ('succeeded','failed','skipped','cancelled')",
+                        params![run.step_id, ts],
+                    )?;
+                    tx.execute(
+                        "UPDATE agent_tasks SET status='needs-you',unread=1,updated_at=?2,revision=revision+1
+                         WHERE id=?1 AND status NOT IN ('succeeded','failed','cancelled','archived')",
+                        params![run.task_id, ts],
+                    )?;
+                    actions.push(RunAction::ReleaseRunSlot { run_id });
+                }
+                let run = Self::run_view_by_id_tx(tx, run_id)?.unwrap();
+                let task = Self::task_view_by_id(tx, run.task_id)?.unwrap();
+                let step = Self::revision_steps_by_id(tx, run.revision_id)?
+                    .into_iter()
+                    .find(|step| step.id == run.step_id)
+                    .ok_or_else(|| anyhow::anyhow!("Agent Run 对应 Step 不存在"))?;
+                Ok(RunMutationResult {
+                    output: RunMutationOutput::StateReported {
+                        run,
+                        task,
+                        step,
+                        session_changed,
+                    },
+                    actions,
+                })
+            }
+            RunMutation::ProposePipeline { task_id, draft } => {
+                let task = Self::task_view_by_id(tx, task_id)?
+                    .ok_or_else(|| anyhow::anyhow!("Workflow Run {task_id} 不存在"))?;
+                anyhow::ensure!(
+                    matches!(
+                        task.status,
+                        TaskStatus::Draft | TaskStatus::NeedsYou | TaskStatus::Failed
+                    ),
+                    "任务当前状态不接受 Planner 提案"
+                );
+                let ts = now();
+                let next: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(revision),0)+1 FROM pipeline_revisions WHERE task_id=?1",
+                    params![task_id],
+                    |row| row.get(0),
+                )?;
+                tx.execute(
+                    "INSERT INTO pipeline_revisions
+                         (task_id,revision,status,public_handle,created_at)
+                     VALUES (?1,?2,'draft',?3,?4)",
+                    params![task_id, next, new_public_handle(), ts],
+                )?;
+                let revision_id = tx.last_insert_rowid();
+                Self::insert_revision_steps(tx, task_id, revision_id, &draft, |_, _, _| {
+                    ("pending".into(), 0, None)
+                })?;
+                tx.execute(
+                    "UPDATE agent_tasks SET status='draft',updated_at=?2,revision=revision+1
+                     WHERE id=?1",
+                    params![task_id, ts],
+                )?;
+                let task = Self::task_view_by_id(tx, task_id)?.unwrap();
+                let revision = Self::revision_view_by_id(tx, revision_id)?
+                    .ok_or_else(|| anyhow::anyhow!("Planner draft Revision 插入后读取失败"))?;
+                Ok(RunMutationResult {
+                    output: RunMutationOutput::PipelineProposed { task, revision },
+                    actions: Vec::new(),
+                })
+            }
+        }
+    }
+
     pub fn open(path: &Path) -> Result<Arc<Store>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -514,23 +1403,26 @@ impl Store {
     // ---------- Task ----------
 
     pub fn create_task(&self, title: &str, goal: &str) -> Result<TaskView> {
+        self.with_conn(|c| Self::create_task_tx(c, title, goal))
+    }
+
+    /// 调用方事务内创建 Draft Task(Core Operation step effect 专用)。
+    pub fn create_task_tx(c: &Connection, title: &str, goal: &str) -> Result<TaskView> {
         let ts = now();
-        self.with_conn(|c| {
-            c.execute(
-                "INSERT INTO agent_tasks
-                     (title, goal, status, public_handle, created_at, updated_at)
-                 VALUES (?1, ?2, 'draft', ?3, ?4, ?4)",
-                params![title, goal, new_public_handle(), ts],
-            )?;
-            Self::task_view_by_id(c, c.last_insert_rowid())
-                .transpose()
-                .unwrap_or_else(|| Err(anyhow::anyhow!("task 插入后读取失败")))
-        })
+        c.execute(
+            "INSERT INTO agent_tasks
+                 (title, goal, status, public_handle, created_at, updated_at)
+             VALUES (?1, ?2, 'draft', ?3, ?4, ?4)",
+            params![title, goal, new_public_handle(), ts],
+        )?;
+        Self::task_view_by_id(c, c.last_insert_rowid())
+            .transpose()
+            .unwrap_or_else(|| Err(anyhow::anyhow!("task 插入后读取失败")))
     }
 
     fn task_view_by_id(c: &Connection, id: i64) -> Result<Option<TaskView>> {
         c.query_row(
-            "SELECT t.id, t.title, t.goal, t.status, t.paused, t.unread, t.active_revision,
+            "SELECT t.id, t.public_handle, t.revision, t.title, t.goal, t.status, t.paused, t.unread, t.active_revision,
                     (SELECT COUNT(*) FROM pipeline_revisions r WHERE r.task_id = t.id) AS rev_count,
                     t.created_at, t.updated_at
              FROM agent_tasks t WHERE t.id = ?1",
@@ -538,15 +1430,17 @@ impl Store {
             |r| {
                 Ok(TaskView {
                     id: r.get(0)?,
-                    title: r.get(1)?,
-                    goal: r.get(2)?,
-                    status: TaskStatus::parse(&r.get::<_, String>(3)?).unwrap_or(TaskStatus::Draft),
-                    paused: r.get::<_, i64>(4)? != 0,
-                    unread: r.get::<_, i64>(5)? != 0,
-                    active_revision: r.get(6)?,
-                    revision_count: r.get(7)?,
-                    created_at: r.get(8)?,
-                    updated_at: r.get(9)?,
+                    public_handle: r.get(1)?,
+                    revision: r.get(2)?,
+                    title: r.get(3)?,
+                    goal: r.get(4)?,
+                    status: TaskStatus::parse(&r.get::<_, String>(5)?).unwrap_or(TaskStatus::Draft),
+                    paused: r.get::<_, i64>(6)? != 0,
+                    unread: r.get::<_, i64>(7)? != 0,
+                    active_revision: r.get(8)?,
+                    revision_count: r.get(9)?,
+                    created_at: r.get(10)?,
+                    updated_at: r.get(11)?,
                 })
             },
         )
@@ -556,6 +1450,219 @@ impl Store {
 
     pub fn task_view(&self, id: i64) -> Result<Option<TaskView>> {
         self.with_conn(|c| Self::task_view_by_id(c, id))
+    }
+
+    pub fn task_view_by_handle(&self, public_handle: &str) -> Result<Option<TaskView>> {
+        self.with_conn(|c| Self::task_view_by_handle_tx(c, public_handle))
+    }
+
+    pub fn task_view_by_handle_tx(c: &Connection, public_handle: &str) -> Result<Option<TaskView>> {
+        let id = c
+            .query_row(
+                "SELECT id FROM agent_tasks WHERE public_handle = ?1",
+                params![public_handle],
+                |r| r.get(0),
+            )
+            .optional()?;
+        id.map_or(Ok(None), |id| Self::task_view_by_id(c, id))
+    }
+
+    /// 在调用方持有的同一 transaction/connection snapshot 内收集
+    /// Workflow Run 投影源，避免 Core 逐表读取时产生撕裂快照。
+    pub fn workflow_run_projection_source_tx(
+        c: &Connection,
+        public_handle: &str,
+    ) -> Result<Option<crate::model::WorkflowRunProjectionSource>> {
+        let Some(task) = Self::task_view_by_handle_tx(c, public_handle)? else {
+            return Ok(None);
+        };
+        let active_revision = Self::active_revision_by_id(c, task.id)?;
+        let steps = match &active_revision {
+            Some(revision) => Self::revision_steps_by_id(c, revision.id)?,
+            None => {
+                let latest_revision = c
+                    .query_row(
+                        "SELECT id FROM pipeline_revisions WHERE task_id=?1 ORDER BY revision DESC LIMIT 1",
+                        params![task.id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()?;
+                match latest_revision {
+                    Some(revision_id) => Self::revision_steps_by_id(c, revision_id)?,
+                    None => Vec::new(),
+                }
+            }
+        };
+        let runs = {
+            let mut stmt = c.prepare(&format!(
+                "SELECT {} FROM agent_runs WHERE task_id=?1 ORDER BY id DESC LIMIT 200",
+                Self::RUN_COLS
+            ))?;
+            let rows = stmt
+                .query_map(params![task.id], Self::run_view_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        let session_ids = runs
+            .iter()
+            .filter_map(|run| run.session_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut run_steps = Vec::new();
+        for step_id in runs
+            .iter()
+            .map(|run| run.step_id)
+            .collect::<std::collections::BTreeSet<_>>()
+        {
+            let revision_id = c
+                .query_row(
+                    "SELECT revision_id FROM steps WHERE id=?1",
+                    params![step_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if let Some(revision_id) = revision_id {
+                if let Some(step) = Self::revision_steps_by_id(c, revision_id)?
+                    .into_iter()
+                    .find(|step| step.id == step_id)
+                {
+                    run_steps.push(step);
+                }
+            }
+        }
+        let mut sessions = Vec::with_capacity(session_ids.len());
+        for session_id in session_ids {
+            if let Some(session) = Self::session_view_by_id(c, session_id)? {
+                sessions.push(session);
+            }
+        }
+        let open_questions = {
+            let mut stmt = c.prepare(
+                "SELECT id FROM step_questions WHERE task_id=?1 AND status='open' ORDER BY id",
+            )?;
+            let ids = stmt
+                .query_map(params![task.id], |row| row.get::<_, i64>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let mut questions = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(question) = Self::question_view_by_id(c, id)? {
+                    questions.push(question);
+                }
+            }
+            questions
+        };
+        let handoffs = {
+            let mut stmt = c.prepare(
+                "SELECT id, step_id, run_id, handoff_json FROM handoffs WHERE task_id=?1 ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map(params![task.id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|(id, step_id, run_id, json)| {
+                    Ok(crate::model::HandoffRow {
+                        id,
+                        step_id,
+                        run_id,
+                        handoff: serde_json::from_str(&json)
+                            .with_context(|| format!("handoff 行 {id} 损坏"))?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        let execution_leases = {
+            let mut stmt = c.prepare(
+                "SELECT lease_key, run_id, step_id, task_id, provider, path, isolated,
+                        metadata_json, status, created_at, released_at
+                 FROM execution_leases WHERE task_id=?1 ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map(params![task.id], |row| {
+                    Ok(crate::model::ExecutionLeaseRow {
+                        lease_key: row.get(0)?,
+                        run_id: row.get(1)?,
+                        step_id: row.get(2)?,
+                        task_id: row.get(3)?,
+                        provider: row.get(4)?,
+                        path: row.get(5)?,
+                        isolated: row.get::<_, i64>(6)? != 0,
+                        metadata_json: row.get(7)?,
+                        status: row.get(8)?,
+                        created_at: row.get(9)?,
+                        released_at: row.get(10)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        let pending_merges = {
+            let mut stmt = c.prepare(
+                "SELECT id, lease_json, conflicts_json FROM pending_merges WHERE task_id=?1 ORDER BY id",
+            )?;
+            let rows = stmt
+                .query_map(params![task.id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|(id, lease_json, conflicts_json)| {
+                    Ok(crate::model::PendingMergeRow {
+                        id,
+                        task_id: task.id,
+                        lease: serde_json::from_str(&lease_json)
+                            .with_context(|| format!("pending merge {id} lease 损坏"))?,
+                        conflicts: serde_json::from_str(&conflicts_json)
+                            .with_context(|| format!("pending merge {id} conflicts 损坏"))?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+        Ok(Some(crate::model::WorkflowRunProjectionSource {
+            task,
+            active_revision,
+            steps,
+            run_steps,
+            runs,
+            sessions,
+            open_questions,
+            handoffs,
+            execution_leases,
+            pending_merges,
+        }))
+    }
+
+    pub fn workflow_run_projection_sources_tx(
+        c: &Connection,
+    ) -> Result<Vec<crate::model::WorkflowRunProjectionSource>> {
+        let handles = {
+            let mut stmt = c.prepare(
+                "SELECT t.public_handle FROM agent_tasks t
+                 WHERE EXISTS(SELECT 1 FROM pipeline_revisions r WHERE r.task_id=t.id)
+                 ORDER BY t.updated_at DESC, t.id DESC",
+            )?;
+            let handles = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            handles
+        };
+        handles
+            .into_iter()
+            .map(|handle| {
+                Self::workflow_run_projection_source_tx(c, &handle)?.ok_or_else(|| {
+                    anyhow::anyhow!("Workflow Run `{handle}` 在同一 snapshot 中消失")
+                })
+            })
+            .collect()
     }
 
     pub fn list_tasks(&self, include_archived: bool) -> Result<Vec<TaskView>> {
@@ -574,8 +1681,26 @@ impl Store {
     pub fn set_task_status(&self, id: i64, status: TaskStatus) -> Result<Option<TaskView>> {
         self.with_conn(|c| {
             c.execute(
-                "UPDATE agent_tasks SET status = ?2, updated_at = ?3 WHERE id = ?1",
+                "UPDATE agent_tasks SET status = ?2, updated_at = ?3, revision = revision + 1 WHERE id = ?1",
                 params![id, status.as_str(), now()],
+            )?;
+            Self::task_view_by_id(c, id)
+        })
+    }
+
+    /// 同一次写入发布 Task 状态与未读标记，避免观察者先看到
+    /// `needs-you`、随后才看到 `unread` 的撕裂投影。
+    pub fn set_task_status_and_unread(
+        &self,
+        id: i64,
+        status: TaskStatus,
+        unread: bool,
+    ) -> Result<Option<TaskView>> {
+        self.with_conn(|c| {
+            c.execute(
+                "UPDATE agent_tasks SET status = ?2, unread = ?3, updated_at = ?4,
+                     revision = revision + 1 WHERE id = ?1",
+                params![id, status.as_str(), unread as i64, now()],
             )?;
             Self::task_view_by_id(c, id)
         })
@@ -584,7 +1709,7 @@ impl Store {
     pub fn set_task_unread(&self, id: i64, unread: bool) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
-                "UPDATE agent_tasks SET unread = ?2 WHERE id = ?1",
+                "UPDATE agent_tasks SET unread = ?2, revision = revision + 1 WHERE id = ?1",
                 params![id, unread as i64],
             )?;
             Ok(())
@@ -594,7 +1719,7 @@ impl Store {
     pub fn set_task_paused(&self, id: i64, paused: bool) -> Result<Option<TaskView>> {
         self.with_conn(|c| {
             c.execute(
-                "UPDATE agent_tasks SET paused = ?2, updated_at = ?3 WHERE id = ?1",
+                "UPDATE agent_tasks SET paused = ?2, updated_at = ?3, revision = revision + 1 WHERE id = ?1",
                 params![id, paused as i64, now()],
             )?;
             Self::task_view_by_id(c, id)
@@ -604,7 +1729,7 @@ impl Store {
     pub fn update_task_meta(&self, id: i64, title: &str, goal: &str) -> Result<Option<TaskView>> {
         self.with_conn(|c| {
             c.execute(
-                "UPDATE agent_tasks SET title = ?2, goal = ?3, updated_at = ?4 WHERE id = ?1",
+                "UPDATE agent_tasks SET title = ?2, goal = ?3, updated_at = ?4, revision = revision + 1 WHERE id = ?1",
                 params![id, title, goal, now()],
             )?;
             Self::task_view_by_id(c, id)
@@ -730,16 +1855,11 @@ impl Store {
                 ("pending".into(), 0, None)
             })?;
             c.execute(
-                "UPDATE agent_tasks SET updated_at = ?2 WHERE id = ?1",
+                "UPDATE agent_tasks SET updated_at = ?2, revision = revision + 1 WHERE id = ?1",
                 params![task_id, ts],
             )?;
-            Ok(RevisionView {
-                id: rev_id,
-                task_id,
-                revision: next,
-                status: RevisionStatus::Draft,
-                created_at: ts,
-            })
+            Self::revision_view_by_id(c, rev_id)?
+                .ok_or_else(|| anyhow::anyhow!("revision 插入后读取失败"))
         })
     }
 
@@ -817,7 +1937,7 @@ impl Store {
                     .optional()?;
                 if let Some(nid) = new_id {
                     c.execute(
-                        "UPDATE steps SET started_at = ?2, ended_at = ?3, updated_at = ?4 WHERE id = ?1",
+                        "UPDATE steps SET started_at = ?2, ended_at = ?3, updated_at = ?4, revision = revision + 1 WHERE id = ?1",
                         params![nid, old.started_at, old.ended_at, ts],
                     )?;
                 }
@@ -831,10 +1951,10 @@ impl Store {
                 params![rev_id],
             )?;
             c.execute(
-                "UPDATE agent_tasks SET active_revision = ?2, updated_at = ?3 WHERE id = ?1",
+                "UPDATE agent_tasks SET active_revision = ?2, updated_at = ?3, revision = revision + 1 WHERE id = ?1",
                 params![task_id, rev_id, ts],
             )?;
-            Ok(RevisionView { id: rev_id, task_id, revision: next, status: RevisionStatus::Active, created_at: ts })
+            Self::revision_view_by_id(c, rev_id)?.ok_or_else(|| anyhow::anyhow!("revision 插入后读取失败"))
         })
     }
 
@@ -865,7 +1985,7 @@ impl Store {
                 params![rev_id],
             )?;
             c.execute(
-                "UPDATE agent_tasks SET active_revision = ?2, status = 'ready', updated_at = ?3 WHERE id = ?1",
+                "UPDATE agent_tasks SET active_revision = ?2, status = 'ready', updated_at = ?3, revision = revision + 1 WHERE id = ?1",
                 params![task_id, rev_id, ts],
             )?;
             Self::promote_ready_tx(c, rev_id)?;
@@ -875,17 +1995,18 @@ impl Store {
 
     fn active_revision_by_id(c: &Connection, task_id: i64) -> Result<Option<RevisionView>> {
         c.query_row(
-            "SELECT id, task_id, revision, status, created_at FROM pipeline_revisions
+            "SELECT id, public_handle, task_id, revision, status, created_at FROM pipeline_revisions
              WHERE task_id = ?1 AND status = 'active'",
             params![task_id],
             |r| {
                 Ok(RevisionView {
                     id: r.get(0)?,
-                    task_id: r.get(1)?,
-                    revision: r.get(2)?,
-                    status: RevisionStatus::parse(&r.get::<_, String>(3)?)
+                    public_handle: r.get(1)?,
+                    task_id: r.get(2)?,
+                    revision: r.get(3)?,
+                    status: RevisionStatus::parse(&r.get::<_, String>(4)?)
                         .unwrap_or(RevisionStatus::Draft),
-                    created_at: r.get(4)?,
+                    created_at: r.get(5)?,
                 })
             },
         )
@@ -897,9 +2018,39 @@ impl Store {
         self.with_conn(|c| Self::active_revision_by_id(c, task_id))
     }
 
+    fn revision_view_by_id(c: &Connection, id: i64) -> Result<Option<RevisionView>> {
+        c.query_row(
+            "SELECT id, public_handle, task_id, revision, status, created_at FROM pipeline_revisions WHERE id = ?1",
+            params![id],
+            |r| Ok(RevisionView {
+                id: r.get(0)?, public_handle: r.get(1)?, task_id: r.get(2)?, revision: r.get(3)?,
+                status: RevisionStatus::parse(&r.get::<_, String>(4)?).unwrap_or(RevisionStatus::Draft),
+                created_at: r.get(5)?,
+            }),
+        ).optional().map_err(Into::into)
+    }
+
+    pub fn revision_view_by_handle(&self, public_handle: &str) -> Result<Option<RevisionView>> {
+        self.with_conn(|c| Self::revision_view_by_handle_tx(c, public_handle))
+    }
+
+    pub fn revision_view_by_handle_tx(
+        c: &Connection,
+        public_handle: &str,
+    ) -> Result<Option<RevisionView>> {
+        let id = c
+            .query_row(
+                "SELECT id FROM pipeline_revisions WHERE public_handle = ?1",
+                params![public_handle],
+                |r| r.get(0),
+            )
+            .optional()?;
+        id.map_or(Ok(None), |id| Self::revision_view_by_id(c, id))
+    }
+
     fn revision_steps_by_id(c: &Connection, revision_id: i64) -> Result<Vec<StepView>> {
         let mut stmt = c.prepare(
-            "SELECT id, revision_id, task_id, step_key, title, instructions, agent_profile,
+            "SELECT id, public_handle, revision, revision_id, task_id, step_key, title, instructions, agent_profile,
                     session_policy, status, attempts, auto_retry, result, started_at, ended_at
              FROM steps WHERE revision_id = ?1 ORDER BY id",
         )?;
@@ -907,20 +2058,22 @@ impl Store {
             .query_map(params![revision_id], |r| {
                 Ok(StepView {
                     id: r.get(0)?,
-                    revision_id: r.get(1)?,
-                    task_id: r.get(2)?,
-                    step_key: r.get(3)?,
-                    title: r.get(4)?,
-                    instructions: r.get(5)?,
-                    agent_profile: r.get(6)?,
-                    session_policy: r.get(7)?,
-                    status: StepStatus::parse(&r.get::<_, String>(8)?)
+                    public_handle: r.get(1)?,
+                    revision: r.get(2)?,
+                    revision_id: r.get(3)?,
+                    task_id: r.get(4)?,
+                    step_key: r.get(5)?,
+                    title: r.get(6)?,
+                    instructions: r.get(7)?,
+                    agent_profile: r.get(8)?,
+                    session_policy: r.get(9)?,
+                    status: StepStatus::parse(&r.get::<_, String>(10)?)
                         .unwrap_or(StepStatus::Pending),
-                    attempts: r.get(9)?,
-                    auto_retry: r.get::<_, i64>(10)? as i32,
-                    result: r.get(11)?,
-                    started_at: r.get(12)?,
-                    ended_at: r.get(13)?,
+                    attempts: r.get(11)?,
+                    auto_retry: r.get::<_, i64>(12)? as i32,
+                    result: r.get(13)?,
+                    started_at: r.get(14)?,
+                    ended_at: r.get(15)?,
                     deps: Vec::new(),
                 })
             })?
@@ -939,22 +2092,59 @@ impl Store {
         self.with_conn(|c| Self::revision_steps_by_id(c, revision_id))
     }
 
+    pub fn step_view_by_handle(&self, public_handle: &str) -> Result<Option<StepView>> {
+        self.with_conn(|c| Self::step_view_by_handle_tx(c, public_handle))
+    }
+
+    pub fn step_view_by_handle_tx(c: &Connection, public_handle: &str) -> Result<Option<StepView>> {
+        let ids = c
+            .query_row(
+                "SELECT id, revision_id FROM steps WHERE public_handle = ?1",
+                params![public_handle],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .optional()?;
+        match ids {
+            Some((id, rev)) => Ok(Self::revision_steps_by_id(c, rev)?
+                .into_iter()
+                .find(|s| s.id == id)),
+            None => Ok(None),
+        }
+    }
+
+    fn step_view_by_id_tx(c: &Connection, step_id: i64) -> Result<Option<StepView>> {
+        let revision_id = c
+            .query_row(
+                "SELECT revision_id FROM steps WHERE id=?1",
+                params![step_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        match revision_id {
+            Some(revision_id) => Ok(Self::revision_steps_by_id(c, revision_id)?
+                .into_iter()
+                .find(|step| step.id == step_id)),
+            None => Ok(None),
+        }
+    }
+
     /// 当前活动 revision 的 steps;若无活动 revision,取最新 revision。
     pub fn task_steps(&self, task_id: i64) -> Result<Vec<StepView>> {
         self.with_conn(|c| {
             let rev = Self::active_revision_by_id(c, task_id)?.or_else(|| {
                 c.query_row(
-                    "SELECT id, task_id, revision, status, created_at FROM pipeline_revisions
+                    "SELECT id, public_handle, task_id, revision, status, created_at FROM pipeline_revisions
                      WHERE task_id = ?1 ORDER BY revision DESC LIMIT 1",
                     params![task_id],
                     |r| {
                         Ok(RevisionView {
                             id: r.get(0)?,
-                            task_id: r.get(1)?,
-                            revision: r.get(2)?,
-                            status: RevisionStatus::parse(&r.get::<_, String>(3)?)
+                            public_handle: r.get(1)?,
+                            task_id: r.get(2)?,
+                            revision: r.get(3)?,
+                            status: RevisionStatus::parse(&r.get::<_, String>(4)?)
                                 .unwrap_or(RevisionStatus::Draft),
-                            created_at: r.get(4)?,
+                            created_at: r.get(5)?,
                         })
                     },
                 )
@@ -993,7 +2183,7 @@ impl Store {
                 "UPDATE steps SET status = ?2,
                     started_at = CASE WHEN ?3 = 1 AND started_at IS NULL THEN ?4 ELSE started_at END,
                     ended_at = CASE WHEN ?5 = 1 THEN ?4 ELSE ended_at END,
-                    updated_at = ?4
+                    updated_at = ?4, revision = revision + 1
                  WHERE id = ?1",
                 params![
                     step_id,
@@ -1017,7 +2207,7 @@ impl Store {
     pub fn set_step_auto_retry(&self, step_id: i64, limit: i32) -> Result<Option<StepView>> {
         self.with_conn(|c| {
             c.execute(
-                "UPDATE steps SET auto_retry = ?2, updated_at = ?3 WHERE id = ?1",
+                "UPDATE steps SET auto_retry = ?2, updated_at = ?3, revision = revision + 1 WHERE id = ?1",
                 params![step_id, limit, now()],
             )?;
             let rev: Option<i64> = c
@@ -1040,7 +2230,7 @@ impl Store {
         self.with_conn(|c| {
             let ts = now();
             c.execute(
-                "UPDATE steps SET attempts = attempts + 1, started_at = COALESCE(started_at, ?2), updated_at = ?2 WHERE id = ?1",
+                "UPDATE steps SET attempts = attempts + 1, started_at = COALESCE(started_at, ?2), updated_at = ?2, revision = revision + 1 WHERE id = ?1",
                 params![step_id, ts],
             )?;
             c.query_row("SELECT attempts FROM steps WHERE id = ?1", params![step_id], |r| r.get(0))
@@ -1065,7 +2255,7 @@ impl Store {
             });
             if ok {
                 c.execute(
-                    "UPDATE steps SET status = 'ready', updated_at = ?2 WHERE id = ?1",
+                    "UPDATE steps SET status = 'ready', updated_at = ?2, revision = revision + 1 WHERE id = ?1",
                     params![s.id, now()],
                 )?;
                 promoted.push(s.clone());
@@ -1074,6 +2264,7 @@ impl Store {
         if !promoted.is_empty() {
             for s in &mut promoted {
                 s.status = StepStatus::Ready;
+                s.revision += 1;
             }
         }
         Ok(promoted)
@@ -1081,51 +2272,54 @@ impl Store {
 
     /// 失败只阻塞后代:failed Step 的全部传递后代中仍 pending/ready 的 → blocked。
     pub fn block_descendants(&self, step_id: i64) -> Result<Vec<StepView>> {
-        self.with_conn(|c| {
-            let rev: i64 = c.query_row(
-                "SELECT revision_id FROM steps WHERE id = ?1",
-                params![step_id],
-                |r| r.get(0),
-            )?;
-            let steps = Self::revision_steps_by_id(c, rev)?;
-            let by_id: HashMap<i64, &StepView> = steps.iter().map(|s| (s.id, s)).collect();
-            let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
-            for s in &steps {
-                for d in &s.deps {
-                    children.entry(*d).or_default().push(s.id);
-                }
+        self.with_conn(|c| Self::block_descendants_tx(c, step_id))
+    }
+
+    fn block_descendants_tx(c: &Connection, step_id: i64) -> Result<Vec<StepView>> {
+        let rev: i64 = c.query_row(
+            "SELECT revision_id FROM steps WHERE id = ?1",
+            params![step_id],
+            |r| r.get(0),
+        )?;
+        let steps = Self::revision_steps_by_id(c, rev)?;
+        let by_id: HashMap<i64, &StepView> = steps.iter().map(|s| (s.id, s)).collect();
+        let mut children: HashMap<i64, Vec<i64>> = HashMap::new();
+        for s in &steps {
+            for d in &s.deps {
+                children.entry(*d).or_default().push(s.id);
             }
-            let mut blocked_ids = Vec::new();
-            let mut stack = vec![step_id];
-            let mut seen = std::collections::HashSet::new();
-            while let Some(n) = stack.pop() {
-                if let Some(kids) = children.get(&n) {
-                    for &k in kids {
-                        if seen.insert(k) {
-                            if let Some(st) = by_id.get(&k) {
-                                if matches!(st.status, StepStatus::Pending | StepStatus::Ready) {
-                                    blocked_ids.push(k);
-                                }
+        }
+        let mut blocked_ids = Vec::new();
+        let mut stack = vec![step_id];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(n) = stack.pop() {
+            if let Some(kids) = children.get(&n) {
+                for &k in kids {
+                    if seen.insert(k) {
+                        if let Some(st) = by_id.get(&k) {
+                            if matches!(st.status, StepStatus::Pending | StepStatus::Ready) {
+                                blocked_ids.push(k);
                             }
-                            stack.push(k);
                         }
+                        stack.push(k);
                     }
                 }
             }
-            let mut out = Vec::new();
-            for id in blocked_ids {
-                c.execute(
-                    "UPDATE steps SET status = 'blocked', updated_at = ?2 WHERE id = ?1",
+        }
+        let mut out = Vec::new();
+        for id in blocked_ids {
+            c.execute(
+                    "UPDATE steps SET status = 'blocked', updated_at = ?2, revision = revision + 1 WHERE id = ?1",
                     params![id, now()],
                 )?;
-                if let Some(s) = by_id.get(&id) {
-                    let mut s = (*s).clone();
-                    s.status = StepStatus::Blocked;
-                    out.push(s);
-                }
+            if let Some(s) = by_id.get(&id) {
+                let mut s = (*s).clone();
+                s.status = StepStatus::Blocked;
+                s.revision += 1;
+                out.push(s);
             }
-            Ok(out)
-        })
+        }
+        Ok(out)
     }
 
     /// 依赖图收敛判定:全部 Step 终结;全 succeeded/skipped → Ok(true)。
@@ -1209,6 +2403,25 @@ impl Store {
         self.with_conn(|c| Self::session_view_by_id(c, id))
     }
 
+    pub fn session_view_by_handle(&self, public_handle: &str) -> Result<Option<SessionView>> {
+        self.with_conn(|c| Self::session_view_by_handle_tx(c, public_handle))
+    }
+
+    pub fn session_view_by_handle_tx(
+        c: &Connection,
+        public_handle: &str,
+    ) -> Result<Option<SessionView>> {
+        c.query_row(
+            "SELECT id, public_handle, revision, session_key, runtime, agent_profile, title,
+                    status, last_instruction, last_reply, unread, created_at, updated_at
+             FROM agent_sessions WHERE public_handle = ?1",
+            params![public_handle],
+            Self::session_view_row,
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     pub fn find_reusable_session(
         &self,
         session_key: &str,
@@ -1256,7 +2469,7 @@ impl Store {
                     status = COALESCE(?2, status),
                     last_instruction = COALESCE(?3, last_instruction),
                     last_reply = COALESCE(?4, last_reply),
-                    updated_at = ?5
+                    updated_at = ?5, revision = revision + 1
                  WHERE id = ?1",
                 params![
                     id,
@@ -1273,7 +2486,7 @@ impl Store {
     pub fn set_session_unread(&self, id: i64, unread: bool) -> Result<()> {
         self.with_conn(|c| {
             c.execute(
-                "UPDATE agent_sessions SET unread = ?2, updated_at = ?3 WHERE id = ?1",
+                "UPDATE agent_sessions SET unread = ?2, updated_at = ?3, revision = revision + 1 WHERE id = ?1",
                 params![id, unread as i64, now()],
             )?;
             Ok(())
@@ -1357,18 +2570,20 @@ impl Store {
     }
 
     pub fn run_view_by_handle(&self, public_handle: &str) -> Result<Option<RunView>> {
-        self.with_conn(|c| {
-            c.query_row(
-                &format!(
-                    "SELECT {} FROM agent_runs WHERE public_handle = ?1",
-                    Self::RUN_COLS
-                ),
-                params![public_handle],
-                Self::run_view_row,
-            )
-            .optional()
-            .map_err(Into::into)
-        })
+        self.with_conn(|c| Self::run_view_by_handle_tx(c, public_handle))
+    }
+
+    pub fn run_view_by_handle_tx(c: &Connection, public_handle: &str) -> Result<Option<RunView>> {
+        c.query_row(
+            &format!(
+                "SELECT {} FROM agent_runs WHERE public_handle = ?1",
+                Self::RUN_COLS
+            ),
+            params![public_handle],
+            Self::run_view_row,
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     pub fn run_by_token(&self, token: &str) -> Result<Option<RunView>> {
@@ -1390,7 +2605,8 @@ impl Store {
         self.with_conn(|c| {
             c.execute(
                 "UPDATE agent_runs SET status = ?2,
-                    ended_at = CASE ?3 WHEN 1 THEN ?4 ELSE ended_at END
+                    ended_at = CASE ?3 WHEN 1 THEN ?4 ELSE ended_at END,
+                    revision = revision + 1
                  WHERE id = ?1",
                 params![
                     id,
@@ -1406,7 +2622,7 @@ impl Store {
     pub fn set_run_agent_state(&self, id: i64, state: AgentState) -> Result<Option<RunView>> {
         self.with_conn(|c| {
             c.execute(
-                "UPDATE agent_runs SET agent_state = ?2 WHERE id = ?1",
+                "UPDATE agent_runs SET agent_state = ?2, revision = revision + 1 WHERE id = ?1",
                 params![id, state.as_str()],
             )?;
             Self::run_view_by_id(c, id)
@@ -1476,14 +2692,68 @@ impl Store {
         revision_id: i64,
         session_id: i64,
     ) -> Result<RunView> {
+        self.dispatch_run_consuming(task_id, step_id, revision_id, session_id, None)
+    }
+
+    /// 原子派发并 CAS 消费 retry 写入的下一-attempt 会话意图。
+    ///
+    /// `expected_next_session` 来自派发前只读选择；事务内若已被另一派发
+    /// 消费/替换，整个创建 run 操作失败，不会产生重复 attempt。
+    pub fn dispatch_run_consuming(
+        &self,
+        task_id: i64,
+        step_id: i64,
+        revision_id: i64,
+        session_id: i64,
+        expected_next_session: Option<crate::run_mutation::NextAttemptSession>,
+    ) -> Result<RunView> {
         let ts = now();
         self.with_tx(|tx| {
-            tx.execute(
+            let current = tx
+                .query_row(
+                    "SELECT mode,session_id FROM step_next_attempt_sessions WHERE step_id=?1",
+                    [step_id],
+                    |row| {
+                        let mode: String = row.get(0)?;
+                        let session_id: Option<i64> = row.get(1)?;
+                        Ok(match mode.as_str() {
+                            "fresh" => crate::run_mutation::NextAttemptSession::fresh(),
+                            "continue" => crate::run_mutation::NextAttemptSession {
+                                mode: RetryMode::ContinueSession,
+                                session_id,
+                            },
+                            _ => unreachable!("schema CHECK 拒绝未知 next-attempt mode"),
+                        })
+                    },
+                )
+                .optional()?;
+            anyhow::ensure!(
+                current == expected_next_session,
+                "Step {step_id} 的下一 attempt 会话策略已被并发消费或替换"
+            );
+            let changed = tx.execute(
                 "UPDATE steps SET attempts = attempts + 1, status = 'running',
-                    started_at = COALESCE(started_at, ?2), updated_at = ?2
-                 WHERE id = ?1",
-                params![step_id, ts],
+                    started_at = COALESCE(started_at, ?2), updated_at = ?2,
+                    revision = revision + 1
+                 WHERE id = ?1 AND revision_id=?3 AND task_id=?4 AND status='ready'",
+                params![step_id, ts, revision_id, task_id],
             )?;
+            anyhow::ensure!(changed == 1, "Step {step_id} 已不是可派发的 ready 状态");
+            if let Some(expected) = expected_next_session {
+                let mode = match expected.mode {
+                    RetryMode::FreshSession => "fresh",
+                    RetryMode::ContinueSession => "continue",
+                };
+                let consumed = tx.execute(
+                    "DELETE FROM step_next_attempt_sessions
+                     WHERE step_id=?1 AND mode=?2 AND session_id IS ?3",
+                    params![step_id, mode, expected.session_id],
+                )?;
+                anyhow::ensure!(
+                    consumed == 1,
+                    "Step {step_id} 的下一 attempt 会话策略 CAS 失败"
+                );
+            }
             tx.execute(
                 "INSERT INTO agent_runs (task_id, step_id, revision_id, session_id, status,
                     capability_token, agent_state, public_handle, started_at)
@@ -1500,6 +2770,33 @@ impl Store {
             )?;
             Self::run_view_by_id_tx(tx, tx.last_insert_rowid())?
                 .ok_or_else(|| anyhow::anyhow!("run 插入后读取失败"))
+        })
+    }
+
+    /// 读取尚未被 dispatch 消费的下一-attempt 会话意图。
+    pub fn next_attempt_session(
+        &self,
+        step_id: i64,
+    ) -> Result<Option<crate::run_mutation::NextAttemptSession>> {
+        self.with_conn(|conn| {
+            conn.query_row(
+                "SELECT mode,session_id FROM step_next_attempt_sessions WHERE step_id=?1",
+                [step_id],
+                |row| {
+                    let mode: String = row.get(0)?;
+                    let session_id: Option<i64> = row.get(1)?;
+                    match mode.as_str() {
+                        "fresh" => Ok(crate::run_mutation::NextAttemptSession::fresh()),
+                        "continue" => Ok(crate::run_mutation::NextAttemptSession {
+                            mode: RetryMode::ContinueSession,
+                            session_id,
+                        }),
+                        _ => Err(rusqlite::Error::InvalidQuery),
+                    }
+                },
+            )
+            .optional()
+            .map_err(Into::into)
         })
     }
 
@@ -1537,11 +2834,11 @@ impl Store {
             for (step_id, task_id) in &orphans {
                 tx.execute(
                     "UPDATE steps SET status = 'failed', result = '崩溃窗口修复:step 无活动 run',
-                        ended_at = ?2, updated_at = ?2 WHERE id = ?1",
+                        ended_at = ?2, updated_at = ?2, revision = revision + 1 WHERE id = ?1",
                     params![step_id, ts],
                 )?;
                 tx.execute(
-                    "UPDATE agent_tasks SET status = 'needs-you', unread = 1, updated_at = ?2
+                    "UPDATE agent_tasks SET status = 'needs-you', unread = 1, updated_at = ?2, revision = revision + 1
                      WHERE id = ?1 AND status NOT IN ('succeeded','failed','cancelled','archived')",
                     params![task_id, ts],
                 )?;
@@ -1557,6 +2854,7 @@ impl Store {
         settlement: Settlement,
     ) -> std::result::Result<(RunView, SettleOutcome), SettleError> {
         self.settle_impl(token, None, settlement)
+            .map(|(run, outcome, _)| (run, outcome))
     }
 
     pub fn settle_run_by_id(
@@ -1565,6 +2863,29 @@ impl Store {
         settlement: Settlement,
     ) -> std::result::Result<(RunView, SettleOutcome), SettleError> {
         self.settle_impl("", Some(run_id), settlement)
+            .map(|(run, outcome, _)| (run, outcome))
+    }
+
+    pub(crate) fn settle_run_by_token_with_actions(
+        &self,
+        token: &str,
+        settlement: Settlement,
+    ) -> std::result::Result<
+        (RunView, SettleOutcome, Vec<crate::run_mutation::RunAction>),
+        SettleError,
+    > {
+        self.settle_impl(token, None, settlement)
+    }
+
+    pub(crate) fn settle_run_by_id_with_actions(
+        &self,
+        run_id: i64,
+        settlement: Settlement,
+    ) -> std::result::Result<
+        (RunView, SettleOutcome, Vec<crate::run_mutation::RunAction>),
+        SettleError,
+    > {
+        self.settle_impl("", Some(run_id), settlement)
     }
 
     fn settle_impl(
@@ -1572,130 +2893,44 @@ impl Store {
         token: &str,
         run_id: Option<i64>,
         settlement: Settlement,
-    ) -> std::result::Result<(RunView, SettleOutcome), SettleError> {
-        // 结算是唯一成功依据:必须整体事务 + 条件更新(防止半应用与并发双写)
-        self.with_tx(|tx| -> Result<(RunView, SettleOutcome)> {
-            let run = if let Some(id) = run_id {
-                Self::run_view_by_id_tx(tx, id)?
-            } else {
-                tx.query_row(
-                    &format!("SELECT {} FROM agent_runs WHERE capability_token = ?1", Self::RUN_COLS),
-                    params![token],
-                    Self::run_view_row,
-                )
-                .optional()?
-            }
-            .ok_or(SettleError::UnknownToken)?;
-
-            if let Some(existing) = &run.outcome {
-                if existing == settlement.kind_str() {
-                    return Ok((run, SettleOutcome::AlreadyApplied));
-                }
-                return Err(SettleError::Conflict {
-                    existing: existing.clone(),
-                    attempted: settlement.kind_str().into(),
-                })
-                .map_err(anyhow::Error::from);
-            }
-            // interrupted(重启后未知状态)允许人工结算(设计 §13)
-            if !matches!(
-                run.status,
-                RunStatus::Running | RunStatus::AwaitingOutcome | RunStatus::Interrupted
-            ) {
-                return Err(SettleError::RunNotActive(run.status)).map_err(anyhow::Error::from);
-            }
-            let ts = now();
-            // 条件更新:outcome 仍为空才写入;0 行受影响 = 并发已结算 → 重读判定幂等/冲突
-            let applied = tx.execute(
-                "UPDATE agent_runs SET status = ?2, outcome = ?3, outcome_payload = ?4, ended_at = ?5
-                 WHERE id = ?1 AND outcome IS NULL
-                   AND status IN ('running','awaiting-outcome','interrupted')",
-                params![
-                    run.id,
-                    settlement.result_status().as_str(),
-                    settlement.kind_str(),
-                    settlement.payload(),
-                    ts,
-                ],
-            )?;
-            if applied == 0 {
-                let fresh = Self::run_view_by_id_tx(tx, run.id)?
-                    .ok_or(SettleError::UnknownToken)?;
-                if fresh.outcome.as_deref() == Some(settlement.kind_str()) {
-                    return Ok((fresh, SettleOutcome::AlreadyApplied));
-                }
-                return Err(SettleError::Conflict {
-                    existing: fresh.outcome.unwrap_or_default(),
-                    attempted: settlement.kind_str().into(),
-                })
-                .map_err(anyhow::Error::from);
-            }
-            // 结算写入「活动 revision」中同 key 的 step(暂停编辑产生新 revision 时,
-            // run 记录的 step_id 属于旧 revision,只改旧行会让新 revision 的副本永久卡在 running)
-            let step_key: Option<String> = tx
-                .query_row(
-                    "SELECT step_key FROM steps WHERE id = ?1",
-                    params![run.step_id],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            let target_step: Option<i64> = match step_key {
-                Some(key) => {
-                    let active_rev: Option<i64> = tx
-                        .query_row(
-                            "SELECT active_revision FROM agent_tasks WHERE id = ?1",
-                            params![run.task_id],
-                            |r| r.get(0),
-                        )
-                        .optional()?
-                        .flatten();
-                    match active_rev {
-                        Some(rev) => tx
-                            .query_row(
-                                "SELECT id FROM steps WHERE revision_id = ?1 AND step_key = ?2",
-                                params![rev, key],
-                                |r| r.get(0),
-                            )
-                            .optional()?,
-                        None => None,
-                    }
-                }
-                None => None,
+    ) -> std::result::Result<
+        (RunView, SettleOutcome, Vec<crate::run_mutation::RunAction>),
+        SettleError,
+    > {
+        // mfctl capability-token 与 Controller 的 handle/CAS 授权不同，
+        // 但最终业务写必须共用同一个 transaction-scoped seam。
+        self.with_tx(|tx| -> Result<_> {
+            let run_id = match run_id {
+                Some(id) => id,
+                None => tx
+                    .query_row(
+                        "SELECT id FROM agent_runs WHERE capability_token=?1",
+                        params![token],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .ok_or(SettleError::UnknownToken)?,
             };
-            let step_id = target_step.unwrap_or(run.step_id);
-            tx.execute(
-                "UPDATE steps SET status = ?2, result = ?3, ended_at = ?4, updated_at = ?4
-                 WHERE id = ?1 AND status NOT IN ('succeeded','failed','skipped','cancelled')",
-                params![step_id, settlement.step_status().as_str(), settlement.payload(), ts],
+            let result = Self::apply_run_mutation_tx(
+                tx,
+                crate::run_mutation::RunMutation::Settle { run_id, settlement },
             )?;
-            // 成功结算与 Handoff 落库同一事务:下游解锁的前提是两者都已持久化
-            if settlement.kind_str() == "complete" {
-                // 完整 Handoff:摘要 + 结构化 output(下游精确引用)+ 日志引用
-                let handoff = crate::handoff::Handoff {
-                    status: "complete".into(),
-                    summary: settlement.payload().to_string(),
-                    output: match &settlement {
-                        Settlement::Complete { output, .. } => output.clone(),
-                        Settlement::Fail { .. } => serde_json::Value::Null,
-                    },
-                    raw_log_ref: Some(format!("agent-run:{}", run.id)),
-                    ..Default::default()
-                };
-                tx.execute(
-                    "INSERT INTO handoffs (task_id, step_id, run_id, handoff_json, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![
-                        run.task_id,
-                        step_id,
-                        run.id,
-                        serde_json::to_string(&handoff)?,
-                        ts
-                    ],
-                )?;
-            }
-            let updated = Self::run_view_by_id_tx(tx, run.id)?
-                .ok_or(SettleError::UnknownToken)?;
-            Ok((updated, SettleOutcome::Applied))
+            let crate::run_mutation::RunMutationOutput::Settled {
+                run,
+                already_applied,
+            } = result.output
+            else {
+                anyhow::bail!("settle seam 返回了非结算结果")
+            };
+            Ok((
+                run,
+                if already_applied {
+                    SettleOutcome::AlreadyApplied
+                } else {
+                    SettleOutcome::Applied
+                },
+                result.actions,
+            ))
         })
         .map_err(|e| match e.downcast_ref::<SettleError>() {
             Some(s) => s.clone(),
@@ -1756,7 +2991,7 @@ impl Store {
                 if status == "awaiting-outcome" {
                     // 已退出未结算:等待人工确认,状态原样,任务提示
                     tx.execute(
-                        "UPDATE agent_tasks SET status = 'needs-you', unread = 1, updated_at = ?2
+                        "UPDATE agent_tasks SET status = 'needs-you', unread = 1, updated_at = ?2, revision = revision + 1
                          WHERE id = (SELECT task_id FROM agent_runs WHERE id = ?1)
                            AND status NOT IN ('succeeded','failed','cancelled','archived')",
                         params![id, ts],
@@ -1766,17 +3001,17 @@ impl Store {
                 // 进程状态未知:interrupted + awaiting-outcome(不判失败)
                 interrupted_ids.push(*id);
                 tx.execute(
-                    "UPDATE agent_runs SET status = 'interrupted', ended_at = ?2 WHERE id = ?1",
+                    "UPDATE agent_runs SET status = 'interrupted', ended_at = ?2, revision = revision + 1 WHERE id = ?1",
                     params![id, ts],
                 )?;
                 tx.execute(
-                    "UPDATE steps SET status = 'awaiting-outcome', updated_at = ?2
+                    "UPDATE steps SET status = 'awaiting-outcome', updated_at = ?2, revision = revision + 1
                      WHERE id = (SELECT step_id FROM agent_runs WHERE id = ?1)
                        AND status NOT IN ('succeeded','failed','skipped','cancelled')",
                     params![id, ts],
                 )?;
                 tx.execute(
-                    "UPDATE agent_tasks SET status = 'needs-you', unread = 1, updated_at = ?2
+                    "UPDATE agent_tasks SET status = 'needs-you', unread = 1, updated_at = ?2, revision = revision + 1
                      WHERE id = (SELECT task_id FROM agent_runs WHERE id = ?1)
                        AND status NOT IN ('succeeded','failed','cancelled','archived')",
                     params![id, ts],
@@ -1798,7 +3033,7 @@ impl Store {
                         continue;
                     }
                     tx.execute(
-                        "UPDATE agent_sessions SET status = 'dead', updated_at = ?2 WHERE id = ?1",
+                        "UPDATE agent_sessions SET status = 'dead', updated_at = ?2, revision = revision + 1 WHERE id = ?1",
                         params![sid, ts],
                     )?;
                 }
@@ -1881,15 +3116,172 @@ impl Store {
         .map_err(Into::into)
     }
 
-    pub fn answer_question(&self, id: i64, answer: &str) -> Result<Option<StepQuestionView>> {
-        self.with_conn(|c| {
-            c.execute(
-                "UPDATE step_questions SET answer = ?2, status = 'answered', answered_at = ?3
-                 WHERE id = ?1 AND status = 'open'",
-                params![id, answer, now()],
+    pub fn question(&self, id: i64) -> Result<Option<StepQuestionView>> {
+        self.with_conn(|c| Self::question_view_by_id(c, id))
+    }
+
+    /// `question_answer_deliveries` 行(含 pending 明文;delivered 行明文
+    /// 已被收口事务置 NULL,读取为空串)。无行 = 该问题从未进入两阶段投递。
+    fn answer_delivery_by_question_tx(
+        c: &Connection,
+        question_id: i64,
+    ) -> Result<Option<AnswerDeliveryRecord>> {
+        c.query_row(
+            "SELECT question_id, task_id, step_id, run_id, run_handle, run_revision,
+                    nonce, answer, status
+             FROM question_answer_deliveries WHERE question_id = ?1",
+            params![question_id],
+            |r| {
+                Ok(AnswerDeliveryRecord {
+                    question_id: r.get(0)?,
+                    task_id: r.get(1)?,
+                    step_id: r.get(2)?,
+                    run_id: r.get(3)?,
+                    run_handle: r.get(4)?,
+                    run_revision: r.get(5)?,
+                    nonce: r.get(6)?,
+                    answer: r.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    status: r.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// 投递执行入口的持久幂等键查询。
+    pub fn answer_delivery_of_question(
+        &self,
+        question_id: i64,
+    ) -> Result<Option<AnswerDeliveryRecord>> {
+        self.with_conn(|c| Self::answer_delivery_by_question_tx(c, question_id))
+    }
+
+    /// 两阶段投递的收口事务(宿主确认投递成功后调用):
+    /// 1. CAS `pending → delivered` 并清空 answer 明文(0 行 = 已被并发
+    ///    确认,幂等返回);
+    /// 2. question CAS `open → answered`(answer 回填域表);
+    /// 3. Step `needs-input → running`,attention 清空时 Task 回 running。
+    /// 三个推进在同一事务内原子完成;nonce 不匹配一律拒绝(fail-closed)。
+    pub fn confirm_answer_delivery(
+        &self,
+        question_id: i64,
+        nonce: &str,
+    ) -> Result<AnswerDeliveryConfirm> {
+        self.with_tx(|tx| {
+            let delivery = Self::answer_delivery_by_question_tx(tx, question_id)?
+                .ok_or_else(|| anyhow::anyhow!("问题 {question_id} 没有持久投递记录:拒绝确认"))?;
+            anyhow::ensure!(
+                delivery.nonce == nonce,
+                "问题 {question_id} 投递 nonce 不匹配:拒绝陈旧 action(fail-closed)"
+            );
+            if delivery.status != "pending" {
+                let question = Self::question_view_by_id(tx, question_id)?
+                    .ok_or_else(|| anyhow::anyhow!("问题 {question_id} 不存在"))?;
+                return Ok(AnswerDeliveryConfirm {
+                    question,
+                    already_confirmed: true,
+                });
+            }
+            let ts = now();
+            let changed = tx.execute(
+                "UPDATE question_answer_deliveries
+                 SET status='delivered', answer=NULL, delivered_at=?3
+                 WHERE question_id=?1 AND nonce=?2 AND status='pending'",
+                params![question_id, nonce, ts],
             )?;
-            Self::question_view_by_id(c, id)
+            if changed != 1 {
+                // 与「已确认」收敛(并发收口);其余形态如实失败。
+                let reread = Self::answer_delivery_by_question_tx(tx, question_id)?.unwrap();
+                anyhow::ensure!(
+                    reread.status == "delivered",
+                    "问题 {question_id} 投递记录并发变更:收口失败"
+                );
+                let question = Self::question_view_by_id(tx, question_id)?
+                    .ok_or_else(|| anyhow::anyhow!("问题 {question_id} 不存在"))?;
+                return Ok(AnswerDeliveryConfirm {
+                    question,
+                    already_confirmed: true,
+                });
+            }
+            let answered_rows = tx.execute(
+                "UPDATE step_questions SET answer=?2, status='answered', answered_at=?3
+                 WHERE id=?1 AND status='open'",
+                params![question_id, delivery.answer, ts],
+            )?;
+            if answered_rows != 1 {
+                let question = Self::question_view_by_id(tx, question_id)?
+                    .ok_or_else(|| anyhow::anyhow!("问题 {question_id} 不存在"))?;
+                anyhow::ensure!(
+                    question.status == "answered",
+                    "问题 {question_id} 状态异常({}):无法收口",
+                    question.status
+                );
+                return Ok(AnswerDeliveryConfirm {
+                    question,
+                    already_confirmed: true,
+                });
+            }
+            if let Some(step_id) = delivery.step_id {
+                tx.execute(
+                    "UPDATE steps SET status='running', updated_at=?2, revision=revision+1
+                     WHERE id=?1 AND status='needs-input'",
+                    params![step_id, ts],
+                )?;
+            }
+            Self::clear_task_attention_if_settled_tx(tx, delivery.task_id, &ts)?;
+            let question = Self::question_view_by_id(tx, question_id)?.unwrap();
+            Ok(AnswerDeliveryConfirm {
+                question,
+                already_confirmed: false,
+            })
         })
+    }
+
+    /// attention 清空判定:无 open 问题、无待处理 Step/Run、无待决合并时,
+    /// 把 needs-you 的 Task 拉回 running(Respond 收口路径复用)。
+    fn clear_task_attention_if_settled_tx(tx: &Transaction, task_id: i64, ts: &str) -> Result<()> {
+        let attention_cleared = tx.query_row(
+            "SELECT
+                NOT EXISTS(SELECT 1 FROM step_questions WHERE task_id=?1 AND status='open')
+                AND NOT EXISTS(
+                    SELECT 1 FROM steps
+                    WHERE task_id=?1 AND status IN ('failed','blocked','awaiting-outcome','needs-input')
+                )
+                AND NOT EXISTS(
+                    SELECT 1 FROM agent_runs
+                    WHERE task_id=?1 AND status IN ('interrupted','awaiting-outcome')
+                )
+                AND NOT EXISTS(SELECT 1 FROM pending_merges WHERE task_id=?1)",
+            params![task_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if attention_cleared {
+            tx.execute(
+                "UPDATE agent_tasks SET status='running', updated_at=?2, revision=revision+1
+                 WHERE id=?1 AND status='needs-you'",
+                params![task_id, ts],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// 兼容入口:与 Orchestrator/kernel 共用同一权威两阶段 mutation。
+    /// 有 runtime 绑定的问题只完成 accept(投递由 action 执行端收口)。
+    pub fn answer_question(&self, id: i64, answer: &str) -> Result<Option<StepQuestionView>> {
+        let result = self.with_tx(|tx| {
+            Store::apply_run_mutation_tx(
+                tx,
+                crate::run_mutation::RunMutation::Respond {
+                    question_id: id,
+                    answer: answer.to_string(),
+                },
+            )
+        })?;
+        match result.output {
+            crate::run_mutation::RunMutationOutput::Responded(view) => Ok(Some(view)),
+            _ => Ok(None),
+        }
     }
 
     pub fn open_questions(&self, task_id: Option<i64>) -> Result<Vec<StepQuestionView>> {
@@ -2080,72 +3472,85 @@ impl Store {
         snapshot: &crate::workflow::WorkflowSnapshot,
         content_digest: Option<&str>,
     ) -> Result<RevisionView> {
-        self.with_tx(|c| {
-            let ts = now();
-            let next: i64 = c.query_row(
-                "SELECT COALESCE(MAX(revision), 0) + 1 FROM pipeline_revisions WHERE task_id = ?1",
-                params![task_id],
-                |r| r.get(0),
-            )?;
-            c.execute(
-                "INSERT INTO pipeline_revisions
-                     (task_id, revision, status, snapshot_json, public_handle, created_at,
-                      content_digest)
-                 VALUES (?1, ?2, 'draft', ?3, ?4, ?5, ?6)",
-                params![
-                    task_id,
-                    next,
-                    serde_json::to_string(snapshot)?,
-                    new_public_handle(),
-                    ts,
-                    content_digest
-                ],
-            )?;
-            let rev_id = c.last_insert_rowid();
-            Self::project_workflow_steps_tx(c, task_id, rev_id, snapshot)?;
-            Ok(RevisionView {
-                id: rev_id,
+        self.with_tx(|c| Self::create_workflow_revision_tx(c, task_id, snapshot, content_digest))
+    }
+
+    /// 调用方事务内保存工作流快照为新 Revision(Core Operation step
+    /// effect 专用);语义与 [`Self::create_workflow_revision`] 完全一致。
+    pub fn create_workflow_revision_tx(
+        c: &Connection,
+        task_id: i64,
+        snapshot: &crate::workflow::WorkflowSnapshot,
+        content_digest: Option<&str>,
+    ) -> Result<RevisionView> {
+        let ts = now();
+        let next: i64 = c.query_row(
+            "SELECT COALESCE(MAX(revision), 0) + 1 FROM pipeline_revisions WHERE task_id = ?1",
+            params![task_id],
+            |r| r.get(0),
+        )?;
+        c.execute(
+            "INSERT INTO pipeline_revisions
+                 (task_id, revision, status, snapshot_json, public_handle, created_at,
+                  content_digest)
+             VALUES (?1, ?2, 'draft', ?3, ?4, ?5, ?6)",
+            params![
                 task_id,
-                revision: next,
-                status: RevisionStatus::Draft,
-                created_at: ts,
-            })
-        })
+                next,
+                serde_json::to_string(snapshot)?,
+                new_public_handle(),
+                ts,
+                content_digest
+            ],
+        )?;
+        let rev_id = c.last_insert_rowid();
+        Self::project_workflow_steps_tx(c, task_id, rev_id, snapshot)?;
+        Self::revision_view_by_id(c, rev_id)?
+            .ok_or_else(|| anyhow::anyhow!("revision 插入后读取失败"))
     }
 
     /// 删除任务(Composer 分配失败的回滚):无任何 Agent Run 时才允许;
     /// 连带删除 Revision/Step/待决汇合行。返回是否删除。
     pub fn delete_task_if_unused(&self, task_id: i64) -> Result<bool> {
-        self.with_tx(|c| {
-            let runs: i64 = c.query_row(
-                "SELECT COUNT(*) FROM agent_runs WHERE task_id = ?1",
-                params![task_id],
-                |r| r.get(0),
-            )?;
-            if runs > 0 {
-                return Ok(false);
-            }
-            c.execute(
-                "DELETE FROM step_deps WHERE step_id IN
-                   (SELECT id FROM steps WHERE task_id = ?1)",
-                params![task_id],
-            )?;
-            c.execute("DELETE FROM steps WHERE task_id = ?1", params![task_id])?;
-            c.execute(
-                "DELETE FROM pipeline_revisions WHERE task_id = ?1",
-                params![task_id],
-            )?;
-            c.execute(
-                "DELETE FROM pending_merges WHERE task_id = ?1",
-                params![task_id],
-            )?;
-            c.execute(
-                "DELETE FROM step_questions WHERE task_id = ?1",
-                params![task_id],
-            )?;
-            let deleted = c.execute("DELETE FROM agent_tasks WHERE id = ?1", params![task_id])?;
-            Ok(deleted == 1)
-        })
+        self.with_tx(|c| Self::delete_task_if_unused_tx(c, task_id))
+    }
+
+    /// 调用方事务内删除任务(Core Operation 补偿 step 专用);
+    /// 语义与 [`Self::delete_task_if_unused`] 完全一致。
+    pub fn delete_task_if_unused_tx(c: &Connection, task_id: i64) -> Result<bool> {
+        let runs: i64 = c.query_row(
+            "SELECT COUNT(*) FROM agent_runs WHERE task_id = ?1",
+            params![task_id],
+            |r| r.get(0),
+        )?;
+        if runs > 0 {
+            return Ok(false);
+        }
+        c.execute(
+            "DELETE FROM step_deps WHERE step_id IN
+               (SELECT id FROM steps WHERE task_id = ?1)",
+            params![task_id],
+        )?;
+        c.execute("DELETE FROM steps WHERE task_id = ?1", params![task_id])?;
+        c.execute(
+            "DELETE FROM pipeline_revisions WHERE task_id = ?1",
+            params![task_id],
+        )?;
+        c.execute(
+            "DELETE FROM pending_merges WHERE task_id = ?1",
+            params![task_id],
+        )?;
+        // 两阶段投递账本与问题同生共死:绝不留下悬挂的 pending 明文。
+        c.execute(
+            "DELETE FROM question_answer_deliveries WHERE task_id = ?1",
+            params![task_id],
+        )?;
+        c.execute(
+            "DELETE FROM step_questions WHERE task_id = ?1",
+            params![task_id],
+        )?;
+        let deleted = c.execute("DELETE FROM agent_tasks WHERE id = ?1", params![task_id])?;
+        Ok(deleted == 1)
     }
 
     /// 删除尚未激活的 draft Revision(pin 失败回滚用;连带删除投影 Step)。

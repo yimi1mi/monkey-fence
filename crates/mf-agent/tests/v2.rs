@@ -1,5 +1,8 @@
 //! v2 验收测试:数据库迁移、结算令牌、崩溃恢复、调度规则、多项目隔离。
 
+#[path = "common/run_lifecycle.rs"]
+mod run_lifecycle;
+
 use crossbeam_channel::Sender;
 use mf_agent::config::Config;
 use mf_agent::model::*;
@@ -726,8 +729,7 @@ fn retry_creates_new_session_for_fresh_step() {
     .unwrap();
     // 独立 Step 重试:创建新会话
     let a = orch.store.task_steps(task.id).unwrap()[0].clone();
-    orch.retry_step(a.id, mf_agent::RetryMode::FreshSession)
-        .unwrap();
+    run_lifecycle::retry_step(&orch, a.id, mf_agent::RetryMode::FreshSession).unwrap();
     assert!(wait_until(Duration::from_secs(5), || host.launch_count() == 2));
     assert_ne!(
         host.spec_of(1).session_id,

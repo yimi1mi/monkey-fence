@@ -1,6 +1,9 @@
 //! Review 修复回归测试:取消不复活、终态事件丢弃、retry/skip 取消孤儿 run、
 //! 崩溃窗口孤儿 step 修复、done 会话保留。
 
+#[path = "common/run_lifecycle.rs"]
+mod run_lifecycle;
+
 use mf_agent::config::Config;
 use mf_agent::model::*;
 use mf_agent::orchestrator::{GlobalLimiter, Orchestrator, ProfileCatalog};
@@ -242,8 +245,7 @@ fn retry_cancels_orphan_awaiting_run() {
     let run_id = orch.runs_of_task(task.id).unwrap()[0].id;
 
     let s = orch.task_detail(task.id).unwrap().unwrap().1;
-    orch.retry_step(s[0].id, mf_agent::RetryMode::FreshSession)
-        .unwrap();
+    run_lifecycle::retry_step(&orch, s[0].id, mf_agent::RetryMode::FreshSession).unwrap();
     let r = orch.store.run_view(run_id).unwrap().unwrap();
     assert_eq!(
         r.status,
