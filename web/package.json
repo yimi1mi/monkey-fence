@@ -12,7 +12,9 @@
     "react": "19.0.0",
     "react-dom": "19.0.0",
     "@xyflow/react": "12.11.0",
-    "@dagrejs/dagre": "1.1.4"
+    "@dagrejs/dagre": "1.1.4",
+    "@xterm/xterm": "6.0.0",
+    "@xterm/addon-fit": "0.11.0"
   },
   "devDependencies": {
     "@playwright/test": "1.49.0",
