@@ -881,6 +881,12 @@ fn two_projects_end_to_end() {
     )
     .unwrap();
     o1.confirm_and_run(task_a.id).unwrap();
+    // A 的首步派发是后台异步:先等它恰好落地,后续断言才不与之竞态
+    // (慢速 CI runner 上该启动可能先于下方断言到达)。
+    assert!(
+        wait_until(Duration::from_secs(30), || host.launch_count() == 1),
+        "项目A 确认后应恰好派发首步 a1"
+    );
 
     let task_b = o2.create_task("项目B:Planner 生成", "").unwrap();
     o2.planner_propose(
@@ -888,11 +894,15 @@ fn two_projects_end_to_end() {
         &draft(vec![step("b1", &[]), step("b2", &["b1"])]),
     )
     .unwrap();
-    assert_eq!(host.launch_count(), 0, "Planner 提案不得直接启动");
+    assert_eq!(
+        host.launch_count(),
+        1,
+        "Planner 提案不得直接启动(A 的 a1 已计入)"
+    );
     o2.confirm_and_run(task_b.id).unwrap();
 
     // 并行运行:两个项目各派发首步
-    assert!(wait_until(Duration::from_secs(5), || host.launch_count() == 2));
+    assert!(wait_until(Duration::from_secs(30), || host.launch_count() == 2));
     // 数据库互不污染
     assert_eq!(o1.tasks().unwrap().len(), 1);
     assert_eq!(o2.tasks().unwrap().len(), 1);
