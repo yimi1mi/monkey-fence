@@ -17,4 +17,5 @@ pub mod integration;
 pub mod limits;
 pub mod problem;
 pub mod takeover;
+pub mod workbench_serve;
 pub mod ws;

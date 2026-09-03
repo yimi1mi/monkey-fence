@@ -17,6 +17,7 @@ mf-agent.workspace = true
 mf-terminal.workspace = true
 mf-elevated.workspace = true
 chrono.workspace = true
+parking_lot.workspace = true
 # T7a 网关外壳:loopback 绑定 + 安全头 middleware;领域路由在 #41 接入
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
@@ -26,3 +27,7 @@ tower = "0.5"
 tempfile = "3"
 uuid = { workspace = true, features = ["v7"] }
 mf-kernel = { workspace = true, features = ["test-support"] }
+
+[[bin]]
+name = "mf-workbench"
+path = "src/bin/mf-workbench.rs"

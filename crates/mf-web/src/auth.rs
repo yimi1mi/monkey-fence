@@ -188,8 +188,10 @@ impl BootstrapAuth {
 pub fn validate_host(host_header: &str, bind_ip: &str, port: u16) -> bool {
     let expected_v4 = format!("{bind_ip}:{port}");
     let expected_v6 = format!("[{bind_ip}]:{port}");
-    // 精确匹配;不接受任意 hostname(即使解析到 loopback)
-    host_header == expected_v4 || host_header == expected_v6
+    // 精确匹配;不接受任意 hostname(即使解析到 loopback)。
+    // 端口 80 的浏览器规范形态省略 :80(RFC 3986 默认端口)。
+    let port80_default = port == 80 && host_header == bind_ip;
+    host_header == expected_v4 || host_header == expected_v6 || port80_default
 }
 
 /// Origin 校验(§6.1):精确匹配绑定的 loopback origin;public origin、
@@ -198,7 +200,9 @@ pub fn validate_host(host_header: &str, bind_ip: &str, port: u16) -> bool {
 pub fn validate_origin(origin_header: &str, bind_ip: &str, port: u16) -> bool {
     let expected = format!("http://{bind_ip}:{port}");
     let expected_v6 = format!("http://[{bind_ip}]:{port}");
-    origin_header == expected || origin_header == expected_v6
+    // 端口 80 的 Origin 省略 :80(浏览器序列化规则)。
+    let port80_default = port == 80 && origin_header == format!("http://{bind_ip}");
+    origin_header == expected || origin_header == expected_v6 || port80_default
 }
 
 /// 绑定地址白名单(仅 loopback IP literal)。
