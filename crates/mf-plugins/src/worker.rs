@@ -384,11 +384,15 @@ while ($line = [Console]::In.ReadLine()) {
         let client = WorkerClient::start(&std::path::PathBuf::from("powershell.exe"), &args, None)
             .expect("powershell 可用");
         let client = Arc::new(parking_lot::Mutex::new(client));
+        // 前置往返用默认 60s 预算:powershell 冷启动在慢速 CI runner 上
+        // 可达数秒,不能与 hang 用例的 800ms 超时共用窗口。
+        client
+            .lock()
+            .request("ping", json!({}))
+            .expect("前置往返");
         client
             .lock()
             .set_request_timeout(Duration::from_millis(800));
-        // 前置:正常请求可用
-        client.lock().request("ping", json!({})).expect("前置往返");
 
         let c2 = client.clone();
         let (tx, rx) = std::sync::mpsc::channel::<Result<Value>>();
