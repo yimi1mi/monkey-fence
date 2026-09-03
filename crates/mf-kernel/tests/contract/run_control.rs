@@ -122,7 +122,9 @@ impl RunControlFixture {
         ));
         let client_id = ClientId::parse("run-control").unwrap();
         let principal = Principal::parse("mfctl-agent").unwrap();
-        let epoch = kernel.grant_controller_checked(&client_id, &principal).unwrap();
+        let epoch = kernel
+            .grant_controller_checked(&client_id, &principal)
+            .unwrap();
         let client = LegacyKernelClient::new(kernel.clone(), principal, client_id, epoch);
         let mut projects = Vec::new();
         for index in 0..=extra_projects {

@@ -194,7 +194,9 @@ impl RunFixture {
             .unwrap();
         let client = ClientId::parse("run-controller").unwrap();
         let principal = Principal::parse("run-user").unwrap();
-        let epoch = kernel.grant_controller_checked(&client, &principal).unwrap();
+        let epoch = kernel
+            .grant_controller_checked(&client, &principal)
+            .unwrap();
         Self {
             _tmp: tmp,
             store,

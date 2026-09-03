@@ -67,7 +67,9 @@ fn restart_snapshot_preserves_needs_you_and_exit_is_not_settlement() {
     let project = kernel.register_project_store(tmp.path(), reopened).unwrap();
     let client = ClientId::parse("snapshot-controller").unwrap();
     let principal = Principal::parse("snapshot-user").unwrap();
-    kernel.grant_controller_checked(&client, &principal).unwrap();
+    kernel
+        .grant_controller_checked(&client, &principal)
+        .unwrap();
 
     let snapshot = kernel
         .snapshot(SnapshotQuery::WorkflowRun {

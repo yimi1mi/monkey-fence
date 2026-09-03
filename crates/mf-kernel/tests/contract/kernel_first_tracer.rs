@@ -65,7 +65,9 @@ impl TracerFixture {
             .unwrap();
         let client_id = ClientId::parse("client-tracer").unwrap();
         let principal = Principal::parse("user-tracer").unwrap();
-        let epoch = kernel.grant_controller_checked(&client_id, &principal).unwrap();
+        let epoch = kernel
+            .grant_controller_checked(&client_id, &principal)
+            .unwrap();
         Self {
             _tmp: tmp,
             store,
@@ -713,7 +715,9 @@ fn runtime_open_reconciles_old_intent_and_outbox_before_serving() {
         .unwrap();
     let client_id = ClientId::parse("old-client").unwrap();
     let principal = Principal::parse("user").unwrap();
-    let epoch = old.grant_controller_checked(&client_id, &principal).unwrap();
+    let epoch = old
+        .grant_controller_checked(&client_id, &principal)
+        .unwrap();
     let command_id = CommandId::new();
     old.dispatch_rename_with_fault(
         KernelCommandRequest::new(
