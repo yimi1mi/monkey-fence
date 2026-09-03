@@ -28,15 +28,32 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let kernel: Arc<dyn mf_kernel::kernel::CoreKernel> =
+    let kernel_runtime =
         match mf_kernel::app_runtime::bootstrap_kernel_with_terminal_host(runtime.registry.clone())
         {
-            Ok(kernel_runtime) => kernel_runtime.kernel().clone(),
+            Ok(kernel_runtime) => kernel_runtime,
             Err(error) => {
                 eprintln!("mf-workbench kernel: {error}");
                 std::process::exit(3);
             }
         };
+    // 验收模式:注册沙箱项目(临时目录,不触碰真实 catalog),让
+    // 工作台有真实投影与命令目标;生产形态项目经 pipe/orchestrator 注册。
+    if std::env::var("MF_WEB_ACCEPTANCE").ok().as_deref() == Some("1") {
+        let sandbox = std::env::temp_dir().join("mf-workbench-acceptance-project");
+        if let Err(error) = std::fs::create_dir_all(&sandbox) {
+            eprintln!("mf-workbench: 沙箱目录创建失败:{error}");
+        }
+        match kernel_runtime.open_project(&sandbox) {
+            Ok(project) => println!(
+                "mf-workbench: acceptance sandbox project {}({})",
+                project.handle().as_str(),
+                sandbox.display()
+            ),
+            Err(error) => eprintln!("mf-workbench: 沙箱项目注册失败:{error}"),
+        }
+    }
+    let kernel: Arc<dyn mf_kernel::kernel::CoreKernel> = kernel_runtime.kernel().clone();
     let port: u16 = std::env::var("MF_WEB_PORT")
         .ok()
         .and_then(|p| p.parse().ok())

@@ -66,6 +66,60 @@ export function workflowCommand(input: {
   };
 }
 
+/** workflow.create envelope(target=project handle;collection CAS 走
+ *  payload 字段,与 kernel_bridge 的读取逐字对齐;draft 至少一个节点
+ *  ——空节点是 EmptyWorkflow 校验错误)。 */
+export function workflowCreateCommand(
+  input: {
+    commandId: string;
+    clientId: string;
+    controllerLeaseEpoch: string;
+    projectHandle: string;
+    name: string;
+    /** 首节点标题。 */
+    firstNodeTitle: string;
+    agentInstanceId: string;
+  },
+  collectionRevision: string,
+): CommandEnvelope {
+  // key 仅允许 ASCII 字母数字/-/_(is_valid_key);非 ASCII 一律丢弃,
+  // 并追加 command_id 派生后缀防同名碰撞。
+  const base =
+    input.name
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "workflow";
+  const suffix = input.commandId.replaceAll("-", "").slice(0, 6);
+  const key = `${base}-${suffix}`;
+  return {
+    schema: "mf.command.v1",
+    command_id: input.commandId,
+    client_id: input.clientId,
+    controller_lease_epoch: input.controllerLeaseEpoch,
+    target: { kind: "project", handle: input.projectHandle },
+    expected: [],
+    type: "workflow.create",
+    payload: {
+      draft: {
+        key,
+        name: input.name.trim(),
+        nodes: [
+          {
+            key: "start",
+            title: input.firstNodeTitle.trim(),
+            instructions: "",
+            agent_instance_id: input.agentInstanceId.trim(),
+            deps: [],
+          },
+        ],
+        allow_unsafe_parallel: false,
+      },
+      expected_collection_revision: collectionRevision,
+    },
+  };
+}
+
 /** 乐观更新模型:提交前记录回滚态;revision_conflict → 回滚 + 提示刷新。 */
 export interface OptimisticUpdate<T> {
   pending: T;

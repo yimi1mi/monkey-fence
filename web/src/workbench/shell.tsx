@@ -7,6 +7,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { ApiError, type WorkbenchClient } from "../api/client.ts";
 import { storeSession } from "../api/session.ts";
+import { uuidv7 } from "../api/uuid.ts";
+import { workflowCreateCommand } from "../state/workflow_commands.ts";
 import {
   activeRunsAcross,
   runIsActive,
@@ -27,7 +29,7 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
   const [toast, setToast] = useState<string | null>(null);
   const [connection, setConnection] = useState<"live" | "reconnecting">("live");
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
-  const [guideOpen, setGuideOpen] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -275,9 +277,15 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
             <button
               className="mf-btn primary"
               style={{ width: "100%" }}
-              disabled={!isController}
-              title={isController ? undefined : "Observer 禁写——接管为 Controller 后可操作"}
-              onClick={() => setGuideOpen(true)}
+              disabled={!isController || !view || view.projects.length === 0}
+              title={
+                !isController
+                  ? "Observer 禁写——接管为 Controller 后可操作"
+                  : view && view.projects.length === 0
+                    ? "尚无已注册项目"
+                    : undefined
+              }
+              onClick={() => setCreateOpen(true)}
             >
               新建工作流
             </button>
@@ -302,7 +310,18 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
           {toast}
         </div>
       )}
-      {guideOpen && <CreateGuide onClose={() => setGuideOpen(false)} />}
+      {createOpen && view && view.projects.length > 0 && (
+        <CreateWorkflowModal
+          client={client}
+          projects={view.projects}
+          onDone={(message) => {
+            setCreateOpen(false);
+            setToast(message);
+            void refresh();
+          }}
+          onClose={() => setCreateOpen(false)}
+        />
+      )}
     </div>
   );
 }
@@ -434,9 +453,31 @@ function RunDetail({ run }: { run: RunView }) {
   );
 }
 
-/** v1 诚实引导:workflow.create 需要 snapshot 未暴露的 collection
- * revision CAS,创建入口留给 DAG 编辑器(批次 B)/mfctl,不做必败按钮。 */
-function CreateGuide({ onClose }: { onClose: () => void }) {
+/** 新建工作流弹层:真实 workflow.create 命令(collection CAS 来自
+ *  快照;draft 首节点——空节点是 EmptyWorkflow 校验错误)。 */
+function CreateWorkflowModal({
+  client,
+  projects,
+  onDone,
+  onClose,
+}: {
+  client: WorkbenchClient;
+  projects: ProjectView[];
+  onDone: (message: string) => void;
+  onClose: () => void;
+}) {
+  const [name, setName] = useState("");
+  const [firstNodeTitle, setFirstNodeTitle] = useState("");
+  const [agentInstanceId, setAgentInstanceId] = useState("");
+  const [projectHandle, setProjectHandle] = useState(projects[0]?.handle ?? "");
+  const [busy, setBusy] = useState(false);
+
+  const valid =
+    name.trim().length > 0 &&
+    firstNodeTitle.trim().length > 0 &&
+    agentInstanceId.trim().length > 0 &&
+    projectHandle !== "";
+
   return (
     <div
       className="scrim"
@@ -448,17 +489,84 @@ function CreateGuide({ onClose }: { onClose: () => void }) {
         <h3>
           <span className="mark">◤</span>新建工作流
         </h3>
-        <p>
-          工作流编排在 v1 由 DAG 编辑器承载(即将开放)。命令面已就绪:
-          <code style={{ fontFamily: "var(--mono)", fontSize: 12 }}>workflow.create</code>{" "}
-          需要 collection revision CAS,当前可通过 mfctl 在命令行创建:
-        </p>
-        <p style={{ fontFamily: "var(--mono)", fontSize: 12 }}>
-          mfctl workflow create --name "巡检" --node 检查=agent
-        </p>
+        <div className="field">
+          <label htmlFor="wf-project">项目</label>
+          <select
+            id="wf-project"
+            value={projectHandle}
+            onChange={(event) => setProjectHandle(event.target.value)}
+          >
+            {projects.map((project) => (
+              <option key={project.handle} value={project.handle}>
+                {project.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="field">
+          <label htmlFor="wf-name">工作流名称</label>
+          <input
+            id="wf-name"
+            value={name}
+            placeholder="如:仓库巡检"
+            onChange={(event) => setName(event.target.value)}
+          />
+        </div>
+        <div className="field">
+          <label htmlFor="wf-node">首节点标题</label>
+          <input
+            id="wf-node"
+            value={firstNodeTitle}
+            placeholder="如:检查变更"
+            onChange={(event) => setFirstNodeTitle(event.target.value)}
+          />
+        </div>
+        <div className="field">
+          <label htmlFor="wf-agent">Agent 实例 ID</label>
+          <input
+            id="wf-agent"
+            value={agentInstanceId}
+            placeholder="Agent Instance 稳定 ID(mfctl agent 查看)"
+            onChange={(event) => setAgentInstanceId(event.target.value)}
+          />
+          <span className="hint">实例存在性在运行时绑定;创建时仅要求非空。</span>
+        </div>
         <div className="actions">
-          <button className="mf-btn primary" onClick={onClose}>
-            知道了
+          <button className="mf-btn ghost" onClick={onClose}>
+            取消
+          </button>
+          <button
+            className="mf-btn primary"
+            disabled={!valid || busy}
+            onClick={async () => {
+              setBusy(true);
+              const project = projects.find((entry) => entry.handle === projectHandle);
+              if (!project) return;
+              try {
+                await client.command(
+                  workflowCreateCommand(
+                    {
+                      commandId: uuidv7(),
+                      clientId: client.clientId,
+                      controllerLeaseEpoch: client.leaseEpoch,
+                      projectHandle,
+                      name,
+                      firstNodeTitle,
+                      agentInstanceId,
+                    },
+                    project.collectionRevision,
+                  ),
+                );
+                onDone(`工作流「${name.trim()}」已创建`);
+              } catch (error) {
+                setBusy(false);
+                onDone(
+                  `创建失败:${error instanceof Error ? error.message : String(error)}`,
+                );
+              }
+            }}
+          >
+            {busy ? "创建中…" : "创建"}
           </button>
         </div>
       </div>

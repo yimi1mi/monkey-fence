@@ -840,6 +840,48 @@ main.panes {
   gap: 10px;
 }
 
+/* ── 表单字段 ────────────────────────────────────────── */
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 12px;
+}
+
+.field label {
+  font-size: 11.5px;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+}
+
+.field input,
+.field select {
+  font: inherit;
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg0);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 7px 10px;
+  outline: none;
+  transition: border-color 0.15s;
+}
+
+.field input:focus,
+.field select:focus {
+  border-color: rgba(240, 168, 63, 0.55);
+}
+
+.field input::placeholder {
+  color: var(--text-faint);
+}
+
+.field .hint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+
 /* ── 致命错误屏(bootstrap 失败)────────────────────── */
 
 .mf-fatal {

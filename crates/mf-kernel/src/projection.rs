@@ -277,6 +277,9 @@ pub struct WorkspaceSnapshotData {
 pub struct WorkspaceProjectSnapshot {
     pub project: crate::handles::ProjectStoreHandle,
     pub display_name: String,
+    /// workflow.create/delete 的 collection CAS 轴(project_meta
+    /// singleton;v1 additive:旧客户端忽略新字段)。
+    pub workflow_collection_revision: u64,
     pub workflow_runs: Vec<WorkflowRunSummarySnapshot>,
     pub active_agent_sessions: usize,
 }

@@ -312,8 +312,17 @@ pub fn dispatch_via_kernel(
 }
 
 /// Snapshot 投射:kernel envelope(内部 u64 数字)→ wire envelope
-/// (字符串化 u64;data 原样)。
+/// (字符串化 u64;data 为去标签的负载对象——Rust 枚举 tag 不进 wire,
+/// 与前端 `data: Record<string, unknown>` 契约一致)。
 pub fn snapshot_to_wire(snapshot: KernelSnapshot) -> super::snapshot::SnapshotEnvelope {
+    use mf_kernel::projection::SnapshotData;
+    let data = match snapshot.data {
+        SnapshotData::Workspace(inner) => serde_json::to_value(inner),
+        SnapshotData::Workflow(inner) => serde_json::to_value(inner),
+        SnapshotData::WorkflowRun(inner) => serde_json::to_value(inner),
+        SnapshotData::Operation(inner) => serde_json::to_value(inner),
+    }
+    .unwrap_or_default();
     super::snapshot::SnapshotEnvelope {
         schema: "mf.snapshot.v1".to_string(),
         server_instance_id: snapshot.server_instance_id.as_str().to_string(),
@@ -321,6 +330,6 @@ pub fn snapshot_to_wire(snapshot: KernelSnapshot) -> super::snapshot::SnapshotEn
             stream_epoch: snapshot.cursor.stream_epoch.as_str().to_string(),
             through_seq: snapshot.cursor.through_seq,
         },
-        data: serde_json::to_value(snapshot.data).unwrap_or_default(),
+        data,
     }
 }

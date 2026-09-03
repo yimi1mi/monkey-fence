@@ -44,6 +44,11 @@ export class WorkbenchClient {
     return this.context.controllerLeaseEpoch;
   }
 
+  /** 本会话 client id(envelope 构造)。 */
+  get clientId(): string {
+    return this.context.clientId;
+  }
+
   /** Workspace Snapshot(权威;刷新后以此为基线再 resume 事件)。 */
   async workspaceSnapshot(): Promise<SnapshotEnvelope> {
     const response = await fetch("/api/v1/snapshots/workspace", {

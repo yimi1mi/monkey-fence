@@ -71,6 +71,12 @@ fn workspace_snapshot_counts_needs_you_per_run_and_excludes_blocked_descendants(
     assert_eq!(data.projects.len(), 2);
     assert_eq!(data.active_workflow_runs, 2);
     assert_eq!(data.needs_you_count, 1, "徽标按 Workflow Run 计数");
+    for project in &data.projects {
+        assert!(
+            project.workflow_collection_revision >= 1,
+            "collection CAS 轴暴露(project_meta singleton 默认 1)"
+        );
+    }
     let needs = data
         .projects
         .iter()

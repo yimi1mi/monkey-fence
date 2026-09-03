@@ -2,7 +2,13 @@
 // 创建/删除 collection CAS、冲突回滚。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { beginOptimistic, isSemanticCommand, settleOptimistic, workflowCommand } from "../workflow_commands.ts";
+import {
+  beginOptimistic,
+  isSemanticCommand,
+  settleOptimistic,
+  workflowCommand,
+  workflowCreateCommand,
+} from "../workflow_commands.ts";
 
 const revisions = { semantic: "13", presentation: "91", collection: "5" };
 
@@ -50,4 +56,29 @@ test("optimistic update rolls back on conflict with refresh hint", () => {
   const conflict = settleOptimistic(update2, { ok: false, code: "revision_conflict" });
   assert.equal(conflict.state.title, "旧", "冲突回滚");
   assert.equal(conflict.conflict, true, "提示刷新");
+});
+
+test("create command targets project with payload collection CAS and valid node", () => {
+  const envelope = workflowCreateCommand(
+    {
+      commandId: "018f3e2a-1b2c-7d3e-9f4a-5b6c7d8e9f0a",
+      clientId: "cl_x",
+      controllerLeaseEpoch: "17",
+      projectHandle: "proj_0123456789abcdef0123456789abcdef",
+      name: "巡检 流程",
+      firstNodeTitle: "第一步",
+      agentInstanceId: "agent-main",
+    },
+    "4",
+  );
+  assert.equal(envelope.type, "workflow.create");
+  assert.equal(envelope.target.kind, "project", "创建 target 是 project(工作流尚不存在)");
+  const draft = envelope.payload.draft as Record<string, unknown>;
+  // key 仅 ASCII:中文名退化为分隔符,保留 command 派生后缀防碰撞
+  assert.match(String(draft.key), /^-?[a-z0-9-]*-018f3e$/, "key 为 ASCII slug + 命令后缀");
+  assert.equal(draft.key, "workflow-018f3e");
+  const node = (draft.nodes as Array<Record<string, unknown>>)[0];
+  assert.equal(node.agent_instance_id, "agent-main");
+  assert.equal(node.title, "第一步");
+  assert.equal(envelope.payload.expected_collection_revision, "4", "collection CAS 在 payload(kernel_bridge 口径)");
 });

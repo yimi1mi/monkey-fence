@@ -20,6 +20,12 @@ pub(crate) fn read_workspace(
         let sources = store
             .with_tx(|tx| Store::workflow_run_projection_sources_tx(tx))
             .map_err(|error| KernelProblem::Internal(format!("{error:#}")))?;
+        // collection revision(workflow.create/delete 的 CAS 轴;与
+        // sources 同 Store 但独立短事务——只读不参与 L-PUBLISH)。
+        let workflow_collection_revision = store
+            .workflow_collection_revision()
+            .map_err(|error| KernelProblem::Internal(format!("{error:#}")))?
+            .max(0) as u64;
         let active_agent_sessions = sources
             .iter()
             .flat_map(|source| &source.sessions)
@@ -46,6 +52,7 @@ pub(crate) fn read_workspace(
         project_rows.push(WorkspaceProjectSnapshot {
             project,
             display_name,
+            workflow_collection_revision,
             workflow_runs,
             active_agent_sessions,
         });

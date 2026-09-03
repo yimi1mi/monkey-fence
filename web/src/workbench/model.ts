@@ -57,6 +57,8 @@ export interface RunView {
 export interface ProjectView {
   handle: string;
   name: string;
+  /** workflow.create/delete 的 collection CAS 轴。 */
+  collectionRevision: string;
   activeSessions: number;
   runs: RunView[];
 }
@@ -86,6 +88,7 @@ export function workspaceViewOf(snapshot: SnapshotEnvelope): WorkspaceView {
   const projects: ProjectView[] = (data.projects ?? []).map((project) => {
     const handle = String(project.project ?? "");
     const name = String(project.display_name ?? "未命名项目");
+    const collectionRevision = String(project.workflow_collection_revision ?? "0");
     const runs = (Array.isArray(project.workflow_runs) ? project.workflow_runs : []).map(
       (run): RunView => {
         const row = run as Record<string, unknown>;
@@ -114,6 +117,7 @@ export function workspaceViewOf(snapshot: SnapshotEnvelope): WorkspaceView {
     return {
       handle,
       name,
+      collectionRevision,
       activeSessions: Number(project.active_agent_sessions ?? 0),
       runs,
     };
