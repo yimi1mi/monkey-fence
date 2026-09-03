@@ -27,6 +27,10 @@ struct WorkbenchState {
     auth: Mutex<BootstrapAuth>,
     dist_root: PathBuf,
     kernel: Arc<dyn CoreKernel>,
+    /// 本机验收模式(MF_WEB_ACCEPTANCE=1 显式开启):允许页面在 nonce
+    /// 被浏览器预加载消耗后请求重签。生产 bundle 不设置该变量,
+    /// 路由保持 404(一次性 nonce 语义不变)。
+    acceptance: bool,
 }
 
 /// 绑定并启动 workbench 服务(后台线程持有运行时;进程退出即止)。
@@ -48,17 +52,20 @@ pub fn serve_workbench(
     listener.set_nonblocking(true)?;
     let mut auth = BootstrapAuth::new(WebLimits::default());
     let nonce = auth.issue_nonce();
+    let acceptance = std::env::var("MF_WEB_ACCEPTANCE").ok().as_deref() == Some("1");
     let state = Arc::new(WorkbenchState {
         bind_ip: "127.0.0.1".into(),
         port: bound_port,
         auth: Mutex::new(auth),
         dist_root,
         kernel,
+        acceptance,
     });
     let router = Router::new()
         .route("/", get(index))
         .route("/auth/exchange", post(auth_exchange))
         .route("/api/v1/snapshots/workspace", get(workspace_snapshot))
+        .route("/acceptance/new-nonce", post(acceptance_new_nonce))
         .route("/assets/{*path}", get(asset))
         .with_state(state);
     std::thread::Builder::new()
@@ -296,4 +303,17 @@ async fn workspace_snapshot(
             )
         }
     }
+}
+
+/// 验收模式重签(默认 404;Host/Origin 校验同其它写路径)。
+async fn acceptance_new_nonce(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if !state.acceptance || !host_origin_ok(&state, &headers, true) {
+        return respond(StatusCode::NOT_FOUND, Vec::new(), Vec::new());
+    }
+    let nonce = state.auth.lock().issue_nonce();
+    let body = serde_json::json!({ "nonce": nonce });
+    respond(StatusCode::OK, Vec::new(), body.to_string().into_bytes())
 }

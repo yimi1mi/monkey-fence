@@ -17,9 +17,17 @@ function showFatal(message: string): void {
   }
 }
 
+async function exchange(nonce: string): Promise<Response> {
+  return fetch("/auth/exchange", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ nonce }),
+  });
+}
+
 async function bootstrap(): Promise<void> {
   const params = new URLSearchParams(location.hash.slice(1));
-  const nonce = params.get("nonce");
+  let nonce = params.get("nonce");
   if (!nonce) {
     showFatal(
       "缺少一次性入口令牌。请使用 launcher 给出的 <code>#nonce=…</code> 入口 URL 打开本页。",
@@ -28,11 +36,18 @@ async function bootstrap(): Promise<void> {
   }
   let response: Response;
   try {
-    response = await fetch("/auth/exchange", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ nonce }),
-    });
+    response = await exchange(nonce);
+    // 浏览器预加载可能已消耗一次性 nonce:本机验收模式下自动重签重试一次
+    if (response.status === 401) {
+      const reissue = await fetch("/acceptance/new-nonce", { method: "POST" }).catch(
+        () => null,
+      );
+      if (reissue && reissue.ok) {
+        const fresh = (await reissue.json()) as { nonce: string };
+        nonce = fresh.nonce;
+        response = await exchange(nonce);
+      }
+    }
   } catch (error) {
     showFatal(`无法连接 Core(${String(error)})。请确认 Core 正在运行后刷新。`);
     return;
