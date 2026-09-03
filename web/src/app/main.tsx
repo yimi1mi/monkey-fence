@@ -1,8 +1,10 @@
 // Workbench 入口(T11 发布形态)。一次性 nonce 从 URL fragment 读取,
-// 交换后立即清除;凭据永不进 URL/query/store。
+// 交换后立即清除;凭据永不进 URL/query/store(sessionStorage 只保留
+// 刷新续用所需的 client/CSRF 标识,不包含 nonce 本身)。
 import { createRoot } from "react-dom/client";
 import { WorkbenchShell } from "../workbench/shell.tsx";
 import { WorkbenchClient } from "../api/client.ts";
+import "../styles/global.css";
 
 interface BootstrapResponse {
   client_id: string;
@@ -10,11 +12,37 @@ interface BootstrapResponse {
   controller: { role: string; lease_epoch?: string | number };
 }
 
+const SESSION_KEY = "mf.workbench.session";
+
 function showFatal(message: string): void {
   const mount = document.getElementById("workbench");
   if (mount) {
-    mount.innerHTML = `<div role="alert" style="font-family:system-ui;padding:32px;line-height:1.6">${message}</div>`;
+    mount.innerHTML = `<div class="mf-fatal" role="alert"><div class="card"><h1>◤ 无法进入工作台</h1>${message}</div></div>`;
   }
+}
+
+function readStoredSession(): BootstrapResponse | null {
+  try {
+    const raw = sessionStorage.getItem(SESSION_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as BootstrapResponse;
+    return parsed.client_id && parsed.csrf_token ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function mountWorkbench(data: BootstrapResponse): void {
+  sessionStorage.setItem(SESSION_KEY, JSON.stringify(data));
+  const client = new WorkbenchClient({
+    csrfToken: data.csrf_token,
+    clientId: data.client_id,
+    controllerLeaseEpoch: String(data.controller?.lease_epoch ?? "1"),
+    role: data.controller?.role === "controller" ? "controller" : "observer",
+  });
+  const mount = document.getElementById("workbench");
+  if (!mount) return;
+  createRoot(mount).render(<WorkbenchShell client={client} />);
 }
 
 async function exchange(nonce: string): Promise<Response> {
@@ -25,32 +53,21 @@ async function exchange(nonce: string): Promise<Response> {
   });
 }
 
-async function bootstrap(): Promise<void> {
-  const params = new URLSearchParams(location.hash.slice(1));
-  let nonce = params.get("nonce");
-  if (!nonce) {
-    showFatal(
-      "缺少一次性入口令牌。请使用 launcher 给出的 <code>#nonce=…</code> 入口 URL 打开本页。",
-    );
-    return;
-  }
-  let response: Response;
-  try {
-    response = await exchange(nonce);
-    // 浏览器预加载可能已消耗一次性 nonce:本机验收模式下自动重签重试一次
-    if (response.status === 401) {
-      const reissue = await fetch("/acceptance/new-nonce", { method: "POST" }).catch(
-        () => null,
-      );
-      if (reissue && reissue.ok) {
-        const fresh = (await reissue.json()) as { nonce: string };
-        nonce = fresh.nonce;
-        response = await exchange(nonce);
-      }
+/** 验收模式重签(生产 404 → 返回 null,不影响一次性 nonce 语义)。 */
+async function reissueNonce(): Promise<string | null> {
+  const response = await fetch("/acceptance/new-nonce", { method: "POST" }).catch(() => null);
+  if (!response || !response.ok) return null;
+  return ((await response.json()) as { nonce: string }).nonce;
+}
+
+async function bootstrapWithNonce(nonce: string): Promise<void> {
+  let response = await exchange(nonce);
+  // 浏览器预加载可能已消耗一次性 nonce:本机验收模式下自动重签重试一次
+  if (response.status === 401) {
+    const fresh = await reissueNonce();
+    if (fresh) {
+      response = await exchange(fresh);
     }
-  } catch (error) {
-    showFatal(`无法连接 Core(${String(error)})。请确认 Core 正在运行后刷新。`);
-    return;
   }
   if (!response.ok) {
     const detail = await response.text().catch(() => "");
@@ -59,19 +76,43 @@ async function bootstrap(): Promise<void> {
     );
     return;
   }
-  const data = (await response.json()) as BootstrapResponse;
   // fragment 立即清除(nonce 已消耗;不留在浏览器历史)
   history.replaceState(null, "", location.pathname);
+  mountWorkbench((await response.json()) as BootstrapResponse);
+}
 
-  const client = new WorkbenchClient({
-    csrfToken: data.csrf_token,
-    clientId: data.client_id,
-    controllerLeaseEpoch: String(data.controller?.lease_epoch ?? "1"),
-    role: data.controller?.role === "controller" ? "controller" : "observer",
-  });
-  const mount = document.getElementById("workbench");
-  if (!mount) return;
-  createRoot(mount).render(<WorkbenchShell client={client} />);
+async function bootstrap(): Promise<void> {
+  const params = new URLSearchParams(location.hash.slice(1));
+  const nonce = params.get("nonce");
+  if (nonce) {
+    try {
+      await bootstrapWithNonce(nonce);
+    } catch (error) {
+      showFatal(`无法连接 Core(${String(error)})。请确认 Core 正在运行后刷新。`);
+    }
+    return;
+  }
+  // 无 fragment:刷新场景——已有会话(HttpOnly cookie)则直接续用;
+  // 否则本机验收模式尝试重签,生产保持明确指引。
+  const stored = readStoredSession();
+  if (stored) {
+    const probe = await fetch("/api/v1/snapshots/workspace", {
+      headers: { "X-Client-Id": stored.client_id },
+    }).catch(() => null);
+    if (probe && probe.ok) {
+      mountWorkbench(stored);
+      return;
+    }
+    sessionStorage.removeItem(SESSION_KEY);
+  }
+  const fresh = await reissueNonce();
+  if (fresh) {
+    await bootstrapWithNonce(fresh);
+    return;
+  }
+  showFatal(
+    "缺少一次性入口令牌。请使用 launcher 给出的 <code>#nonce=…</code> 入口 URL 打开本页。",
+  );
 }
 
 void bootstrap();
