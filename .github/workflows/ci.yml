@@ -15,9 +15,14 @@ jobs:
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
+      # 2 核 runner 上并行测试线程与后台 worker/真实进程竞争,
+      # 计时敏感的 saga/跨进程契约测试系统性抖动;CI 串行化换取
+      # 确定性(本地开发保持默认并行)。
       - run: cargo fmt --all -- --check
       - run: cargo check --workspace
       - run: cargo test --workspace
+        env:
+          RUST_TEST_THREADS: "1"
 
   web:
     runs-on: ubuntu-latest
