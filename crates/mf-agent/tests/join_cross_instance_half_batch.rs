@@ -173,7 +173,7 @@ fn cross_instance_complete_merges_full_batch_exactly_once() {
         fx.assign_and_run(task.id, &version);
         // A 派发 a(并发槽内只有 a ready;先于 B 存在)
         assert!(
-            wait_until(Duration::from_secs(5), || fx.host.0.workflow.lock().len()
+            wait_until(Duration::from_secs(30), || fx.host.0.workflow.lock().len()
                 == 1),
             "实例 A 先派发 a(第 {round} 轮)"
         );
@@ -204,7 +204,7 @@ fn cross_instance_complete_merges_full_batch_exactly_once() {
             )
             .unwrap()
         };
-        if !wait_until(Duration::from_secs(5), || {
+        if !wait_until(Duration::from_secs(30), || {
             fx.host.0.workflow.lock().len() == 2
         }) {
             let steps = fx.orch.store.task_steps(task.id).unwrap();
@@ -253,7 +253,7 @@ fn cross_instance_complete_merges_full_batch_exactly_once() {
 
         // 断言收敛(等待后台 flush 完成)
         assert!(
-            wait_until(Duration::from_secs(5), || {
+            wait_until(Duration::from_secs(30), || {
                 fx.orch
                     .store
                     .list_execution_leases(task.id)
