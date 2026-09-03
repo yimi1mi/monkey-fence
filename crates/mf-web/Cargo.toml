@@ -19,7 +19,7 @@ mf-elevated.workspace = true
 chrono.workspace = true
 parking_lot.workspace = true
 # T7a 网关外壳:loopback 绑定 + 安全头 middleware;领域路由在 #41 接入
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
 tower = "0.5"
 

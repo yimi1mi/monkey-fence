@@ -70,9 +70,11 @@ pub fn serve_workbench(
     let router = Router::new()
         .route("/", get(index))
         .route("/auth/exchange", post(auth_exchange))
+        .route("/auth/session", get(auth_session))
         .route("/api/v1/snapshots/workspace", get(workspace_snapshot))
         .route("/api/v1/commands", post(submit_command))
         .route("/api/v1/controller/takeover", post(controller_takeover))
+        .route("/api/v1/events", get(events_ws))
         .route("/acceptance/new-nonce", post(acceptance_new_nonce))
         .route("/assets/{*path}", get(asset))
         .with_state(state);
@@ -496,6 +498,197 @@ async fn submit_command(
 #[derive(serde::Deserialize)]
 struct TakeoverRequest {
     last_observed_epoch: String,
+}
+
+/// `GET /auth/session`:刷新续用探测——服务端权威回报当前角色与
+/// lease epoch(存储的 bootstrap 会过期:其它会话接管/重换后本会话
+/// 已降 Observer,客户端不得沿用旧角色)。
+async fn auth_session(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let Some(session_id) = session_of(&state, &headers) else {
+        return problem_response(&Problem::new(
+            ProblemCode::Unauthenticated,
+            "会话不存在或已失效",
+            Some(Retry::AfterReauth),
+        ));
+    };
+    let session = match state.auth.lock().verify(&session_id, None) {
+        Ok(session) => session,
+        Err(problem) => {
+            return problem_response(&Problem::new(
+                ProblemCode::Unauthenticated,
+                problem.to_string(),
+                Some(Retry::AfterReauth),
+            ))
+        }
+    };
+    let role = if session.role == SessionRole::Controller {
+        "controller"
+    } else {
+        "observer"
+    };
+    let body = serde_json::json!({
+        "schema": "mf.auth-bootstrap.v1",
+        "client_id": session.client_id,
+        "csrf_token": session.csrf_token,
+        "controller": {
+            "role": role,
+            "lease_epoch": state.kernel.controller_epoch().to_string(),
+        },
+    });
+    let mut headers = security(&state);
+    headers.push((header_name("content-type"), "application/json".into()));
+    respond(StatusCode::OK, headers, body.to_string().into_bytes())
+}
+
+/// `GET /api/v1/events`(WS;子协议 mf-workflow.v1):session 认证 +
+/// Origin 校验 → 首帧 Resume → hello → 100ms poll 驱动事件 fan-out;
+/// epoch 旋转/gap/慢客户端 → problem 帧 + close 4409(客户端全量
+/// resync)。凭据不进 URL(cookie 自动携带)。
+async fn events_ws(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> impl IntoResponse {
+    if !host_origin_ok(&state, &headers, true) {
+        return problem_response(&Problem::new(
+            ProblemCode::OriginRejected,
+            "Origin/Host 校验失败(loopback 精确匹配)",
+            Some(Retry::Never),
+        ))
+        .into_response();
+    }
+    if session_of(&state, &headers).is_none() {
+        return problem_response(&Problem::new(
+            ProblemCode::Unauthenticated,
+            "事件流需要已认证 session",
+            None,
+        ))
+        .into_response();
+    }
+    // 子协议:未带默认 mf-workflow.v1;带了就必须精确
+    let requested: Vec<String> = headers
+        .get_all("sec-websocket-protocol")
+        .iter()
+        .filter_map(|value| value.to_str().ok().map(str::to_string))
+        .collect();
+    if !requested.is_empty() && !requested.iter().any(|p| p == "mf-workflow.v1") {
+        return problem_response(&Problem::new(
+            ProblemCode::UnsupportedWsSubprotocol,
+            "事件流仅支持 mf-workflow.v1",
+            Some(Retry::Never),
+        ))
+        .into_response();
+    }
+    let kernel = state.kernel.clone();
+    ws.protocols(["mf-workflow.v1"])
+        .on_upgrade(move |socket| async move {
+            events_pump(socket, kernel).await;
+        })
+        .into_response()
+}
+
+async fn events_pump(mut socket: axum::extract::ws::WebSocket, kernel: Arc<dyn CoreKernel>) {
+    use crate::ws::events::{EventsSession, PollOutcome};
+
+    // 首帧必须是 Resume(cursor 恢复)
+    let control = loop {
+        match socket.recv().await {
+            Some(Ok(axum::extract::ws::Message::Text(text))) => {
+                match serde_json::from_str::<crate::ws::events::EventsControl>(&text) {
+                    Ok(control) => break control,
+                    Err(error) => {
+                        let problem = Problem::new(
+                            ProblemCode::InvalidEnvelope,
+                            format!("首帧必须是 Resume 控制帧:{error}"),
+                            Some(Retry::Never),
+                        );
+                        let _ = socket
+                            .send(axum::extract::ws::Message::Text(
+                                serde_json::to_string(&problem).unwrap_or_default().into(),
+                            ))
+                            .await;
+                        close_ws(&mut socket, crate::problem::close_code::INVALID_ENVELOPE).await;
+                        return;
+                    }
+                }
+            }
+            Some(Ok(_)) => continue,
+            _ => return,
+        }
+    };
+    let mut session = match EventsSession::resume(kernel.as_ref(), &control) {
+        Ok(session) => session,
+        Err(problem) => {
+            let _ = socket
+                .send(axum::extract::ws::Message::Text(
+                    serde_json::to_string(&problem).unwrap_or_default().into(),
+                ))
+                .await;
+            close_ws(
+                &mut socket,
+                crate::problem::close_code::RESYNC_OR_HISTORY_GAP,
+            )
+            .await;
+            return;
+        }
+    };
+    // hello(resume 回执;resync_required 时客户端自行拉全量快照)
+    if let Ok(hello) = serde_json::to_string(session.hello()) {
+        if socket
+            .send(axum::extract::ws::Message::Text(hello.into()))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+    loop {
+        tokio::select! {
+            _ = tick.tick() => match session.poll() {
+                PollOutcome::Events(events) => {
+                    for event in events {
+                        let wire = crate::api::events::EventEnvelope::from(event);
+                        let Ok(text) = serde_json::to_string(&wire) else { continue };
+                        if socket
+                            .send(axum::extract::ws::Message::Text(text.into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                PollOutcome::Closed { close_code, problem } => {
+                    let _ = socket
+                        .send(axum::extract::ws::Message::Text(
+                            serde_json::to_string(&problem).unwrap_or_default().into(),
+                        ))
+                        .await;
+                    close_ws(&mut socket, close_code).await;
+                    return;
+                }
+            },
+            incoming = socket.recv() => match incoming {
+                Some(Ok(axum::extract::ws::Message::Close(_))) | None => return,
+                Some(Ok(_)) => {}
+                Some(Err(_)) => return,
+            },
+        }
+    }
+}
+
+async fn close_ws(socket: &mut axum::extract::ws::WebSocket, code: u16) {
+    use axum::extract::ws::{CloseFrame, Message};
+    let _ = socket
+        .send(Message::Close(Some(CloseFrame {
+            code,
+            reason: "mf.events".into(),
+        })))
+        .await;
 }
 
 /// `POST /api/v1/controller/takeover`:Observer 显式接管(kernel CAS)。

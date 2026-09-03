@@ -4,10 +4,17 @@
 // snapshot(model.ts 映射),3s 轮询保持活性;事件流接入 WS 后经
 // reducer 增量投影。
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, type WorkbenchClient } from "../api/client.ts";
+import { EventSocket } from "../api/events.ts";
 import { storeSession } from "../api/session.ts";
 import { uuidv7 } from "../api/uuid.ts";
+import {
+  reduceEvents,
+  reduceSnapshot,
+  PROJECTION_FEED_LIMIT,
+  type ProjectionState,
+} from "../state/reducer.ts";
 import { workflowCreateCommand } from "../state/workflow_commands.ts";
 import {
   activeRunsAcross,
@@ -21,20 +28,30 @@ import {
 
 export type WorkbenchTab = "workflows" | "runs";
 
-const POLL_INTERVAL_MS = 3000;
+const POLL_FALLBACK_MS = 3000;
+const POLL_LIVE_MS = 15000;
 
 export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
   const [tab, setTab] = useState<WorkbenchTab>("workflows");
   const [view, setView] = useState<WorkspaceView | null>(null);
+  const [projection, setProjection] = useState<ProjectionState | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [connection, setConnection] = useState<"live" | "reconnecting">("live");
+  const [wsOpen, setWsOpen] = useState(false);
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const projectionRef = useRef<ProjectionState | null>(null);
+  const socketStarted = useRef(false);
 
   const refresh = useCallback(async () => {
     try {
       const snapshot = await client.workspaceSnapshot();
       setView(workspaceViewOf(snapshot));
+      setProjection((prev) => {
+        const next = reduceSnapshot(prev ?? (null as never), snapshot);
+        projectionRef.current = next;
+        return next;
+      });
       setConnection("live");
     } catch (error) {
       setToast(String(error));
@@ -42,16 +59,63 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
     }
   }, [client]);
 
-  // 初始 snapshot + 轮询(页面隐藏时暂停;快照本机便宜)
+  // 初始 snapshot + 轮询兜底(WS 活跃时降频;页面隐藏暂停)
   useEffect(() => {
     void refresh();
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === "visible") {
-        void refresh();
-      }
-    }, POLL_INTERVAL_MS);
-    return () => window.clearInterval(timer);
   }, [refresh]);
+  useEffect(() => {
+    const timer = window.setInterval(
+      () => {
+        if (document.visibilityState === "visible") void refresh();
+      },
+      wsOpen ? POLL_LIVE_MS : POLL_FALLBACK_MS,
+    );
+    return () => window.clearInterval(timer);
+  }, [refresh, wsOpen]);
+
+  // 事件流(首份 snapshot 后订阅一次;cursor 续传;4409/未知 critical → 全量)
+  useEffect(() => {
+    if (!projection || socketStarted.current) return;
+    socketStarted.current = true;
+    const socket = new EventSocket({
+      cursor: () =>
+        projectionRef.current
+          ? {
+              streamEpoch: projectionRef.current.cursor.streamEpoch,
+              throughSeq: projectionRef.current.cursor.throughSeq,
+            }
+          : { streamEpoch: "", throughSeq: "0" },
+      onEvents: (events) => {
+        const prev = projectionRef.current;
+        if (!prev) return;
+        const { state: next, resyncRequired } = reduceEvents(prev, events);
+        // feed 是显示层"本页会话送达的事件":命令触发的快照刷新可能
+        // 先于 WS 帧把 cursor 推进(reducer 去重正确跳过重复),送达的
+        // 事件仍要展示一次。
+        const feed = [
+          ...events.map((event) => ({
+            type: event.type,
+            seq: event.seq,
+            critical: event.critical,
+            at: Date.now(),
+          })),
+          ...next.feed,
+        ].slice(0, PROJECTION_FEED_LIMIT);
+        const merged = { ...next, feed };
+        projectionRef.current = merged;
+        setProjection(merged);
+        if (resyncRequired) void refresh();
+      },
+      onResync: () => {
+        void refresh();
+      },
+      onStateChange: (state) => setWsOpen(state === "open"),
+    });
+    socket.connect();
+    return () => socket.stop();
+    // 仅在首个投影基线就绪时建立一次
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [projection !== null, refresh]);
 
   // 自动选中的 run 失效时回退到第一个活动 run
   const runs = useMemo(() => (view ? activeRunsAcross(view.projects) : []), [view]);
@@ -272,6 +336,29 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
               </div>
             ) : (
               <p className="muted-note">没有等待你处理的运行。</p>
+            )}
+
+            <div className="pane-head" style={{ margin: "0 -14px", padding: 0 }}>
+              <h2 style={{ fontSize: 11, padding: "8px 14px", width: "100%" }}>
+                事件流 {wsOpen ? "●" : "○"}
+              </h2>
+            </div>
+            {projection && projection.feed.length > 0 ? (
+              <div className="feed">
+                {projection.feed.slice(0, 12).map((item) => (
+                  <div
+                    key={item.seq}
+                    className={`feed-item ${item.critical ? "critical" : ""}`}
+                  >
+                    <span className="seq">{item.seq}</span>
+                    <span>{item.type}</span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="muted-note">
+                等待事件…{wsOpen ? "(已订阅)" : "(事件流未连接,轮询兜底)"}
+              </p>
             )}
 
             <button
@@ -560,6 +647,13 @@ function CreateWorkflowModal({
                 onDone(`工作流「${name.trim()}」已创建`);
               } catch (error) {
                 setBusy(false);
+                const code = error instanceof ApiError ? error.problem.code : null;
+                if (code === "controller_required" || code === "controller_lease_expired") {
+                  // 角色已过期(其它会话接管):重新探活,UI 回到
+                  // Observer + 接管入口
+                  location.reload();
+                  return;
+                }
                 onDone(
                   `创建失败:${error instanceof Error ? error.message : String(error)}`,
                 );

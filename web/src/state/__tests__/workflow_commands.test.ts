@@ -74,9 +74,8 @@ test("create command targets project with payload collection CAS and valid node"
   assert.equal(envelope.type, "workflow.create");
   assert.equal(envelope.target.kind, "project", "创建 target 是 project(工作流尚不存在)");
   const draft = envelope.payload.draft as Record<string, unknown>;
-  // key 仅 ASCII:中文名退化为分隔符,保留 command 派生后缀防碰撞
-  assert.match(String(draft.key), /^-?[a-z0-9-]*-018f3e$/, "key 为 ASCII slug + 命令后缀");
-  assert.equal(draft.key, "workflow-018f3e");
+  // key 仅 ASCII:中文名退化为分隔符,后缀取 command_id 末 6 位随机段
+  assert.equal(draft.key, "workflow-8e9f0a", "key 为 ASCII slug + 命令随机后缀");
   const node = (draft.nodes as Array<Record<string, unknown>>)[0];
   assert.equal(node.agent_instance_id, "agent-main");
   assert.equal(node.title, "第一步");

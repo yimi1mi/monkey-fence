@@ -20,19 +20,26 @@ export type ReducerAction =
 
 export const PROJECTION_FEED_LIMIT = 200;
 
-/** snapshot 基线(刷新后的起点;丢弃旧投影)。 */
+/** snapshot 基线(刷新后的起点;权威计数重播种)。feed 是显示层
+ *  历史:保留既有条目(事件不因快照重拉而"消失");cursor 重置到
+ *  快照位置,后续事件继续叠加。 */
 export function reduceSnapshot(
   state: ProjectionState,
   snapshot: SnapshotEnvelope,
 ): ProjectionState {
+  const data = (snapshot.data ?? {}) as {
+    needs_you_count?: number;
+    active_workflow_runs?: number;
+  };
+  const previous = state as ProjectionState | null;
   return {
     cursor: {
       streamEpoch: snapshot.cursor.stream_epoch,
       throughSeq: snapshot.cursor.through_seq,
     },
-    feed: [],
-    needsYou: 0,
-    activeRuns: 0,
+    feed: previous?.feed ?? [],
+    needsYou: Number(data.needs_you_count ?? 0),
+    activeRuns: Number(data.active_workflow_runs ?? 0),
   };
 }
 
@@ -87,13 +94,27 @@ export function reduceEvents(
   };
 }
 
-/** 已知 critical 事件集(v1 冻结;新增必须 additive optional)。 */
+/** 已知 critical 事件集(v1 冻结;新增必须 additive optional)。run
+ *  状态族 + 服务端 delta 全集(kernel project_workflow_effect:create
+ *  以 replace 全量投影发布、delete 以 tombstone;编辑族为 typed_delta)。 */
 const KNOWN_CRITICAL_EVENTS = new Set([
   "workflow_run.needs_you",
   "workflow_run.started",
   "workflow_run.settled",
   "workflow_run.cancelled",
   "workspace.resync",
+  "workflow.replace",
+  "workflow.delete",
+  "workflow.rename",
+  "workflow.add_node",
+  "workflow.update_node",
+  "workflow.remove_node",
+  "workflow.connect",
+  "workflow.disconnect",
+  "workflow.node_position_set",
+  "workflow.viewport_set",
+  "workflow.set_unsafe_parallel",
+  "project.workflow_collection_changed",
 ]);
 
 /** resync:丢弃投影,等待下一次 snapshot 基线。 */

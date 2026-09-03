@@ -79,15 +79,14 @@ async function bootstrap(): Promise<void> {
     }
     return;
   }
-  // 无 fragment:刷新场景——已有会话(HttpOnly cookie)则直接续用;
-  // 否则本机验收模式尝试重签,生产保持明确指引。
+  // 无 fragment:刷新场景——服务端权威探活(/auth/session 回报当前
+  // 角色与 epoch;存储的角色可能已过期——其它会话接管/重换后本会话
+  // 已降 Observer)。探活失败则本机验收模式尝试重签,生产保持指引。
   const stored = readStoredSession();
   if (stored) {
-    const probe = await fetch("/api/v1/snapshots/workspace", {
-      headers: { "X-Client-Id": stored.client_id },
-    }).catch(() => null);
+    const probe = await fetch("/auth/session").catch(() => null);
     if (probe && probe.ok) {
-      mountWorkbench(stored);
+      mountWorkbench((await probe.json()) as BootstrapSession);
       return;
     }
     clearStoredSession();

@@ -36,6 +36,21 @@ impl EventEnvelope {
     }
 }
 
+/// kernel EventEnvelope → wire(§7.1:seq 字符串化;projection_critical
+/// → critical;typed_delta 投影整体作为 data 透传,禁止 JSON Patch)。
+impl From<mf_kernel::projection::EventEnvelope> for EventEnvelope {
+    fn from(event: mf_kernel::projection::EventEnvelope) -> Self {
+        Self {
+            schema: "mf.event.v1".to_string(),
+            event_type: event.event_type.clone(),
+            critical: event.projection_critical,
+            stream_epoch: event.stream_epoch.as_str().to_string(),
+            seq: event.seq,
+            data: event.projection,
+        }
+    }
+}
+
 /// 未知事件的客户端处置(§7.2:additive optional change)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnknownEventPolicy {

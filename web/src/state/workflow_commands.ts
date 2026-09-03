@@ -82,15 +82,16 @@ export function workflowCreateCommand(
   },
   collectionRevision: string,
 ): CommandEnvelope {
-  // key 仅允许 ASCII 字母数字/-/_(is_valid_key);非 ASCII 一律丢弃,
-  // 并追加 command_id 派生后缀防同名碰撞。
+  // key 仅允许 ASCII 字母数字/-/_(is_valid_key);非 ASCII 一律丢弃。
+  // 后缀取 command_id 末 6 位(uuidv7 尾部是随机段;前缀是时间戳,
+  // 短时间多次创建会碰撞)。
   const base =
     input.name
       .trim()
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-+|-+$/g, "") || "workflow";
-  const suffix = input.commandId.replaceAll("-", "").slice(0, 6);
+  const suffix = input.commandId.replaceAll("-", "").slice(-6);
   const key = `${base}-${suffix}`;
   return {
     schema: "mf.command.v1",
