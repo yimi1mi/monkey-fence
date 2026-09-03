@@ -260,7 +260,15 @@ fn cross_instance_complete_merges_full_batch_exactly_once() {
                     .map(|rows| rows.iter().all(|r| r.status == "released"))
                     .unwrap_or(false)
             }),
-            "两个实例的租约都必须由唯一领取者释放(第 {round} 轮)"
+            "两个实例的租约都必须由唯一领取者释放(第 {round} 轮) leases={:?} deferrals={:?}",
+            fx.orch.store.list_execution_leases(task.id).map(|rows| rows
+                .iter()
+                .map(|r| (r.id.clone(), r.status.clone()))
+                .collect::<Vec<_>>()),
+            fx.orch.store.list_join_deferrals(None).map(|rows| rows
+                .iter()
+                .map(|d| (d.lease.id.clone(), d.lease.status.clone()))
+                .collect::<Vec<_>>())
         );
         assert_eq!(
             fx.directory.merges.load(Ordering::SeqCst),
