@@ -203,6 +203,18 @@ mod tests {
         ) -> mf_kernel::shutdown::ShutdownAssessment {
             Default::default()
         }
+        fn grant_controller(
+            &self,
+            _client_id: &str,
+            _principal: &str,
+        ) -> Result<u64, mf_kernel::kernel::KernelProblem> {
+            Err(mf_kernel::kernel::KernelProblem::ServiceUnavailable(
+                "no kernel".into(),
+            ))
+        }
+        fn controller_epoch(&self) -> u64 {
+            0
+        }
     }
 
     #[test]

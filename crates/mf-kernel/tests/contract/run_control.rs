@@ -122,7 +122,7 @@ impl RunControlFixture {
         ));
         let client_id = ClientId::parse("run-control").unwrap();
         let principal = Principal::parse("mfctl-agent").unwrap();
-        let epoch = kernel.grant_controller(&client_id, &principal).unwrap();
+        let epoch = kernel.grant_controller_checked(&client_id, &principal).unwrap();
         let client = LegacyKernelClient::new(kernel.clone(), principal, client_id, epoch);
         let mut projects = Vec::new();
         for index in 0..=extra_projects {
@@ -816,7 +816,7 @@ fn controller_takeover_does_not_revoke_run_capability_authority() {
     let f = RunControlFixture::new(0);
     let project = &f.projects[0];
     f.kernel
-        .grant_controller(
+        .grant_controller_checked(
             &ClientId::parse("new-web-controller").unwrap(),
             &Principal::parse("different-user").unwrap(),
         )

@@ -4,15 +4,13 @@
 import { createRoot } from "react-dom/client";
 import { WorkbenchShell } from "../workbench/shell.tsx";
 import { WorkbenchClient } from "../api/client.ts";
+import {
+  clearStoredSession,
+  readStoredSession,
+  storeSession,
+  type BootstrapSession,
+} from "../api/session.ts";
 import "../styles/global.css";
-
-interface BootstrapResponse {
-  client_id: string;
-  csrf_token: string;
-  controller: { role: string; lease_epoch?: string | number };
-}
-
-const SESSION_KEY = "mf.workbench.session";
 
 function showFatal(message: string): void {
   const mount = document.getElementById("workbench");
@@ -21,19 +19,8 @@ function showFatal(message: string): void {
   }
 }
 
-function readStoredSession(): BootstrapResponse | null {
-  try {
-    const raw = sessionStorage.getItem(SESSION_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as BootstrapResponse;
-    return parsed.client_id && parsed.csrf_token ? parsed : null;
-  } catch {
-    return null;
-  }
-}
-
-function mountWorkbench(data: BootstrapResponse): void {
-  sessionStorage.setItem(SESSION_KEY, JSON.stringify(data));
+function mountWorkbench(data: BootstrapSession): void {
+  storeSession(data);
   const client = new WorkbenchClient({
     csrfToken: data.csrf_token,
     clientId: data.client_id,
@@ -78,7 +65,7 @@ async function bootstrapWithNonce(nonce: string): Promise<void> {
   }
   // fragment 立即清除(nonce 已消耗;不留在浏览器历史)
   history.replaceState(null, "", location.pathname);
-  mountWorkbench((await response.json()) as BootstrapResponse);
+  mountWorkbench((await response.json()) as BootstrapSession);
 }
 
 async function bootstrap(): Promise<void> {
@@ -103,7 +90,7 @@ async function bootstrap(): Promise<void> {
       mountWorkbench(stored);
       return;
     }
-    sessionStorage.removeItem(SESSION_KEY);
+    clearStoredSession();
   }
   const fresh = await reissueNonce();
   if (fresh) {

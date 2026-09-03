@@ -9,6 +9,7 @@ import type {
   Problem,
   SnapshotEnvelope,
 } from "./protocol.ts";
+import type { BootstrapSession } from "./session.ts";
 
 export interface ClientContext {
   csrfToken: string;
@@ -36,6 +37,11 @@ export class WorkbenchClient {
 
   get isController(): boolean {
     return this.context.role === "controller";
+  }
+
+  /** 本会话的 controller lease epoch(takeover CAS 观察值)。 */
+  get leaseEpoch(): string {
+    return this.context.controllerLeaseEpoch;
   }
 
   /** Workspace Snapshot(权威;刷新后以此为基线再 resume 事件)。 */
@@ -67,8 +73,9 @@ export class WorkbenchClient {
     return (await response.json()) as CommandOutcomeWire;
   }
 
-  /** Observer 显式 takeover(CAS:最后观察 epoch)。 */
-  async takeover(lastObservedEpoch: string): Promise<void> {
+  /** Observer 显式 takeover(CAS:最后观察 epoch);成功返回新会话
+   *  形态(角色升 Controller + 新 lease epoch),前端续存后生效。 */
+  async takeover(lastObservedEpoch: string): Promise<BootstrapSession> {
     const response = await fetch("/api/v1/controller/takeover", {
       method: "POST",
       headers: {
@@ -79,6 +86,7 @@ export class WorkbenchClient {
       body: JSON.stringify({ last_observed_epoch: lastObservedEpoch }),
     });
     if (!response.ok) throw new ApiError(await problemOf(response));
+    return (await response.json()) as BootstrapSession;
   }
 }
 

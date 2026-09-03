@@ -166,6 +166,26 @@ impl BootstrapAuth {
         Ok(session.clone())
     }
 
+    /// takeover 提升:该会话升 Controller,其余全部降 Observer(§6.4:
+    /// 不断开、只降写;kernel 侧 epoch 旋转由调用方先行完成)。
+    pub fn promote_controller(&mut self, session_id: &str) {
+        let target_client = self.sessions.get(session_id).map(|s| s.client_id.clone());
+        let Some(target_client) = target_client else {
+            return;
+        };
+        for session in self.sessions.values_mut() {
+            session.role = SessionRole::Observer;
+        }
+        for role in self.client_roles.values_mut() {
+            *role = SessionRole::Observer;
+        }
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.role = SessionRole::Controller;
+        }
+        self.client_roles
+            .insert(target_client, SessionRole::Controller);
+    }
+
     /// Core 重启语义:nonce/session/CSRF/client id 全部失效(§6.2/6.7)。
     pub fn core_restart(&mut self) {
         self.nonces.clear();

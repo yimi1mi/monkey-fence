@@ -194,7 +194,7 @@ impl RunFixture {
             .unwrap();
         let client = ClientId::parse("run-controller").unwrap();
         let principal = Principal::parse("run-user").unwrap();
-        let epoch = kernel.grant_controller(&client, &principal).unwrap();
+        let epoch = kernel.grant_controller_checked(&client, &principal).unwrap();
         Self {
             _tmp: tmp,
             store,
@@ -1135,7 +1135,7 @@ fn fenced_cancel_recovers_after_crash_and_rejects_other_command_without_stop() {
     let takeover_client = ClientId::parse("run-controller-takeover").unwrap();
     let takeover_epoch = f
         .kernel
-        .grant_controller(&takeover_client, &f.principal)
+        .grant_controller_checked(&takeover_client, &f.principal)
         .unwrap();
     assert_eq!(
         f.kernel.dispatch(old_request),

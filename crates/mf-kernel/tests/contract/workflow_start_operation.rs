@@ -658,7 +658,7 @@ fn runtime_open_project_resumes_accepted_start_in_background() {
         .unwrap();
     let client = ClientId::parse("restart-client").unwrap();
     let principal = Principal::parse("restart-user").unwrap();
-    let epoch = first.grant_controller(&client, &principal).unwrap();
+    let epoch = first.grant_controller_checked(&client, &principal).unwrap();
     first
         .register_run_lifecycle_port(&project, Arc::new(FakeRunPort::default()))
         .unwrap();

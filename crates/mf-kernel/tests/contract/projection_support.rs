@@ -67,7 +67,7 @@ impl ProjectionFixture {
             .unwrap();
         let client = ClientId::parse("client-projection-contract").unwrap();
         let principal = Principal::parse("user-projection-contract").unwrap();
-        let epoch = kernel.grant_controller(&client, &principal).unwrap();
+        let epoch = kernel.grant_controller_checked(&client, &principal).unwrap();
         Self {
             _tmp: tmp,
             store,

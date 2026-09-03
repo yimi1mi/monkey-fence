@@ -406,6 +406,18 @@ impl KernelCommandRequest {
             command,
         }
     }
+
+    pub fn client_id(&self) -> &ClientId {
+        &self.client_id
+    }
+
+    pub fn principal(&self) -> &Principal {
+        &self.principal
+    }
+
+    pub fn controller_epoch(&self) -> u64 {
+        self.controller_epoch
+    }
 }
 
 /// dispatch 结果。`202 accepted`(Operation)属后续 ticket;T2a 只有
@@ -531,7 +543,9 @@ pub use mf_terminal::channel::{
 // ---------------------------------------------------------------------------
 
 /// 所有调用方(WebGateway、legacy GPUI adapter、launcher/tray IPC、测试
-/// harness)只允许经这五个方法与 Core 交互;字段一律私有。
+/// harness)只允许经这些方法与 Core 交互;字段一律私有。前五个是数据面;
+/// `grant_controller`/`controller_epoch` 是 Web bootstrap/takeover 的
+/// controller 授予面(L-TAKEOVER 落点,epoch 单调旋转)。
 pub trait CoreKernel: Send + Sync {
     fn dispatch(&self, request: KernelCommandRequest) -> Result<KernelOutcome, KernelProblem>;
     fn snapshot(&self, query: SnapshotQuery) -> Result<SnapshotEnvelope, KernelProblem>;
@@ -542,6 +556,12 @@ pub trait CoreKernel: Send + Sync {
         attach: TerminalAttach,
     ) -> Result<TerminalChannel, KernelProblem>;
     fn shutdown(&self, intent: ShutdownIntent) -> ShutdownAssessment;
+    /// 授予 Controller lease(新 controller 使旧 epoch 立即失效)并返回
+    /// 新 epoch。Web exchange/takeover 调用;client_id/principal 非空
+    /// 字符串,dispatch 时逐字复验。
+    fn grant_controller(&self, client_id: &str, principal: &str) -> Result<u64, KernelProblem>;
+    /// 当前 controller epoch(Web takeover CAS 的观察对象)。
+    fn controller_epoch(&self) -> u64;
 }
 
 // ---------------------------------------------------------------------------
@@ -2033,8 +2053,8 @@ impl InProcessCoreKernel {
     }
 
     /// 授予 Controller lease(新 controller 使旧 epoch 立即失效)并返回
-    /// 新 epoch。
-    pub(crate) fn grant_controller(
+    /// 新 epoch(已解析 handle 形态;web 字符串入口经 trait 方法)。
+    pub(crate) fn grant_controller_checked(
         &self,
         client: &ClientId,
         principal: &Principal,
@@ -2656,6 +2676,18 @@ impl CoreKernel for InProcessCoreKernel {
 
     fn shutdown(&self, intent: ShutdownIntent) -> ShutdownAssessment {
         self.assess_shutdown(intent)
+    }
+
+    fn grant_controller(&self, client_id: &str, principal: &str) -> Result<u64, KernelProblem> {
+        let client = ClientId::parse(client_id)
+            .map_err(|e| KernelProblem::Internal(format!("client_id 非法:{e}")))?;
+        let principal = Principal::parse(principal)
+            .map_err(|e| KernelProblem::Internal(format!("principal 非法:{e}")))?;
+        self.grant_controller_checked(&client, &principal)
+    }
+
+    fn controller_epoch(&self) -> u64 {
+        self.lease.state.read().epoch
     }
 }
 
@@ -5125,7 +5157,7 @@ impl InProcessKernelRuntime {
             capability_key,
         ));
         kernel.install_workflow_start_worker()?;
-        let epoch = kernel.grant_controller(&client_id, &principal)?;
+        let epoch = kernel.grant_controller_checked(&client_id, &principal)?;
         let client = LegacyKernelClient::new(kernel.clone(), principal, client_id, epoch);
         Ok((
             Arc::new(Self {
@@ -5150,7 +5182,7 @@ impl InProcessKernelRuntime {
                 .map_err(|error| KernelProblem::Internal(format!("{error:#}")))?,
         ));
         kernel.install_workflow_start_worker()?;
-        let epoch = kernel.grant_controller(&client_id, &principal)?;
+        let epoch = kernel.grant_controller_checked(&client_id, &principal)?;
         let client = LegacyKernelClient::new(kernel.clone(), principal, client_id, epoch);
         Ok((
             Arc::new(Self {

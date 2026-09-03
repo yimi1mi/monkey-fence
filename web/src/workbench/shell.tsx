@@ -5,7 +5,8 @@
 // reducer 增量投影。
 
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { WorkbenchClient } from "../api/client.ts";
+import { ApiError, type WorkbenchClient } from "../api/client.ts";
+import { storeSession } from "../api/session.ts";
 import {
   activeRunsAcross,
   runIsActive,
@@ -101,8 +102,8 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
         {!isController && (
           <TakeoverButton
             client={client}
-            observedEpoch={view?.streamEpoch ?? "0"}
             onTaken={() => location.reload()}
+            onFailed={(message) => setToast(`接管失败:${message}`)}
           />
         )}
       </header>
@@ -467,12 +468,12 @@ function CreateGuide({ onClose }: { onClose: () => void }) {
 
 function TakeoverButton({
   client,
-  observedEpoch,
   onTaken,
+  onFailed,
 }: {
   client: WorkbenchClient;
-  observedEpoch: string;
   onTaken: () => void;
+  onFailed: (message: string) => void;
 }) {
   const [busy, setBusy] = useState(false);
   return (
@@ -482,15 +483,24 @@ function TakeoverButton({
       onClick={async () => {
         setBusy(true);
         try {
-          // CAS:最后观察 epoch = 当前投影 stream epoch
-          await client.takeover(observedEpoch);
+          // CAS:本会话最后观察的 controller lease epoch;若已被其它
+          // bootstrap 前移,服务端在 problem.current 里给出当前值,
+          // 以当前值重试一次(仍失败才报错)。
+          const session = await client.takeover(client.leaseEpoch).catch(async (error) => {
+            const current =
+              error instanceof ApiError ? error.problem.current?.controller_epoch : undefined;
+            if (current === undefined) throw error;
+            return client.takeover(String(current));
+          });
+          storeSession(session);
           onTaken();
-        } catch {
+        } catch (error) {
           setBusy(false);
+          onFailed(error instanceof Error ? error.message : String(error));
         }
       }}
     >
-      接管为 Controller
+      {busy ? "接管中…" : "接管为 Controller"}
     </button>
   );
 }

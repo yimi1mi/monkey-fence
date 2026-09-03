@@ -107,6 +107,18 @@ mod tests {
         ) -> crate::shutdown::ShutdownAssessment {
             crate::shutdown::ShutdownAssessment::default()
         }
+        fn grant_controller(
+            &self,
+            _client_id: &str,
+            _principal: &str,
+        ) -> Result<u64, crate::kernel::KernelProblem> {
+            Err(crate::kernel::KernelProblem::ServiceUnavailable(
+                "no kernel".into(),
+            ))
+        }
+        fn controller_epoch(&self) -> u64 {
+            0
+        }
     }
 
     struct ReadHalf {

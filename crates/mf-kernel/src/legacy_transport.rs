@@ -452,6 +452,16 @@ mod tests {
             ) -> crate::shutdown::ShutdownAssessment {
                 crate::shutdown::ShutdownAssessment::default()
             }
+            fn grant_controller(
+                &self,
+                _client_id: &str,
+                _principal: &str,
+            ) -> Result<u64, KernelProblem> {
+                Err(KernelProblem::ServiceUnavailable("fake".into()))
+            }
+            fn controller_epoch(&self) -> u64 {
+                0
+            }
         }
         Arc::new(FakeKernel)
     }
