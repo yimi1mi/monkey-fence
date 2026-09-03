@@ -255,7 +255,10 @@ pub fn wait_for_file(path: &Path, timeout: Duration) -> Option<String> {
     let deadline = Instant::now() + timeout;
     loop {
         if let Ok(text) = fs::read_to_string(path) {
-            return Some(text);
+            // probe 进程创建与写入非原子:文件存在但内容未落盘时继续等
+            if !text.trim().is_empty() {
+                return Some(text);
+            }
         }
         if Instant::now() >= deadline {
             return None;
