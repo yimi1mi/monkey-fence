@@ -26,6 +26,7 @@ import {
 import type { CommandType } from "../api/protocol.ts";
 import { WorkflowEditor } from "./workflow_editor.tsx";
 import { TerminalPanel } from "./terminal_panel.tsx";
+import { initialValues, renderFields, validate, type FormSchema, type FormValues } from "./form_schema.tsx";
 import { CodeBrowserModal, VcsPanel } from "./code_browser.tsx";
 import {
   activeRunsAcross,
@@ -1591,17 +1592,27 @@ function CreateWorkflowModal({
   onDone: (message: string) => void;
   onClose: () => void;
 }) {
-  const [name, setName] = useState("");
-  const [firstNodeTitle, setFirstNodeTitle] = useState("");
-  const [agentInstanceId, setAgentInstanceId] = useState("");
-  const [projectHandle, setProjectHandle] = useState(projects[0]?.handle ?? "");
+  const schema: FormSchema = {
+    fields: [
+      { kind: "select", id: "project", label: "项目", required: true,
+        options: projects.map((p) => ({ value: p.handle, label: p.name })) },
+      { kind: "text", id: "name", label: "工作流名称", placeholder: "如:仓库巡检", required: true },
+      { kind: "text", id: "node", label: "首节点标题", placeholder: "如:检查变更", required: true },
+      { kind: "text", id: "agent", label: "Agent 实例 ID", placeholder: "选择或输入 CLI(如 codex)",
+        required: true, datalist: cliOptions, hint: "实例存在性在运行时绑定;创建时仅要求非空。" },
+    ],
+  };
+  const [values, setValues] = useState<FormValues>(() => initialValues({
+    fields: schema.fields.map((f) => (f.id === "project" ? { ...f, options: [{ value: projects[0]?.handle ?? "", label: projects[0]?.name ?? "" }] } : f)),
+  }));
   const [busy, setBusy] = useState(false);
-
-  const valid =
-    name.trim().length > 0 &&
-    firstNodeTitle.trim().length > 0 &&
-    agentInstanceId.trim().length > 0 &&
-    projectHandle !== "";
+  const errors = validate(schema, values);
+  const name = values.name ?? "";
+  const firstNodeTitle = values.node ?? "";
+  const agentInstanceId = values.agent ?? "";
+  const projectHandle = values.project ?? "";
+  const valid = Object.keys(errors).length === 0;
+  const set = (id: string, value: string) => setValues((prev) => ({ ...prev, [id]: value }));
 
   return (
     <div
@@ -1614,54 +1625,7 @@ function CreateWorkflowModal({
         <h3>
           <span className="mark">◤</span>新建工作流
         </h3>
-        <div className="field">
-          <label htmlFor="wf-project">项目</label>
-          <select
-            id="wf-project"
-            value={projectHandle}
-            onChange={(event) => setProjectHandle(event.target.value)}
-          >
-            {projects.map((project) => (
-              <option key={project.handle} value={project.handle}>
-                {project.name}
-              </option>
-            ))}
-          </select>
-        </div>
-        <div className="field">
-          <label htmlFor="wf-name">工作流名称</label>
-          <input
-            id="wf-name"
-            value={name}
-            placeholder="如:仓库巡检"
-            onChange={(event) => setName(event.target.value)}
-          />
-        </div>
-        <div className="field">
-          <label htmlFor="wf-node">首节点标题</label>
-          <input
-            id="wf-node"
-            value={firstNodeTitle}
-            placeholder="如:检查变更"
-            onChange={(event) => setFirstNodeTitle(event.target.value)}
-          />
-        </div>
-        <div className="field">
-          <label htmlFor="wf-agent">Agent 实例 ID</label>
-          <input
-            id="wf-agent"
-            list="cli-options"
-            value={agentInstanceId}
-            placeholder="选择或输入 CLI(如 codex)"
-            onChange={(event) => setAgentInstanceId(event.target.value)}
-          />
-          <datalist id="cli-options">
-            {cliOptions.map((option) => (
-              <option key={option} value={option} />
-            ))}
-          </datalist>
-          <span className="hint">实例存在性在运行时绑定;创建时仅要求非空。</span>
-        </div>
+        {renderFields(schema, values, errors, set)}
         <div className="actions">
           <button className="mf-btn ghost" onClick={onClose}>
             取消
