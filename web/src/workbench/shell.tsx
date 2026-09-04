@@ -41,7 +41,7 @@ import {
 export type WorkbenchTab = "workflows" | "runs" | "settings";
 
 const POLL_FALLBACK_MS = 3000;
-const POLL_LIVE_MS = 15000;
+const POLL_LIVE_MS = 60000;
 
 export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
   const [tab, setTab] = useState<WorkbenchTab>(
@@ -64,6 +64,8 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
   useEffect(() => {
     void client.cliDetect().then(setClis).catch(() => setClis([]));
   }, [client]);
+  // #91 通知: needs-you 系统通知 + 提示音(设置开关;默认开)
+  const notificationsOn = localStorage.getItem("mf.notify") !== "off";
   const [codeBrowser, setCodeBrowser] = useState<string | null>(null);
   const [vcsRoot, setVcsRoot] = useState<string | null>(null);
   const projectionRef = useRef<ProjectionState | null>(null);
@@ -84,6 +86,18 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
       setConnection("reconnecting");
     }
   }, [client]);
+
+  // #91 首次交互请求通知权限
+  useEffect(() => {
+    const requestOnce = () => {
+      if ("Notification" in window && Notification.permission === "default") {
+        void Notification.requestPermission();
+        window.removeEventListener("click", requestOnce);
+      }
+    };
+    window.addEventListener("click", requestOnce);
+    return () => window.removeEventListener("click", requestOnce);
+  }, []);
 
   // #84 命令面板:Ctrl+K
   useEffect(() => {
@@ -125,6 +139,15 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
             }
           : { streamEpoch: "", throughSeq: "0" },
       onEvents: (events) => {
+        // #91: needs-you → 系统通知 + 提示音(页面不可见时)
+        if (notificationsOn) {
+          const needsYou = events.find(
+            (event) => event.type === "workflow_run.needs_you" && event.critical,
+          );
+          if (needsYou && document.visibilityState !== "visible") {
+            void notifyNeedsYou(needsYou.data);
+          }
+        }
         const prev = projectionRef.current;
         if (!prev) return;
         const { state: next, resyncRequired } = reduceEvents(prev, events);
@@ -1273,6 +1296,25 @@ function SettingsPane({
 
         <div className="settings-section">
           <div className="settings-title">
+            <span>通知</span>
+            <button
+              className="mf-btn ghost"
+              onClick={() => {
+                const next = localStorage.getItem("mf.notify") === "off" ? "on" : "off";
+                localStorage.setItem("mf.notify", next);
+                onDone(next === "off" ? "通知已关闭(刷新生效)" : "通知已开启(刷新生效)");
+              }}
+            >
+              {localStorage.getItem("mf.notify") === "off" ? "开启" : "关闭"}
+            </button>
+          </div>
+          <p className="muted-note">
+            运行进入「需要你」时发送系统通知与提示音(仅页面不在前台时打扰)。
+          </p>
+        </div>
+
+        <div className="settings-section">
+          <div className="settings-title">
             <span>CLI 管理</span>
           </div>
           <p className="muted-note">
@@ -1673,6 +1715,39 @@ function TakeoverButton({
       {busy ? "接管中…" : "接管为 Controller"}
     </button>
   );
+}
+
+/** #91: needs-you 系统通知 + 提示音(页面不可见时才打扰)。 */
+async function notifyNeedsYou(data: Record<string, unknown>): Promise<void> {
+  try {
+    if ("Notification" in window && Notification.permission === "granted") {
+      const title = String(data?.title ?? data?.workflow_run ?? "运行需要你");
+      new Notification("MonkeyFence · 需要你", {
+        body: `${title} 正在等待你的处理`,
+        tag: "mf-needs-you",
+      });
+    }
+    // 提示音: 短促双音(880Hz → 660Hz, 各 120ms)
+    const AudioCtor =
+      window.AudioContext ??
+      (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (AudioCtor) {
+      const audio = new AudioCtor();
+      const beep = (frequency: number, at: number) => {
+        const oscillator = audio.createOscillator();
+        const gain = audio.createGain();
+        oscillator.frequency.value = frequency;
+        oscillator.connect(gain);
+        gain.connect(audio.destination);
+        oscillator.start(audio.currentTime + at);
+        oscillator.stop(audio.currentTime + at + 0.12);
+      };
+      beep(880, 0);
+      beep(660, 0.15);
+    }
+  } catch {
+    /* 通知/音频失败不影响主流程 */
+  }
 }
 
 // 窄屏:Inspector 下移为第四行(布局由 CSS grid 的媒体查询承载;
