@@ -1020,10 +1020,13 @@ async fn cli_detect(
         "claude",
         "gemini",
         "qwen",
+        "opencode",
+        "crush",
         "copilot",
         "aider",
         "cursor-agent",
         "goose",
+        "amazonq",
     ];
     let path_env = std::env::var("PATH").unwrap_or_default();
     let mut detected: Vec<serde_json::Value> = Vec::new();

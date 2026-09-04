@@ -91,6 +91,8 @@ pub struct CliRecipe {
     pub agent_type: &'static str,
     pub package: &'static str,
     pub display: &'static str,
+    /// npm | pip(aider 走 pip;其余 npm)。
+    pub prefer: &'static str,
 }
 
 pub const RECIPES: &[CliRecipe] = &[
@@ -98,42 +100,98 @@ pub const RECIPES: &[CliRecipe] = &[
         agent_type: "codex",
         package: "@openai/codex",
         display: "OpenAI Codex CLI",
+        prefer: "npm",
     },
     CliRecipe {
         agent_type: "claude",
         package: "@anthropic-ai/claude-code",
         display: "Anthropic Claude Code",
+        prefer: "npm",
     },
     CliRecipe {
         agent_type: "gemini",
         package: "@google/gemini-cli",
         display: "Google Gemini CLI",
+        prefer: "npm",
     },
     CliRecipe {
         agent_type: "qwen",
         package: "@qwen-code/qwen-code",
         display: "Qwen Code CLI",
+        prefer: "npm",
+    },
+    CliRecipe {
+        agent_type: "opencode",
+        package: "opencode-ai",
+        display: "OpenCode CLI",
+        prefer: "npm",
+    },
+    CliRecipe {
+        agent_type: "crush",
+        package: "@charmbracelet/crush",
+        display: "Charm Crush CLI",
+        prefer: "npm",
+    },
+    CliRecipe {
+        agent_type: "copilot",
+        package: "@github/copilot",
+        display: "GitHub Copilot CLI",
+        prefer: "npm",
+    },
+    CliRecipe {
+        agent_type: "aider",
+        package: "aider-chat",
+        display: "Aider (pip)",
+        prefer: "pip",
     },
 ];
 
 /// 探测可用的包管理器(npm 优先;winget 备选)。Windows 上 npm 是
 /// .cmd(Rust Command 不解析 PATHEXT,须显式 npm.cmd)。
 pub fn detect_package_manager() -> Option<(&'static str, Vec<String>)> {
-    // npm install -g <pkg>
-    let npm = if cfg!(windows) { "npm.cmd" } else { "npm" };
-    if Command::new(npm)
+    detect_manager_named("npm")
+        .or_else(|| detect_manager_named("pip"))
+        .or_else(|| detect_manager_named("winget"))
+}
+
+/// 按 manager 名探测:返回 (名, 安装基参数)。
+/// npm → install -g;pip → install;winget → install --silent。
+fn detect_manager_named(name: &str) -> Option<(&'static str, Vec<String>)> {
+    let program = match name {
+        "npm" => {
+            if cfg!(windows) {
+                "npm.cmd"
+            } else {
+                "npm"
+            }
+        }
+        "pip" => {
+            if cfg!(windows) {
+                "pip.exe"
+            } else {
+                "pip3"
+            }
+        }
+        other => other,
+    };
+    let ok = Command::new(program)
         .arg("--version")
         .output()
-        .is_ok_and(|o| o.status.success())
-    {
-        return Some(("npm", vec!["install".into(), "-g".into()]));
+        .is_ok_and(|o| o.status.success());
+    if !ok {
+        return None;
     }
-    if Command::new("winget")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
-        return Some(("winget", vec!["install".into(), "--silent".into()]));
-    }
-    None
+    let argv = match name {
+        "npm" => vec!["install".to_string(), "-g".to_string()],
+        "pip" => vec!["install".to_string()],
+        _ => vec!["install".to_string(), "--silent".to_string()],
+    };
+    Some((
+        match name {
+            "npm" => "npm",
+            "pip" => "pip",
+            _ => "winget",
+        },
+        argv,
+    ))
 }
