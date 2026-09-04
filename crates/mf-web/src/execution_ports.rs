@@ -233,7 +233,7 @@ pub fn assemble_project_execution(
     project: &ProjectStoreHandle,
     root: &Path,
 ) -> Result<(), String> {
-    assemble_project_execution_with(runtime, registry, project, root, false)
+    assemble_project_execution_with(runtime, registry, project, root, false, None)
 }
 
 /// `acceptance = true` 时实例解析使用验收 mock([`AcceptanceMockCatalog`])。
@@ -243,6 +243,7 @@ pub fn assemble_project_execution_with(
     project: &ProjectStoreHandle,
     root: &Path,
     acceptance: bool,
+    pipe_name: Option<&str>,
 ) -> Result<(), String> {
     let store = mf_agent::Store::open(&mf_agent::project_db_path(root))
         .map_err(|error| format!("打开项目库失败:{error:#}"))?;
@@ -256,7 +257,7 @@ pub fn assemble_project_execution_with(
         host,
         Arc::new(parking_lot::RwLock::new(ProfileCatalog::default())),
         mf_agent::GlobalLimiter::new(4),
-        "\\\\.\\pipe\\mf-workbench-execution".into(),
+        pipe_name.unwrap_or("mf-workbench-no-pipe").to_string(),
         directory.clone(),
     )
     .map_err(|error| format!("调度器启动失败:{error:#}"))?;

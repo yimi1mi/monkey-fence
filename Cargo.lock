@@ -1053,6 +1053,7 @@ dependencies = [
  "base64",
  "chrono",
  "hmac",
+ "log",
  "mf-agent",
  "mf-elevated",
  "mf-kernel",
@@ -1067,6 +1068,7 @@ dependencies = [
  "tokio",
  "tower",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

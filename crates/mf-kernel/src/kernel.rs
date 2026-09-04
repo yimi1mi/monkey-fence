@@ -5316,7 +5316,9 @@ pub struct LegacyKernelClient {
 }
 
 impl LegacyKernelClient {
-    pub(crate) fn new(
+    /// pub( mf-workbench 装配 RunControl 管道面用;capability 执行器
+    /// 身份固定,与 controller 轮换解耦)。
+    pub fn new(
         kernel: Arc<InProcessCoreKernel>,
         principal: Principal,
         client_id: ClientId,
