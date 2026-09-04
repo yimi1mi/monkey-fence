@@ -154,6 +154,12 @@ pub enum WorkflowRunCommand {
         settlement: mf_agent::Settlement,
         expected: WorkflowRunExpected,
     },
+    /// 激活 agent 提案的 draft revision(#89)。
+    ConfirmProposal {
+        project: ProjectStoreHandle,
+        workflow_run: WorkflowRunHandle,
+        expected: WorkflowRunExpected,
+    },
 }
 
 /// Run 命令携带 goal、回答和 Settlement 正文；这些内容可能包含用户隐私、
@@ -240,6 +246,16 @@ impl std::fmt::Debug for WorkflowRunCommand {
                 .field("agent_run", agent_run)
                 .field("settlement_kind", &settlement.kind_str())
                 .field("settlement_payload", &"<redacted>")
+                .field("expected", expected)
+                .finish(),
+            Self::ConfirmProposal {
+                project,
+                workflow_run,
+                expected,
+            } => f
+                .debug_struct("ConfirmProposal")
+                .field("project", project)
+                .field("workflow_run", workflow_run)
                 .field("expected", expected)
                 .finish(),
         }
@@ -358,6 +374,7 @@ impl WorkflowRunCommand {
             Self::SkipStep { .. } => CommandType::WorkflowSkipStep,
             Self::Respond { .. } => CommandType::WorkflowRespond,
             Self::Settle { .. } => CommandType::WorkflowSettle,
+            Self::ConfirmProposal { .. } => CommandType::WorkflowConfirmProposal,
         }
     }
 }
@@ -3374,7 +3391,8 @@ fn workflow_run_project(command: &WorkflowRunCommand) -> &ProjectStoreHandle {
         | WorkflowRunCommand::RetryStep { project, .. }
         | WorkflowRunCommand::SkipStep { project, .. }
         | WorkflowRunCommand::Respond { project, .. }
-        | WorkflowRunCommand::Settle { project, .. } => project,
+        | WorkflowRunCommand::Settle { project, .. }
+        | WorkflowRunCommand::ConfirmProposal { project, .. } => project,
     }
 }
 
@@ -3391,6 +3409,9 @@ fn workflow_run_target(command: &WorkflowRunCommand) -> Result<AggregateRef, Ker
         | WorkflowRunCommand::Respond { step, .. } => (AggregateKind::Step, step.as_str()),
         WorkflowRunCommand::Settle { agent_run, .. } => {
             (AggregateKind::AgentRun, agent_run.as_str())
+        }
+        WorkflowRunCommand::ConfirmProposal { workflow_run, .. } => {
+            (AggregateKind::WorkflowRun, workflow_run.as_str())
         }
     };
     AggregateRef::new(kind, handle.to_owned())
@@ -3442,6 +3463,11 @@ fn workflow_run_expected_revisions(
                 expected,
                 ..
             } => (workflow_run, expected, Some(step), Some(agent_run)),
+            WorkflowRunCommand::ConfirmProposal {
+                workflow_run,
+                expected,
+                ..
+            } => (workflow_run, expected, None, None),
             WorkflowRunCommand::Start { .. } => unreachable!(),
         };
         if required_step
@@ -3552,6 +3578,9 @@ pub(crate) fn workflow_run_payload(command: &WorkflowRunCommand) -> Value {
             "agent_run": agent_run.as_str(),
             "settlement": settlement,
         }),
+        WorkflowRunCommand::ConfirmProposal { workflow_run, .. } => serde_json::json!({
+            "workflow_run": workflow_run.as_str(),
+        }),
     }
 }
 
@@ -3585,6 +3614,11 @@ fn validate_workflow_run_scope_tx(
                 workflow_run,
                 expected,
                 ..
+            }
+            | WorkflowRunCommand::ConfirmProposal {
+                workflow_run,
+                expected,
+                ..
             } => (workflow_run, expected),
             WorkflowRunCommand::Start { .. } => unreachable!(),
         };
@@ -3602,7 +3636,7 @@ fn validate_workflow_run_scope_tx(
             | WorkflowRunCommand::SkipStep { step, .. }
             | WorkflowRunCommand::Respond { step, .. }
             | WorkflowRunCommand::Settle { step, .. } => Some(scope_step_id(tx, step, task_id)?),
-            WorkflowRunCommand::Cancel { .. } => None,
+            WorkflowRunCommand::Cancel { .. } | WorkflowRunCommand::ConfirmProposal { .. } => None,
             WorkflowRunCommand::Start { .. } => unreachable!(),
         };
         if let Some(step) = match command {
@@ -3610,7 +3644,7 @@ fn validate_workflow_run_scope_tx(
             | WorkflowRunCommand::SkipStep { step, .. }
             | WorkflowRunCommand::Respond { step, .. }
             | WorkflowRunCommand::Settle { step, .. } => Some(step),
-            WorkflowRunCommand::Cancel { .. } => None,
+            WorkflowRunCommand::Cancel { .. } | WorkflowRunCommand::ConfirmProposal { .. } => None,
             WorkflowRunCommand::Start { .. } => unreachable!(),
         } {
             let target = [step.as_str().to_owned()].into_iter().collect();
@@ -3645,6 +3679,9 @@ fn validate_workflow_run_scope_tx(
                     "Agent Run",
                 )?;
                 ensure_session_set_for_runs(tx, &runs, expected)?;
+            }
+            WorkflowRunCommand::ConfirmProposal { .. } => {
+                // 提案确认针对 run 级 revision;无 step/agent_run 复验
             }
             WorkflowRunCommand::RetryStep { mode, .. } => {
                 let step_id = step_id.expect("retry has step");
@@ -4208,6 +4245,21 @@ fn run_lifecycle_effect(
                 run_id: agent_run_id_tx(tx, agent_run)?,
                 settlement: settlement.clone(),
             }
+        }
+        WorkflowRunCommand::ConfirmProposal { workflow_run, .. } => {
+            if preparation != &RunPreparation::Ready {
+                return Err(CommandProblem::InvalidEnvelope(
+                    "confirm_proposal prepare 结果不匹配".into(),
+                ));
+            }
+            let task_id = tx
+                .query_row(
+                    "SELECT id FROM agent_tasks WHERE public_handle=?1",
+                    [workflow_run.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|error| CommandProblem::Internal(error.to_string()))?;
+            mf_agent::RunMutation::ConfirmProposal { task_id }
         }
     };
     let expected = workflow_run_expected_revisions(command)

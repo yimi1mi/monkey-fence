@@ -36,6 +36,12 @@ export interface RunSessionView {
   status: string;
 }
 
+export interface PendingProposalView {
+  revisionHandle: string;
+  revision: string;
+  steps: Array<{ key: string; title: string; agent: string }>;
+}
+
 export interface RunDetailView {
   workflowRun: string;
   revision: string;
@@ -49,6 +55,7 @@ export interface RunDetailView {
   agentRuns: RunAgentRunView[];
   sessions: RunSessionView[];
   focusStep: string | null;
+  pendingProposals: PendingProposalView[];
 }
 
 type Row = Record<string, unknown>;
@@ -119,6 +126,19 @@ export function runDetailViewOf(data: Row): RunDetailView {
       },
     ),
     focusStep: typeof data.focus_step === "string" ? data.focus_step : null,
+    pendingProposals: (Array.isArray(data.pending_proposals) ? data.pending_proposals : []).map(
+      (raw) => {
+        const row = raw as Row;
+        return {
+          revisionHandle: str(row.revision_handle),
+          revision: str(row.revision),
+          steps: (Array.isArray(row.steps) ? row.steps : []).map((step) => {
+            const s = step as Row;
+            return { key: str(s.key), title: str(s.title), agent: str(s.agent) };
+          }),
+        };
+      },
+    ),
   };
 }
 

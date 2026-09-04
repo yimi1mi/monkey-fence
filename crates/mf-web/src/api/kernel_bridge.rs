@@ -336,6 +336,13 @@ pub fn translate_command(command: &CommandEnvelope) -> Result<KernelCommand, Tra
             answer: payload_str(payload, "answer")?.to_string(),
             expected: workflow_expected(&command.expected)?,
         }),
+        Wire::WorkflowConfirmProposal => {
+            KernelCommand::WorkflowRun(WorkflowRunCommand::ConfirmProposal {
+                project: project_handle_of(payload_str(payload, "project_handle")?)?,
+                workflow_run: run_handle_of(&command.target.handle)?,
+                expected: workflow_expected(&command.expected)?,
+            })
+        }
         Wire::WorkflowRunSettle => KernelCommand::WorkflowRun(WorkflowRunCommand::Settle {
             project: project_handle_of(payload_str(payload, "project_handle")?)?,
             workflow_run: run_handle_of(&command.target.handle)?,

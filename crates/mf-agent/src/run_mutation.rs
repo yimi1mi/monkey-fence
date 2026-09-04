@@ -78,6 +78,10 @@ pub enum RunMutation {
         task_id: i64,
         draft: PipelineDraft,
     },
+    /// 激活 agent 提案的 draft revision(#89 提案确认面;Controller 命令)。
+    ConfirmProposal {
+        task_id: i64,
+    },
 }
 
 /// 回答明文不得进入 Debug 输出(日志/错误链会携带它);
@@ -116,6 +120,10 @@ impl std::fmt::Debug for RunMutation {
                 .debug_struct("ReportState")
                 .field("run_id", run_id)
                 .field("state", state)
+                .finish(),
+            Self::ConfirmProposal { task_id } => f
+                .debug_struct("ConfirmProposal")
+                .field("task_id", task_id)
                 .finish(),
             Self::ProposePipeline { task_id, draft } => f
                 .debug_struct("ProposePipeline")
@@ -256,5 +264,8 @@ pub enum RunMutationOutput {
     PipelineProposed {
         task: TaskView,
         revision: RevisionView,
+    },
+    ProposalConfirmed {
+        task: TaskView,
     },
 }

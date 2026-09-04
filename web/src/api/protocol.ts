@@ -27,7 +27,7 @@ export type CommandType =
   | "workflow.move_node" | "workflow.connect" | "workflow.disconnect"
   | "workflow.viewport" | "workflow.set_unsafe_parallel_policy"
   | "workflow.run.start" | "workflow.run.cancel" | "workflow.run.retry_step"
-  | "workflow.run.respond" | "workflow.run.settle"
+  | "workflow.run.respond" | "workflow.run.settle" | "workflow.confirm_proposal"
   | "session.start_preview" | "session.stop_preview"
   | "session.start_adhoc" | "session.stop_adhoc"
   | "catalog.refresh_discovery" | "catalog.provider_model_probe"

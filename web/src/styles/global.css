@@ -1478,3 +1478,29 @@ main.panes {
   flex-wrap: wrap;
   gap: 10px;
 }
+
+/* ── 提案确认卡(#89)────────────────────────────────── */
+
+.proposal-card {
+  border: 1px solid rgba(27, 127, 212, 0.35);
+  border-radius: var(--radius-sm);
+  background: var(--brand-tint);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.proposal-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.proposal-steps {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  flex: 1;
+}

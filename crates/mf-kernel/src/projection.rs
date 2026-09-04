@@ -177,6 +177,26 @@ pub struct WorkflowRunSnapshotData {
     pub needs_you_reasons: Vec<NeedsYouReasonSnapshot>,
     pub reason_count: usize,
     pub focus_step: Option<StepHandle>,
+    /// agent 经 pipeline propose 提交的待确认 draft revision(#89;
+    /// v1 additive:旧客户端忽略)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_proposals: Vec<PendingProposalSnapshot>,
+}
+
+/// 待确认提案(步骤摘要;确认走 workflow.confirm_proposal)。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PendingProposalSnapshot {
+    pub revision_handle: String,
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    pub revision: u64,
+    pub steps: Vec<PendingProposalStepSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PendingProposalStepSnapshot {
+    pub key: String,
+    pub title: String,
+    pub agent: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

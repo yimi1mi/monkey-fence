@@ -824,6 +824,35 @@ function RunDetail({
         </div>
       )}
 
+      {detail && detail.pendingProposals.length > 0 && (
+        <div className="proposal-card">
+          <div className="question-text">
+            Agent 提案了新的任务链({detail.pendingProposals.length} 个 draft revision):
+          </div>
+          {detail.pendingProposals.map((proposal) => (
+            <div key={proposal.revisionHandle} className="proposal-item">
+              <div className="proposal-steps">
+                {proposal.steps.map((step) => (
+                  <span key={step.key} className="badge tone-info">
+                    {step.title} · {step.agent}
+                  </span>
+                ))}
+              </div>
+              <button
+                className="mf-btn primary"
+                disabled={!client.isController}
+                title={client.isController ? undefined : "Observer 禁写"}
+                onClick={() =>
+                  act("workflow.confirm_proposal", { project_handle: run.projectHandle })
+                }
+              >
+                确认激活
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       {detail && <AgentRunsRow detail={detail} />}
 
       {detail && detail.steps.length > 0 && (

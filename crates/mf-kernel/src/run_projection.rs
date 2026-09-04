@@ -6,8 +6,9 @@
 use crate::handles::{AgentRunHandle, AgentSessionHandle, StepHandle, WorkflowRunHandle};
 use crate::projection::{
     AgentRunSnapshot, AgentSessionSnapshot, ExecutionLeaseSnapshot, HandoffSnapshot,
-    NeedsYouReasonSnapshot, OpenQuestionSnapshot, PendingMergeSnapshot, PipelineRevisionSnapshot,
-    ScalarRevision, WorkflowRunSnapshotData, WorkflowRunStepSnapshot,
+    NeedsYouReasonSnapshot, OpenQuestionSnapshot, PendingMergeSnapshot, PendingProposalSnapshot,
+    PendingProposalStepSnapshot, PipelineRevisionSnapshot, ScalarRevision, WorkflowRunSnapshotData,
+    WorkflowRunStepSnapshot,
 };
 use mf_agent::Store;
 use std::collections::{BTreeMap, BTreeSet};
@@ -291,5 +292,18 @@ pub(crate) fn read_workflow_run(
         needs_you_reasons,
         reason_count,
         focus_step,
+        pending_proposals: store
+            .draft_proposal_steps(task.id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(handle, revision, steps)| PendingProposalSnapshot {
+                revision_handle: handle,
+                revision: revision.max(0) as u64,
+                steps: steps
+                    .into_iter()
+                    .map(|(key, title, agent)| PendingProposalStepSnapshot { key, title, agent })
+                    .collect(),
+            })
+            .collect(),
     }))
 }

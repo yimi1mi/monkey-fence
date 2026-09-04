@@ -49,6 +49,9 @@ pub enum CommandType {
     WorkflowRunRespond,
     #[serde(rename = "workflow.run.settle")]
     WorkflowRunSettle,
+    /// 激活 agent 提案的 draft revision(#89 additive)。
+    #[serde(rename = "workflow.confirm_proposal")]
+    WorkflowConfirmProposal,
     // Agent Session(terminal attach/input 不走此入口)
     #[serde(rename = "session.start_preview")]
     SessionStartPreview,

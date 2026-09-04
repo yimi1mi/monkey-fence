@@ -1310,6 +1310,14 @@ impl Store {
                     actions: Vec::new(),
                 })
             }
+            RunMutation::ConfirmProposal { task_id } => {
+                let task = Self::activate_revision_tx(tx, task_id)?
+                    .ok_or_else(|| anyhow::anyhow!("Workflow Run {task_id} 不存在"))?;
+                Ok(RunMutationResult {
+                    output: RunMutationOutput::ProposalConfirmed { task },
+                    actions: Vec::new(),
+                })
+            }
         }
     }
 
@@ -1960,36 +1968,74 @@ impl Store {
 
     /// 激活当前 draft revision:无依赖(或依赖已满足)的 Step → ready,Task → ready。
     pub fn activate_revision(&self, task_id: i64) -> Result<Option<TaskView>> {
-        self.with_conn(|c| {
-            let ts = now();
-            let rev = c
-                .query_row(
-                    "SELECT id FROM pipeline_revisions WHERE task_id = ?1 AND status = 'draft' ORDER BY revision DESC LIMIT 1",
-                    params![task_id],
-                    |r| r.get::<_, i64>(0),
-                )
-                .optional()?;
-            let rev_id = match rev {
-                Some(r) => r,
-                None => {
-                    // 没有新草案:重复确认当前活动 revision(幂等)
-                    return Self::task_view_by_id(c, task_id);
-                }
-            };
-            c.execute(
-                "UPDATE pipeline_revisions SET status = 'superseded' WHERE task_id = ?1 AND status = 'active'",
+        self.with_conn(|c| Self::activate_revision_tx(c, task_id))
+    }
+
+    /// 激活最新 draft revision(RunMutation::ConfirmProposal 事务内复用)。
+    pub(crate) fn activate_revision_tx(c: &Connection, task_id: i64) -> Result<Option<TaskView>> {
+        let ts = now();
+        let rev = c
+            .query_row(
+                "SELECT id FROM pipeline_revisions WHERE task_id = ?1 AND status = 'draft' ORDER BY revision DESC LIMIT 1",
                 params![task_id],
-            )?;
-            c.execute(
-                "UPDATE pipeline_revisions SET status = 'active' WHERE id = ?1",
-                params![rev_id],
-            )?;
-            c.execute(
-                "UPDATE agent_tasks SET active_revision = ?2, status = 'ready', updated_at = ?3, revision = revision + 1 WHERE id = ?1",
-                params![task_id, rev_id, ts],
-            )?;
-            Self::promote_ready_tx(c, rev_id)?;
-            Self::task_view_by_id(c, task_id)
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?;
+        let rev_id = match rev {
+            Some(r) => r,
+            None => {
+                // 没有新草案:重复确认当前活动 revision(幂等)
+                return Self::task_view_by_id(c, task_id);
+            }
+        };
+        c.execute(
+            "UPDATE pipeline_revisions SET status = 'superseded' WHERE task_id = ?1 AND status = 'active'",
+            params![task_id],
+        )?;
+        c.execute(
+            "UPDATE pipeline_revisions SET status = 'active' WHERE id = ?1",
+            params![rev_id],
+        )?;
+        c.execute(
+            "UPDATE agent_tasks SET active_revision = ?2, status = 'ready', updated_at = ?3, revision = revision + 1 WHERE id = ?1",
+            params![task_id, rev_id, ts],
+        )?;
+        Self::promote_ready_tx(c, rev_id)?;
+        Self::task_view_by_id(c, task_id)
+    }
+
+    /// draft 提案摘要(#89:agent 提案在 web 运行详情可见)。
+    pub fn draft_proposal_steps(
+        &self,
+        task_id: i64,
+    ) -> Result<Vec<(String, i64, Vec<(String, String, String)>)>> {
+        self.with_conn(|c| {
+            let mut drafts: Vec<(i64, String, i64)> = Vec::new();
+            {
+                let mut stmt = c.prepare(
+                    "SELECT id, public_handle, revision FROM pipeline_revisions
+                     WHERE task_id = ?1 AND status = 'draft' ORDER BY revision",
+                )?;
+                let rows = stmt
+                    .query_map(params![task_id], |r| {
+                        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                drafts = rows;
+            }
+            let mut out = Vec::with_capacity(drafts.len());
+            for (revision_id, handle, revision) in drafts {
+                let mut stmt = c.prepare(
+                    "SELECT step_key, title, agent_profile FROM steps WHERE revision_id = ?1 ORDER BY id",
+                )?;
+                let steps = stmt
+                    .query_map(params![revision_id], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                out.push((handle, revision, steps));
+            }
+            Ok(out)
         })
     }
 
