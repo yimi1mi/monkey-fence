@@ -92,6 +92,18 @@ export class WorkbenchClient {
     return envelope.data;
   }
 
+  /** CLI 检测(#90):PATH 扫描常见 agent CLI(只读)。 */
+  async cliDetect(): Promise<Array<{ agent_type_id: string; executable: string; source: string }>> {
+    const response = await fetch("/api/v1/cli/detect", {
+      headers: { "X-Client-Id": this.context.clientId },
+    });
+    if (!response.ok) throw new ApiError(await problemOf(response));
+    const data = (await response.json()) as {
+      detected: Array<{ agent_type_id: string; executable: string; source: string }>;
+    };
+    return data.detected;
+  }
+
   /** 目录浏览:浏览起点(盘符/主目录;只读,已认证会话可用)。 */
   async fsRoots(): Promise<Array<{ path: string; name: string }>> {
     const response = await fetch("/api/v1/fs/roots", {

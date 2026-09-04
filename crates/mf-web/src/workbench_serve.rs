@@ -101,6 +101,7 @@ pub fn serve_workbench_with_hook(
         .route("/api/v1/terminal/{session}/output", get(terminal_output))
         .route("/api/v1/fs/file", get(fs_file))
         .route("/api/v1/vcs/status", get(vcs_status))
+        .route("/api/v1/cli/detect", get(cli_detect))
         .route("/api/v1/commands", post(submit_command))
         .route("/api/v1/controller/takeover", post(controller_takeover))
         .route("/api/v1/projects", post(attach_project_route))
@@ -775,6 +776,68 @@ async fn vcs_status(
         "repo": true,
         "branch": branch,
         "entries": entries,
+    });
+    let mut headers = security(&state);
+    headers.push((header_name("content-type"), "application/json".into()));
+    respond(
+        StatusCode::OK,
+        headers,
+        serde_json::to_vec(&body).unwrap_or_default(),
+    )
+}
+
+/// `GET /api/v1/cli/detect`(#90):PATH 扫描常见 agent CLI + catalog
+/// 安装记录只读合并。安装/维护写面待 cli.* 内核接管(#87)。
+async fn cli_detect(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if session_of(&state, &headers).is_none() {
+        return problem_response(&Problem::new(
+            ProblemCode::Unauthenticated,
+            "需要已认证 session",
+            None,
+        ));
+    }
+    const KNOWN: &[&str] = &[
+        "codex",
+        "claude",
+        "gemini",
+        "qwen",
+        "copilot",
+        "aider",
+        "cursor-agent",
+        "goose",
+    ];
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let mut detected: Vec<serde_json::Value> = Vec::new();
+    for name in KNOWN {
+        let hit = std::env::split_paths(&path_env).find_map(|dir| {
+            let exe = dir.join(format!("{name}.exe"));
+            if exe.is_file() {
+                Some(exe.to_string_lossy().into_owned())
+            } else {
+                let plain = dir.join(name);
+                if plain.is_file() {
+                    Some(plain.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            }
+        });
+        if let Some(executable) = hit {
+            detected.push(serde_json::json!({
+                "agent_type_id": name,
+                "executable": executable,
+                "source": "path",
+            }));
+        }
+    }
+    let body = serde_json::json!({
+        "schema": "mf.cli-detect.v1",
+        "detected": detected,
+        "maintenance": "unavailable",
+        "maintenance_reason": "cli.* 命令族待 CoreKernel 接管(#87);检测面只读",
     });
     let mut headers = security(&state);
     headers.push((header_name("content-type"), "application/json".into()));

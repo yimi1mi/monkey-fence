@@ -60,6 +60,10 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
     null,
   );
   const [terminalSession, setTerminalSession] = useState<string | null>(null);
+  const [clis, setClis] = useState<Array<{ agent_type_id: string; executable: string }>>([]);
+  useEffect(() => {
+    void client.cliDetect().then(setClis).catch(() => setClis([]));
+  }, [client]);
   const [codeBrowser, setCodeBrowser] = useState<string | null>(null);
   const [vcsRoot, setVcsRoot] = useState<string | null>(null);
   const projectionRef = useRef<ProjectionState | null>(null);
@@ -303,6 +307,7 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
             <SettingsPane
               client={client}
               view={view}
+              clis={clis}
               onBrowse={(root) => setCodeBrowser(root)}
               onVcs={(root) => setVcsRoot(root)}
               onDone={(message) => {
@@ -567,6 +572,7 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
         <CreateWorkflowModal
           client={client}
           projects={view.projects}
+          cliOptions={clis.map((cli) => cli.agent_type_id)}
           onDone={(message) => {
             setCreateOpen(false);
             setToast(message);
@@ -1146,12 +1152,14 @@ function SettleCard({
 function SettingsPane({
   client,
   view,
+  clis,
   onBrowse,
   onVcs,
   onDone,
 }: {
   client: WorkbenchClient;
   view: WorkspaceView | null;
+  clis: Array<{ agent_type_id: string; executable: string }>;
   onBrowse: (root: string) => void;
   onVcs: (root: string) => void;
   onDone: (message: string) => void;
@@ -1231,6 +1239,30 @@ function SettingsPane({
             </div>
           ) : (
             <p className="muted-note">当前没有在线项目。</p>
+          )}
+        </div>
+
+        <div className="settings-section">
+          <div className="settings-title">
+            <span>CLI 管理</span>
+          </div>
+          <p className="muted-note">
+            检测本机 PATH 中的 agent CLI;安装/更新/修复写面待内核命令族接管(深水区票)。
+          </p>
+          {clis.length > 0 ? (
+            <div className="project-admin-list">
+              {clis.map((cli) => (
+                <div key={cli.agent_type_id} className="project-admin-row">
+                  <div className="info">
+                    <span className="name">{cli.agent_type_id}</span>
+                    <span className="meta">{cli.executable}</span>
+                  </div>
+                  <span className="badge tone-ok">已检测</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="muted-note">未在 PATH 中检测到常见 agent CLI(codex/claude/gemini 等)。</p>
           )}
         </div>
 
@@ -1444,11 +1476,13 @@ function AddProjectModal({
 function CreateWorkflowModal({
   client,
   projects,
+  cliOptions,
   onDone,
   onClose,
 }: {
   client: WorkbenchClient;
   projects: ProjectView[];
+  cliOptions: string[];
   onDone: (message: string) => void;
   onClose: () => void;
 }) {
@@ -1511,10 +1545,16 @@ function CreateWorkflowModal({
           <label htmlFor="wf-agent">Agent 实例 ID</label>
           <input
             id="wf-agent"
+            list="cli-options"
             value={agentInstanceId}
-            placeholder="Agent Instance 稳定 ID(mfctl agent 查看)"
+            placeholder="选择或输入 CLI(如 codex)"
             onChange={(event) => setAgentInstanceId(event.target.value)}
           />
+          <datalist id="cli-options">
+            {cliOptions.map((option) => (
+              <option key={option} value={option} />
+            ))}
+          </datalist>
           <span className="hint">实例存在性在运行时绑定;创建时仅要求非空。</span>
         </div>
         <div className="actions">

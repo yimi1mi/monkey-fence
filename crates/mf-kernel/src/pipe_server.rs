@@ -40,8 +40,16 @@ impl PipeServer {
     /// 启动管道服务线程。令牌全局唯一;settlement 经 Core run_control
     /// 跨已登记 Project 路由；transport 不持有 Orchestrator。
     pub fn start(run_control: Option<Arc<dyn RunControl>>) -> anyhow::Result<PipeServer> {
+        Self::start_named(pipe_name_for_current_process(), run_control)
+    }
+
+    /// 机器级稳定名(#89):mf-workbench 重启后运行中 agent 的 MF_PIPE
+    /// 仍指向本管道;同机单实例由 FIRST_PIPE_INSTANCE 防抢注保证。
+    pub fn start_named(
+        name: String,
+        run_control: Option<Arc<dyn RunControl>>,
+    ) -> anyhow::Result<PipeServer> {
         let shutdown = Arc::new(AtomicBool::new(false));
-        let name = pipe_name_for_current_process();
         let flag = shutdown.clone();
         let routing = Arc::new(PipeRouting { run_control });
         std::thread::Builder::new()

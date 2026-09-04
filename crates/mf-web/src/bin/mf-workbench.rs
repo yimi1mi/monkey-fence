@@ -49,15 +49,16 @@ fn main() {
     let acceptance_mode = std::env::var("MF_WEB_ACCEPTANCE").ok().as_deref() == Some("1");
     // 管道面(动态调整 B/C):agent 经 MF_PIPE/MF_RUN_TOKEN 提交结算/
     // 状态/提案。capability 执行器身份固定,与 controller 轮换解耦。
-    let pipe_name = pipe_server::pipe_name_for_current_process();
+    let pipe_name = r"\\.\pipe\monkeyfence-mfctl".to_string();
     let run_control_client = mf_kernel::kernel::LegacyKernelClient::new(
         kernel_runtime.kernel().clone(),
         mf_kernel::handles::Principal::parse("mf-workbench-run-control").expect("principal 合法"),
         mf_kernel::handles::ClientId::parse("mf-workbench-run-control").expect("client id 合法"),
         0,
     );
-    let _pipe_server = pipe_server::PipeServer::start(Some(Arc::new(run_control_client)))
-        .expect("mfctl 管道服务启动");
+    let _pipe_server =
+        pipe_server::PipeServer::start_named(pipe_name.clone(), Some(Arc::new(run_control_client)))
+            .expect("mfctl 管道服务启动");
     println!("mf-workbench: mfctl pipe {}", pipe_name);
     let pipe_for_hook = pipe_name.clone();
     let assembler: ProjectAttachHook = Arc::new(move |project_handle, root| {
