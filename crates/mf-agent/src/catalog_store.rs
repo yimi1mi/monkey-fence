@@ -90,6 +90,20 @@ impl CatalogStore {
         Self::open(&catalog_db_path())
     }
 
+    /// 只读打开(#87 web 实例目录):READ_ONLY flags、不跑 schema
+    /// init/migration——真实 catalog 库绝不因读取被写入。库必须已
+    /// 初始化(真实库恒满足)。
+    pub fn open_read_only(path: &Path) -> Result<Arc<CatalogStore>> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .with_context(|| format!("只读打开目录库失败: {}", path.display()))?;
+        Ok(Arc::new(CatalogStore {
+            conn: Mutex::new(conn),
+        }))
+    }
+
     pub fn memory() -> Result<Arc<CatalogStore>> {
         Self::init(Connection::open_in_memory()?).map(Arc::new)
     }

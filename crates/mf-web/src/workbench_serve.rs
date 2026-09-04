@@ -116,6 +116,7 @@ pub fn serve_workbench_full(
         .route("/api/v1/fs/file", get(fs_file))
         .route("/api/v1/vcs/status", get(vcs_status))
         .route("/api/v1/cli/detect", get(cli_detect))
+        .route("/api/v1/catalog/instances", get(catalog_instances))
         .route("/api/v1/terminal/ws", get(terminal_ws))
         .route("/api/v1/commands", post(submit_command))
         .route("/api/v1/controller/takeover", post(controller_takeover))
@@ -1051,6 +1052,58 @@ async fn cli_detect(
         "detected": detected,
         "maintenance": "unavailable",
         "maintenance_reason": "cli.* 命令族待 CoreKernel 接管(#87);检测面只读",
+    });
+    let mut headers = security(&state);
+    headers.push((header_name("content-type"), "application/json".into()));
+    respond(
+        StatusCode::OK,
+        headers,
+        serde_json::to_vec(&body).unwrap_or_default(),
+    )
+}
+
+/// `GET /api/v1/catalog/instances`(#87):真实 catalog 只读实例列表
+/// (READ_ONLY 打开,绝不写入)。写面(注册/编辑)经 launcher/CLI。
+async fn catalog_instances(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if session_of(&state, &headers).is_none() {
+        return problem_response(&Problem::new(
+            ProblemCode::Unauthenticated,
+            "需要已认证 session",
+            None,
+        ));
+    }
+    let catalog = match mf_agent::CatalogStore::open_read_only(&mf_agent::catalog_db_path()) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            return problem_response(&Problem::new(
+                ProblemCode::ServiceUnavailable,
+                format!("catalog 只读打开失败:{error:#}"),
+                Some(Retry::Never),
+            ))
+        }
+    };
+    let instances = catalog
+        .list_agent_instances(None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|instance| {
+            serde_json::json!({
+                "id": instance.id,
+                "name": instance.name,
+                "agent_type": instance.agent_type,
+                "enabled": instance.enabled,
+                "version": instance.current_version,
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = serde_json::json!({
+        "schema": "mf.catalog-instances.v1",
+        "instances": instances,
+        "writable": false,
+        "write_note": "实例写面经 launcher/CLI(web 只读)",
     });
     let mut headers = security(&state);
     headers.push((header_name("content-type"), "application/json".into()));

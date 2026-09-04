@@ -92,6 +92,20 @@ export class WorkbenchClient {
     return envelope.data;
   }
 
+  /** 真实 catalog 实例列表(#87;只读)。 */
+  async catalogInstances(): Promise<
+    Array<{ id: string; name: string; agent_type: string; enabled: boolean }>
+  > {
+    const response = await fetch("/api/v1/catalog/instances", {
+      headers: { "X-Client-Id": this.context.clientId },
+    });
+    if (!response.ok) throw new ApiError(await problemOf(response));
+    const data = (await response.json()) as {
+      instances: Array<{ id: string; name: string; agent_type: string; enabled: boolean }>;
+    };
+    return data.instances;
+  }
+
   /** CLI 检测(#90):PATH 扫描常见 agent CLI(只读)。 */
   async cliDetect(): Promise<Array<{ agent_type_id: string; executable: string; source: string }>> {
     const response = await fetch("/api/v1/cli/detect", {

@@ -61,8 +61,10 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
   );
   const [terminalSession, setTerminalSession] = useState<string | null>(null);
   const [clis, setClis] = useState<Array<{ agent_type_id: string; executable: string }>>([]);
+  const [instances, setInstances] = useState<Array<{ id: string; name: string; enabled: boolean }>>([]);
   useEffect(() => {
     void client.cliDetect().then(setClis).catch(() => setClis([]));
+    void client.catalogInstances().then(setInstances).catch(() => setInstances([]));
   }, [client]);
   // #91 通知: needs-you 系统通知 + 提示音(设置开关;默认开)
   const notificationsOn = localStorage.getItem("mf.notify") !== "off";
@@ -331,6 +333,7 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
               client={client}
               view={view}
               clis={clis}
+              instances={instances}
               onBrowse={(root) => setCodeBrowser(root)}
               onVcs={(root) => setVcsRoot(root)}
               onDone={(message) => {
@@ -595,7 +598,10 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
         <CreateWorkflowModal
           client={client}
           projects={view.projects}
-          cliOptions={clis.map((cli) => cli.agent_type_id)}
+          cliOptions={[
+            ...instances.filter((i) => i.enabled).map((i) => i.id),
+            ...clis.map((cli) => cli.agent_type_id),
+          ]}
           onDone={(message) => {
             setCreateOpen(false);
             setToast(message);
@@ -1205,6 +1211,7 @@ function SettingsPane({
   client,
   view,
   clis,
+  instances,
   onBrowse,
   onVcs,
   onDone,
@@ -1212,6 +1219,7 @@ function SettingsPane({
   client: WorkbenchClient;
   view: WorkspaceView | null;
   clis: Array<{ agent_type_id: string; executable: string }>;
+  instances: Array<{ id: string; name: string; enabled: boolean }>;
   onBrowse: (root: string) => void;
   onVcs: (root: string) => void;
   onDone: (message: string) => void;
@@ -1334,6 +1342,32 @@ function SettingsPane({
             </div>
           ) : (
             <p className="muted-note">未在 PATH 中检测到常见 agent CLI(codex/claude/gemini 等)。</p>
+          )}
+        </div>
+
+        <div className="settings-section">
+          <div className="settings-title">
+            <span>Agent 实例(catalog)</span>
+          </div>
+          <p className="muted-note">
+            真实目录只读列表;节点实例下拉优先使用这些 ID。注册/编辑经 launcher/CLI(web 不写目录)。
+          </p>
+          {instances.length > 0 ? (
+            <div className="project-admin-list">
+              {instances.map((instance) => (
+                <div key={instance.id} className="project-admin-row">
+                  <div className="info">
+                    <span className="name">{instance.name}</span>
+                    <span className="meta">{instance.id}</span>
+                  </div>
+                  <span className={`badge tone-${instance.enabled ? "ok" : "dim"}`}>
+                    {instance.enabled ? "启用" : "停用"}
+                  </span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="muted-note">目录中暂无实例。</p>
           )}
         </div>
 

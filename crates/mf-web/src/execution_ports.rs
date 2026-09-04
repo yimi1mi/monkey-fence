@@ -188,6 +188,20 @@ impl WorkflowInstanceResolver for UnresolvedInstanceCatalog {
     }
 }
 
+/// 生产实例目录(#87):真实 catalog 只读解析(READ_ONLY;写面经
+/// launcher/CLI,web 不写)。引用 = Agent Instance 稳定 ID。
+struct CatalogInstanceResolver {
+    catalog: Arc<mf_agent::CatalogStore>,
+}
+
+impl WorkflowInstanceResolver for CatalogInstanceResolver {
+    fn resolve(&self, reference: &str) -> anyhow::Result<AgentInstanceSnapshot> {
+        self.catalog
+            .snapshot_agent_instance(reference, None)
+            .map_err(|error| anyhow::anyhow!("Agent Instance `{reference}` 解析失败:{error:#}"))
+    }
+}
+
 /// 验收模式实例解析:任意引用合成最小 CLI 实例(平台 shell echo)——
 /// 让启动/步骤/needs-you/结算链在无真实 agent 目录的验收环境可演示。
 /// 生产装配绝不使用。
@@ -285,7 +299,15 @@ pub fn assemble_project_execution_with(
         if acceptance {
             Arc::new(AcceptanceMockCatalog)
         } else {
-            Arc::new(UnresolvedInstanceCatalog)
+            match mf_agent::CatalogStore::open_read_only(&mf_agent::catalog_db_path()) {
+                Ok(catalog) => Arc::new(CatalogInstanceResolver { catalog }),
+                Err(error) => {
+                    // 目录不可用不阻断装配:启动含 Agent 节点的 run 时
+                    // 才 fail-closed(与 Unresolved 同语义,错误更明确)
+                    log::warn!("catalog 只读打开失败,实例解析 fail-closed:{error:#}");
+                    Arc::new(UnresolvedInstanceCatalog)
+                }
+            }
         },
         &directory,
         None,
