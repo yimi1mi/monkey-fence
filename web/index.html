@@ -11,7 +11,29 @@
         background: #ffffff;
         color-scheme: light;
       }
+      html[data-theme="dark"],
+      html[data-theme="dark"] body {
+        background: #0e1014;
+        color-scheme: dark;
+      }
     </style>
+    <script>
+      // 预上色:首帧前应用持久化/系统主题,防止闪色
+      (function () {
+        try {
+          var stored = localStorage.getItem("mf.theme");
+          var theme =
+            stored === "light" || stored === "dark"
+              ? stored
+              : window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "dark"
+                : "light";
+          document.documentElement.dataset.theme = theme;
+        } catch (error) {
+          document.documentElement.dataset.theme = "light";
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="workbench"></div>

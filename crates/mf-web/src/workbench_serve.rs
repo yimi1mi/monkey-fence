@@ -76,6 +76,8 @@ pub fn serve_workbench(
         .route("/api/v1/controller/takeover", post(controller_takeover))
         .route("/api/v1/projects", post(attach_project_route))
         .route("/api/v1/projects/{handle}", delete(detach_project_route))
+        .route("/api/v1/fs/roots", get(fs_roots))
+        .route("/api/v1/fs/dirs", get(fs_dirs))
         .route("/api/v1/events", get(events_ws))
         .route("/acceptance/new-nonce", post(acceptance_new_nonce))
         .route("/assets/{*path}", get(asset))
@@ -500,6 +502,171 @@ async fn submit_command(
 #[derive(serde::Deserialize)]
 struct TakeoverRequest {
     last_observed_epoch: String,
+}
+
+// ---------------------------------------------------------------------------
+// 目录浏览(#73):添加项目的浏览选择面。只读、仅目录名;已认证会话
+// 可用(挂载仍需 Controller)。
+// ---------------------------------------------------------------------------
+
+/// 单个目录的可见性过滤:隐藏/系统目录不进入浏览面。
+fn browsable_dir_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        !name.starts_with('.')
+    }
+    #[cfg(windows)]
+    {
+        !(name.starts_with('$')
+            || name.starts_with('.')
+            || name.eq_ignore_ascii_case("System Volume Information")
+            || name.eq_ignore_ascii_case("Config.Msi")
+            || name.eq_ignore_ascii_case("Recovery")
+            || name.eq_ignore_ascii_case("PerfLogs"))
+    }
+}
+
+#[derive(serde::Serialize)]
+struct FsEntryWire {
+    path: String,
+    name: String,
+}
+
+#[derive(serde::Serialize)]
+struct FsDirsWire {
+    path: String,
+    parent: Option<String>,
+    dirs: Vec<FsEntryWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn parent_of(path: &std::path::Path) -> Option<String> {
+    path.parent()
+        .filter(|p| p.as_os_str() != std::ffi::OsStr::new(""))
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// `GET /api/v1/fs/dirs?path=…`:列子目录(仅目录名,上限 500;
+/// 无权限/不存在 → 200 + error 字段,UI 原地提示)。
+async fn fs_dirs(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if session_of(&state, &headers).is_none() {
+        return problem_response(&Problem::new(
+            ProblemCode::Unauthenticated,
+            "目录浏览需要已认证 session",
+            None,
+        ))
+        .into_response();
+    }
+    let raw = query.get("path").cloned().unwrap_or_default();
+    if raw.trim().is_empty() {
+        return problem_response(&Problem::new(
+            ProblemCode::InvalidEnvelope,
+            "缺少 path 查询参数",
+            Some(Retry::Never),
+        ))
+        .into_response();
+    }
+    let path = std::path::PathBuf::from(&raw);
+    let mut dirs = Vec::new();
+    let mut error = None;
+    match std::fs::read_dir(&path) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !browsable_dir_name(&name) {
+                    continue;
+                }
+                dirs.push(FsEntryWire {
+                    path: entry.path().to_string_lossy().into_owned(),
+                    name,
+                });
+                if dirs.len() >= 500 {
+                    break;
+                }
+            }
+            dirs.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        }
+        Err(err) => {
+            error = Some(format!("无法读取目录:{err}"));
+        }
+    }
+    let wire = FsDirsWire {
+        path: path.to_string_lossy().into_owned(),
+        parent: parent_of(&path),
+        dirs,
+        error,
+    };
+    let mut headers = security(&state);
+    headers.push((header_name("content-type"), "application/json".into()));
+    respond(
+        StatusCode::OK,
+        headers,
+        serde_json::to_vec(&wire).unwrap_or_default(),
+    )
+    .into_response()
+}
+
+/// `GET /api/v1/fs/roots`:浏览起点(盘符 + 用户主目录)。
+async fn fs_roots(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if session_of(&state, &headers).is_none() {
+        return problem_response(&Problem::new(
+            ProblemCode::Unauthenticated,
+            "目录浏览需要已认证 session",
+            None,
+        ))
+        .into_response();
+    }
+    let mut roots = Vec::new();
+    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
+        roots.push(FsEntryWire {
+            name: "主目录".into(),
+            path: home.clone(),
+        });
+        let desktop = std::path::PathBuf::from(&home).join("Desktop");
+        if desktop.is_dir() {
+            roots.push(FsEntryWire {
+                name: "桌面".into(),
+                path: desktop.to_string_lossy().into_owned(),
+            });
+        }
+    }
+    #[cfg(windows)]
+    for letter in b'A'..=b'Z' {
+        let drive = format!("{}:\\", letter as char);
+        if std::path::Path::new(&drive).is_dir() {
+            roots.push(FsEntryWire {
+                name: format!("{} 盘", letter as char),
+                path: drive,
+            });
+        }
+    }
+    #[cfg(unix)]
+    roots.push(FsEntryWire {
+        name: "根目录".into(),
+        path: "/".into(),
+    });
+    let mut headers = security(&state);
+    headers.push((header_name("content-type"), "application/json".into()));
+    respond(
+        StatusCode::OK,
+        headers,
+        serde_json::to_vec(&serde_json::json!({ "roots": roots })).unwrap_or_default(),
+    )
+    .into_response()
 }
 
 /// `GET /auth/session`:刷新续用探测——服务端权威回报当前角色与
@@ -1082,6 +1249,42 @@ mod tests {
         let handle = state.kernel.attach_project(tmp.path()).unwrap();
         assert!(handle.starts_with("proj_"));
         state.kernel.detach_project(&handle).unwrap();
+    }
+
+    #[test]
+    fn fs_browsing_filters_hidden_and_reports_parent() {
+        // 过滤规则:隐藏/系统目录不进入浏览面
+        assert!(!browsable_dir_name(""));
+        assert!(!browsable_dir_name(".hidden"));
+        assert!(!browsable_dir_name("$RECYCLE.BIN"));
+        assert!(!browsable_dir_name("System Volume Information"));
+        assert!(browsable_dir_name("workspace"));
+        assert!(browsable_dir_name("我的项目"));
+
+        // parent 语义:根/盘符无 parent,子目录有
+        assert_eq!(parent_of(std::path::Path::new("C:\\")), None);
+        let parent = parent_of(std::path::Path::new("C:\\Users\\dev"));
+        assert_eq!(parent.as_deref(), Some("C:\\Users"));
+    }
+
+    #[test]
+    fn fs_dirs_listing_only_contains_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("alpha")).unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join("file.txt"), "x").unwrap();
+        // 直接复用 handler 的核心读取逻辑(read_dir + 过滤)
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(tmp.path()).unwrap().flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if browsable_dir_name(&name) {
+                names.push(name);
+            }
+        }
+        assert_eq!(names, vec!["alpha".to_string()], "文件与隐藏目录被过滤");
     }
 
     #[test]

@@ -78,6 +78,28 @@ export class WorkbenchClient {
     return (await response.json()) as CommandOutcomeWire;
   }
 
+  /** 目录浏览:浏览起点(盘符/主目录;只读,已认证会话可用)。 */
+  async fsRoots(): Promise<Array<{ path: string; name: string }>> {
+    const response = await fetch("/api/v1/fs/roots", {
+      headers: { "X-Client-Id": this.context.clientId },
+    });
+    if (!response.ok) throw new ApiError(await problemOf(response));
+    const data = (await response.json()) as { roots: Array<{ path: string; name: string }> };
+    return data.roots;
+  }
+
+  /** 目录浏览:列子目录(仅目录名;无权限时 error 字段说明)。 */
+  async fsDirs(
+    path: string,
+  ): Promise<{ path: string; parent: string | null; dirs: Array<{ path: string; name: string }>; error?: string }> {
+    const response = await fetch(
+      `/api/v1/fs/dirs?path=${encodeURIComponent(path)}`,
+      { headers: { "X-Client-Id": this.context.clientId } },
+    );
+    if (!response.ok) throw new ApiError(await problemOf(response));
+    return await response.json();
+  }
+
   /** 挂载项目目录(多项目入口;Controller-only)。 */
   async attachProject(path: string): Promise<{ project: string; display_name: string }> {
     const response = await fetch("/api/v1/projects", {

@@ -9,6 +9,7 @@ import { ApiError, type WorkbenchClient } from "../api/client.ts";
 import { EventSocket } from "../api/events.ts";
 import { storeSession } from "../api/session.ts";
 import { uuidv7 } from "../api/uuid.ts";
+import { applyTheme, currentTheme, toggleTheme } from "../api/theme.ts";
 import {
   reduceEvents,
   reduceSnapshot,
@@ -40,6 +41,7 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
   const [wsOpen, setWsOpen] = useState(false);
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [theme, setTheme] = useState(currentTheme());
   const projectionRef = useRef<ProjectionState | null>(null);
   const socketStarted = useRef(false);
 
@@ -161,6 +163,16 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
           </button>
         </nav>
         <span className="header-space" />
+        <button
+          className="mf-btn ghost theme-toggle"
+          title={theme === "dark" ? "切换到亮色" : "切换到深色"}
+          onClick={() => {
+            applyTheme(toggleTheme());
+            setTheme(currentTheme());
+          }}
+        >
+          {theme === "dark" ? "☀" : "☾"}
+        </button>
         <span role="status" className={`chip ${connection === "live" ? "live" : "reconnecting"}`}>
           <span className="dot" />
           {connection === "live" ? "已连接" : "重连中…"}
@@ -667,7 +679,9 @@ function SettingsPane({
   );
 }
 
-/** 添加项目弹层:输入本机目录绝对路径 → attach_project。 */
+/** 添加项目弹层(#73):服务端目录浏览选择(浏览器沙箱拿不到真实
+ * 路径,原生 showDirectoryPicker 不可用)。面包屑 + 目录列表 +
+ * 上级 + 快速入口;选中仍走 POST /api/v1/projects。 */
 function AddProjectModal({
   client,
   onDone,
@@ -677,8 +691,52 @@ function AddProjectModal({
   onDone: (message: string) => void;
   onClose: () => void;
 }) {
-  const [path, setPath] = useState("");
+  const [current, setCurrent] = useState<{ path: string; parent: string | null } | null>(null);
+  const [dirs, setDirs] = useState<Array<{ path: string; name: string }>>([]);
+  const [roots, setRoots] = useState<Array<{ path: string; name: string }>>([]);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [filter, setFilter] = useState("");
+
+  const enter = useCallback(
+    async (path: string) => {
+      setLoading(true);
+      setError(null);
+      try {
+        const listing = await client.fsDirs(path);
+        setCurrent({ path: listing.path, parent: listing.parent });
+        setDirs(listing.dirs);
+        if (listing.error) setError(listing.error);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [client],
+  );
+
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const list = await client.fsRoots();
+        if (cancelled) return;
+        setRoots(list);
+        const home = list.find((r) => r.name === "主目录") ?? list[0];
+        if (home) void enter(home.path);
+      } catch {
+        if (!cancelled) setError("无法获取浏览起点");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [client, enter]);
+
+  const segments = current ? current.path.split(/[\\/]+/).filter(Boolean) : [];
+
   return (
     <div
       className="scrim"
@@ -686,43 +744,105 @@ function AddProjectModal({
         if (event.target === event.currentTarget) onClose();
       }}
     >
-      <div className="modal" role="dialog" aria-modal="true" aria-label="添加项目">
+      <div className="modal folder-modal" role="dialog" aria-modal="true" aria-label="选择项目目录">
         <h3>
           <span className="mark">＋</span>添加项目
         </h3>
-        <div className="field">
-          <label htmlFor="proj-path">项目目录(绝对路径)</label>
-          <input
-            id="proj-path"
-            value={path}
-            placeholder="如 D:\workspace\my-project"
-            onChange={(event) => setPath(event.target.value)}
-          />
-          <span className="hint">
-            目录必须已存在;Core 将在其中初始化/复用 .mf-agent/workflow-v1.db。同一目录重复添加幂等。
-          </span>
+
+        <div className="folder-quick">
+          {roots.map((root) => (
+            <button
+              key={root.path}
+              className={"mf-btn ghost" + (current?.path === root.path ? " active" : "")}
+              onClick={() => void enter(root.path)}
+            >
+              {root.name}
+            </button>
+          ))}
         </div>
+
+        <div className="folder-breadcrumb" aria-label="当前路径">
+          <button
+            className="crumb"
+            disabled={!current?.parent}
+            onClick={() => current?.parent && void enter(current.parent)}
+            title="上一级"
+          >
+            ↑
+          </button>
+          {segments.map((segment, index) => {
+            const target = segments.slice(0, index + 1).join("/");
+            const isLast = index === segments.length - 1;
+            return (
+              <span key={target} className="crumb-seg">
+                <button
+                  className="crumb"
+                  onClick={() => !isLast && void enter(index === 0 ? `${segment}/` : target)}
+                >
+                  {segment}
+                </button>
+                {!isLast && <span className="crumb-sep">/</span>}
+              </span>
+            );
+          })}
+          {loading && <span className="crumb-loading">读取中…</span>}
+        </div>
+
+        {dirs.length > 12 && (
+          <div className="field folder-filter">
+            <input
+              value={filter}
+              placeholder="过滤当前目录…"
+              onChange={(event) => setFilter(event.target.value)}
+              aria-label="过滤目录名"
+            />
+          </div>
+        )}
+
+        <div className="folder-list" role="listbox" aria-label="子目录">
+          {dirs.length === 0 && !loading && (
+            <p className="muted-note">{error ?? "此目录下没有可浏览的子目录。"}</p>
+          )}
+          {dirs
+            .filter((dir) => !filter || dir.name.toLowerCase().includes(filter.toLowerCase()))
+            .map((dir) => (
+            <button
+              key={dir.path}
+              className="folder-item"
+              onDoubleClick={() => void enter(dir.path)}
+              onClick={() => void enter(dir.path)}
+            >
+              <span className="folder-icon">▸</span>
+              {dir.name}
+            </button>
+          ))}
+        </div>
+        {error && dirs.length > 0 && <p className="muted-note">{error}</p>}
+
+        <p className="muted-note">
+          选中「选择此文件夹」挂载当前目录;Core 将在其中初始化/复用 .mf-agent 存储,同一目录重复添加幂等。
+        </p>
+
         <div className="actions">
           <button className="mf-btn ghost" onClick={onClose}>
             取消
           </button>
           <button
             className="mf-btn primary"
-            disabled={path.trim().length === 0 || busy}
+            disabled={!current || busy}
             onClick={async () => {
+              if (!current) return;
               setBusy(true);
               try {
-                const result = await client.attachProject(path.trim());
+                const result = await client.attachProject(current.path);
                 onDone(`项目「${result.display_name}」已挂载`);
-              } catch (error) {
+              } catch (err) {
                 setBusy(false);
-                onDone(
-                  `挂载失败:${error instanceof Error ? error.message : String(error)}`,
-                );
+                setError(err instanceof Error ? err.message : String(err));
               }
             }}
           >
-            {busy ? "挂载中…" : "挂载"}
+            {busy ? "挂载中…" : "选择此文件夹"}
           </button>
         </div>
       </div>
