@@ -17,6 +17,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::Router;
+use base64::Engine as _;
 use parking_lot::Mutex;
 
 use crate::api::commands::{CommandEnvelope, CommandOutcomeWire};
@@ -97,6 +98,7 @@ pub fn serve_workbench_with_hook(
             "/api/v1/snapshots/workflow/{project}/{workflow}",
             get(workflow_snapshot),
         )
+        .route("/api/v1/terminal/{session}/output", get(terminal_output))
         .route("/api/v1/commands", post(submit_command))
         .route("/api/v1/controller/takeover", post(controller_takeover))
         .route("/api/v1/projects", post(attach_project_route))
@@ -581,6 +583,73 @@ async fn workflow_run_snapshot(
         Err(problem) => problem_response(&Problem::new(
             ProblemCode::ResourceNotFound,
             problem.to_string(),
+            Some(Retry::Never),
+        )),
+    }
+}
+
+/// `GET /api/v1/terminal/{session}/output?after=N`:只读终端输出增量
+/// (#77 v1;MFT1 writer 输入面待完整 WS 票)。frames 为 [seq, base64]。
+async fn terminal_output(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    axum::extract::Path(session): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if session_of(&state, &headers).is_none() {
+        return problem_response(&Problem::new(
+            ProblemCode::Unauthenticated,
+            "需要已认证 session",
+            None,
+        ));
+    }
+    let after: u64 = query.get("after").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let handle = mf_kernel::handles::SessionHandle::try_from(
+        session
+            .strip_prefix("sess_")
+            .unwrap_or(&session)
+            .to_string(),
+    );
+    let Ok(handle) = handle else {
+        return problem_response(&Problem::new(
+            ProblemCode::ResourceNotFound,
+            "session handle 非法",
+            Some(Retry::Never),
+        ));
+    };
+    let attach = mf_kernel::kernel::TerminalAttach { after_seq: after };
+    match state.kernel.attach_terminal(handle, attach) {
+        Ok(channel) => {
+            let facts = channel.output_facts().ok();
+            let alive = channel.is_alive();
+            let frames = channel
+                .replay_output(after)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|chunk| {
+                    (
+                        chunk.seq,
+                        base64::engine::general_purpose::STANDARD.encode(chunk.bytes.as_ref()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let body = serde_json::json!({
+                "schema": "mf.terminal-output.v1",
+                "alive": alive,
+                "last_seq": facts.as_ref().map(|f| f.last_seq.to_string()),
+                "frames": frames,
+            });
+            let mut headers = security(&state);
+            headers.push((header_name("content-type"), "application/json".into()));
+            respond(
+                StatusCode::OK,
+                headers,
+                serde_json::to_vec(&body).unwrap_or_default(),
+            )
+        }
+        Err(problem) => problem_response(&Problem::new(
+            ProblemCode::ResourceNotFound,
+            format!("终端附着失败:{problem}"),
             Some(Retry::Never),
         )),
     }

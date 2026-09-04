@@ -25,6 +25,7 @@ import {
 } from "./run_detail.ts";
 import type { CommandType } from "../api/protocol.ts";
 import { WorkflowEditor } from "./workflow_editor.tsx";
+import { TerminalPanel } from "./terminal_panel.tsx";
 import {
   activeRunsAcross,
   runIsActive,
@@ -54,6 +55,7 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
   const [editing, setEditing] = useState<{ project: ProjectView; workflow: WorkflowView } | null>(
     null,
   );
+  const [terminalSession, setTerminalSession] = useState<string | null>(null);
   const projectionRef = useRef<ProjectionState | null>(null);
   const socketStarted = useRef(false);
 
@@ -414,6 +416,7 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
               <RunDetail
                 run={selected}
                 client={client}
+                onTerminal={setTerminalSession}
                 onAction={(message) => {
                   setToast(message);
                   void refresh();
@@ -500,6 +503,9 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
         </aside>
       </main>
 
+      {terminalSession && (
+        <TerminalPanel sessionHandle={terminalSession} onClose={() => setTerminalSession(null)} />
+      )}
       {toast && (
         <div role="alert" className="toast" onClick={() => setToast(null)}>
           {toast}
@@ -626,10 +632,12 @@ function RunCard({
 function RunDetail({
   run,
   client,
+  onTerminal,
   onAction,
 }: {
   run: RunView;
   client: WorkbenchClient;
+  onTerminal: (sessionHandle: string) => void;
   onAction: (message: string) => void;
 }) {
   const meta = runStatusMeta(run.status);
@@ -742,6 +750,21 @@ function RunDetail({
           </>
         )}
       </dl>
+
+      {detail && detail.sessions.length > 0 && (
+        <div className="session-row">
+          {detail.sessions.map((session) => (
+            <button
+              key={session.agentSession}
+              className="mf-btn ghost"
+              onClick={() => onTerminal(session.agentSession)}
+              title={`${session.title} · ${session.runtime}`}
+            >
+              ▶ 终端 {session.title.slice(0, 14)}
+            </button>
+          ))}
+        </div>
+      )}
 
       {detail && detail.steps.length > 0 && (
         <div className="step-timeline">
