@@ -72,6 +72,10 @@ pub fn serve_workbench(
         .route("/auth/exchange", post(auth_exchange))
         .route("/auth/session", get(auth_session))
         .route("/api/v1/snapshots/workspace", get(workspace_snapshot))
+        .route(
+            "/api/v1/snapshots/workflow-run/{project}/{run}",
+            get(workflow_run_snapshot),
+        )
         .route("/api/v1/commands", post(submit_command))
         .route("/api/v1/controller/takeover", post(controller_takeover))
         .route("/api/v1/projects", post(attach_project_route))
@@ -496,6 +500,60 @@ async fn submit_command(
             )
         }
         Err(problem) => problem_response(&problem),
+    }
+}
+
+/// `GET /api/v1/snapshots/workflow-run/{project}/{run}`:单次运行的权威
+/// 详情(steps/questions/agent_runs/sessions;#74 响应链的数据面)。
+async fn workflow_run_snapshot(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    axum::extract::Path((project, run)): axum::extract::Path<(String, String)>,
+) -> impl IntoResponse {
+    if session_of(&state, &headers).is_none() {
+        return problem_response(&Problem::new(
+            ProblemCode::Unauthenticated,
+            "需要已认证 session",
+            None,
+        ));
+    }
+    let Ok(project) = mf_kernel::handles::ProjectStoreHandle::parse(&project) else {
+        return problem_response(&Problem::new(
+            ProblemCode::ResourceNotFound,
+            "project handle 非法",
+            Some(Retry::Never),
+        ));
+    };
+    let Ok(run) =
+        mf_kernel::handles::WorkflowRunHandle::parse(run.strip_prefix("run_").unwrap_or(&run))
+    else {
+        return problem_response(&Problem::new(
+            ProblemCode::ResourceNotFound,
+            "workflow run handle 非法",
+            Some(Retry::Never),
+        ));
+    };
+    match state
+        .kernel
+        .snapshot(mf_kernel::projection::SnapshotQuery::WorkflowRun {
+            project,
+            workflow_run: run,
+        }) {
+        Ok(envelope) => {
+            let wire = snapshot_to_wire(envelope);
+            let mut headers = security(&state);
+            headers.push((header_name("content-type"), "application/json".into()));
+            respond(
+                StatusCode::OK,
+                headers,
+                serde_json::to_vec(&wire).unwrap_or_default(),
+            )
+        }
+        Err(problem) => problem_response(&Problem::new(
+            ProblemCode::ResourceNotFound,
+            problem.to_string(),
+            Some(Retry::Never),
+        )),
     }
 }
 

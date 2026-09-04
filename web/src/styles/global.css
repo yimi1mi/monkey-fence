@@ -1226,3 +1226,84 @@ main.panes {
   padding: 6px 10px;
   font-size: 12.5px;
 }
+
+/* ── 运行步骤时间线与响应卡(#74)────────────────────────── */
+
+.step-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.step-item {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  background: var(--bg-soft);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.step-item.tone-warn {
+  border-color: rgba(217, 119, 6, 0.35);
+}
+
+.step-item.tone-bad {
+  border-color: rgba(220, 38, 38, 0.35);
+}
+
+.step-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.step-title {
+  font-size: 13px;
+  font-weight: 550;
+}
+
+.question-card {
+  border: 1px solid rgba(217, 119, 6, 0.3);
+  border-radius: var(--radius-sm);
+  background: var(--warn-tint);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.question-text {
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.question-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.question-actions input {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  padding: 6px 10px;
+  outline: none;
+}
+
+.question-actions input:focus {
+  border-color: rgba(27, 127, 212, 0.55);
+}
+
+.question-actions .mf-btn {
+  padding: 5px 14px;
+  font-size: 12px;
+  white-space: nowrap;
+}

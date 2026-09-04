@@ -18,6 +18,13 @@ import {
 } from "../state/reducer.ts";
 import { workflowCreateCommand } from "../state/workflow_commands.ts";
 import {
+  agentRunOfStep,
+  runDetailViewOf,
+  runActionCommand,
+  type RunDetailView,
+} from "./run_detail.ts";
+import type { CommandType } from "../api/protocol.ts";
+import {
   activeRunsAcross,
   runIsActive,
   runStatusMeta,
@@ -343,7 +350,14 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
           </div>
           <div className="inspector-body">
             {selected ? (
-              <RunDetail run={selected} />
+              <RunDetail
+                run={selected}
+                client={client}
+                onAction={(message) => {
+                  setToast(message);
+                  void refresh();
+                }}
+              />
             ) : (
               <p className="muted-note">选择一个运行查看详情。</p>
             )}
@@ -533,8 +547,62 @@ function RunCard({
   );
 }
 
-function RunDetail({ run }: { run: RunView }) {
+function RunDetail({
+  run,
+  client,
+  onAction,
+}: {
+  run: RunView;
+  client: WorkbenchClient;
+  onAction: (message: string) => void;
+}) {
   const meta = runStatusMeta(run.status);
+  const [detail, setDetail] = useState<RunDetailView | null>(null);
+
+  // 选中运行时拉取权威详情(轮询由外层 refresh 触发重拉)
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const data = await client.workflowRunSnapshot(run.projectHandle, run.handle);
+        if (!cancelled) setDetail(runDetailViewOf(data));
+      } catch {
+        /* 详情拉取失败时保留摘要;动作面不可用 */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [client, run.handle, run.projectHandle, run.revision]);
+
+  const act = useCallback(
+    async (type: CommandType, payload: Record<string, unknown>) => {
+      if (!detail) return;
+      try {
+        await client.command(
+          runActionCommand({
+            commandId: uuidv7(),
+            clientId: client.clientId,
+            controllerLeaseEpoch: client.leaseEpoch,
+            runHandle: run.handle,
+            runRevision: detail.revision,
+            type,
+            payload,
+          }),
+        );
+        onAction("已提交");
+      } catch (error) {
+        const code = error instanceof ApiError ? error.problem.code : null;
+        if (code === "controller_required" || code === "controller_lease_expired") {
+          location.reload();
+          return;
+        }
+        onAction(`操作失败:${error instanceof Error ? error.message : String(error)}`);
+      }
+    },
+    [client, detail, onAction, run.handle],
+  );
+
   return (
     <>
       <div>
@@ -569,7 +637,140 @@ function RunDetail({ run }: { run: RunView }) {
           </>
         )}
       </dl>
+
+      {detail && detail.steps.length > 0 && (
+        <div className="step-timeline">
+          {detail.steps.map((step) => {
+            const question = detail.questions.find((q) => q.step === step.step) ?? null;
+            const stepMeta = stepStatusMeta(step.status);
+            return (
+              <div key={step.step} className={`step-item tone-${stepMeta.tone}`}>
+                <div className="step-head">
+                  <span className={`badge tone-${stepMeta.tone}`}>{stepMeta.label}</span>
+                  <span className="step-title">{step.title}</span>
+                </div>
+                {question && (
+                  <QuestionCard question={question} onAnswer={(answer) => act("workflow.run.respond", { step_handle: step.step, answer })} />
+                )}
+                {step.status === "awaiting-outcome" && (
+                  <SettleCard
+                    disabled={!client.isController || agentRunOfStep(detail, step.step) === null}
+                    onSettle={(kind, text) =>
+                      act("workflow.run.settle", {
+                        step_handle: step.step,
+                        agent_run_handle: agentRunOfStep(detail, step.step),
+                        settlement:
+                          kind === "complete"
+                            ? { kind: "complete", summary: text }
+                            : { kind: "fail", reason: text },
+                      })
+                    }
+                  />
+                )}
+                {step.status === "failed" && client.isController && (
+                  <button className="mf-btn ghost" onClick={() => act("workflow.run.retry_step", { step_handle: step.step, mode: "fresh_session" })}>
+                    重试(新会话)
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </>
+  );
+}
+
+/** 步骤状态元数据(StepStatus str_enum 的中文标签)。 */
+function stepStatusMeta(status: string): { label: string; tone: string } {
+  const table: Record<string, { label: string; tone: string }> = {
+    pending: { label: "等待依赖", tone: "dim" },
+    ready: { label: "就绪", tone: "info" },
+    running: { label: "执行中", tone: "live" },
+    "awaiting-outcome": { label: "待结算", tone: "warn" },
+    "needs-input": { label: "等待输入", tone: "warn" },
+    succeeded: { label: "成功", tone: "ok" },
+    failed: { label: "失败", tone: "bad" },
+    blocked: { label: "被阻塞", tone: "dim" },
+    skipped: { label: "已跳过", tone: "dim" },
+    cancelled: { label: "已取消", tone: "dim" },
+  };
+  return table[status] ?? { label: status, tone: "dim" };
+}
+
+function QuestionCard({
+  question,
+  onAnswer,
+}: {
+  question: { question: string };
+  onAnswer: (answer: string) => void;
+}) {
+  const [answer, setAnswer] = useState("");
+  const [busy, setBusy] = useState(false);
+  return (
+    <div className="question-card">
+      <div className="question-text">{question.question}</div>
+      <div className="question-actions">
+        <input
+          value={answer}
+          placeholder="输入回答…"
+          onChange={(event) => setAnswer(event.target.value)}
+        />
+        <button
+          className="mf-btn primary"
+          disabled={answer.trim().length === 0 || busy}
+          onClick={() => {
+            setBusy(true);
+            onAnswer(answer.trim());
+          }}
+        >
+          回答
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function SettleCard({
+  disabled,
+  onSettle,
+}: {
+  disabled: boolean;
+  onSettle: (kind: "complete" | "fail", text: string) => void;
+}) {
+  const [text, setText] = useState("");
+  const [busy, setBusy] = useState(false);
+  return (
+    <div className="question-card">
+      <div className="question-text">该步骤在等待结算(exit/idle 都不是结算——由你判定)。</div>
+      <div className="question-actions">
+        <input
+          value={text}
+          placeholder={text === "" ? "总结(可选)" : "总结"}
+          onChange={(event) => setText(event.target.value)}
+        />
+        <button
+          className="mf-btn primary"
+          disabled={busy}
+          onClick={() => {
+            setBusy(true);
+            onSettle("complete", text.trim() || "完成");
+          }}
+        >
+          结算成功
+        </button>
+        <button
+          className="mf-btn danger"
+          disabled={busy}
+          onClick={() => {
+            setBusy(true);
+            onSettle("fail", text.trim() || "未说明原因");
+          }}
+        >
+          结算失败
+        </button>
+      </div>
+    </div>
   );
 }
 

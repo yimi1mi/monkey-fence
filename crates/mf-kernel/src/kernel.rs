@@ -4153,6 +4153,26 @@ fn run_lifecycle_effect(
                 ));
             }
             let step_id = step_id_tx(tx, step)?;
+            // 哨兵 0:web facade 不携带 Project Store rowid;按 step 解析
+            // 唯一 open question(数量≠1 → fail-closed,与显式 id 语义同严)。
+            let question_id = if *question_id <= 0 {
+                let open: Vec<i64> = tx
+                    .prepare("SELECT id FROM step_questions WHERE step_id=?1 AND status='open'")
+                    .and_then(|mut stmt| {
+                        stmt.query_map([step_id], |row| row.get::<_, i64>(0))?
+                            .collect()
+                    })
+                    .map_err(|error| CommandProblem::Internal(error.to_string()))?;
+                if open.len() != 1 {
+                    return Err(CommandProblem::InvalidEnvelope(format!(
+                        "目标 Step 的 open question 数量为 {},须恰好一个才能匿名应答",
+                        open.len()
+                    )));
+                }
+                open[0]
+            } else {
+                *question_id
+            };
             let question_step_id = tx
                 .query_row(
                     "SELECT step_id FROM step_questions WHERE id=?1 AND status='open'",
@@ -4170,7 +4190,7 @@ fn run_lifecycle_effect(
                 ));
             }
             mf_agent::RunMutation::Respond {
-                question_id: *question_id,
+                question_id,
                 answer: answer.clone(),
             }
         }

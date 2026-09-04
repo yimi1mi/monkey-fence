@@ -78,6 +78,20 @@ export class WorkbenchClient {
     return (await response.json()) as CommandOutcomeWire;
   }
 
+  /** 单次运行权威详情(steps/questions/agent_runs/sessions;#74)。 */
+  async workflowRunSnapshot(
+    projectHandle: string,
+    runHandle: string,
+  ): Promise<Record<string, unknown>> {
+    const response = await fetch(
+      `/api/v1/snapshots/workflow-run/${encodeURIComponent(projectHandle)}/${encodeURIComponent(runHandle)}`,
+      { headers: { "X-Client-Id": this.context.clientId } },
+    );
+    if (!response.ok) throw new ApiError(await problemOf(response));
+    const envelope = (await response.json()) as { data: Record<string, unknown> };
+    return envelope.data;
+  }
+
   /** 目录浏览:浏览起点(盘符/主目录;只读,已认证会话可用)。 */
   async fsRoots(): Promise<Array<{ path: string; name: string }>> {
     const response = await fetch("/api/v1/fs/roots", {

@@ -128,6 +128,49 @@ fn run_handle_of(handle: &str) -> Result<mf_kernel::handles::WorkflowRunHandle, 
         .map_err(|e| TranslateError::new(ProblemCode::ResourceNotFound, e.to_string()))
 }
 
+fn step_handle_of(handle: &str) -> Result<mf_kernel::handles::StepHandle, TranslateError> {
+    mf_kernel::handles::StepHandle::parse(strip_wire_prefix(handle))
+        .map_err(|e| TranslateError::new(ProblemCode::ResourceNotFound, e.to_string()))
+}
+
+fn agent_run_handle_of(handle: &str) -> Result<mf_kernel::handles::AgentRunHandle, TranslateError> {
+    mf_kernel::handles::AgentRunHandle::parse(strip_wire_prefix(handle))
+        .map_err(|e| TranslateError::new(ProblemCode::ResourceNotFound, e.to_string()))
+}
+
+/// settlement 负载:{"kind":"complete","summary":…,"output":…} 或
+/// {"kind":"fail","reason":…}(与 mf_agent::Settlement 的 serde 形态一致)。
+fn settlement_of(payload: &serde_json::Value) -> Result<mf_agent::Settlement, TranslateError> {
+    let settlement = payload.get("settlement").ok_or_else(|| {
+        TranslateError::new(ProblemCode::InvalidEnvelope, "payload 缺少 settlement 字段")
+    })?;
+    let kind = settlement
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let normalized = match kind {
+        "complete" | "Complete" => serde_json::json!({
+            "Complete": {
+                "summary": settlement.get("summary").cloned().unwrap_or_default(),
+                "output": settlement.get("output").cloned().unwrap_or_default(),
+            }
+        }),
+        "fail" | "Fail" => serde_json::json!({
+            "Fail": {
+                "reason": settlement.get("reason").cloned().unwrap_or_default(),
+            }
+        }),
+        other => {
+            return Err(TranslateError::new(
+                ProblemCode::InvalidEnvelope,
+                format!("settlement.kind 非法:{other}(complete|fail)"),
+            ))
+        }
+    };
+    serde_json::from_value(normalized)
+        .map_err(|e| TranslateError::new(ProblemCode::InvalidEnvelope, e.to_string()))
+}
+
 fn payload_u64(payload: &serde_json::Value, field: &str) -> Result<u64, TranslateError> {
     let text = match payload.get(field) {
         Some(serde_json::Value::String(s)) => s.clone(),
@@ -202,6 +245,37 @@ pub fn translate_command(command: &CommandEnvelope) -> Result<KernelCommand, Tra
         Wire::WorkflowRunCancel => KernelCommand::WorkflowRun(WorkflowRunCommand::Cancel {
             project: project_handle_of(&command.target.handle)?,
             workflow_run: run_handle_of(&command.target.handle)?,
+            expected: workflow_expected(&command.expected)?,
+        }),
+        Wire::WorkflowRunRetryStep => KernelCommand::WorkflowRun(WorkflowRunCommand::RetryStep {
+            project: project_handle_of(&command.target.handle)?,
+            workflow_run: run_handle_of(&command.target.handle)?,
+            step: step_handle_of(payload_str(payload, "step_handle")?)?,
+            mode: match payload_str(payload, "mode")? {
+                "continue_session" => mf_agent::RetryMode::ContinueSession,
+                _ => mf_agent::RetryMode::FreshSession,
+            },
+            expected: workflow_expected(&command.expected)?,
+        }),
+        // 注:SkipStep 不在 v1 冻结命令族(wire 只含 start/cancel/
+        // retry_step/respond/settle);如需跳过须 wire v2 或 additive 流程。
+        // question_id 哨兵 0:Project Store rowid 有意不出 wire(§
+        // OpenQuestionSnapshot);内核按 step 解析唯一 open question——
+        // 与 Respond 事务内"恰有一个 open question"的既有校验一致。
+        Wire::WorkflowRunRespond => KernelCommand::WorkflowRun(WorkflowRunCommand::Respond {
+            project: project_handle_of(&command.target.handle)?,
+            workflow_run: run_handle_of(&command.target.handle)?,
+            step: step_handle_of(payload_str(payload, "step_handle")?)?,
+            question_id: 0,
+            answer: payload_str(payload, "answer")?.to_string(),
+            expected: workflow_expected(&command.expected)?,
+        }),
+        Wire::WorkflowRunSettle => KernelCommand::WorkflowRun(WorkflowRunCommand::Settle {
+            project: project_handle_of(&command.target.handle)?,
+            workflow_run: run_handle_of(&command.target.handle)?,
+            step: step_handle_of(payload_str(payload, "step_handle")?)?,
+            agent_run: agent_run_handle_of(payload_str(payload, "agent_run_handle")?)?,
+            settlement: settlement_of(payload)?,
             expected: workflow_expected(&command.expected)?,
         }),
         // kernel 尚未接管的命令族:fail-closed 明确拒绝(不旁路直写)
