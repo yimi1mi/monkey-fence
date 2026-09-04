@@ -1466,3 +1466,15 @@ main.panes {
   flex-wrap: wrap;
   gap: 8px;
 }
+
+/* ── 命令面板(#84)与 agent 状态行(#86)──────────────── */
+
+.command-palette {
+  width: min(420px, calc(100vw - 48px));
+}
+
+.agent-runs-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}

@@ -44,7 +44,10 @@ const POLL_FALLBACK_MS = 3000;
 const POLL_LIVE_MS = 15000;
 
 export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
-  const [tab, setTab] = useState<WorkbenchTab>("workflows");
+  const [tab, setTab] = useState<WorkbenchTab>(
+    () => (localStorage.getItem("mf.defaultTab") as WorkbenchTab) ?? "workflows",
+  );
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const [view, setView] = useState<WorkspaceView | null>(null);
   const [projection, setProjection] = useState<ProjectionState | null>(null);
   const [toast, setToast] = useState<string | null>(null);
@@ -77,6 +80,19 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
       setConnection("reconnecting");
     }
   }, [client]);
+
+  // #84 命令面板:Ctrl+K
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        setPaletteOpen((value) => !value);
+      }
+      if (event.key === "Escape") setPaletteOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 
   // 初始 snapshot + 轮询兜底(WS 活跃时降频;页面隐藏暂停)
   useEffect(() => {
@@ -169,13 +185,13 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
           <span className="sub">WORKBENCH</span>
         </div>
         <nav className="tabs" aria-label="主视图">
-          <button aria-selected={tab === "workflows"} onClick={() => setTab("workflows")}>
+          <button aria-selected={tab === "workflows"} onClick={() => { setTab("workflows"); localStorage.setItem("mf.defaultTab", "workflows"); }}>
             工作流
           </button>
-          <button aria-selected={tab === "runs"} onClick={() => setTab("runs")}>
+          <button aria-selected={tab === "runs"} onClick={() => { setTab("runs"); localStorage.setItem("mf.defaultTab", "runs"); }}>
             运行
           </button>
-          <button aria-selected={tab === "settings"} onClick={() => setTab("settings")}>
+          <button aria-selected={tab === "settings"} onClick={() => { setTab("settings"); localStorage.setItem("mf.defaultTab", "settings"); }}>
             设置
           </button>
         </nav>
@@ -513,6 +529,23 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
         </aside>
       </main>
 
+      {paletteOpen && (
+        <CommandPalette
+          onClose={() => setPaletteOpen(false)}
+          actions={[
+            { label: "工作流", run: () => { setTab("workflows"); localStorage.setItem("mf.defaultTab", "workflows"); } },
+            { label: "运行", run: () => { setTab("runs"); localStorage.setItem("mf.defaultTab", "runs"); } },
+            { label: "设置 / 项目管理", run: () => { setTab("settings"); localStorage.setItem("mf.defaultTab", "settings"); } },
+            {
+              label: `切换到${currentTheme() === "dark" ? "亮色" : "深色"}主题`,
+              run: () => {
+                applyTheme(toggleTheme());
+                setTheme(currentTheme());
+              },
+            },
+          ]}
+        />
+      )}
       {codeBrowser && codeBrowser !== "" && (
         <CodeBrowserModal
           client={client}
@@ -785,6 +818,8 @@ function RunDetail({
         </div>
       )}
 
+      {detail && <AgentRunsRow detail={detail} />}
+
       {detail && detail.steps.length > 0 && (
         <div className="step-timeline">
           {detail.steps.map((step) => {
@@ -942,6 +977,74 @@ function WorkflowCard({
           </button>
         </div>
       )}
+    </div>
+  );
+}
+
+/** 命令面板(#84):Ctrl+K;过滤执行动作列表。 */
+function CommandPalette({
+  actions,
+  onClose,
+}: {
+  actions: Array<{ label: string; run: () => void }>;
+  onClose: () => void;
+}) {
+  const [query, setQuery] = useState("");
+  const filtered = actions.filter((action) =>
+    action.label.toLowerCase().includes(query.trim().toLowerCase()),
+  );
+  return (
+    <div
+      className="scrim"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div className="modal command-palette" role="dialog" aria-modal="true" aria-label="命令面板">
+        <div className="field" style={{ marginBottom: 8 }}>
+          <input
+            autoFocus
+            value={query}
+            placeholder="输入命令…(Ctrl+K 切换)"
+            onChange={(event) => setQuery(event.target.value)}
+          />
+        </div>
+        <div className="folder-list" style={{ minHeight: 0 }}>
+          {filtered.map((action) => (
+            <button
+              key={action.label}
+              className="folder-item"
+              onClick={() => {
+                action.run();
+                onClose();
+              }}
+            >
+              <span className="folder-icon">↳</span>
+              {action.label}
+            </button>
+          ))}
+          {filtered.length === 0 && <p className="muted-note">没有匹配命令。</p>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** Agent 运行状态行(#86:终端嗅探语义的 agent_state 可视化)。 */
+function AgentRunsRow({ detail }: { detail: RunDetailView }) {
+  if (detail.agentRuns.length === 0) return null;
+  const stateIcon = (state: string): string => {
+    if (state.includes("working")) return "◉";
+    if (state.includes("waiting")) return "◐";
+    return "○";
+  };
+  return (
+    <div className="agent-runs-row">
+      {detail.agentRuns.map((run) => (
+        <span key={run.agentRun} className="mono-dim" title={`${run.status} · ${run.agentState}`}>
+          {stateIcon(run.agentState)} {run.status}
+        </span>
+      ))}
     </div>
   );
 }
