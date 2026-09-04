@@ -93,6 +93,10 @@ pub fn serve_workbench_with_hook(
             "/api/v1/snapshots/workflow-run/{project}/{run}",
             get(workflow_run_snapshot),
         )
+        .route(
+            "/api/v1/snapshots/workflow/{project}/{workflow}",
+            get(workflow_snapshot),
+        )
         .route("/api/v1/commands", post(submit_command))
         .route("/api/v1/controller/takeover", post(controller_takeover))
         .route("/api/v1/projects", post(attach_project_route))
@@ -585,6 +589,58 @@ async fn workflow_run_snapshot(
 #[derive(serde::Deserialize)]
 struct TakeoverRequest {
     last_observed_epoch: String,
+}
+
+/// `GET /api/v1/snapshots/workflow/{project}/{workflow}`:单工作流权威
+/// 详情(nodes/edges/双轴 revision;#76 编辑器数据面)。
+async fn workflow_snapshot(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    axum::extract::Path((project, workflow)): axum::extract::Path<(String, String)>,
+) -> impl IntoResponse {
+    if session_of(&state, &headers).is_none() {
+        return problem_response(&Problem::new(
+            ProblemCode::Unauthenticated,
+            "需要已认证 session",
+            None,
+        ));
+    }
+    let Ok(project) = mf_kernel::handles::ProjectStoreHandle::parse(&project) else {
+        return problem_response(&Problem::new(
+            ProblemCode::ResourceNotFound,
+            "project handle 非法",
+            Some(Retry::Never),
+        ));
+    };
+    let Ok(workflow) = mf_kernel::handles::WorkflowHandle::parse(
+        workflow.strip_prefix("wf_").unwrap_or(&workflow),
+    ) else {
+        return problem_response(&Problem::new(
+            ProblemCode::ResourceNotFound,
+            "workflow handle 非法",
+            Some(Retry::Never),
+        ));
+    };
+    match state
+        .kernel
+        .snapshot(mf_kernel::projection::SnapshotQuery::Workflow { project, workflow })
+    {
+        Ok(envelope) => {
+            let wire = snapshot_to_wire(envelope);
+            let mut headers = security(&state);
+            headers.push((header_name("content-type"), "application/json".into()));
+            respond(
+                StatusCode::OK,
+                headers,
+                serde_json::to_vec(&wire).unwrap_or_default(),
+            )
+        }
+        Err(problem) => problem_response(&Problem::new(
+            ProblemCode::ResourceNotFound,
+            problem.to_string(),
+            Some(Retry::Never),
+        )),
+    }
 }
 
 // ---------------------------------------------------------------------------

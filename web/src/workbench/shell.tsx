@@ -24,6 +24,7 @@ import {
   type RunDetailView,
 } from "./run_detail.ts";
 import type { CommandType } from "../api/protocol.ts";
+import { WorkflowEditor } from "./workflow_editor.tsx";
 import {
   activeRunsAcross,
   runIsActive,
@@ -50,6 +51,9 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
   const [theme, setTheme] = useState(currentTheme());
+  const [editing, setEditing] = useState<{ project: ProjectView; workflow: WorkflowView } | null>(
+    null,
+  );
   const projectionRef = useRef<ProjectionState | null>(null);
   const socketStarted = useRef(false);
 
@@ -260,7 +264,20 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
           </div>
         </aside>
 
-        {tab === "settings" ? (
+        {editing ? (
+          <section className="pane center editor-pane" aria-label="工作流编辑器">
+            <WorkflowEditor
+              client={client}
+              projectHandle={editing.project.handle}
+              workflowHandle={editing.workflow.handle}
+              onDone={(message) => {
+                setToast(message);
+                void refresh();
+              }}
+              onClose={() => setEditing(null)}
+            />
+          </section>
+        ) : tab === "settings" ? (
           <section className="pane center" aria-label="设置">
             <SettingsPane
               client={client}
@@ -301,6 +318,7 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
                             workflow={workflow}
                             project={project}
                             client={client}
+                            onEdit={() => setEditing({ project, workflow })}
                             onDone={(message) => {
                               setToast(message);
                               void refresh();
@@ -793,11 +811,13 @@ function WorkflowCard({
   workflow,
   project,
   client,
+  onEdit,
   onDone,
 }: {
   workflow: WorkflowView;
   project: ProjectView;
   client: WorkbenchClient;
+  onEdit: () => void;
   onDone: (message: string) => void;
 }) {
   const [goal, setGoal] = useState("");
@@ -808,6 +828,13 @@ function WorkflowCard({
       <div className="row1">
         <span className="title">{workflow.name}</span>
         <span className="mono-dim">wf_{workflow.handle.slice(4, 14)}…</span>
+        <button
+          className="mf-btn ghost card-action"
+          onClick={onEdit}
+          title="打开 DAG 编辑器"
+        >
+          编辑
+        </button>
         <button
           className="mf-btn primary card-action"
           disabled={!client.isController}

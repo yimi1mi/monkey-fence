@@ -232,6 +232,69 @@ pub fn translate_command(command: &CommandEnvelope) -> Result<KernelCommand, Tra
                 )?,
             })
         }
+        Wire::WorkflowAddNode => KernelCommand::ProjectWorkflow(ProjectWorkflowCommand::AddNode {
+            project: project_handle_of(payload_str(payload, "project_handle")?)?,
+            workflow: workflow_handle_of(payload_str(payload, "workflow_handle")?)?,
+            node: serde_json::from_value(payload.get("node").cloned().unwrap_or_default())
+                .map_err(|e| TranslateError::new(ProblemCode::InvalidEnvelope, e.to_string()))?,
+            expected_semantic_revision: revision_of(
+                &command.expected,
+                "project_workflow",
+                "semantic",
+            )?,
+        }),
+        Wire::WorkflowUpdateNode => {
+            KernelCommand::ProjectWorkflow(ProjectWorkflowCommand::UpdateNode {
+                project: project_handle_of(payload_str(payload, "project_handle")?)?,
+                workflow: workflow_handle_of(payload_str(payload, "workflow_handle")?)?,
+                node_handle: payload_str(payload, "node_handle")?.to_string(),
+                title: payload_str(payload, "title")?.to_string(),
+                instructions: payload_str(payload, "instructions")?.to_string(),
+                agent_instance_id: payload_str(payload, "agent_instance_id")?.to_string(),
+                expected_semantic_revision: revision_of(
+                    &command.expected,
+                    "project_workflow",
+                    "semantic",
+                )?,
+            })
+        }
+        Wire::WorkflowRemoveNode => {
+            KernelCommand::ProjectWorkflow(ProjectWorkflowCommand::RemoveNode {
+                project: project_handle_of(payload_str(payload, "project_handle")?)?,
+                workflow: workflow_handle_of(payload_str(payload, "workflow_handle")?)?,
+                node_handle: payload_str(payload, "node_handle")?.to_string(),
+                expected_semantic_revision: revision_of(
+                    &command.expected,
+                    "project_workflow",
+                    "semantic",
+                )?,
+            })
+        }
+        Wire::WorkflowConnect => KernelCommand::ProjectWorkflow(ProjectWorkflowCommand::Connect {
+            project: project_handle_of(payload_str(payload, "project_handle")?)?,
+            workflow: workflow_handle_of(payload_str(payload, "workflow_handle")?)?,
+            upstream_node_handle: payload_str(payload, "upstream_node_handle")?.to_string(),
+            downstream_node_handle: payload_str(payload, "downstream_node_handle")?.to_string(),
+            expected_semantic_revision: revision_of(
+                &command.expected,
+                "project_workflow",
+                "semantic",
+            )?,
+        }),
+        Wire::WorkflowDisconnect => {
+            KernelCommand::ProjectWorkflow(ProjectWorkflowCommand::Disconnect {
+                project: project_handle_of(payload_str(payload, "project_handle")?)?,
+                workflow: workflow_handle_of(payload_str(payload, "workflow_handle")?)?,
+                edge_handle: payload_str(payload, "edge_handle")?.to_string(),
+                expected_semantic_revision: revision_of(
+                    &command.expected,
+                    "project_workflow",
+                    "semantic",
+                )?,
+            })
+        }
+        // 工作流命令族契约:target=project_workflow(workflow handle)或
+        // project;统一经 payload 显式携带 project_handle/workflow_handle。
         Wire::WorkflowRunStart => KernelCommand::WorkflowRun(WorkflowRunCommand::Start {
             project: project_handle_of(&command.target.handle)?,
             workflow: workflow_handle_of(payload_str(payload, "workflow_handle")?)?,
