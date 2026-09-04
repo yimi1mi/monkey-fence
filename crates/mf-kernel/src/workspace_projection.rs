@@ -1,9 +1,10 @@
 //! 跨 Project 的 Workspace 权威摘要投影。
 
-use crate::handles::{ProjectStoreHandle, StepHandle, WorkflowRunHandle};
+use crate::handles::{ProjectStoreHandle, StepHandle, WorkflowHandle, WorkflowRunHandle};
 use crate::kernel::KernelProblem;
 use crate::projection::{
-    ScalarRevision, WorkflowRunSummarySnapshot, WorkspaceProjectSnapshot, WorkspaceSnapshotData,
+    ScalarRevision, WorkflowRunSummarySnapshot, WorkflowSummarySnapshot, WorkspaceProjectSnapshot,
+    WorkspaceSnapshotData,
 };
 use mf_agent::model::WorkflowRunProjectionSource;
 use mf_agent::Store;
@@ -26,6 +27,23 @@ pub(crate) fn read_workspace(
             .workflow_collection_revision()
             .map_err(|error| KernelProblem::Internal(format!("{error:#}")))?
             .max(0) as u64;
+        // 工作流摘要(#75 启动运行入口)
+        let workflows = store
+            .project_workflow_summaries()
+            .map_err(|error| KernelProblem::Internal(format!("{error:#}")))?
+            .into_iter()
+            .map(|(handle, name, semantic, presentation)| {
+                let workflow = WorkflowHandle::parse(handle.clone())
+                    .map_err(|error| KernelProblem::Internal(error.to_string()))?;
+                let summary = WorkflowSummarySnapshot {
+                    workflow,
+                    name,
+                    semantic_revision: semantic.max(0) as u64,
+                    presentation_revision: presentation.max(0) as u64,
+                };
+                Result::<_, KernelProblem>::Ok(summary)
+            })
+            .collect::<Result<Vec<_>, KernelProblem>>()?;
         let active_agent_sessions = sources
             .iter()
             .flat_map(|source| &source.sessions)
@@ -53,6 +71,7 @@ pub(crate) fn read_workspace(
             project,
             display_name,
             workflow_collection_revision,
+            workflows,
             workflow_runs,
             active_agent_sessions,
         });

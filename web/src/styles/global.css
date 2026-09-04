@@ -1307,3 +1307,60 @@ main.panes {
   font-size: 12px;
   white-space: nowrap;
 }
+
+/* ── 工作流卡片(#75)────────────────────────────────── */
+
+.workflow-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.workflow-card {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  padding: 10px 14px;
+  background: var(--bg-soft);
+  transition: border-color 0.15s;
+}
+
+.workflow-card:hover {
+  border-color: rgba(27, 127, 212, 0.35);
+}
+
+.workflow-card .row1 {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.workflow-card .title {
+  font-size: 13.5px;
+  font-weight: 600;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mono-dim {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.workflow-card .row2 {
+  display: flex;
+  gap: 12px;
+  margin-top: 6px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+
+.card-action {
+  padding: 4px 12px !important;
+  font-size: 12px !important;
+  white-space: nowrap;
+}

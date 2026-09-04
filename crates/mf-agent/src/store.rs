@@ -4579,6 +4579,27 @@ impl Store {
         self.with_conn(Self::collection_revision_tx)
     }
 
+    /// 项目工作流摘要(workspace 投影用:handle/name/双轴 revision)。
+    pub fn project_workflow_summaries(&self) -> Result<Vec<(String, String, i64, i64)>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT public_handle, name, semantic_revision, presentation_revision
+                 FROM project_workflows ORDER BY updated_at DESC, workflow_key",
+            )?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+    }
+
     /// CAS 删除项目工作流:identity/presentation/position 同事务清理,
     /// collection revision +1。行不存在时返回 false(不递增)。
     pub fn delete_project_workflow_cas(

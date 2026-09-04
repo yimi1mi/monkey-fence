@@ -37,7 +37,13 @@ struct WorkbenchState {
     /// 被浏览器预加载消耗后请求重签。生产 bundle 不设置该变量,
     /// 路由保持 404(一次性 nonce 语义不变)。
     acceptance: bool,
+    /// 项目挂载后的执行面装配钩(#75:Orchestrator + ports;None =
+    /// 仅数据面——快照/命令可见但运行不可执行)。
+    on_project_attached: Option<ProjectAttachHook>,
 }
+
+/// 挂载钩:参数为 project handle 与项目根目录(Store 由钩子幂等重开)。
+pub type ProjectAttachHook = Arc<dyn Fn(&str, &Path) -> Result<(), String> + Send + Sync>;
 
 /// 绑定并启动 workbench 服务(后台线程持有运行时;进程退出即止)。
 /// 返回带一次性 nonce fragment 的入口 URL(浏览器直接打开)。
@@ -45,6 +51,16 @@ pub fn serve_workbench(
     kernel: Arc<dyn CoreKernel>,
     dist_root: impl Into<PathBuf>,
     port: u16,
+) -> anyhow::Result<String> {
+    serve_workbench_with_hook(kernel, dist_root, port, None)
+}
+
+/// 同 [`serve_workbench`],并在每次项目挂载成功后调用执行面装配钩。
+pub fn serve_workbench_with_hook(
+    kernel: Arc<dyn CoreKernel>,
+    dist_root: impl Into<PathBuf>,
+    port: u16,
+    on_project_attached: Option<ProjectAttachHook>,
 ) -> anyhow::Result<String> {
     let dist_root = dist_root.into();
     anyhow::ensure!(
@@ -66,6 +82,7 @@ pub fn serve_workbench(
         dist_root,
         kernel,
         acceptance,
+        on_project_attached,
     });
     let router = Router::new()
         .route("/", get(index))
@@ -499,7 +516,15 @@ async fn submit_command(
                 serde_json::to_vec(&outcome).unwrap_or_default(),
             )
         }
-        Err(problem) => problem_response(&problem),
+        Err(problem) => {
+            eprintln!(
+                "[mf-workbench] command {} failed: {} ({})",
+                envelope.command_type.as_str(),
+                problem.message,
+                serde_json::to_string(&problem.code).unwrap_or_default()
+            );
+            problem_response(&problem)
+        }
     }
 }
 
@@ -1005,6 +1030,12 @@ async fn attach_project_route(
     }
     match state.kernel.attach_project(&root) {
         Ok(handle) => {
+            // 执行面装配(#75):失败不回滚数据面挂载(快照可见),
+            // 错误进入响应供 UI 提示。
+            let execution_error = state
+                .on_project_attached
+                .as_ref()
+                .and_then(|hook| hook(&handle, &root).err());
             let body = serde_json::json!({
                 "schema": "mf.project-attach.v1",
                 "project": handle,
@@ -1012,6 +1043,8 @@ async fn attach_project_route(
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("Project"),
+                "execution": if execution_error.is_some() { "unavailable" } else { "ready" },
+                "execution_error": execution_error,
             });
             let mut headers = security(&state);
             headers.push((header_name("content-type"), "application/json".into()));
@@ -1153,6 +1186,7 @@ mod tests {
             dist_root: PathBuf::from("."),
             kernel,
             acceptance: true,
+            on_project_attached: None,
         })
     }
 

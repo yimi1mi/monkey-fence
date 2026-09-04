@@ -31,6 +31,7 @@ import {
   workspaceViewOf,
   type ProjectView,
   type RunView,
+  type WorkflowView,
   type WorkspaceView,
 } from "./model.ts";
 
@@ -283,25 +284,67 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
           <div className="pane-body">
             {tab === "workflows" ? (
               (view?.projects ?? []).map((project) =>
-                project.runs.length === 0 ? null : (
+                project.runs.length === 0 && project.workflows.length === 0 ? null : (
                   <div key={project.handle} style={{ marginBottom: 14 }}>
                     <div className="group-head">
                       <span className="name">{project.name}</span>
                       <span className="meta">
-                        {project.runs.length} 运行 · {project.activeSessions} 活跃会话
+                        {project.workflows.length} 工作流 · {project.runs.length} 运行 ·{" "}
+                        {project.activeSessions} 活跃会话
                       </span>
                     </div>
-                    <div className="run-list" style={{ marginTop: 8 }}>
-                      {project.runs.map((run, index) => (
-                        <RunCard
-                          key={run.handle}
-                          run={run}
-                          selected={run.handle === selectedRun}
-                          index={index}
-                          onSelect={() => setSelectedRun(run.handle)}
-                        />
-                      ))}
-                    </div>
+                    {project.workflows.length > 0 && (
+                      <div className="workflow-list" style={{ marginBottom: 10 }}>
+                        {project.workflows.map((workflow) => (
+                          <WorkflowCard
+                            key={workflow.handle}
+                            workflow={workflow}
+                            project={project}
+                            client={client}
+                            onDone={(message) => {
+                              setToast(message);
+                              void refresh();
+                            }}
+                          />
+                        ))}
+                      </div>
+                    )}
+                    {project.runs.length > 0 && (
+                      <div className="run-list">
+                        {project.runs.map((run, index) => (
+                          <RunCard
+                            key={run.handle}
+                            run={run}
+                            selected={run.handle === selectedRun}
+                            index={index}
+                            cancellable={client.isController && runIsActive(run.status)}
+                            onCancel={async () => {
+                              try {
+                                await client.command(
+                                  runActionCommand({
+                                    commandId: uuidv7(),
+                                    clientId: client.clientId,
+                                    controllerLeaseEpoch: client.leaseEpoch,
+                                    projectHandle: run.projectHandle,
+                                    runHandle: run.handle,
+                                    runRevision: run.revision,
+                                    type: "workflow.run.cancel",
+                                    payload: {},
+                                  }),
+                                );
+                                setToast("已请求取消");
+                                void refresh();
+                              } catch (error) {
+                                setToast(
+                                  `取消失败:${error instanceof Error ? error.message : String(error)}`,
+                                );
+                              }
+                            }}
+                            onSelect={() => setSelectedRun(run.handle)}
+                          />
+                        ))}
+                      </div>
+                    )}
                   </div>
                 ),
               )
@@ -498,11 +541,15 @@ function RunCard({
   run,
   selected,
   index,
+  cancellable = false,
+  onCancel,
   onSelect,
 }: {
   run: RunView;
   selected: boolean;
   index: number;
+  cancellable?: boolean;
+  onCancel?: () => void;
   onSelect: () => void;
 }) {
   const meta = runStatusMeta(run.status);
@@ -519,6 +566,17 @@ function RunCard({
           <span className="dot" />
           {meta.label}
         </span>
+        {cancellable && (
+          <button
+            className="mf-btn danger card-action"
+            onClick={(event) => {
+              event.stopPropagation();
+              onCancel?.();
+            }}
+          >
+            取消
+          </button>
+        )}
       </div>
       <div className="row2">
         <span>run_{run.handle.slice(4, 14)}…</span>
@@ -576,20 +634,49 @@ function RunDetail({
   }, [client, run.handle, run.projectHandle, run.revision]);
 
   const act = useCallback(
-    async (type: CommandType, payload: Record<string, unknown>) => {
+    async (
+      type: CommandType,
+      payload: Record<string, unknown>,
+      stepHandle?: string,
+      stepRevision?: string,
+    ) => {
       if (!detail) return;
+      // RetryStep/Respond/Settle 要求 expected 携带目标 Step 语义 revision
+      const stepExpectation =
+        stepHandle && stepRevision
+          ? [
+              {
+                aggregate: {
+                  kind: "workflow_step",
+                  handle: stepHandle.startsWith("step_") ? stepHandle : `step_${stepHandle}`,
+                },
+                semantic_revision: stepRevision,
+              },
+            ]
+          : [];
       try {
-        await client.command(
-          runActionCommand({
+        await client.command({
+          ...runActionCommand({
             commandId: uuidv7(),
             clientId: client.clientId,
             controllerLeaseEpoch: client.leaseEpoch,
+            projectHandle: run.projectHandle,
             runHandle: run.handle,
             runRevision: detail.revision,
             type,
             payload,
           }),
-        );
+          expected: [
+            {
+              aggregate: {
+                kind: "workflow_run",
+                handle: run.handle.startsWith("run_") ? run.handle : `run_${run.handle}`,
+              },
+              semantic_revision: detail.revision,
+            },
+            ...stepExpectation,
+          ],
+        });
         onAction("已提交");
       } catch (error) {
         const code = error instanceof ApiError ? error.problem.code : null;
@@ -600,7 +687,7 @@ function RunDetail({
         onAction(`操作失败:${error instanceof Error ? error.message : String(error)}`);
       }
     },
-    [client, detail, onAction, run.handle],
+    [client, detail, onAction, run.handle, run.projectHandle],
   );
 
   return (
@@ -650,25 +737,45 @@ function RunDetail({
                   <span className="step-title">{step.title}</span>
                 </div>
                 {question && (
-                  <QuestionCard question={question} onAnswer={(answer) => act("workflow.run.respond", { step_handle: step.step, answer })} />
+                  <QuestionCard
+                    question={question}
+                    onAnswer={(answer) =>
+                      act("workflow.run.respond", { step_handle: step.step, answer }, step.step, step.revision)
+                    }
+                  />
                 )}
                 {step.status === "awaiting-outcome" && (
                   <SettleCard
                     disabled={!client.isController || agentRunOfStep(detail, step.step) === null}
                     onSettle={(kind, text) =>
-                      act("workflow.run.settle", {
-                        step_handle: step.step,
-                        agent_run_handle: agentRunOfStep(detail, step.step),
-                        settlement:
-                          kind === "complete"
-                            ? { kind: "complete", summary: text }
-                            : { kind: "fail", reason: text },
-                      })
+                      act(
+                        "workflow.run.settle",
+                        {
+                          step_handle: step.step,
+                          agent_run_handle: agentRunOfStep(detail, step.step),
+                          settlement:
+                            kind === "complete"
+                              ? { kind: "complete", summary: text }
+                              : { kind: "fail", reason: text },
+                        },
+                        step.step,
+                        step.revision,
+                      )
                     }
                   />
                 )}
                 {step.status === "failed" && client.isController && (
-                  <button className="mf-btn ghost" onClick={() => act("workflow.run.retry_step", { step_handle: step.step, mode: "fresh_session" })}>
+                  <button
+                    className="mf-btn ghost"
+                    onClick={() =>
+                      act(
+                        "workflow.run.retry_step",
+                        { step_handle: step.step, mode: "fresh_session" },
+                        step.step,
+                        step.revision,
+                      )
+                    }
+                  >
                     重试(新会话)
                   </button>
                 )}
@@ -678,6 +785,95 @@ function RunDetail({
         </div>
       )}
     </>
+  );
+}
+
+/** 工作流卡片(#75):名称 + 双轴修订 + 启动运行(goal 输入)。 */
+function WorkflowCard({
+  workflow,
+  project,
+  client,
+  onDone,
+}: {
+  workflow: WorkflowView;
+  project: ProjectView;
+  client: WorkbenchClient;
+  onDone: (message: string) => void;
+}) {
+  const [goal, setGoal] = useState("");
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  return (
+    <div className="workflow-card">
+      <div className="row1">
+        <span className="title">{workflow.name}</span>
+        <span className="mono-dim">wf_{workflow.handle.slice(4, 14)}…</span>
+        <button
+          className="mf-btn primary card-action"
+          disabled={!client.isController}
+          title={client.isController ? undefined : "Observer 禁写"}
+          onClick={() => setOpen((value) => !value)}
+        >
+          启动运行
+        </button>
+      </div>
+      <div className="row2">
+        <span>语义 rev {workflow.semanticRevision}</span>
+        <span className="sep">|</span>
+        <span>呈现 rev {workflow.presentationRevision}</span>
+      </div>
+      {open && (
+        <div className="question-actions" style={{ marginTop: 8 }}>
+          <input
+            value={goal}
+            placeholder="本次运行的目标(必填)"
+            onChange={(event) => setGoal(event.target.value)}
+          />
+          <button
+            className="mf-btn primary"
+            disabled={goal.trim().length === 0 || busy}
+            onClick={async () => {
+              setBusy(true);
+              try {
+                await client.command({
+                  schema: "mf.command.v1",
+                  command_id: uuidv7(),
+                  client_id: client.clientId,
+                  controller_lease_epoch: client.leaseEpoch,
+                  target: { kind: "project_workflow", handle: project.handle },
+                  expected: [
+                    {
+                      aggregate: {
+                        kind: "project_workflow",
+                        handle: `wf_${workflow.handle}`,
+                      },
+                      semantic_revision: workflow.semanticRevision,
+                    },
+                  ],
+                  type: "workflow.run.start",
+                  payload: {
+                    workflow_handle: `wf_${workflow.handle}`,
+                    goal: goal.trim(),
+                  },
+                });
+                setOpen(false);
+                onDone("运行已启动");
+              } catch (error) {
+                setBusy(false);
+                const code = error instanceof ApiError ? error.problem.code : null;
+                if (code === "controller_required" || code === "controller_lease_expired") {
+                  location.reload();
+                  return;
+                }
+                onDone(`启动失败:${error instanceof Error ? error.message : String(error)}`);
+              }
+            }}
+          >
+            {busy ? "启动中…" : "启动"}
+          </button>
+        </div>
+      )}
+    </div>
   );
 }
 

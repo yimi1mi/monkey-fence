@@ -8,7 +8,8 @@
 //! 环境变量:`MF_WEB_DIST`(默认 `web/dist`)、`MF_WEB_PORT`(默认 80)。
 //! 这是发布验收的入口形态,不改变 production bundle 的装配次序。
 
-use mf_web::workbench_serve::serve_workbench;
+use mf_web::execution_ports::assemble_project_execution_with;
+use mf_web::workbench_serve::{serve_workbench_with_hook, ProjectAttachHook};
 use std::sync::Arc;
 
 fn main() {
@@ -37,19 +38,40 @@ fn main() {
                 std::process::exit(3);
             }
         };
-    // 验收模式:注册沙箱项目(临时目录,不触碰真实 catalog),让
-    // 工作台有真实投影与命令目标;生产形态项目经 pipe/orchestrator 注册。
+    // 执行面装配钩(#75):挂载即装配 Orchestrator + ports(数据面
+    // 与执行面同生命周期;失败不阻断挂载,响应中提示)。
+    let registry = runtime.registry.clone();
+    let kernel_runtime_for_hook = kernel_runtime.clone();
+    let acceptance_mode = std::env::var("MF_WEB_ACCEPTANCE").ok().as_deref() == Some("1");
+    let assembler: ProjectAttachHook = Arc::new(move |project_handle, root| {
+        let project = mf_kernel::handles::ProjectStoreHandle::parse(project_handle)
+            .map_err(|e| format!("handle 非法:{e}"))?;
+        assemble_project_execution_with(
+            &kernel_runtime_for_hook,
+            &registry,
+            &project,
+            root,
+            acceptance_mode,
+        )
+    });
+    // 验收模式:注册沙箱项目(临时目录,不触碰真实 catalog),并装配
+    // 执行面;生产形态项目经 pipe/orchestrator 注册。
     if std::env::var("MF_WEB_ACCEPTANCE").ok().as_deref() == Some("1") {
         let sandbox = std::env::temp_dir().join("mf-workbench-acceptance-project");
         if let Err(error) = std::fs::create_dir_all(&sandbox) {
             eprintln!("mf-workbench: 沙箱目录创建失败:{error}");
         }
         match kernel_runtime.open_project(&sandbox) {
-            Ok(project) => println!(
-                "mf-workbench: acceptance sandbox project {}({})",
-                project.handle().as_str(),
-                sandbox.display()
-            ),
+            Ok(project) => {
+                println!(
+                    "mf-workbench: acceptance sandbox project {}({})",
+                    project.handle().as_str(),
+                    sandbox.display()
+                );
+                if let Err(error) = assembler(project.handle().as_str(), &sandbox) {
+                    eprintln!("mf-workbench: 沙箱执行面装配失败(仅数据面可用):{error}");
+                }
+            }
             Err(error) => eprintln!("mf-workbench: 沙箱项目注册失败:{error}"),
         }
     }
@@ -58,7 +80,7 @@ fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(80);
-    match serve_workbench(kernel, &dist, port) {
+    match serve_workbench_with_hook(kernel, &dist, port, Some(assembler)) {
         Ok(url) => {
             println!("mf-workbench: serving {dist} on 127.0.0.1:{port}");
             println!("WEB_ENTRY={url}");

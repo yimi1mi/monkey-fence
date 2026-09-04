@@ -242,13 +242,16 @@ pub fn translate_command(command: &CommandEnvelope) -> Result<KernelCommand, Tra
                 "semantic",
             )?,
         }),
+        // run 命令族契约:target = workflow run handle;project 经
+        // payload.project_handle(opaque proj_ 形态)——target 不可能同时
+        // 是 project 与 run,原实现两者都取 target 是矛盾的。
         Wire::WorkflowRunCancel => KernelCommand::WorkflowRun(WorkflowRunCommand::Cancel {
-            project: project_handle_of(&command.target.handle)?,
+            project: project_handle_of(payload_str(payload, "project_handle")?)?,
             workflow_run: run_handle_of(&command.target.handle)?,
             expected: workflow_expected(&command.expected)?,
         }),
         Wire::WorkflowRunRetryStep => KernelCommand::WorkflowRun(WorkflowRunCommand::RetryStep {
-            project: project_handle_of(&command.target.handle)?,
+            project: project_handle_of(payload_str(payload, "project_handle")?)?,
             workflow_run: run_handle_of(&command.target.handle)?,
             step: step_handle_of(payload_str(payload, "step_handle")?)?,
             mode: match payload_str(payload, "mode")? {
@@ -263,7 +266,7 @@ pub fn translate_command(command: &CommandEnvelope) -> Result<KernelCommand, Tra
         // OpenQuestionSnapshot);内核按 step 解析唯一 open question——
         // 与 Respond 事务内"恰有一个 open question"的既有校验一致。
         Wire::WorkflowRunRespond => KernelCommand::WorkflowRun(WorkflowRunCommand::Respond {
-            project: project_handle_of(&command.target.handle)?,
+            project: project_handle_of(payload_str(payload, "project_handle")?)?,
             workflow_run: run_handle_of(&command.target.handle)?,
             step: step_handle_of(payload_str(payload, "step_handle")?)?,
             question_id: 0,
@@ -271,7 +274,7 @@ pub fn translate_command(command: &CommandEnvelope) -> Result<KernelCommand, Tra
             expected: workflow_expected(&command.expected)?,
         }),
         Wire::WorkflowRunSettle => KernelCommand::WorkflowRun(WorkflowRunCommand::Settle {
-            project: project_handle_of(&command.target.handle)?,
+            project: project_handle_of(payload_str(payload, "project_handle")?)?,
             workflow_run: run_handle_of(&command.target.handle)?,
             step: step_handle_of(payload_str(payload, "step_handle")?)?,
             agent_run: agent_run_handle_of(payload_str(payload, "agent_run_handle")?)?,
@@ -305,7 +308,33 @@ fn workflow_expected(
                 })?,
                 "workflow_run_revision",
             )?;
-            return Ok(mf_kernel::kernel::WorkflowRunExpected::only_run(revision));
+            // run 级命令(RetryStep/Respond/Settle)要求 expected 携带
+            // 目标 Step 的语义 revision(kernel L-CMD 复验)。
+            let steps = expected
+                .iter()
+                .filter(|entry| entry.aggregate.kind == "workflow_step")
+                .map(|entry| {
+                    let handle = mf_kernel::handles::StepHandle::parse(strip_wire_prefix(
+                        &entry.aggregate.handle,
+                    ))
+                    .map_err(|e| {
+                        TranslateError::new(ProblemCode::ResourceNotFound, e.to_string())
+                    })?;
+                    let revision = u64_of(
+                        entry.semantic_revision.as_deref().ok_or_else(|| {
+                            TranslateError::new(
+                                ProblemCode::RevisionConflict,
+                                "expected 缺少 workflow_step semantic_revision",
+                            )
+                        })?,
+                        "workflow_step_revision",
+                    )?;
+                    Ok(mf_kernel::kernel::VersionedHandle { handle, revision })
+                })
+                .collect::<Result<Vec<_>, TranslateError>>()?;
+            let mut result = mf_kernel::kernel::WorkflowRunExpected::only_run(revision);
+            result.steps = steps;
+            return Ok(result);
         }
     }
     Err(TranslateError::new(

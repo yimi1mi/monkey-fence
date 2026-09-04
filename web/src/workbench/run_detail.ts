@@ -6,6 +6,7 @@ import type { CommandEnvelope, CommandType } from "../api/protocol.ts";
 
 export interface RunStepView {
   step: string;
+  revision: string;
   key: string;
   title: string;
   instructions: string;
@@ -54,9 +55,15 @@ type Row = Record<string, unknown>;
 
 export function runDetailViewOf(data: Row): RunDetailView {
   const str = (v: unknown): string => String(v ?? "");
+  // ScalarRevision 序列化为 {revision: "3"} 对象形态
+  const revisionRaw = data.revision as Row | number | string | undefined;
+  const revision =
+    typeof revisionRaw === "object" && revisionRaw !== null
+      ? String(revisionRaw.revision ?? "0")
+      : String(revisionRaw ?? "0");
   return {
     workflowRun: str(data.workflow_run),
-    revision: str(data.revision),
+    revision,
     title: str(data.title),
     goal: str(data.goal),
     status: str(data.status),
@@ -64,8 +71,14 @@ export function runDetailViewOf(data: Row): RunDetailView {
     reasonCount: Number(data.reason_count ?? 0),
     steps: (Array.isArray(data.steps) ? data.steps : []).map((raw) => {
       const row = raw as Row;
+      const revisionRaw = row.revision as Row | number | string | undefined;
+      const revision =
+        typeof revisionRaw === "object" && revisionRaw !== null
+          ? String(revisionRaw.revision ?? "0")
+          : String(revisionRaw ?? "0");
       return {
         step: str(row.step),
+        revision,
         key: str(row.key),
         title: str(row.title),
         instructions: str(row.instructions),
@@ -115,30 +128,36 @@ export function agentRunOfStep(detail: RunDetailView, step: string): string | nu
   return candidates.length > 0 ? candidates[candidates.length - 1].agentRun : null;
 }
 
-/** run 级命令 envelope(target=run;CAS run revision;payload 与
- * kernel_bridge 读取字段逐一对齐)。 */
+/** run 级命令 envelope(target=run;project 经 payload——kernel_bridge
+ * run 命令族契约;run/step 走 expected CAS;payload 与翻译层对齐)。 */
 export function runActionCommand(input: {
   commandId: string;
   clientId: string;
   controllerLeaseEpoch: string;
+  projectHandle: string;
   runHandle: string;
   runRevision: string;
   type: CommandType;
   payload: Record<string, unknown>;
 }): CommandEnvelope {
+  // kernel 快照序列化的 handle 是裸 UUIDv7;wire 校验(handle::parse)
+  // 要求 wf_/run_/… 前缀形态,故统一补前缀(translate 层会 strip)。
+  const wireRun = input.runHandle.startsWith("run_")
+    ? input.runHandle
+    : `run_${input.runHandle}`;
   return {
     schema: "mf.command.v1",
     command_id: input.commandId,
     client_id: input.clientId,
     controller_lease_epoch: input.controllerLeaseEpoch,
-    target: { kind: "workflow_run", handle: input.runHandle },
+    target: { kind: "workflow_run", handle: wireRun },
     expected: [
       {
-        aggregate: { kind: "workflow_run", handle: input.runHandle },
+        aggregate: { kind: "workflow_run", handle: wireRun },
         semantic_revision: input.runRevision,
       },
     ],
     type: input.type,
-    payload: input.payload,
+    payload: { project_handle: input.projectHandle, ...input.payload },
   };
 }

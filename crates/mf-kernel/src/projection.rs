@@ -280,8 +280,22 @@ pub struct WorkspaceProjectSnapshot {
     /// workflow.create/delete 的 collection CAS 轴(project_meta
     /// singleton;v1 additive:旧客户端忽略新字段)。
     pub workflow_collection_revision: u64,
+    /// 项目工作流摘要(#75 启动运行需要 workflow handle + semantic
+    /// revision;v1 additive)。
+    pub workflows: Vec<WorkflowSummarySnapshot>,
     pub workflow_runs: Vec<WorkflowRunSummarySnapshot>,
     pub active_agent_sessions: usize,
+}
+
+/// 项目工作流摘要(启动运行/编辑器入口的数据面)。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkflowSummarySnapshot {
+    pub workflow: crate::handles::WorkflowHandle,
+    pub name: String,
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    pub semantic_revision: u64,
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    pub presentation_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
