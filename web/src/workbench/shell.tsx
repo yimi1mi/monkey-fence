@@ -507,6 +507,7 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
               <RunDetail
                 run={selected}
                 client={client}
+                instances={instances}
                 onTerminal={setTerminalSession}
                 onAction={(message) => {
                   setToast(message);
@@ -753,11 +754,13 @@ function RunCard({
 function RunDetail({
   run,
   client,
+  instances,
   onTerminal,
   onAction,
 }: {
   run: RunView;
   client: WorkbenchClient;
+  instances: Array<{ id: string; name: string; enabled: boolean }>;
   onTerminal: (sessionHandle: string) => void;
   onAction: (message: string) => void;
 }) {
@@ -871,6 +874,33 @@ function RunDetail({
           </>
         )}
       </dl>
+
+      {detail && client.isController && instances.length > 0 && (
+        <button
+          className="mf-btn ghost"
+          onClick={() => {
+            const instanceId = window.prompt(
+              "Agent 实例 ID(来自 catalog)",
+              instances[0]?.id ?? "",
+            );
+            if (!instanceId) return;
+            void client
+              .adhocSession({
+                projectHandle: run.projectHandle,
+                runHandle: run.handle,
+                instanceId,
+              })
+              .then((result) => {
+                onAction(`会话「${result.title}」已发起${result.display_session_handle ? ";可在会话列表打开终端" : ""}`);
+              })
+              .catch((error) => {
+                onAction(`发起失败:${error instanceof Error ? error.message : String(error)}`);
+              });
+          }}
+        >
+          ＋发起 ad-hoc 会话
+        </button>
+      )}
 
       {detail && detail.sessions.length > 0 && (
         <div className="session-row">

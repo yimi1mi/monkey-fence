@@ -92,6 +92,31 @@ export class WorkbenchClient {
     return envelope.data;
   }
 
+  /** 发起 ad-hoc 会话(#92;Controller-only)。 */
+  async adhocSession(input: {
+    projectHandle: string;
+    runHandle: string;
+    instanceId: string;
+    prompt?: string;
+  }): Promise<{ title: string; display_session_handle: string | null }> {
+    const response = await fetch("/api/v1/sessions/adhoc", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": this.context.csrfToken,
+        "X-Client-Id": this.context.clientId,
+      },
+      body: JSON.stringify({
+        project_handle: input.projectHandle,
+        run_handle: input.runHandle,
+        instance_id: input.instanceId,
+        prompt: input.prompt,
+      }),
+    });
+    if (!response.ok) throw new ApiError(await problemOf(response));
+    return await response.json();
+  }
+
   /** CLI 安装 recipe(#93;含包管理器探测)。 */
   async cliRecipes(): Promise<{
     recipes: Array<{ agent_type: string; package: string; display: string }>;

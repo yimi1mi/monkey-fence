@@ -12,7 +12,7 @@
 #[path = "../../../mf-kernel/src/pipe_server.rs"]
 mod pipe_server;
 
-use mf_web::execution_ports::assemble_project_execution_with;
+use mf_web::execution_ports::assemble_with_host;
 use mf_web::workbench_serve::{serve_workbench_with_hook, ProjectAttachHook};
 use std::sync::Arc;
 
@@ -42,6 +42,30 @@ fn main() {
                 std::process::exit(3);
             }
         };
+    // #92 ad-hoc:带 launcher 的完整宿主(内置 CLI agents + 真实 catalog
+    // 只读 + secret 缝)。装配进执行面后 create_ad_hoc_session 可用。
+    let launcher_host = {
+        let catalog = mf_agent::CatalogStore::open_read_only(&mf_agent::catalog_db_path())
+            .unwrap_or_else(|error| {
+                eprintln!("mf-workbench: catalog 只读打开失败(launcher 用内存目录):{error:#}");
+                mf_agent::CatalogStore::memory().expect("内存目录库")
+            });
+        let plugins = mf_plugins::PluginHost::load_at_with_catalog(
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            catalog.clone(),
+            &mf_agent::Config::default(),
+            &mf_skills::load_skills(None),
+        );
+        mf_terminal::session_runtime::RuntimeHostImpl::with_launcher(
+            runtime.registry.clone(),
+            mf_terminal::session_runtime::WorkflowLauncher {
+                plugins,
+                catalog,
+                secret_master_key: None,
+            },
+        )
+    };
+
     // 执行面装配钩(#75):挂载即装配 Orchestrator + ports(数据面
     // 与执行面同生命周期;失败不阻断挂载,响应中提示)。
     let registry = runtime.registry.clone();
@@ -64,9 +88,10 @@ fn main() {
     let assembler: ProjectAttachHook = Arc::new(move |project_handle, root| {
         let project = mf_kernel::handles::ProjectStoreHandle::parse(project_handle)
             .map_err(|e| format!("handle 非法:{e}"))?;
-        assemble_project_execution_with(
+        assemble_with_host(
             &kernel_runtime_for_hook,
             &registry,
+            launcher_host.clone(),
             &project,
             root,
             acceptance_mode,

@@ -24,6 +24,8 @@ base64 = "0.22"
 log = "0.4"
 mf-vcs.workspace = true
 mf-installer.workspace = true
+mf-skills.workspace = true
+mf-plugins.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros"] }
 tower = "0.5"
 

@@ -1058,6 +1058,8 @@ dependencies = [
  "mf-elevated",
  "mf-installer",
  "mf-kernel",
+ "mf-plugins",
+ "mf-skills",
  "mf-terminal",
  "mf-vcs",
  "parking_lot",

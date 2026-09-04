@@ -19,6 +19,15 @@ use mf_kernel::run_lifecycle::{RunActionDelivery, RunLifecyclePort, RunPreparati
 use mf_kernel::workflow_start::{PreparedWorkflowStartPlan, WorkflowStartPort};
 use mf_terminal::session_runtime::{RuntimeHostImpl, SessionRegistry};
 
+/// #92:project → Orchestrator 编排面注册(装配时写入;web 端点寻址)。
+pub fn ad_hoc_orchestrators(
+) -> &'static parking_lot::Mutex<std::collections::HashMap<String, Arc<Orchestrator>>> {
+    static REGISTRY: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<String, Arc<Orchestrator>>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Project Workflow → durable Start plan 的生产编译 adapter(自旧
 /// workflow_start_port.rs 恢复):实例版本/插件 pin/目录 provider pin
 /// 全部冻结进 plan;Secret 只以 sealed id 留在快照。
@@ -259,9 +268,26 @@ pub fn assemble_project_execution_with(
     acceptance: bool,
     pipe_name: Option<&str>,
 ) -> Result<(), String> {
+    let host = RuntimeHostImpl::new(registry.clone());
+    assemble_with_host(
+        runtime, registry, host, project, root, acceptance, pipe_name,
+    )
+}
+
+/// #92 ad-hoc 编排面:host 由调用方注入(bin 构造带 launcher 的完整
+/// 宿主);orchestrator 写入共享 registry 供 web 端点寻址。
+pub fn assemble_with_host(
+    runtime: &Arc<mf_kernel::kernel::InProcessKernelRuntime>,
+    registry: &Arc<SessionRegistry>,
+    host: Arc<RuntimeHostImpl>,
+    project: &ProjectStoreHandle,
+    root: &Path,
+    acceptance: bool,
+    pipe_name: Option<&str>,
+) -> Result<(), String> {
+    let _ = registry;
     let store = mf_agent::Store::open(&mf_agent::project_db_path(root))
         .map_err(|error| format!("打开项目库失败:{error:#}"))?;
-    let host = RuntimeHostImpl::new(registry.clone());
     let directory: Arc<dyn ExecutionDirectoryProvider> =
         Arc::new(mf_agent::execution_directory::ProjectDirectoryProvider::default());
     let orchestrator = Orchestrator::start(
@@ -275,6 +301,9 @@ pub fn assemble_project_execution_with(
         directory.clone(),
     )
     .map_err(|error| format!("调度器启动失败:{error:#}"))?;
+    ad_hoc_orchestrators()
+        .lock()
+        .insert(project.as_str().to_string(), orchestrator.clone());
     runtime
         .register_run_lifecycle_port(
             project,

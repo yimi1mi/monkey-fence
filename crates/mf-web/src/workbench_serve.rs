@@ -119,6 +119,8 @@ pub fn serve_workbench_full(
         .route("/api/v1/catalog/instances", get(catalog_instances))
         .route("/api/v1/cli/recipes", get(cli_recipes))
         .route("/api/v1/cli/install", post(cli_install_route))
+        .route("/api/v1/sessions/adhoc", post(adhoc_session_start))
+        .route("/api/v1/sessions/{handle}", delete(adhoc_session_stop))
         .route("/api/v1/terminal/ws", get(terminal_ws))
         .route("/api/v1/commands", post(submit_command))
         .route("/api/v1/controller/takeover", post(controller_takeover))
@@ -1016,17 +1018,39 @@ async fn cli_detect(
         ));
     }
     const KNOWN: &[&str] = &[
-        "codex",
-        "claude",
-        "gemini",
-        "qwen",
-        "opencode",
-        "crush",
-        "copilot",
         "aider",
-        "cursor-agent",
+        "amp-acp",
+        "antigravity-acp",
+        "auggie",
+        "claude",
+        "cline",
+        "codex",
+        "copilot",
+        "cortex-code",
+        "corust-agent",
+        "crow-cli",
+        "crush",
+        "cursor",
+        "devin",
+        "dimcode",
+        "dirac",
+        "droid",
+        "gemini",
         "goose",
-        "amazonq",
+        "grok",
+        "harn",
+        "junie",
+        "kilo",
+        "kimi",
+        "mistral-vibe",
+        "nova",
+        "opencode",
+        "poolside",
+        "qoder",
+        "qwen",
+        "sigit",
+        "stakpak",
+        "vtcode",
     ];
     let path_env = std::env::var("PATH").unwrap_or_default();
     let mut detected: Vec<serde_json::Value> = Vec::new();
@@ -1309,6 +1333,224 @@ async fn cli_install_route(
         serde_json::to_vec(&body).unwrap_or_default(),
     )
     .into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct AdHocSessionRequest {
+    project_handle: String,
+    run_handle: String,
+    instance_id: String,
+    prompt: Option<String>,
+}
+
+/// `POST /api/v1/sessions/adhoc`(#92):Controller-only;web 直连执行面
+/// Orchestrator(离散会话无 revision/CAS 语义,设计 §4.7 不建 Step/
+/// Agent Run)。编译缝 = compile_instance_launch(launcher 同源)。
+async fn adhoc_session_start(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    payload: Result<axum::Json<AdHocSessionRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if let Err(problem) = authorize(&state, &headers, csrf.as_deref(), true) {
+        return problem_response(&problem).into_response();
+    }
+    let request = match payload {
+        Ok(axum::Json(request)) => request,
+        Err(rejection) => {
+            return problem_response(&Problem::new(
+                ProblemCode::InvalidEnvelope,
+                rejection.body_text(),
+                Some(Retry::Never),
+            ))
+            .into_response()
+        }
+    };
+    let project = match mf_kernel::handles::ProjectStoreHandle::parse(&request.project_handle) {
+        Ok(project) => project,
+        Err(error) => {
+            return problem_response(&Problem::new(
+                ProblemCode::ResourceNotFound,
+                error.to_string(),
+                Some(Retry::Never),
+            ))
+            .into_response()
+        }
+    };
+    let run = match mf_kernel::handles::WorkflowRunHandle::parse(
+        request
+            .run_handle
+            .strip_prefix("run_")
+            .unwrap_or(&request.run_handle),
+    ) {
+        Ok(run) => run,
+        Err(error) => {
+            return problem_response(&Problem::new(
+                ProblemCode::ResourceNotFound,
+                error.to_string(),
+                Some(Retry::Never),
+            ))
+            .into_response()
+        }
+    };
+    let Some(orchestrator) = crate::execution_ports::ad_hoc_orchestrators()
+        .lock()
+        .get(project.as_str())
+        .cloned()
+    else {
+        return problem_response(&Problem::new(
+            ProblemCode::ServiceUnavailable,
+            "项目执行面未装配(挂载后可用)",
+            Some(Retry::Never),
+        ))
+        .into_response();
+    };
+    let task_id = orchestrator
+        .store
+        .task_view_by_handle(run.as_str())
+        .ok()
+        .flatten()
+        .map(|task| task.id);
+    let Some(task_id) = task_id else {
+        return problem_response(&Problem::new(
+            ProblemCode::ResourceNotFound,
+            "运行不存在",
+            Some(Retry::Never),
+        ))
+        .into_response();
+    };
+    let catalog = match mf_agent::CatalogStore::open_read_only(&mf_agent::catalog_db_path()) {
+        Ok(catalog) => catalog,
+        Err(error) => {
+            return problem_response(&Problem::new(
+                ProblemCode::ServiceUnavailable,
+                format!("catalog 只读打开失败:{error:#}"),
+                Some(Retry::Never),
+            ))
+            .into_response()
+        }
+    };
+    let instance = match catalog.snapshot_agent_instance(&request.instance_id, None) {
+        Ok(instance) => instance,
+        Err(error) => {
+            return problem_response(&Problem::new(
+                ProblemCode::ValidationFailed,
+                format!("实例 `{}` 解析失败:{error:#}", request.instance_id),
+                Some(Retry::Never),
+            ))
+            .into_response()
+        }
+    };
+    let run_temp = std::env::temp_dir().join(format!("mf-adhoc-{}", uuid::Uuid::now_v7().simple()));
+    std::fs::create_dir_all(&run_temp).ok();
+    let run_token = format!("adhoc-{}", uuid::Uuid::now_v7().simple());
+    let plugins = mf_plugins::PluginHost::load_at_with_catalog(
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        catalog.clone(),
+        &mf_agent::Config::default(),
+        &mf_skills::load_skills(None),
+    );
+    let plan = mf_plugins::adapter_launch::compile_instance_launch(
+        &plugins,
+        &catalog,
+        &instance,
+        None,
+        run_temp.clone(),
+        orchestrator.root.clone(),
+        request.prompt.clone(),
+        &run_token,
+        instance.external_config,
+        None,
+    );
+    let plan = match plan {
+        Ok(plan) => plan.into_plan(),
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&run_temp);
+            return problem_response(&Problem::new(
+                ProblemCode::ValidationFailed,
+                format!("启动计划编译失败:{error:#}"),
+                Some(Retry::Never),
+            ))
+            .into_response();
+        }
+    };
+    match orchestrator.create_ad_hoc_session(
+        task_id,
+        &instance,
+        mf_agent::model::RunMode::Interactive,
+        run_temp,
+        plan,
+    ) {
+        Ok(view) => {
+            let display_handle = view
+                .display_session_id
+                .and_then(|id| orchestrator.store.session_view(id).ok().flatten())
+                .map(|session| session.public_handle);
+            let body = serde_json::json!({
+                "schema": "mf.adhoc-session.v1",
+                "title": view.title,
+                "display_session_handle": display_handle,
+            });
+            let mut headers = security(&state);
+            headers.push((header_name("content-type"), "application/json".into()));
+            respond(
+                StatusCode::CREATED,
+                headers,
+                serde_json::to_vec(&body).unwrap_or_default(),
+            )
+            .into_response()
+        }
+        Err(error) => problem_response(&Problem::new(
+            ProblemCode::ServiceUnavailable,
+            format!("ad-hoc 会话创建失败:{error:#}"),
+            Some(Retry::Never),
+        ))
+        .into_response(),
+    }
+}
+
+/// `DELETE /api/v1/sessions/{handle}`(#92):终止展示会话(进程真停)。
+async fn adhoc_session_stop(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    axum::extract::Path(handle): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if let Err(problem) = authorize(&state, &headers, csrf.as_deref(), true) {
+        return problem_response(&problem);
+    }
+    let reference = mf_terminal::TerminalSessionRef::new(handle.clone());
+    let alive = state
+        .terminal_host
+        .as_ref()
+        .is_some_and(|host| host.session_alive(&reference));
+    // kill 通道: 任一 orchestrator 的宿主共用同一 SessionRegistry(单例)
+    let registry_kill = crate::execution_ports::ad_hoc_orchestrators()
+        .lock()
+        .values()
+        .next()
+        .cloned();
+    if let Some(orchestrator) = registry_kill {
+        orchestrator.host().kill_session(&handle);
+    }
+    let body = serde_json::json!({
+        "schema": "mf.adhoc-session-stop.v1",
+        "handle": handle,
+        "was_alive": alive,
+    });
+    let mut headers = security(&state);
+    headers.push((header_name("content-type"), "application/json".into()));
+    respond(
+        StatusCode::OK,
+        headers,
+        serde_json::to_vec(&body).unwrap_or_default(),
+    )
 }
 
 #[derive(serde::Deserialize)]
