@@ -2438,7 +2438,7 @@ impl InProcessCoreKernel {
                         .filter(|value| !value.is_empty())
                         .unwrap_or("Project")
                         .to_owned();
-                    (project.project_handle, name)
+                    (project.project_handle, (name, project.display_path))
                 })
                 .collect::<HashMap<_, _>>();
             let mut projects = self
@@ -2453,7 +2453,7 @@ impl InProcessCoreKernel {
                         display_names
                             .get(handle)
                             .cloned()
-                            .unwrap_or_else(|| "Project".into()),
+                            .unwrap_or_else(|| ("Project".into(), String::new())),
                         registration.store.clone(),
                     ))
                 })

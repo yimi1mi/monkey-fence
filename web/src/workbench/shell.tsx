@@ -26,6 +26,7 @@ import {
 import type { CommandType } from "../api/protocol.ts";
 import { WorkflowEditor } from "./workflow_editor.tsx";
 import { TerminalPanel } from "./terminal_panel.tsx";
+import { CodeBrowserModal, VcsPanel } from "./code_browser.tsx";
 import {
   activeRunsAcross,
   runIsActive,
@@ -56,6 +57,8 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
     null,
   );
   const [terminalSession, setTerminalSession] = useState<string | null>(null);
+  const [codeBrowser, setCodeBrowser] = useState<string | null>(null);
+  const [vcsRoot, setVcsRoot] = useState<string | null>(null);
   const projectionRef = useRef<ProjectionState | null>(null);
   const socketStarted = useRef(false);
 
@@ -284,6 +287,8 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
             <SettingsPane
               client={client}
               view={view}
+              onBrowse={(root) => setCodeBrowser(root)}
+              onVcs={(root) => setVcsRoot(root)}
               onDone={(message) => {
                 setToast(message);
                 void refresh();
@@ -310,6 +315,11 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
                       <span className="meta">
                         {project.workflows.length} 工作流 · {project.runs.length} 运行 ·{" "}
                         {project.activeSessions} 活跃会话
+                      </span>
+                      <span className="group-actions">
+                        <button className="mf-btn ghost card-action" onClick={() => setCodeBrowser(project.root ?? "")}>
+                          代码
+                        </button>
                       </span>
                     </div>
                     {project.workflows.length > 0 && (
@@ -503,6 +513,15 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
         </aside>
       </main>
 
+      {codeBrowser && codeBrowser !== "" && (
+        <CodeBrowserModal
+          client={client}
+          startPath={codeBrowser}
+          title={codeBrowser.split(/[\/]/).pop() ?? codeBrowser}
+          onClose={() => setCodeBrowser(null)}
+        />
+      )}
+      {vcsRoot && <VcsPanel root={vcsRoot} onClose={() => setVcsRoot(null)} />}
       {terminalSession && (
         <TerminalPanel sessionHandle={terminalSession} onClose={() => setTerminalSession(null)} />
       )}
@@ -1024,10 +1043,14 @@ function SettleCard({
 function SettingsPane({
   client,
   view,
+  onBrowse,
+  onVcs,
   onDone,
 }: {
   client: WorkbenchClient;
   view: WorkspaceView | null;
+  onBrowse: (root: string) => void;
+  onVcs: (root: string) => void;
   onDone: (message: string) => void;
 }) {
   const [addOpen, setAddOpen] = useState(false);
@@ -1063,10 +1086,26 @@ function SettingsPane({
                   <div className="info">
                     <span className="name">{project.name}</span>
                     <span className="meta">
-                      {project.handle} · {project.runs.length} 运行 · {project.activeSessions}{" "}
-                      活跃会话
+                      {project.handle} · {project.workflows.length} 工作流 ·{" "}
+                      {project.runs.length} 运行 · {project.activeSessions} 活跃会话
+                      {project.root ? ` · ${project.root}` : ""}
                     </span>
                   </div>
+                  <button
+                    className="mf-btn ghost"
+                    onClick={() => onBrowse(project.root)}
+                    disabled={!project.root}
+                    title={project.root ? "浏览代码" : "路径未知(重启后挂载的项目可见)"}
+                  >
+                    代码
+                  </button>
+                  <button
+                    className="mf-btn ghost"
+                    onClick={() => project.root && onVcs(project.root)}
+                    disabled={!project.root}
+                  >
+                    变更
+                  </button>
                   <button
                     className="mf-btn danger"
                     disabled={!isController}

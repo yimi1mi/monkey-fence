@@ -12,12 +12,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub(crate) fn read_workspace(
-    projects: Vec<(ProjectStoreHandle, String, Arc<Store>)>,
+    projects: Vec<(ProjectStoreHandle, (String, String), Arc<Store>)>,
 ) -> Result<WorkspaceSnapshotData, KernelProblem> {
     let mut project_rows = Vec::with_capacity(projects.len());
     let mut active_workflow_runs = 0usize;
     let mut needs_you_count = 0usize;
-    for (project, display_name, store) in projects {
+    for (project, (display_name, display_root), store) in projects {
+        let display_root = if display_root.is_empty() {
+            None
+        } else {
+            Some(display_root)
+        };
         let sources = store
             .with_tx(|tx| Store::workflow_run_projection_sources_tx(tx))
             .map_err(|error| KernelProblem::Internal(format!("{error:#}")))?;
@@ -74,6 +79,7 @@ pub(crate) fn read_workspace(
             workflows,
             workflow_runs,
             active_agent_sessions,
+            display_root,
         });
     }
     Ok(WorkspaceSnapshotData {

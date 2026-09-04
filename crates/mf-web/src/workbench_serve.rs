@@ -99,6 +99,8 @@ pub fn serve_workbench_with_hook(
             get(workflow_snapshot),
         )
         .route("/api/v1/terminal/{session}/output", get(terminal_output))
+        .route("/api/v1/fs/file", get(fs_file))
+        .route("/api/v1/vcs/status", get(vcs_status))
         .route("/api/v1/commands", post(submit_command))
         .route("/api/v1/controller/takeover", post(controller_takeover))
         .route("/api/v1/projects", post(attach_project_route))
@@ -653,6 +655,134 @@ async fn terminal_output(
             Some(Retry::Never),
         )),
     }
+}
+
+/// `GET /api/v1/fs/file?path=…`:只读文本文件内容(≤256KB;#80)。
+async fn fs_file(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if session_of(&state, &headers).is_none() {
+        return problem_response(&Problem::new(
+            ProblemCode::Unauthenticated,
+            "需要已认证 session",
+            None,
+        ));
+    }
+    let Some(path) = query.get("path") else {
+        return problem_response(&Problem::new(
+            ProblemCode::InvalidEnvelope,
+            "缺少 path",
+            Some(Retry::Never),
+        ));
+    };
+    let target = std::path::PathBuf::from(path);
+    match std::fs::metadata(&target) {
+        Ok(meta) if meta.is_file() && meta.len() <= 256 * 1024 => {}
+        Ok(_) => {
+            return problem_response(&Problem::new(
+                ProblemCode::ValidationFailed,
+                "仅支持 ≤256KB 的文件",
+                Some(Retry::Never),
+            ))
+        }
+        Err(error) => {
+            return problem_response(&Problem::new(
+                ProblemCode::ResourceNotFound,
+                format!("读取失败:{error}"),
+                Some(Retry::Never),
+            ))
+        }
+    }
+    match std::fs::read_to_string(&target) {
+        Ok(content) => {
+            let body = serde_json::json!({
+                "schema": "mf.fs-file.v1",
+                "path": path,
+                "content": content,
+            });
+            let mut headers = security(&state);
+            headers.push((header_name("content-type"), "application/json".into()));
+            respond(
+                StatusCode::OK,
+                headers,
+                serde_json::to_vec(&body).unwrap_or_default(),
+            )
+        }
+        Err(error) => problem_response(&Problem::new(
+            ProblemCode::ValidationFailed,
+            format!("非 UTF-8 文本或读取失败:{error}"),
+            Some(Retry::Never),
+        )),
+    }
+}
+
+/// `GET /api/v1/vcs/status?root=…`:git 分支与工作区状态(#81;只读)。
+async fn vcs_status(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if session_of(&state, &headers).is_none() {
+        return problem_response(&Problem::new(
+            ProblemCode::Unauthenticated,
+            "需要已认证 session",
+            None,
+        ));
+    }
+    let Some(root) = query.get("root") else {
+        return problem_response(&Problem::new(
+            ProblemCode::InvalidEnvelope,
+            "缺少 root",
+            Some(Retry::Never),
+        ));
+    };
+    if !mf_vcs::git::Git::is_repo(root) {
+        let body = serde_json::json!({ "schema": "mf.vcs-status.v1", "repo": false });
+        let mut headers = security(&state);
+        headers.push((header_name("content-type"), "application/json".into()));
+        return respond(
+            StatusCode::OK,
+            headers,
+            serde_json::to_vec(&body).unwrap_or_default(),
+        );
+    }
+    let repo = match mf_vcs::git::Git::open(root) {
+        Ok(repo) => repo,
+        Err(error) => {
+            return problem_response(&Problem::new(
+                ProblemCode::ServiceUnavailable,
+                format!("仓库打开失败:{error}"),
+                Some(Retry::Never),
+            ))
+        }
+    };
+    let branch = repo.branch().unwrap_or_else(|_| "HEAD".into());
+    let entries = repo
+        .status()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| {
+            serde_json::json!({
+                "path": entry.path.to_string_lossy(),
+                "status": entry.status.code(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = serde_json::json!({
+        "schema": "mf.vcs-status.v1",
+        "repo": true,
+        "branch": branch,
+        "entries": entries,
+    });
+    let mut headers = security(&state);
+    headers.push((header_name("content-type"), "application/json".into()));
+    respond(
+        StatusCode::OK,
+        headers,
+        serde_json::to_vec(&body).unwrap_or_default(),
+    )
 }
 
 #[derive(serde::Deserialize)]

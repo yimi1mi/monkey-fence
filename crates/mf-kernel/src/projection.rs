@@ -285,6 +285,9 @@ pub struct WorkspaceProjectSnapshot {
     pub workflows: Vec<WorkflowSummarySnapshot>,
     pub workflow_runs: Vec<WorkflowRunSummarySnapshot>,
     pub active_agent_sessions: usize,
+    /// 项目根目录(代码浏览/版控入口;v1 additive,service 路径只读)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_root: Option<String>,
 }
 
 /// 项目工作流摘要(启动运行/编辑器入口的数据面)。

@@ -64,6 +64,8 @@ export interface WorkflowView {
 export interface ProjectView {
   handle: string;
   name: string;
+  /** 项目根目录(代码浏览/版控入口;快照未含时为空)。 */
+  root: string;
   /** workflow.create/delete 的 collection CAS 轴。 */
   collectionRevision: string;
   workflows: WorkflowView[];
@@ -136,6 +138,7 @@ export function workspaceViewOf(snapshot: SnapshotEnvelope): WorkspaceView {
     return {
       handle,
       name,
+      root: typeof project.display_root === "string" ? project.display_root : "",
       collectionRevision,
       workflows,
       activeSessions: Number(project.active_agent_sessions ?? 0),
