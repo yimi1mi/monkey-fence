@@ -562,6 +562,11 @@ pub trait CoreKernel: Send + Sync {
     fn grant_controller(&self, client_id: &str, principal: &str) -> Result<u64, KernelProblem>;
     /// 当前 controller epoch(Web takeover CAS 的观察对象)。
     fn controller_epoch(&self) -> u64;
+    /// 把项目根目录挂载进 Core(打开/初始化 Project Store 并注册投影
+    /// target),返回 opaque project handle。多项目同时在线的入口。
+    fn attach_project(&self, root: &std::path::Path) -> Result<String, KernelProblem>;
+    /// 卸载项目(handle 为 opaque 形态);未注册/关闭中 → not found。
+    fn detach_project(&self, project_handle: &str) -> Result<(), KernelProblem>;
 }
 
 // ---------------------------------------------------------------------------
@@ -2688,6 +2693,22 @@ impl CoreKernel for InProcessCoreKernel {
 
     fn controller_epoch(&self) -> u64 {
         self.lease.state.read().epoch
+    }
+
+    fn attach_project(&self, root: &std::path::Path) -> Result<String, KernelProblem> {
+        // 与 InProcessKernelRuntime::open_project 同一装配路径:打开
+        // Project Store 并注册投影 target;幂等语义由 service registry
+        // 的 path 复用承载(同路径重挂返回既有 handle)。
+        let store = mf_agent::Store::open(&mf_agent::project_db_path(root))
+            .map_err(|error| KernelProblem::ServiceUnavailable(format!("{error:#}")))?;
+        let project = self.register_project_store(root, store)?;
+        Ok(project.as_str().to_string())
+    }
+
+    fn detach_project(&self, project_handle: &str) -> Result<(), KernelProblem> {
+        let handle = crate::handles::ProjectStoreHandle::parse(project_handle)
+            .map_err(|error| KernelProblem::ResourceNotFound)?;
+        self.unregister_project_store(&handle)
     }
 }
 

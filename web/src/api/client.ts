@@ -78,6 +78,33 @@ export class WorkbenchClient {
     return (await response.json()) as CommandOutcomeWire;
   }
 
+  /** 挂载项目目录(多项目入口;Controller-only)。 */
+  async attachProject(path: string): Promise<{ project: string; display_name: string }> {
+    const response = await fetch("/api/v1/projects", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": this.context.csrfToken,
+        "X-Client-Id": this.context.clientId,
+      },
+      body: JSON.stringify({ path }),
+    });
+    if (!response.ok) throw new ApiError(await problemOf(response));
+    return (await response.json()) as { project: string; display_name: string };
+  }
+
+  /** 卸载项目(Controller-only)。 */
+  async detachProject(projectHandle: string): Promise<void> {
+    const response = await fetch(`/api/v1/projects/${encodeURIComponent(projectHandle)}`, {
+      method: "DELETE",
+      headers: {
+        "X-CSRF-Token": this.context.csrfToken,
+        "X-Client-Id": this.context.clientId,
+      },
+    });
+    if (!response.ok) throw new ApiError(await problemOf(response));
+  }
+
   /** Observer 显式 takeover(CAS:最后观察 epoch);成功返回新会话
    *  形态(角色升 Controller + 新 lease epoch),前端续存后生效。 */
   async takeover(lastObservedEpoch: string): Promise<BootstrapSession> {

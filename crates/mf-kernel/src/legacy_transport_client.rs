@@ -119,6 +119,22 @@ mod tests {
         fn controller_epoch(&self) -> u64 {
             0
         }
+        fn attach_project(
+            &self,
+            _root: &std::path::Path,
+        ) -> Result<String, crate::kernel::KernelProblem> {
+            Err(crate::kernel::KernelProblem::ServiceUnavailable(
+                "no kernel".into(),
+            ))
+        }
+        fn detach_project(
+            &self,
+            _project_handle: &str,
+        ) -> Result<(), crate::kernel::KernelProblem> {
+            Err(crate::kernel::KernelProblem::ServiceUnavailable(
+                "no kernel".into(),
+            ))
+        }
     }
 
     struct ReadHalf {

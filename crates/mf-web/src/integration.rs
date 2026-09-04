@@ -215,6 +215,22 @@ mod tests {
         fn controller_epoch(&self) -> u64 {
             0
         }
+        fn attach_project(
+            &self,
+            _root: &std::path::Path,
+        ) -> Result<String, mf_kernel::kernel::KernelProblem> {
+            Err(mf_kernel::kernel::KernelProblem::ServiceUnavailable(
+                "no kernel".into(),
+            ))
+        }
+        fn detach_project(
+            &self,
+            _project_handle: &str,
+        ) -> Result<(), mf_kernel::kernel::KernelProblem> {
+            Err(mf_kernel::kernel::KernelProblem::ServiceUnavailable(
+                "no kernel".into(),
+            ))
+        }
     }
 
     #[test]

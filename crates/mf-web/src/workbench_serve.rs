@@ -15,7 +15,7 @@ use std::sync::Arc;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use parking_lot::Mutex;
 
@@ -74,6 +74,8 @@ pub fn serve_workbench(
         .route("/api/v1/snapshots/workspace", get(workspace_snapshot))
         .route("/api/v1/commands", post(submit_command))
         .route("/api/v1/controller/takeover", post(controller_takeover))
+        .route("/api/v1/projects", post(attach_project_route))
+        .route("/api/v1/projects/{handle}", delete(detach_project_route))
         .route("/api/v1/events", get(events_ws))
         .route("/acceptance/new-nonce", post(acceptance_new_nonce))
         .route("/assets/{*path}", get(asset))
@@ -738,6 +740,95 @@ async fn controller_takeover(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct AttachProjectRequest {
+    path: String,
+}
+
+/// `POST /api/v1/projects`:挂载项目目录(多项目入口;Controller-only)。
+/// 根目录必须已存在且为目录;同一目录重挂由 service registry 幂等
+/// (返回既有 handle)。
+async fn attach_project_route(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    payload: Result<axum::Json<AttachProjectRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if let Err(problem) = authorize(&state, &headers, csrf.as_deref(), true) {
+        return problem_response(&problem).into_response();
+    }
+    let request = match payload {
+        Ok(axum::Json(request)) => request,
+        Err(rejection) => {
+            return problem_response(&Problem::new(
+                ProblemCode::InvalidEnvelope,
+                rejection.body_text(),
+                Some(Retry::Never),
+            ))
+        }
+    };
+    let root = std::path::PathBuf::from(request.path.trim_end_matches(['/', '\\']));
+    if !root.is_dir() {
+        return problem_response(&Problem::new(
+            ProblemCode::ValidationFailed,
+            format!("项目目录不存在或不是目录:{}", root.display()),
+            Some(Retry::Never),
+        ));
+    }
+    match state.kernel.attach_project(&root) {
+        Ok(handle) => {
+            let body = serde_json::json!({
+                "schema": "mf.project-attach.v1",
+                "project": handle,
+                "display_name": root
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Project"),
+            });
+            let mut headers = security(&state);
+            headers.push((header_name("content-type"), "application/json".into()));
+            respond(StatusCode::CREATED, headers, body.to_string().into_bytes()).into_response()
+        }
+        Err(problem) => problem_response(&Problem::new(
+            ProblemCode::ServiceUnavailable,
+            format!("项目挂载失败:{problem}"),
+            Some(Retry::Never),
+        ))
+        .into_response(),
+    }
+}
+
+/// `DELETE /api/v1/projects/{handle}`:卸载项目(Controller-only)。
+async fn detach_project_route(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    axum::extract::Path(handle): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if let Err(problem) = authorize(&state, &headers, csrf.as_deref(), true) {
+        return problem_response(&problem);
+    }
+    match state.kernel.detach_project(&handle) {
+        Ok(()) => {
+            let body = serde_json::json!({ "schema": "mf.project-detach.v1", "project": handle });
+            let mut headers = security(&state);
+            headers.push((header_name("content-type"), "application/json".into()));
+            respond(StatusCode::OK, headers, body.to_string().into_bytes())
+        }
+        Err(problem) => problem_response(&Problem::new(
+            ProblemCode::ResourceNotFound,
+            format!("项目卸载失败:{problem}"),
+            Some(Retry::Never),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -810,6 +901,22 @@ mod tests {
         }
         fn controller_epoch(&self) -> u64 {
             self.lease.lock().unwrap().0
+        }
+        fn attach_project(&self, root: &std::path::Path) -> Result<String, KernelProblem> {
+            // 测试面:目录必须存在;handle 由路径派生保持稳定
+            if !root.is_dir() {
+                return Err(KernelProblem::ServiceUnavailable(format!(
+                    "目录不存在:{}",
+                    root.display()
+                )));
+            }
+            Ok(format!(
+                "proj_{}",
+                root.display().to_string().len().to_string()
+            ))
+        }
+        fn detach_project(&self, _project_handle: &str) -> Result<(), KernelProblem> {
+            Ok(())
         }
     }
 
@@ -936,6 +1043,45 @@ mod tests {
         forged.client_id = "cl_other".into();
         let problem = command_core(&state, &session, &forged).unwrap_err();
         assert_eq!(problem.code, ProblemCode::InvalidEnvelope);
+    }
+
+    #[test]
+    fn project_attach_requires_controller_and_existing_directory() {
+        let state = test_state(Arc::new(FakeKernel::new()));
+        let controller = exchange_with_grant(&state);
+        let observer_session = {
+            // 第二次 bootstrap 使 controller 降 Observer
+            let nonce = state.auth.lock().issue_nonce();
+            let _new = state.auth.lock().exchange(&nonce, "127.0.0.1:80").unwrap();
+            controller
+        };
+        let demoted = state
+            .auth
+            .lock()
+            .verify(&observer_session.session_id, None)
+            .unwrap();
+        assert_eq!(demoted.role, SessionRole::Observer);
+
+        // Observer 挂载 → controller_required
+        let problem = authorize(
+            &state,
+            &auth_headers(&observer_session, Some(&observer_session.csrf_token)),
+            Some(&observer_session.csrf_token),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(problem.code, ProblemCode::ControllerRequired);
+
+        // 目录不存在 → fake kernel 拒绝(ServiceUnavailable 映射)
+        let missing = std::path::Path::new("Z:/definitely/not/here");
+        let problem = state.kernel.attach_project(missing).unwrap_err();
+        assert!(matches!(problem, KernelProblem::ServiceUnavailable(_)));
+
+        // 存在的目录 → handle 返回(fake 以路径长度派生)
+        let tmp = tempfile::tempdir().unwrap();
+        let handle = state.kernel.attach_project(tmp.path()).unwrap();
+        assert!(handle.starts_with("proj_"));
+        state.kernel.detach_project(&handle).unwrap();
     }
 
     #[test]

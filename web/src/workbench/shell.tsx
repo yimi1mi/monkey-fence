@@ -26,7 +26,7 @@ import {
   type WorkspaceView,
 } from "./model.ts";
 
-export type WorkbenchTab = "workflows" | "runs";
+export type WorkbenchTab = "workflows" | "runs" | "settings";
 
 const POLL_FALLBACK_MS = 3000;
 const POLL_LIVE_MS = 15000;
@@ -156,6 +156,9 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
           <button aria-selected={tab === "runs"} onClick={() => setTab("runs")}>
             运行
           </button>
+          <button aria-selected={tab === "settings"} onClick={() => setTab("settings")}>
+            设置
+          </button>
         </nav>
         <span className="header-space" />
         <span role="status" className={`chip ${connection === "live" ? "live" : "reconnecting"}`}>
@@ -226,12 +229,29 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
                 />
               ))}
               {view && view.projects.length === 0 && (
-                <p className="muted-note">尚未注册项目。用 mfctl 或 launcher 接入后此处会出现。</p>
+                <p className="muted-note">尚无项目——到「设置」里添加项目目录。</p>
               )}
             </div>
           </div>
+          <div className="pane-body" style={{ paddingTop: 2 }}>
+            <button className="mf-btn ghost settings-entry" onClick={() => setTab("settings")}>
+              项目管理 →
+            </button>
+          </div>
         </aside>
 
+        {tab === "settings" ? (
+          <section className="pane center" aria-label="设置">
+            <SettingsPane
+              client={client}
+              view={view}
+              onDone={(message) => {
+                setToast(message);
+                void refresh();
+              }}
+            />
+          </section>
+        ) : (
         <section className="pane center" aria-label={tab === "workflows" ? "工作流运行" : "活动运行"}>
           <div className="pane-head">
             <h2>{tab === "workflows" ? "工作流运行" : "活动运行"}</h2>
@@ -300,6 +320,7 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
             )}
           </div>
         </section>
+        )}
 
         <aside className="pane inspector" aria-label="检视器">
           <div className="pane-head">
@@ -537,6 +558,175 @@ function RunDetail({ run }: { run: RunView }) {
         )}
       </dl>
     </>
+  );
+}
+
+/** 设置页:项目管理(多项目同时在线)+ 系统信息。 */
+function SettingsPane({
+  client,
+  view,
+  onDone,
+}: {
+  client: WorkbenchClient;
+  view: WorkspaceView | null;
+  onDone: (message: string) => void;
+}) {
+  const [addOpen, setAddOpen] = useState(false);
+  const isController = client.isController;
+  const projects = view?.projects ?? [];
+
+  return (
+    <>
+      <div className="pane-head">
+        <h2>设置</h2>
+        <span className="leaf-count">{projects.length} 项目</span>
+      </div>
+      <div className="pane-body">
+        <div className="settings-section">
+          <div className="settings-title">
+            <span>项目管理</span>
+            <button
+              className="mf-btn primary"
+              disabled={!isController}
+              title={isController ? undefined : "Observer 禁写——接管为 Controller 后可操作"}
+              onClick={() => setAddOpen(true)}
+            >
+              添加项目
+            </button>
+          </div>
+          <p className="muted-note">
+            挂载本机项目目录(在其中初始化/复用 .mf-agent 存储);多项目同时在线,快照与事件流覆盖全部项目。
+          </p>
+          {projects.length > 0 ? (
+            <div className="project-admin-list">
+              {projects.map((project) => (
+                <div key={project.handle} className="project-admin-row">
+                  <div className="info">
+                    <span className="name">{project.name}</span>
+                    <span className="meta">
+                      {project.handle} · {project.runs.length} 运行 · {project.activeSessions}{" "}
+                      活跃会话
+                    </span>
+                  </div>
+                  <button
+                    className="mf-btn danger"
+                    disabled={!isController}
+                    title={isController ? undefined : "Observer 禁写"}
+                    onClick={async () => {
+                      try {
+                        await client.detachProject(project.handle);
+                        onDone(`项目「${project.name}」已移除`);
+                      } catch (error) {
+                        onDone(
+                          `移除失败:${error instanceof Error ? error.message : String(error)}`,
+                        );
+                      }
+                    }}
+                  >
+                    移除
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="muted-note">当前没有在线项目。</p>
+          )}
+        </div>
+
+        <div className="settings-section">
+          <div className="settings-title">
+            <span>系统信息</span>
+          </div>
+          <dl className="kv">
+            <dt>Core 实例</dt>
+            <dd>{view?.serverInstanceId ?? "—"}</dd>
+            <dt>投影游标</dt>
+            <dd>
+              {view ? `${view.streamEpoch} @ ${view.throughSeq}` : "—"}
+            </dd>
+            <dt>本会话角色</dt>
+            <dd>{isController ? "Controller(可写)" : "Observer(只读)"}</dd>
+            <dt>客户端 ID</dt>
+            <dd>{client.clientId}</dd>
+            <dt>lease epoch</dt>
+            <dd>{client.leaseEpoch}</dd>
+          </dl>
+        </div>
+      </div>
+      {addOpen && (
+        <AddProjectModal
+          client={client}
+          onClose={() => setAddOpen(false)}
+          onDone={(message) => {
+            setAddOpen(false);
+            onDone(message);
+          }}
+        />
+      )}
+    </>
+  );
+}
+
+/** 添加项目弹层:输入本机目录绝对路径 → attach_project。 */
+function AddProjectModal({
+  client,
+  onDone,
+  onClose,
+}: {
+  client: WorkbenchClient;
+  onDone: (message: string) => void;
+  onClose: () => void;
+}) {
+  const [path, setPath] = useState("");
+  const [busy, setBusy] = useState(false);
+  return (
+    <div
+      className="scrim"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <div className="modal" role="dialog" aria-modal="true" aria-label="添加项目">
+        <h3>
+          <span className="mark">＋</span>添加项目
+        </h3>
+        <div className="field">
+          <label htmlFor="proj-path">项目目录(绝对路径)</label>
+          <input
+            id="proj-path"
+            value={path}
+            placeholder="如 D:\workspace\my-project"
+            onChange={(event) => setPath(event.target.value)}
+          />
+          <span className="hint">
+            目录必须已存在;Core 将在其中初始化/复用 .mf-agent/workflow-v1.db。同一目录重复添加幂等。
+          </span>
+        </div>
+        <div className="actions">
+          <button className="mf-btn ghost" onClick={onClose}>
+            取消
+          </button>
+          <button
+            className="mf-btn primary"
+            disabled={path.trim().length === 0 || busy}
+            onClick={async () => {
+              setBusy(true);
+              try {
+                const result = await client.attachProject(path.trim());
+                onDone(`项目「${result.display_name}」已挂载`);
+              } catch (error) {
+                setBusy(false);
+                onDone(
+                  `挂载失败:${error instanceof Error ? error.message : String(error)}`,
+                );
+              }
+            }}
+          >
+            {busy ? "挂载中…" : "挂载"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 

@@ -462,6 +462,12 @@ mod tests {
             fn controller_epoch(&self) -> u64 {
                 0
             }
+            fn attach_project(&self, _root: &std::path::Path) -> Result<String, KernelProblem> {
+                Err(KernelProblem::ServiceUnavailable("fake".into()))
+            }
+            fn detach_project(&self, _project_handle: &str) -> Result<(), KernelProblem> {
+                Err(KernelProblem::ServiceUnavailable("fake".into()))
+            }
         }
         Arc::new(FakeKernel)
     }
