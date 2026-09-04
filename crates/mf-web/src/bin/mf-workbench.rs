@@ -99,7 +99,15 @@ fn main() {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(80);
-    match serve_workbench_with_hook(kernel, &dist, port, Some(assembler)) {
+    // #87 MFT1 输入面:registry 即 TerminalHost(kernel terminal 注入同源)
+    let terminal_host: Arc<dyn mf_terminal::TerminalHost> = runtime.registry.clone();
+    match mf_web::workbench_serve::serve_workbench_full(
+        kernel,
+        &dist,
+        port,
+        Some(assembler),
+        Some(terminal_host),
+    ) {
         Ok(url) => {
             println!("mf-workbench: serving {dist} on 127.0.0.1:{port}");
             println!("WEB_ENTRY={url}");

@@ -41,6 +41,8 @@ struct WorkbenchState {
     /// 项目挂载后的执行面装配钩(#75:Orchestrator + ports;None =
     /// 仅数据面——快照/命令可见但运行不可执行)。
     on_project_attached: Option<ProjectAttachHook>,
+    /// 终端宿主(#87 MFT1 输入面;None = 输入面禁用,只读输出仍可用)。
+    terminal_host: Option<Arc<dyn mf_terminal::TerminalHost>>,
 }
 
 /// 挂载钩:参数为 project handle 与项目根目录(Store 由钩子幂等重开)。
@@ -63,6 +65,17 @@ pub fn serve_workbench_with_hook(
     port: u16,
     on_project_attached: Option<ProjectAttachHook>,
 ) -> anyhow::Result<String> {
+    serve_workbench_full(kernel, dist_root, port, on_project_attached, None)
+}
+
+/// 全量装配(含终端宿主:#87 MFT1 输入面)。
+pub fn serve_workbench_full(
+    kernel: Arc<dyn CoreKernel>,
+    dist_root: impl Into<PathBuf>,
+    port: u16,
+    on_project_attached: Option<ProjectAttachHook>,
+    terminal_host: Option<Arc<dyn mf_terminal::TerminalHost>>,
+) -> anyhow::Result<String> {
     let dist_root = dist_root.into();
     anyhow::ensure!(
         dist_root.join("index.html").is_file(),
@@ -84,6 +97,7 @@ pub fn serve_workbench_with_hook(
         kernel,
         acceptance,
         on_project_attached,
+        terminal_host,
     });
     let router = Router::new()
         .route("/", get(index))
@@ -102,6 +116,7 @@ pub fn serve_workbench_with_hook(
         .route("/api/v1/fs/file", get(fs_file))
         .route("/api/v1/vcs/status", get(vcs_status))
         .route("/api/v1/cli/detect", get(cli_detect))
+        .route("/api/v1/terminal/ws", get(terminal_ws))
         .route("/api/v1/commands", post(submit_command))
         .route("/api/v1/controller/takeover", post(controller_takeover))
         .route("/api/v1/projects", post(attach_project_route))
@@ -589,6 +604,204 @@ async fn workflow_run_snapshot(
             Some(Retry::Never),
         )),
     }
+}
+
+/// `GET /api/v1/terminal/ws?epoch=N`(WS;子协议 mf-terminal.v1):
+/// MFT1 完整输入面(#87)——attach/hello/replay、writer lease、
+/// binary 输入帧(lease 复验 + 真实写 PTY)、增量输出、resize、exit。
+async fn terminal_ws(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<std::collections::HashMap<String, String>>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> impl IntoResponse {
+    if session_of(&state, &headers).is_none() {
+        return problem_response(&Problem::new(
+            ProblemCode::Unauthenticated,
+            "需要已认证 session",
+            None,
+        ))
+        .into_response();
+    }
+    let Some(host) = state.terminal_host.clone() else {
+        return problem_response(&Problem::new(
+            ProblemCode::ServiceUnavailable,
+            "终端宿主未装配(输入面不可用;只读输出走 HTTP 端点)",
+            Some(Retry::Never),
+        ))
+        .into_response();
+    };
+    let epoch: u64 = query.get("epoch").and_then(|v| v.parse().ok()).unwrap_or(0);
+    ws.protocols(["mf-terminal.v1"])
+        .on_upgrade(move |socket| async move {
+            terminal_pump(socket, host, epoch).await;
+        })
+        .into_response()
+}
+
+/// MFT1 会话泵:Text=ClientControl、Binary=输入帧;100ms tick 驱动
+/// 增量输出与 exit。
+async fn terminal_pump(
+    mut socket: axum::extract::ws::WebSocket,
+    host: Arc<dyn mf_terminal::TerminalHost>,
+    epoch: u64,
+) {
+    use crate::ws::terminal::{
+        ClientControl, ControlOutcome, InputOutcome, ServerControl, TerminalWsSession,
+    };
+    use axum::extract::ws::{CloseFrame, Message, WebSocket};
+    use mf_terminal::TerminalSessionRef;
+
+    let mut session = TerminalWsSession::new();
+    let mut session_handle: Option<String> = None;
+    let mut last_seq: u64 = 0;
+
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        let Ok(control) = serde_json::from_str::<ClientControl>(&text) else {
+                            let _ = socket.send(Message::Text(
+                                serde_json::to_string(&ServerControl::Problem {
+                                    code: "invalid_envelope".into(),
+                                    detail: "控制帧解析失败".into(),
+                                }).unwrap_or_default().into(),
+                            )).await;
+                            continue;
+                        };
+                        if session_handle.is_none() {
+                            if let ClientControl::Attach { session_handle: handle, .. } = &control {
+                                session_handle = Some(handle.clone());
+                            }
+                        }
+                        let Some(handle) = session_handle.clone() else {
+                            let _ = socket.send(Message::Text(
+                                serde_json::to_string(&ServerControl::Problem {
+                                    code: "invalid_envelope".into(),
+                                    detail: "首帧必须是 attach".into(),
+                                }).unwrap_or_default().into(),
+                            )).await;
+                            return;
+                        };
+                        match session.control(host.as_ref(), &handle, control, epoch) {
+                            ControlOutcome::Attached(hello, frames) => {
+                                if let Ok(text) = serde_json::to_string(&hello) {
+                                    let _ = socket.send(Message::Text(text.into())).await;
+                                }
+                                for frame in frames {
+                                    if let Some(seq) = decode_output_seq(&frame) {
+                                        last_seq = last_seq.max(seq);
+                                    }
+                                    let _ = socket.send(Message::Binary(frame.into())).await;
+                                }
+                            }
+                            ControlOutcome::Continued(optional) => {
+                                if let Some(control) = optional {
+                                    if let Ok(text) = serde_json::to_string(&control) {
+                                        let _ = socket.send(Message::Text(text.into())).await;
+                                    }
+                                }
+                            }
+                            ControlOutcome::Close { close_code, problem } => {
+                                if let Ok(text) = serde_json::to_string(&ServerControl::Problem {
+                                    code: "terminal_close".into(),
+                                    detail: problem.message,
+                                }) {
+                                    let _ = socket.send(Message::Text(text.into())).await;
+                                }
+                                let _ = socket.send(Message::Close(Some(CloseFrame {
+                                    code: close_code,
+                                    reason: "mf-terminal".into(),
+                                }))).await;
+                                return;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Binary(frame))) => {
+                        let Some(handle) = session_handle.clone() else { return };
+                        match session.binary_input(host.as_ref(), &frame, epoch, &handle) {
+                            InputOutcome::Acked { input_seq, ack_id } => {
+                                if let Ok(text) = serde_json::to_string(&ServerControl::InputAck {
+                                    input_seq: input_seq.to_string(),
+                                    ack_id: ack_id.to_string(),
+                                }) {
+                                    let _ = socket.send(Message::Text(text.into())).await;
+                                }
+                            }
+                            InputOutcome::OutOfOrder { expected_seq } => {
+                                if let Ok(text) = serde_json::to_string(&ServerControl::OutOfOrder {
+                                    expected_input_seq: expected_seq.to_string(),
+                                }) {
+                                    let _ = socket.send(Message::Text(text.into())).await;
+                                }
+                            }
+                            InputOutcome::Rejected { problem, close } => {
+                                if let Ok(text) = serde_json::to_string(&ServerControl::Problem {
+                                    code: "input_rejected".into(),
+                                    detail: problem.message,
+                                }) {
+                                    let _ = socket.send(Message::Text(text.into())).await;
+                                }
+                                if close { return; }
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Close(_))) | None => {
+                        session.connection_closed();
+                        return;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => return,
+                }
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                let Some(handle) = session_handle.clone() else { continue };
+                let reference = TerminalSessionRef::new(handle.clone());
+                if session.is_attached() {
+                    if let Ok(chunks) = host.replay_output(&reference, last_seq) {
+                        for chunk in chunks {
+                            if let Ok(frame) =
+                                mf_terminal::channel::encode_output_frame(chunk.seq, &chunk.bytes)
+                            {
+                                last_seq = last_seq.max(chunk.seq);
+                                if socket.send(Message::Binary(frame.into())).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    if let Some(problem) = session.poll_output() {
+                        if let Ok(text) = serde_json::to_string(&ServerControl::Problem {
+                            code: "rate_limited".into(),
+                            detail: problem.message,
+                        }) {
+                            let _ = socket.send(Message::Text(text.into())).await;
+                        }
+                        return;
+                    }
+                    if let Some(exit) = session.poll_exit(host.as_ref(), &handle) {
+                        if let Ok(text) = serde_json::to_string(&exit) {
+                            let _ = socket.send(Message::Text(text.into())).await;
+                        }
+                        let _ = socket.send(Message::Close(Some(CloseFrame {
+                            code: 1000,
+                            reason: "mf-terminal-exit".into(),
+                        }))).await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// 从输出帧解 seq(MFT1 头:kind@4, seq@8 大端)。
+fn decode_output_seq(frame: &[u8]) -> Option<u64> {
+    if frame.len() < 16 {
+        return None;
+    }
+    Some(u64::from_be_bytes(frame[8..16].try_into().ok()?))
 }
 
 /// `GET /api/v1/terminal/{session}/output?after=N`:只读终端输出增量
@@ -1505,6 +1718,7 @@ mod tests {
             kernel,
             acceptance: true,
             on_project_attached: None,
+            terminal_host: None,
         })
     }
 
