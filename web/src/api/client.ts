@@ -92,6 +92,34 @@ export class WorkbenchClient {
     return envelope.data;
   }
 
+  /** CLI 安装 recipe(#93;含包管理器探测)。 */
+  async cliRecipes(): Promise<{
+    recipes: Array<{ agent_type: string; package: string; display: string }>;
+    package_manager: string | null;
+    install_available: boolean;
+  }> {
+    const response = await fetch("/api/v1/cli/recipes", {
+      headers: { "X-Client-Id": this.context.clientId },
+    });
+    if (!response.ok) throw new ApiError(await problemOf(response));
+    return await response.json();
+  }
+
+  /** 安装 CLI(#93;Controller-only;包管理器真实执行)。 */
+  async cliInstall(agentType: string): Promise<{ outcome: string; version?: string; reason?: string }> {
+    const response = await fetch("/api/v1/cli/install", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CSRF-Token": this.context.csrfToken,
+        "X-Client-Id": this.context.clientId,
+      },
+      body: JSON.stringify({ agent_type: agentType }),
+    });
+    if (!response.ok) throw new ApiError(await problemOf(response));
+    return await response.json();
+  }
+
   /** 真实 catalog 实例列表(#87;只读)。 */
   async catalogInstances(): Promise<
     Array<{ id: string; name: string; agent_type: string; enabled: boolean }>

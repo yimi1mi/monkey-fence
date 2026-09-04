@@ -117,6 +117,8 @@ pub fn serve_workbench_full(
         .route("/api/v1/vcs/status", get(vcs_status))
         .route("/api/v1/cli/detect", get(cli_detect))
         .route("/api/v1/catalog/instances", get(catalog_instances))
+        .route("/api/v1/cli/recipes", get(cli_recipes))
+        .route("/api/v1/cli/install", post(cli_install_route))
         .route("/api/v1/terminal/ws", get(terminal_ws))
         .route("/api/v1/commands", post(submit_command))
         .route("/api/v1/controller/takeover", post(controller_takeover))
@@ -1112,6 +1114,198 @@ async fn catalog_instances(
         headers,
         serde_json::to_vec(&body).unwrap_or_default(),
     )
+}
+
+/// `GET /api/v1/cli/recipes`(#93):内置安装 recipe + 包管理器探测。
+async fn cli_recipes(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if session_of(&state, &headers).is_none() {
+        return problem_response(&Problem::new(
+            ProblemCode::Unauthenticated,
+            "需要已认证 session",
+            None,
+        ));
+    }
+    let manager = crate::cli_install::detect_package_manager();
+    let recipes = crate::cli_install::RECIPES
+        .iter()
+        .map(|recipe| {
+            serde_json::json!({
+                "agent_type": recipe.agent_type,
+                "package": recipe.package,
+                "display": recipe.display,
+                "manager": manager.as_ref().map(|(m, _)| m),
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = serde_json::json!({
+        "schema": "mf.cli-recipes.v1",
+        "recipes": recipes,
+        "package_manager": manager.as_ref().map(|(m, _)| m),
+        "install_available": manager.is_some(),
+    });
+    let mut headers = security(&state);
+    headers.push((header_name("content-type"), "application/json".into()));
+    respond(
+        StatusCode::OK,
+        headers,
+        serde_json::to_vec(&body).unwrap_or_default(),
+    )
+}
+
+#[derive(serde::Deserialize)]
+struct CliInstallRequest {
+    agent_type: String,
+}
+
+/// `POST /api/v1/cli/install`(#93):Controller-only;PlanFreezer 冻结
+/// → execute_plan(生产 OsExecutorEnv)→ receipt。catalog 恒零写入;
+/// 安装幂等(包管理器语义),检测以 PATH 事实为准。
+async fn cli_install_route(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    payload: Result<axum::Json<CliInstallRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if let Err(problem) = authorize(&state, &headers, csrf.as_deref(), true) {
+        return problem_response(&problem).into_response();
+    }
+    let request = match payload {
+        Ok(axum::Json(request)) => request,
+        Err(rejection) => {
+            return problem_response(&Problem::new(
+                ProblemCode::InvalidEnvelope,
+                rejection.body_text(),
+                Some(Retry::Never),
+            ))
+            .into_response()
+        }
+    };
+    let Some(recipe) = crate::cli_install::RECIPES
+        .iter()
+        .find(|r| r.agent_type == request.agent_type)
+    else {
+        return problem_response(&Problem::new(
+            ProblemCode::ResourceNotFound,
+            format!("未知 agent CLI:{}", request.agent_type),
+            Some(Retry::Never),
+        ))
+        .into_response();
+    };
+    let Some((manager, base_argv)) = crate::cli_install::detect_package_manager() else {
+        return problem_response(&Problem::new(
+            ProblemCode::ServiceUnavailable,
+            "无可用包管理器(npm/winget 均未检测到)",
+            Some(Retry::Never),
+        ))
+        .into_response();
+    };
+    // 构造冻结计划(package-manager 类):
+    // exact_package = 可执行名(executor 以它为 program), argv = 完整参数
+    let program = if manager == "npm" {
+        if cfg!(windows) { "npm.cmd" } else { "npm" }.to_string()
+    } else {
+        manager.to_string()
+    };
+    let mut argv = base_argv.clone();
+    argv.push(recipe.package.to_string());
+    let preview = mf_installer::plan::InstallPreview {
+        agent_type_id: recipe.agent_type.to_string(),
+        installer_id: format!("{manager}-global"),
+        kind: "package-manager".into(),
+        exact_package: program,
+        exact_version: "latest".into(),
+        argv,
+        download: None,
+        catalog_revision: 0,
+    };
+    let mut freezer = mf_installer::plan::PlanFreezer::new(30);
+    let ticket = match freezer.freeze(preview, 0) {
+        Ok(ticket) => ticket,
+        Err(problem) => {
+            return problem_response(&Problem::new(
+                ProblemCode::ValidationFailed,
+                format!("安装计划冻结失败:{problem:?}"),
+                Some(Retry::Never),
+            ))
+            .into_response()
+        }
+    };
+    let plan = match freezer.redeem(&ticket) {
+        Ok(plan) => plan.clone(),
+        Err(problem) => {
+            return problem_response(&Problem::new(
+                ProblemCode::ValidationFailed,
+                format!("安装票据兑换失败:{problem:?}"),
+                Some(Retry::Never),
+            ))
+            .into_response()
+        }
+    };
+    let staging =
+        std::env::temp_dir().join(format!("mf-install-{}", uuid::Uuid::now_v7().simple()));
+    // package-manager 全局安装的可执行落点:npm prefix -g(Windows 的
+    // prefix 即全局 bin,含 <agent_type>.cmd shim)。探测它 = 真实事实。
+    let prefix_output = std::process::Command::new(if cfg!(windows) { "npm.cmd" } else { "npm" })
+        .args(["prefix", "-g"])
+        .output();
+    let target = match prefix_output {
+        Ok(output) if output.status.success() => {
+            let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if cfg!(windows) {
+                std::path::PathBuf::from(prefix).join(format!("{}.cmd", recipe.agent_type))
+            } else {
+                std::path::PathBuf::from(prefix)
+                    .join("bin")
+                    .join(recipe.agent_type)
+            }
+        }
+        _ => staging.join("marker"),
+    };
+    let mut env = crate::cli_install::OsExecutorEnv;
+    let outcome = mf_installer::executor::execute_plan(
+        &mut env,
+        &plan,
+        &staging,
+        &target,
+        &["--version".to_string()],
+        &mf_installer::executor::DownloadPolicy::default(),
+        &|| false,
+    );
+    let body = match outcome {
+        mf_installer::executor::ExecuteOutcome::Installed(receipt) => serde_json::json!({
+            "schema": "mf.cli-install-result.v1",
+            "outcome": "installed",
+            "agent_type": recipe.agent_type,
+            "package": recipe.package,
+            "version": receipt.actual_version,
+        }),
+        mf_installer::executor::ExecuteOutcome::Failed { phase, reason } => serde_json::json!({
+            "schema": "mf.cli-install-result.v1",
+            "outcome": "failed",
+            "agent_type": recipe.agent_type,
+            "phase": format!("{phase:?}"),
+            "reason": reason,
+        }),
+        other => serde_json::json!({
+            "schema": "mf.cli-install-result.v1",
+            "outcome": "other",
+            "detail": format!("{other:?}"),
+        }),
+    };
+    let mut headers = security(&state);
+    headers.push((header_name("content-type"), "application/json".into()));
+    respond(
+        StatusCode::OK,
+        headers,
+        serde_json::to_vec(&body).unwrap_or_default(),
+    )
+    .into_response()
 }
 
 #[derive(serde::Deserialize)]

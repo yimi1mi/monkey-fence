@@ -52,6 +52,11 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
   const [view, setView] = useState<WorkspaceView | null>(null);
   const [projection, setProjection] = useState<ProjectionState | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  useEffect(() => {
+    const onToastEvent = (event: Event) => setToast((event as CustomEvent<string>).detail);
+    window.addEventListener("mf-toast", onToastEvent);
+    return () => window.removeEventListener("mf-toast", onToastEvent);
+  }, []);
   const [connection, setConnection] = useState<"live" | "reconnecting">("live");
   const [wsOpen, setWsOpen] = useState(false);
   const [selectedRun, setSelectedRun] = useState<string | null>(null);
@@ -63,9 +68,12 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
   const [terminalSession, setTerminalSession] = useState<string | null>(null);
   const [clis, setClis] = useState<Array<{ agent_type_id: string; executable: string }>>([]);
   const [instances, setInstances] = useState<Array<{ id: string; name: string; enabled: boolean }>>([]);
+  const [recipes, setRecipes] = useState<Array<{ agent_type: string; package: string; display: string }>>([]);
+  const [installing, setInstalling] = useState<string | null>(null);
   useEffect(() => {
     void client.cliDetect().then(setClis).catch(() => setClis([]));
     void client.catalogInstances().then(setInstances).catch(() => setInstances([]));
+    void client.cliRecipes().then((data) => setRecipes(data.recipes)).catch(() => setRecipes([]));
   }, [client]);
   // #91 通知: needs-you 系统通知 + 提示音(设置开关;默认开)
   const notificationsOn = localStorage.getItem("mf.notify") !== "off";
@@ -335,6 +343,31 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
               view={view}
               clis={clis}
               instances={instances}
+              recipes={recipes}
+              installing={installing}
+              onInstall={async (agentType) => {
+                setInstalling(agentType);
+                try {
+                  const result = await client.cliInstall(agentType);
+                  window.dispatchEvent(
+                    new CustomEvent("mf-toast", {
+                      detail:
+                        result.outcome === "installed"
+                          ? `已安装 ${agentType}${result.version ? `(v${result.version})` : ""}`
+                          : `安装失败:${result.reason ?? result.outcome}`,
+                    }),
+                  );
+                } catch (error) {
+                  window.dispatchEvent(
+                    new CustomEvent("mf-toast", {
+                      detail: `安装失败:${error instanceof Error ? error.message : String(error)}`,
+                    }),
+                  );
+                } finally {
+                  setInstalling(null);
+                  void client.cliDetect().then(setClis).catch(() => {});
+                }
+              }}
               onBrowse={(root) => setCodeBrowser(root)}
               onVcs={(root) => setVcsRoot(root)}
               onDone={(message) => {
@@ -1213,6 +1246,9 @@ function SettingsPane({
   view,
   clis,
   instances,
+  recipes,
+  installing,
+  onInstall,
   onBrowse,
   onVcs,
   onDone,
@@ -1221,6 +1257,9 @@ function SettingsPane({
   view: WorkspaceView | null;
   clis: Array<{ agent_type_id: string; executable: string }>;
   instances: Array<{ id: string; name: string; enabled: boolean }>;
+  recipes: Array<{ agent_type: string; package: string; display: string }>;
+  installing: string | null;
+  onInstall: (agentType: string) => Promise<void>;
   onBrowse: (root: string) => void;
   onVcs: (root: string) => void;
   onDone: (message: string) => void;
@@ -1342,7 +1381,34 @@ function SettingsPane({
               ))}
             </div>
           ) : (
-            <p className="muted-note">未在 PATH 中检测到常见 agent CLI(codex/claude/gemini 等)。</p>
+            <p className="muted-note">未在 PATH 中检测到常见 agent CLI。</p>
+          )}
+          {recipes.length > 0 && (
+            <>
+              <p className="muted-note" style={{ marginTop: 10 }}>
+                安装({recipes.length} 个可用;包管理器全局安装,完成后自动检测):
+              </p>
+              <div className="project-admin-list">
+                {recipes
+                  .filter((recipe) => !clis.some((cli) => cli.agent_type_id === recipe.agent_type))
+                  .map((recipe) => (
+                    <div key={recipe.agent_type} className="project-admin-row">
+                      <div className="info">
+                        <span className="name">{recipe.display}</span>
+                        <span className="meta">{recipe.package}</span>
+                      </div>
+                      <button
+                        className="mf-btn primary"
+                        disabled={!client.isController || installing !== null}
+                        title={client.isController ? undefined : "Observer 禁写"}
+                        onClick={() => void onInstall(recipe.agent_type)}
+                      >
+                        {installing === recipe.agent_type ? "安装中…" : "安装"}
+                      </button>
+                    </div>
+                  ))}
+              </div>
+            </>
           )}
         </div>
 

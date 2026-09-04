@@ -1056,6 +1056,7 @@ dependencies = [
  "log",
  "mf-agent",
  "mf-elevated",
+ "mf-installer",
  "mf-kernel",
  "mf-terminal",
  "mf-vcs",
