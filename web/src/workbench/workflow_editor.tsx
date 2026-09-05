@@ -1,7 +1,9 @@
 // 工作流 DAG 编辑器(#76):React Flow 画布 + dagre 自动布局(graph.ts)。
 // 全部编辑经 workflow.* 命令(双轴 CAS);快照是唯一数据源。
+// #97:节点编辑/新增用表单弹窗,agent_instance_id 可从 catalog 实例与
+// 本机检测 CLI 中选择(datalist,仍允许自由输入)。
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   addEdge,
   Background,
@@ -17,7 +19,6 @@ import "@xyflow/react/dist/style.css";
 import { ApiError, type WorkbenchClient } from "../api/client.ts";
 import { uuidv7 } from "../api/uuid.ts";
 import { autoLayout, type DagGraph } from "../dag/graph.ts";
-import { useModalPrompt } from "./modal_prompt.tsx";
 
 export interface WorkflowSnapshotView {
   workflow: string;
@@ -85,12 +86,15 @@ export function WorkflowEditor({
   client,
   projectHandle,
   workflowHandle,
+  agentOptions,
   onDone,
   onClose,
 }: {
   client: WorkbenchClient;
   projectHandle: string;
   workflowHandle: string;
+  /** agent_instance_id 候选(catalog 实例 id + 本机检测 CLI;#97)。 */
+  agentOptions: string[];
   onDone: (message: string) => void;
   onClose: () => void;
 }) {
@@ -99,7 +103,7 @@ export function WorkflowEditor({
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [busy, setBusy] = useState(false);
-  const prompt = useModalPrompt();
+  const nodeFormModal = useNodeFormModal();
 
   const reload = useCallback(async () => {
     const response = await fetch(
@@ -223,9 +227,15 @@ export function WorkflowEditor({
           语义 rev {snapshot.semanticRevision} · 呈现 rev {snapshot.presentationRevision}
         </span>
         <span className="header-space" />
-        <AddNodeButton busy={busy} onAdd={(key, title, instance) => editCommand("workflow.add_node", {
-          node: { key, title, instructions: "", agent_instance_id: instance, deps: [] },
-        })} />
+        <AddNodeButton
+          busy={busy}
+          agentOptions={agentOptions}
+          onAdd={(key, title, instance, instructions) =>
+            editCommand("workflow.add_node", {
+              node: { key, title, instructions, agent_instance_id: instance, deps: [] },
+            })
+          }
+        />
         {selectedNode && client.isController && (
           <>
             <button
@@ -240,23 +250,22 @@ export function WorkflowEditor({
               disabled={busy}
               onClick={() => {
                 void (async () => {
-                  const title =
-                    (await prompt.ask({
-                      title: "编辑节点",
-                      label: "新标题",
-                      initial: selectedNode.title,
-                    })) ?? selectedNode.title;
-                  const instance =
-                    (await prompt.ask({
-                      title: "编辑节点",
-                      label: "Agent 实例 ID",
-                      initial: selectedNode.agentInstanceId,
-                    })) ?? selectedNode.agentInstanceId;
+                  const form = await nodeFormModal.ask({
+                    title: "编辑节点",
+                    agentOptions,
+                    initial: {
+                      key: selectedNode.key,
+                      title: selectedNode.title,
+                      instance: selectedNode.agentInstanceId,
+                      instructions: selectedNode.instructions,
+                    },
+                  });
+                  if (!form) return;
                   void editCommand("workflow.update_node", {
                     node_handle: selectedNode.handle,
-                    title,
-                    instructions: selectedNode.instructions,
-                    agent_instance_id: instance,
+                    title: form.title,
+                    instructions: form.instructions,
+                    agent_instance_id: form.instance,
                   });
                 })();
               }}
@@ -290,47 +299,188 @@ export function WorkflowEditor({
       <div className="editor-hint">
         点击节点选中(删除/编辑);拖出连线建立依赖;双击连线断开。所有编辑经内核命令(双轴 CAS)。
       </div>
-      {prompt.modal}
+      {nodeFormModal.modal}
+    </div>
+  );
+}
+
+// ── 节点表单弹窗(#97):标题 + agent 选择 + 指令 ───────────────────────
+
+export interface NodeFormValue {
+  key: string;
+  title: string;
+  instance: string;
+  instructions: string;
+}
+
+interface NodeFormSpec {
+  title: string;
+  agentOptions: string[];
+  initial: NodeFormValue;
+  /** 新建节点时允许编辑 key(编辑节点时 key 不可变)。 */
+  withKey?: boolean;
+}
+
+function useNodeFormModal(): {
+  ask: (spec: NodeFormSpec) => Promise<NodeFormValue | null>;
+  modal: ReactNode;
+} {
+  const [spec, setSpec] = useState<NodeFormSpec | null>(null);
+  const resolver = useRef<((value: NodeFormValue | null) => void) | null>(null);
+
+  const ask = useCallback((next: NodeFormSpec) => {
+    setSpec(next);
+    return new Promise<NodeFormValue | null>((resolve) => {
+      resolver.current = resolve;
+    });
+  }, []);
+
+  const settle = useCallback((value: NodeFormValue | null) => {
+    resolver.current?.(value);
+    resolver.current = null;
+    setSpec(null);
+  }, []);
+
+  return {
+    ask,
+    modal: spec ? <NodeFormModal spec={spec} onSettle={settle} /> : null,
+  };
+}
+
+function NodeFormModal({
+  spec,
+  onSettle,
+}: {
+  spec: NodeFormSpec;
+  onSettle: (value: NodeFormValue | null) => void;
+}) {
+  const [value, setValue] = useState<NodeFormValue>(spec.initial);
+
+  useEffect(() => {
+    setValue(spec.initial);
+  }, [spec]);
+
+  const submit = () => {
+    const key = value.key.trim();
+    const title = value.title.trim() || key;
+    const instance = value.instance.trim();
+    if (!key && spec.withKey) return; // 新建必须有 key
+    onSettle({ ...value, key, title, instance });
+  };
+
+  return (
+    <div
+      className="scrim"
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onSettle(null);
+      }}
+    >
+      <div className="modal node-form-modal" role="dialog" aria-modal="true" aria-label={spec.title}>
+        <h3>{spec.title}</h3>
+        {spec.withKey && (
+          <div className="field">
+            <label htmlFor="mf-node-key">节点 key(ASCII,创建后不可改)</label>
+            <input
+              id="mf-node-key"
+              autoFocus
+              value={value.key}
+              placeholder="如 build / test / report"
+              onChange={(event) => setValue({ ...value, key: event.target.value })}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") submit();
+                if (event.key === "Escape") onSettle(null);
+              }}
+            />
+          </div>
+        )}
+        <div className="field">
+          <label htmlFor="mf-node-title">标题</label>
+          <input
+            id="mf-node-title"
+            autoFocus={!spec.withKey}
+            value={value.title}
+            placeholder="节点显示名"
+            onChange={(event) => setValue({ ...value, title: event.target.value })}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") submit();
+              if (event.key === "Escape") onSettle(null);
+            }}
+          />
+        </div>
+        <div className="field">
+          <label htmlFor="mf-node-agent">Agent 实例(每个节点可选不同 agent;下拉候选或自由输入)</label>
+          <input
+            id="mf-node-agent"
+            list="mf-agent-options"
+            value={value.instance}
+            placeholder="如 codex / claude / agent-main"
+            onChange={(event) => setValue({ ...value, instance: event.target.value })}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") submit();
+              if (event.key === "Escape") onSettle(null);
+            }}
+          />
+          <datalist id="mf-agent-options">
+            {spec.agentOptions.map((option) => (
+              <option key={option} value={option} />
+            ))}
+          </datalist>
+          {spec.agentOptions.length === 0 && (
+            <span className="hint">暂无候选——在「设置 → Agent 与 CLI」安装/注册后可选</span>
+          )}
+        </div>
+        <div className="field">
+          <label htmlFor="mf-node-instructions">指令(节点任务说明;可引用上游输出)</label>
+          <textarea
+            id="mf-node-instructions"
+            rows={4}
+            value={value.instructions}
+            placeholder="这个节点让 agent 做什么…"
+            onChange={(event) => setValue({ ...value, instructions: event.target.value })}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") onSettle(null);
+            }}
+          />
+        </div>
+        <div className="actions">
+          <button className="mf-btn ghost" onClick={() => onSettle(null)}>
+            取消
+          </button>
+          <button className="mf-btn primary" onClick={submit}>
+            保存
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
 
 function AddNodeButton({
   busy,
+  agentOptions,
   onAdd,
 }: {
   busy: boolean;
-  onAdd: (key: string, title: string, instance: string) => void;
+  agentOptions: string[];
+  onAdd: (key: string, title: string, instance: string, instructions: string) => void;
 }) {
-  const prompt = useModalPrompt();
+  const nodeFormModal = useNodeFormModal();
   return (
     <>
-      {prompt.modal}
+      {nodeFormModal.modal}
       <button
         className="mf-btn primary"
         disabled={busy}
         onClick={() => {
           void (async () => {
-            const key = await prompt.ask({
+            const form = await nodeFormModal.ask({
               title: "添加节点",
-              label: "节点 key(ASCII,如 build)",
-              placeholder: "build",
+              agentOptions,
+              withKey: true,
+              initial: { key: "", title: "", instance: "agent-main", instructions: "" },
             });
-            const trimmed = key?.trim();
-            if (!trimmed) return;
-            const title =
-              (await prompt.ask({
-                title: "添加节点",
-                label: "节点标题",
-                initial: trimmed,
-              })) ?? trimmed;
-            const instance =
-              (await prompt.ask({
-                title: "添加节点",
-                label: "Agent 实例 ID",
-                initial: "agent-main",
-              })) ?? "agent-main";
-            onAdd(trimmed, title, instance);
+            if (!form || !form.key) return;
+            onAdd(form.key, form.title, form.instance, form.instructions);
           })();
         }}
       >

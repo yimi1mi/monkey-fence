@@ -10,6 +10,7 @@ import {
   storeSession,
   type BootstrapSession,
 } from "../api/session.ts";
+import { installResizeObserverFallback } from "../api/resize_observer_fallback.ts";
 import "../styles/global.css";
 
 function showFatal(message: string): void {
@@ -69,6 +70,9 @@ async function bootstrapWithNonce(nonce: string): Promise<void> {
 }
 
 async function bootstrap(): Promise<void> {
+  // 先装 RO 兜底(#97):必须在 React Flow/xterm 创建任何 ResizeObserver
+  // 之前完成——替换只影响之后 new 的实例。判定 ≤ 两帧,不拖慢首屏。
+  await installResizeObserverFallback();
   const params = new URLSearchParams(location.hash.slice(1));
   const nonce = params.get("nonce");
   if (nonce) {

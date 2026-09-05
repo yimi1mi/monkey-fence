@@ -9,7 +9,7 @@ import type {
   Problem,
   SnapshotEnvelope,
 } from "./protocol.ts";
-import type { BootstrapSession } from "./session.ts";
+import { storeSession, type BootstrapSession } from "./session.ts";
 
 export interface ClientContext {
   csrfToken: string;
@@ -29,7 +29,7 @@ export class ApiError extends Error {
 
 /** 同源 API client(bootstrap cookie 自动携带;凭据永不进 URL)。 */
 export class WorkbenchClient {
-  constructor(private readonly context: ClientContext) {}
+  constructor(private context: ClientContext) {}
 
   get role(): "controller" | "observer" {
     return this.context.role;
@@ -49,6 +49,50 @@ export class WorkbenchClient {
     return this.context.clientId;
   }
 
+  /** 写路径 401 自愈(#97):HttpOnly cookie 由浏览器全局共享,其它
+   * tab 的 exchange 会覆盖它——本 tab 未刷新时持旧 csrf/client_id,
+   * 写命令全部 csrf_rejected(读路径不受影响)。探活 /auth/session
+   * (只认 cookie,同源安全)权威刷新 context 后重试一次;探活失败
+   * (session 真失效)则抛原始错误。 */
+  private async write(send: () => Promise<Response>): Promise<Response> {
+    let response = await send();
+    if (response.status === 401) {
+      const problem = await problemOf(response);
+      if (problem.code === "csrf_rejected" || problem.code === "unauthenticated") {
+        const refreshed = await this.refreshFromServerSession();
+        if (refreshed) {
+          response = await send();
+          if (response.ok) return response;
+          throw new ApiError(await problemOf(response));
+        }
+      }
+      throw new ApiError(problem);
+    }
+    if (!response.ok) throw new ApiError(await problemOf(response));
+    return response;
+  }
+
+  /** 以 cookie session 权威刷新本 client 的 csrf/client/epoch/role。 */
+  async refreshFromServerSession(): Promise<boolean> {
+    try {
+      const probe = await fetch("/auth/session");
+      if (!probe.ok) return false;
+      const data = (await probe.json()) as BootstrapSession;
+      this.context = {
+        csrfToken: data.csrf_token,
+        clientId: data.client_id,
+        controllerLeaseEpoch: String(
+          data.controller?.lease_epoch ?? this.context.controllerLeaseEpoch,
+        ),
+        role: data.controller?.role === "controller" ? "controller" : "observer",
+      };
+      storeSession(data);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /** Workspace Snapshot(权威;刷新后以此为基线再 resume 事件)。 */
   async workspaceSnapshot(): Promise<SnapshotEnvelope> {
     const response = await fetch("/api/v1/snapshots/workspace", {
@@ -64,17 +108,18 @@ export class WorkbenchClient {
     if (!this.isController) {
       throw new Error("observer_forbidden: Observer 不可提交命令");
     }
-    const response = await fetch("/api/v1/commands", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-CSRF-Token": this.context.csrfToken,
-        "X-Client-Id": this.context.clientId,
-        "X-Controller-Lease-Epoch": this.context.controllerLeaseEpoch,
-      },
-      body: JSON.stringify(envelope),
-    });
-    if (!response.ok) throw new ApiError(await problemOf(response));
+    const response = await this.write(() =>
+      fetch("/api/v1/commands", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": this.context.csrfToken,
+          "X-Client-Id": this.context.clientId,
+          "X-Controller-Lease-Epoch": this.context.controllerLeaseEpoch,
+        },
+        body: JSON.stringify(envelope),
+      }),
+    );
     return (await response.json()) as CommandOutcomeWire;
   }
 
@@ -94,9 +139,8 @@ export class WorkbenchClient {
 
   /** 设置项目自定义名字(#custom-name;空串清除)。 */
   async renameProject(projectHandle: string, displayName: string): Promise<void> {
-    const response = await fetch(
-      `/api/v1/projects/${encodeURIComponent(projectHandle)}/name`,
-      {
+    await this.write(() =>
+      fetch(`/api/v1/projects/${encodeURIComponent(projectHandle)}/name`, {
         method: "PUT",
         headers: {
           "Content-Type": "application/json",
@@ -104,9 +148,8 @@ export class WorkbenchClient {
           "X-Client-Id": this.context.clientId,
         },
         body: JSON.stringify({ display_name: displayName }),
-      },
+      }),
     );
-    if (!response.ok) throw new ApiError(await problemOf(response));
   }
 
   /** 发起 ad-hoc 会话(#92;Controller-only)。 */
@@ -116,21 +159,22 @@ export class WorkbenchClient {
     instanceId: string;
     prompt?: string;
   }): Promise<{ title: string; display_session_handle: string | null }> {
-    const response = await fetch("/api/v1/sessions/adhoc", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-CSRF-Token": this.context.csrfToken,
-        "X-Client-Id": this.context.clientId,
-      },
-      body: JSON.stringify({
-        project_handle: input.projectHandle,
-        run_handle: input.runHandle,
-        instance_id: input.instanceId,
-        prompt: input.prompt,
+    const response = await this.write(() =>
+      fetch("/api/v1/sessions/adhoc", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": this.context.csrfToken,
+          "X-Client-Id": this.context.clientId,
+        },
+        body: JSON.stringify({
+          project_handle: input.projectHandle,
+          run_handle: input.runHandle,
+          instance_id: input.instanceId,
+          prompt: input.prompt,
+        }),
       }),
-    });
-    if (!response.ok) throw new ApiError(await problemOf(response));
+    );
     return await response.json();
   }
 
@@ -149,16 +193,17 @@ export class WorkbenchClient {
 
   /** 安装 CLI(#93;Controller-only;包管理器真实执行)。 */
   async cliInstall(agentType: string): Promise<{ outcome: string; version?: string; reason?: string }> {
-    const response = await fetch("/api/v1/cli/install", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-CSRF-Token": this.context.csrfToken,
-        "X-Client-Id": this.context.clientId,
-      },
-      body: JSON.stringify({ agent_type: agentType }),
-    });
-    if (!response.ok) throw new ApiError(await problemOf(response));
+    const response = await this.write(() =>
+      fetch("/api/v1/cli/install", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": this.context.csrfToken,
+          "X-Client-Id": this.context.clientId,
+        },
+        body: JSON.stringify({ agent_type: agentType }),
+      }),
+    );
     return await response.json();
   }
 
@@ -212,44 +257,47 @@ export class WorkbenchClient {
 
   /** 挂载项目目录(多项目入口;Controller-only)。 */
   async attachProject(path: string): Promise<{ project: string; display_name: string }> {
-    const response = await fetch("/api/v1/projects", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-CSRF-Token": this.context.csrfToken,
-        "X-Client-Id": this.context.clientId,
-      },
-      body: JSON.stringify({ path }),
-    });
-    if (!response.ok) throw new ApiError(await problemOf(response));
+    const response = await this.write(() =>
+      fetch("/api/v1/projects", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": this.context.csrfToken,
+          "X-Client-Id": this.context.clientId,
+        },
+        body: JSON.stringify({ path }),
+      }),
+    );
     return (await response.json()) as { project: string; display_name: string };
   }
 
   /** 卸载项目(Controller-only)。 */
   async detachProject(projectHandle: string): Promise<void> {
-    const response = await fetch(`/api/v1/projects/${encodeURIComponent(projectHandle)}`, {
-      method: "DELETE",
-      headers: {
-        "X-CSRF-Token": this.context.csrfToken,
-        "X-Client-Id": this.context.clientId,
-      },
-    });
-    if (!response.ok) throw new ApiError(await problemOf(response));
+    await this.write(() =>
+      fetch(`/api/v1/projects/${encodeURIComponent(projectHandle)}`, {
+        method: "DELETE",
+        headers: {
+          "X-CSRF-Token": this.context.csrfToken,
+          "X-Client-Id": this.context.clientId,
+        },
+      }),
+    );
   }
 
   /** Observer 显式 takeover(CAS:最后观察 epoch);成功返回新会话
    *  形态(角色升 Controller + 新 lease epoch),前端续存后生效。 */
   async takeover(lastObservedEpoch: string): Promise<BootstrapSession> {
-    const response = await fetch("/api/v1/controller/takeover", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-CSRF-Token": this.context.csrfToken,
-        "X-Client-Id": this.context.clientId,
-      },
-      body: JSON.stringify({ last_observed_epoch: lastObservedEpoch }),
-    });
-    if (!response.ok) throw new ApiError(await problemOf(response));
+    const response = await this.write(() =>
+      fetch("/api/v1/controller/takeover", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": this.context.csrfToken,
+          "X-Client-Id": this.context.clientId,
+        },
+        body: JSON.stringify({ last_observed_epoch: lastObservedEpoch }),
+      }),
+    );
     return (await response.json()) as BootstrapSession;
   }
 }

@@ -76,6 +76,13 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
     void client.catalogInstances().then(setInstances).catch(() => setInstances([]));
     void client.cliRecipes().then((data) => setRecipes(data.recipes)).catch(() => setRecipes([]));
   }, [client]);
+  // #97 节点 agent 候选:catalog 实例 + 本机检测 CLI(去重;自由输入仍允许)
+  const agentOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (const instance of instances) set.add(instance.id);
+    for (const cli of clis) set.add(cli.agent_type_id);
+    return [...set];
+  }, [instances, clis]);
   // #91 通知: needs-you 系统通知 + 提示音(设置开关;默认开)
   const notificationsOn = localStorage.getItem("mf.notify") !== "off";
   const [codeBrowser, setCodeBrowser] = useState<string | null>(null);
@@ -330,6 +337,7 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
               client={client}
               projectHandle={editing.project.handle}
               workflowHandle={editing.workflow.handle}
+              agentOptions={agentOptions}
               onDone={(message) => {
                 setToast(message);
                 void refresh();

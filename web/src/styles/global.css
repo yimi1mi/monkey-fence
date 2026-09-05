@@ -1167,6 +1167,16 @@ nav.subtabs button[aria-selected="true"] {
   width: min(400px, calc(100vw - 48px));
 }
 
+/* 节点表单弹窗(#97):标题/agent 下拉/指令 */
+.modal.node-form-modal {
+  width: min(560px, calc(100vw - 48px));
+}
+
+.field .hint {
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+
 /* ── 文件夹浏览弹层(#73)────────────────────────────── */
 
 .folder-modal {
@@ -1289,7 +1299,8 @@ nav.subtabs button[aria-selected="true"] {
 }
 
 .field input,
-.field select {
+.field select,
+.field textarea {
   font: inherit;
   font-size: 13.5px;
   color: var(--text);
@@ -1303,8 +1314,15 @@ nav.subtabs button[aria-selected="true"] {
     box-shadow 0.15s;
 }
 
+.field textarea {
+  resize: vertical;
+  min-height: 76px;
+  line-height: 1.55;
+}
+
 .field input:focus,
-.field select:focus {
+.field select:focus,
+.field textarea:focus {
   border-color: rgba(27, 127, 212, 0.55);
   box-shadow: 0 0 0 3px var(--brand-ring);
   background: var(--surface);
