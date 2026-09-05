@@ -962,7 +962,6 @@ fn settle_leaves_finalized_receipt_on_agent_run_aggregate() {
     assert!(receipt.2.is_some(), "receipt 必须 finalized");
 }
 
-
 // ---------- #88 B 自主版:EvolveWorkflow ----------
 
 #[test]
@@ -986,7 +985,9 @@ fn evolve_workflow_rejects_token_taint_in_node_fields() {
         agent_instance_id: "codex".into(),
         deps: vec![],
     };
-    assert!(crate::run_control::command_contains_token(&command, "sk-123"));
+    assert!(crate::run_control::command_contains_token(
+        &command, "sk-123"
+    ));
     let clean = crate::run_control::RunControlCommand::EvolveWorkflow {
         key: "build".into(),
         title: "标题".into(),
@@ -994,5 +995,7 @@ fn evolve_workflow_rejects_token_taint_in_node_fields() {
         agent_instance_id: "codex".into(),
         deps: vec![],
     };
-    assert!(!crate::run_control::command_contains_token(&clean, "sk-123"));
+    assert!(!crate::run_control::command_contains_token(
+        &clean, "sk-123"
+    ));
 }
