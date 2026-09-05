@@ -1327,9 +1327,11 @@ function SettingsPane({
                   <div className="info">
                     <span className="name">{project.name}</span>
                     <span className="meta">
-                      {project.handle} · {project.workflows.length} 工作流 ·{" "}
-                      {project.runs.length} 运行 · {project.activeSessions} 活跃会话
-                      {project.root ? ` · ${project.root}` : ""}
+                      <span className="stat">proj_{project.handle.slice(5, 13)}…</span>
+                      <span className="stat">{project.workflows.length} 工作流</span>
+                      <span className="stat">{project.runs.length} 运行</span>
+                      <span className="stat">{project.activeSessions} 会话</span>
+                      {project.root && <span className="stat">{project.root}</span>}
                     </span>
                   </div>
                   <button
