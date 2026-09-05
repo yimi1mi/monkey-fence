@@ -46,12 +46,9 @@ export function CodeBrowserModal({
     void openDir(startPath);
   }, [openDir, startPath]);
 
-  const openFile = async (name: string) => {
-    // fs/dirs 只列目录;文件浏览通过 fs/file 直接按路径读
-    const path = `${current.replace(/[\\/]+$/, "")}\\${name}`;
+  const readFile = async (input: string) => {
+    // fs/dirs 只列目录;文件浏览通过 fs/file 直接按完整路径读
     setError(null);
-    const input = window.prompt(`读取文件的完整路径(当前目录 + 文件名)`, path);
-    if (!input) return;
     const response = await fetch(`/api/v1/fs/file?path=${encodeURIComponent(input)}`);
     const data = (await response.json()) as { content?: string; message?: string };
     if (!response.ok) {
@@ -100,7 +97,7 @@ export function CodeBrowserModal({
             onKeyDown={(event) => {
               if (event.key === "Enter") {
                 const value = (event.target as HTMLInputElement).value.trim();
-                if (value) void openFile(value.split(/[\\/]/).pop() ?? value).then?.(() => {});
+                if (value) void readFile(value);
               }
             }}
           />

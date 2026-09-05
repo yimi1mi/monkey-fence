@@ -17,6 +17,7 @@ import "@xyflow/react/dist/style.css";
 import { ApiError, type WorkbenchClient } from "../api/client.ts";
 import { uuidv7 } from "../api/uuid.ts";
 import { autoLayout, type DagGraph } from "../dag/graph.ts";
+import { useModalPrompt } from "./modal_prompt.tsx";
 
 export interface WorkflowSnapshotView {
   workflow: string;
@@ -98,6 +99,7 @@ export function WorkflowEditor({
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [busy, setBusy] = useState(false);
+  const prompt = useModalPrompt();
 
   const reload = useCallback(async () => {
     const response = await fetch(
@@ -237,16 +239,26 @@ export function WorkflowEditor({
               className="mf-btn ghost"
               disabled={busy}
               onClick={() => {
-                const title = window.prompt("新标题", selectedNode.title) ?? selectedNode.title;
-                const instance =
-                  window.prompt("Agent 实例 ID", selectedNode.agentInstanceId) ??
-                  selectedNode.agentInstanceId;
-                void editCommand("workflow.update_node", {
-                  node_handle: selectedNode.handle,
-                  title,
-                  instructions: selectedNode.instructions,
-                  agent_instance_id: instance,
-                });
+                void (async () => {
+                  const title =
+                    (await prompt.ask({
+                      title: "编辑节点",
+                      label: "新标题",
+                      initial: selectedNode.title,
+                    })) ?? selectedNode.title;
+                  const instance =
+                    (await prompt.ask({
+                      title: "编辑节点",
+                      label: "Agent 实例 ID",
+                      initial: selectedNode.agentInstanceId,
+                    })) ?? selectedNode.agentInstanceId;
+                  void editCommand("workflow.update_node", {
+                    node_handle: selectedNode.handle,
+                    title,
+                    instructions: selectedNode.instructions,
+                    agent_instance_id: instance,
+                  });
+                })();
               }}
             >
               编辑节点
@@ -278,6 +290,7 @@ export function WorkflowEditor({
       <div className="editor-hint">
         点击节点选中(删除/编辑);拖出连线建立依赖;双击连线断开。所有编辑经内核命令(双轴 CAS)。
       </div>
+      {prompt.modal}
     </div>
   );
 }
@@ -289,19 +302,40 @@ function AddNodeButton({
   busy: boolean;
   onAdd: (key: string, title: string, instance: string) => void;
 }) {
+  const prompt = useModalPrompt();
   return (
-    <button
-      className="mf-btn primary"
-      disabled={busy}
-      onClick={() => {
-        const key = window.prompt("节点 key(ASCII,如 build)")?.trim();
-        if (!key) return;
-        const title = window.prompt("节点标题", key) ?? key;
-        const instance = window.prompt("Agent 实例 ID", "agent-main") ?? "agent-main";
-        onAdd(key, title, instance);
-      }}
-    >
-      ＋节点
-    </button>
+    <>
+      {prompt.modal}
+      <button
+        className="mf-btn primary"
+        disabled={busy}
+        onClick={() => {
+          void (async () => {
+            const key = await prompt.ask({
+              title: "添加节点",
+              label: "节点 key(ASCII,如 build)",
+              placeholder: "build",
+            });
+            const trimmed = key?.trim();
+            if (!trimmed) return;
+            const title =
+              (await prompt.ask({
+                title: "添加节点",
+                label: "节点标题",
+                initial: trimmed,
+              })) ?? trimmed;
+            const instance =
+              (await prompt.ask({
+                title: "添加节点",
+                label: "Agent 实例 ID",
+                initial: "agent-main",
+              })) ?? "agent-main";
+            onAdd(trimmed, title, instance);
+          })();
+        }}
+      >
+        ＋节点
+      </button>
+    </>
   );
 }

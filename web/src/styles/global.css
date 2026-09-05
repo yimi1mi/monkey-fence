@@ -1128,6 +1128,11 @@ main.panes {
   margin-top: 4px;
 }
 
+/* 单输入模态(#95):窄于标准弹层 */
+.modal.prompt-modal {
+  width: min(400px, calc(100vw - 48px));
+}
+
 /* ── 文件夹浏览弹层(#73)────────────────────────────── */
 
 .folder-modal {

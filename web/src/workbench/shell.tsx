@@ -10,6 +10,7 @@ import { EventSocket } from "../api/events.ts";
 import { storeSession } from "../api/session.ts";
 import { uuidv7 } from "../api/uuid.ts";
 import { applyTheme, currentTheme, toggleTheme } from "../api/theme.ts";
+import { useModalPrompt } from "./modal_prompt.tsx";
 import {
   reduceEvents,
   reduceSnapshot,
@@ -766,6 +767,7 @@ function RunDetail({
 }) {
   const meta = runStatusMeta(run.status);
   const [detail, setDetail] = useState<RunDetailView | null>(null);
+  const prompt = useModalPrompt();
 
   // 选中运行时拉取权威详情(轮询由外层 refresh 触发重拉)
   useEffect(() => {
@@ -879,23 +881,26 @@ function RunDetail({
         <button
           className="mf-btn ghost"
           onClick={() => {
-            const instanceId = window.prompt(
-              "Agent 实例 ID(来自 catalog)",
-              instances[0]?.id ?? "",
-            );
-            if (!instanceId) return;
-            void client
-              .adhocSession({
-                projectHandle: run.projectHandle,
-                runHandle: run.handle,
-                instanceId,
-              })
-              .then((result) => {
-                onAction(`会话「${result.title}」已发起${result.display_session_handle ? ";可在会话列表打开终端" : ""}`);
-              })
-              .catch((error) => {
-                onAction(`发起失败:${error instanceof Error ? error.message : String(error)}`);
+            void (async () => {
+              const instanceId = await prompt.ask({
+                title: "发起临时会话",
+                label: "Agent 实例 ID(来自 catalog)",
+                initial: instances[0]?.id ?? "",
               });
+              if (!instanceId) return;
+              try {
+                const result = await client.adhocSession({
+                  projectHandle: run.projectHandle,
+                  runHandle: run.handle,
+                  instanceId,
+                });
+                onAction(
+                  `会话「${result.title}」已发起${result.display_session_handle ? ";可在会话列表打开终端" : ""}`,
+                );
+              } catch (error) {
+                onAction(`发起失败:${error instanceof Error ? error.message : String(error)}`);
+              }
+            })();
           }}
         >
           ＋发起 ad-hoc 会话
@@ -1007,6 +1012,7 @@ function RunDetail({
           })}
         </div>
       )}
+      {prompt.modal}
     </>
   );
 }
@@ -1295,6 +1301,7 @@ function SettingsPane({
   onDone: (message: string) => void;
 }) {
   const [addOpen, setAddOpen] = useState(false);
+  const prompt = useModalPrompt();
   const isController = client.isController;
   const projects = view?.projects ?? [];
 
@@ -1350,14 +1357,25 @@ function SettingsPane({
                       title="重命名(自定义显示名)"
                       disabled={!isController}
                       onClick={() => {
-                        const name = window.prompt("项目自定义名字(留空恢复路径名)", project.name);
-                        if (name === null) return;
-                        void client
-                          .renameProject(project.handle, name)
-                          .then(() => onDone(name.trim() ? `已重命名为「${name.trim()}」` : "已恢复路径名"))
-                          .catch((error) =>
-                            onDone(`重命名失败:${error instanceof Error ? error.message : String(error)}`),
-                          );
+                        void (async () => {
+                          const name = await prompt.ask({
+                            title: "重命名项目",
+                            label: "自定义名字(留空恢复路径名)",
+                            initial: project.name,
+                            confirmText: "保存",
+                          });
+                          if (name === null) return;
+                          try {
+                            await client.renameProject(project.handle, name.trim());
+                            onDone(
+                              name.trim() ? `已重命名为「${name.trim()}」` : "已恢复路径名",
+                            );
+                          } catch (error) {
+                            onDone(
+                              `重命名失败:${error instanceof Error ? error.message : String(error)}`,
+                            );
+                          }
+                        })();
                       }}
                     >
                       ✎
@@ -1530,6 +1548,7 @@ function SettingsPane({
           }}
         />
       )}
+      {prompt.modal}
     </>
   );
 }
