@@ -674,7 +674,7 @@ function ProjectRow({
             <span className="dot" />
           </span>
         )}
-        {project.name}
+        <span className="t">{project.name}</span>
       </span>
       <span className="meta">
         proj {project.handle.slice(4, 12)} · {project.runs.length} 运行
@@ -1321,68 +1321,81 @@ function SettingsPane({
             挂载本机项目目录(在其中初始化/复用 .mf-agent 存储);多项目同时在线,快照与事件流覆盖全部项目。
           </p>
           {projects.length > 0 ? (
-            <div className="project-admin-list">
+            <div className="project-table">
+              <div className="project-table-row head">
+                <span>项目</span>
+                <span className="num">工作流</span>
+                <span className="num">运行</span>
+                <span className="num">会话</span>
+                <span className="path">路径</span>
+                <span className="ops" aria-hidden="true" />
+              </div>
               {projects.map((project) => (
-                <div key={project.handle} className="project-admin-row">
-                  <div className="info">
-                    <span className="name">{project.name}</span>
-                    <span className="meta">
-                      <span className="stat">proj_{project.handle.slice(5, 13)}…</span>
-                      <span className="stat">{project.workflows.length} 工作流</span>
-                      <span className="stat">{project.runs.length} 运行</span>
-                      <span className="stat">{project.activeSessions} 会话</span>
-                      {project.root && <span className="stat">{project.root}</span>}
-                    </span>
-                  </div>
-                  <button
-                    className="mf-btn ghost"
-                    title="重命名(自定义显示名)"
-                    disabled={!isController}
-                    onClick={() => {
-                      const name = window.prompt("项目自定义名字(留空恢复路径名)", project.name);
-                      if (name === null) return;
-                      void client
-                        .renameProject(project.handle, name)
-                        .then(() => onDone(name.trim() ? `已重命名为「${name.trim()}」` : "已恢复路径名"))
-                        .catch((error) =>
-                          onDone(`重命名失败:${error instanceof Error ? error.message : String(error)}`),
-                        );
-                    }}
+                <div key={project.handle} className="project-table-row">
+                  <span className="pname" title={`proj_${project.handle.slice(5, 13)}`}>
+                    {project.name}
+                  </span>
+                  <span className="num">{project.workflows.length}</span>
+                  <span className="num">{project.runs.length}</span>
+                  <span className="num">{project.activeSessions}</span>
+                  <span
+                    className="path"
+                    title={project.root || "路径未知(重启后挂载的项目可见)"}
                   >
-                    重命名
-                  </button>
-                  <button
-                    className="mf-btn ghost"
-                    onClick={() => onBrowse(project.root)}
-                    disabled={!project.root}
-                    title={project.root ? "浏览代码" : "路径未知(重启后挂载的项目可见)"}
-                  >
-                    代码
-                  </button>
-                  <button
-                    className="mf-btn ghost"
-                    onClick={() => project.root && onVcs(project.root)}
-                    disabled={!project.root}
-                  >
-                    变更
-                  </button>
-                  <button
-                    className="mf-btn danger"
-                    disabled={!isController}
-                    title={isController ? undefined : "Observer 禁写"}
-                    onClick={async () => {
-                      try {
-                        await client.detachProject(project.handle);
-                        onDone(`项目「${project.name}」已移除`);
-                      } catch (error) {
-                        onDone(
-                          `移除失败:${error instanceof Error ? error.message : String(error)}`,
-                        );
-                      }
-                    }}
-                  >
-                    移除
-                  </button>
+                    {project.root || "—"}
+                  </span>
+                  <span className="ops">
+                    <button
+                      className="icon-btn"
+                      title="重命名(自定义显示名)"
+                      disabled={!isController}
+                      onClick={() => {
+                        const name = window.prompt("项目自定义名字(留空恢复路径名)", project.name);
+                        if (name === null) return;
+                        void client
+                          .renameProject(project.handle, name)
+                          .then(() => onDone(name.trim() ? `已重命名为「${name.trim()}」` : "已恢复路径名"))
+                          .catch((error) =>
+                            onDone(`重命名失败:${error instanceof Error ? error.message : String(error)}`),
+                          );
+                      }}
+                    >
+                      ✎
+                    </button>
+                    <button
+                      className="icon-btn"
+                      onClick={() => onBrowse(project.root)}
+                      disabled={!project.root}
+                      title={project.root ? "浏览代码" : "路径未知(重启后挂载的项目可见)"}
+                    >
+                      {"</>"}
+                    </button>
+                    <button
+                      className="icon-btn"
+                      onClick={() => project.root && onVcs(project.root)}
+                      disabled={!project.root}
+                      title="查看 Git 变更"
+                    >
+                      ⎇
+                    </button>
+                    <button
+                      className="icon-btn danger"
+                      disabled={!isController}
+                      title={isController ? "移除项目" : "Observer 禁写"}
+                      onClick={async () => {
+                        try {
+                          await client.detachProject(project.handle);
+                          onDone(`项目「${project.name}」已移除`);
+                        } catch (error) {
+                          onDone(
+                            `移除失败:${error instanceof Error ? error.message : String(error)}`,
+                          );
+                        }
+                      }}
+                    >
+                      ✕
+                    </button>
+                  </span>
                 </div>
               ))}
             </div>

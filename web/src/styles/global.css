@@ -482,6 +482,14 @@ main.panes {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
+}
+
+.project-row .name .t {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .project-row .meta {
@@ -489,6 +497,9 @@ main.panes {
   font-size: 10.5px;
   color: var(--text-faint);
   margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .leaf-count {
@@ -873,53 +884,170 @@ main.panes {
 .project-admin-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 6px;
 }
 
-/* 项目管理行: 左信息(名称+统计)右操作(按钮组), 窄屏按钮组折行 */
+/* 简单单行列表(CLI 检测 / 可安装配方 / Agent 实例):名称+元信息一行排开 */
 .project-admin-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  flex-wrap: wrap;
-  padding: 12px 14px;
+  gap: 10px;
+  padding: 7px 12px;
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
   background: var(--bg-soft);
 }
 
 .project-admin-row .info {
-  min-width: 0;
   flex: 1;
-  min-width: 180px;
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
 }
 
 .project-admin-row .name {
-  font-size: 14px;
+  font-size: 13px;
   font-weight: 600;
-  display: flex;
-  align-items: center;
-  gap: 8px;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .project-admin-row .meta {
   font-family: var(--mono);
   font-size: 10.5px;
   color: var(--text-faint);
-  display: flex;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin-top: 4px;
-}
-
-.project-admin-row .meta .stat {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .project-admin-row > button,
 .project-admin-row > .mf-btn {
   flex-shrink: 0;
+  padding: 4px 12px;
+  font-size: 12px;
+}
+
+/* ── 项目管理表:紧凑网格——列对齐统计 + 图标操作,替代大卡片行 ── */
+
+.project-table {
+  --pt-cols: minmax(140px, 1.3fr) 56px 48px 48px minmax(160px, 1fr) max-content;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  overflow: hidden;
+}
+
+.project-table-row {
+  display: grid;
+  grid-template-columns: var(--pt-cols);
+  align-items: center;
+  gap: 12px;
+  padding: 0 12px;
+  height: 40px;
+  min-width: 0;
+  font-size: 12.5px;
+  border-bottom: 1px solid var(--line);
+}
+
+.project-table-row:last-child {
+  border-bottom: none;
+}
+
+.project-table-row.head {
+  height: 30px;
+  background: var(--bg-inset);
+  color: var(--text-faint);
+  font-size: 11px;
+  border-bottom: 1px solid var(--line-strong);
+}
+
+.project-table-row:not(.head):hover {
+  background: var(--bg-soft);
+}
+
+.project-table .pname {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-table .num {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--text-dim);
+}
+
+.project-table .path {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-left: 1px solid var(--line-strong);
+  padding-left: 12px;
+}
+
+.project-table .ops {
+  display: inline-flex;
+  justify-content: flex-end;
+  gap: 4px;
+}
+
+/* 图标按钮(表格行内操作):28px 方块,悬停着色,危险项红 */
+.icon-btn {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  transition:
+    background 0.15s,
+    color 0.15s,
+    border-color 0.15s;
+}
+
+.icon-btn:hover:not(:disabled) {
+  background: var(--brand-tint);
+  border-color: var(--line);
+  color: var(--brand);
+}
+
+.icon-btn:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+.icon-btn.danger:hover:not(:disabled) {
+  background: var(--bad-tint);
+  color: var(--bad);
+}
+
+@media (max-width: 920px) {
+  .project-table {
+    --pt-cols: minmax(120px, 1fr) 48px 44px 44px max-content;
+  }
+
+  .project-table .path {
+    display: none;
+  }
 }
 
 /* ── 弹层(toast / 弹窗)────────────────────────────── */
