@@ -222,7 +222,7 @@ fn dispatch(
         return Err("缺少能力令牌(环境变量 MF_RUN_TOKEN)".into());
     }
     match method {
-        "step.complete" | "step.fail" | "agent.state" | "pipeline.propose" => {
+        "step.complete" | "step.fail" | "agent.state" | "pipeline.propose" | "workflow.evolve" => {
             // fail-closed:Core 未装配时拒绝结算,绝不回退直写路径。
             let Some(settle) = routing.run_control.as_ref() else {
                 return Err("Core 未装配,结算不可用".into());
@@ -261,6 +261,39 @@ fn dispatch(
                 RunControlCommand::ReportState(
                     AgentState::parse(state).ok_or_else(|| format!("未知状态: {state}"))?,
                 )
+            } else if method == "workflow.evolve" {
+                let node = params.get("node").cloned().unwrap_or_else(|| json!({}));
+                let deps = node
+                    .get("deps")
+                    .and_then(|d| d.as_array())
+                    .cloned()
+                    .unwrap_or_default();
+                RunControlCommand::EvolveWorkflow {
+                    key: node
+                        .get("key")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    title: node
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    instructions: node
+                        .get("instructions")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    agent_instance_id: node
+                        .get("agent_instance_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    deps: deps
+                        .iter()
+                        .filter_map(|d| d.as_str().map(str::to_string))
+                        .collect(),
+                }
             } else {
                 let draft: PipelineDraft = serde_json::from_value(
                     params.get("draft").cloned().unwrap_or_else(|| json!({})),

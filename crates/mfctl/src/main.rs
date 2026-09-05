@@ -53,6 +53,16 @@ fn run(args: &[String]) -> Result<String> {
             flag_key = Some("summary");
         } else if a == "--reason" {
             flag_key = Some("reason");
+        } else if a == "--key" {
+            flag_key = Some("key");
+        } else if a == "--title" {
+            flag_key = Some("title");
+        } else if a == "--instance" {
+            flag_key = Some("instance");
+        } else if a == "--instructions" {
+            flag_key = Some("instructions");
+        } else if a == "--deps" {
+            flag_key = Some("deps");
         } else if a == "--file" {
             flag_key = Some("file");
         } else if a == "--output-json" {
@@ -125,9 +135,31 @@ fn run(args: &[String]) -> Result<String> {
                 serde_json::from_str(&text).context("PipelineDraft JSON 解析失败")?;
             ("pipeline.propose", json!({ "draft": draft }))
         }
+        // #88 B 自主版:agent 在步骤内向源模板提案新节点(预算护栏在内核)。
+        [cmd, sub] if cmd.as_str() == "workflow" && sub.as_str() == "evolve" => {
+            let key = flag("key").context("workflow evolve 需要 --key <节点键>")?;
+            let title = flag("title").context("workflow evolve 需要 --title <标题>")?;
+            let instance = flag("instance").unwrap_or_else(|| "agent-main".into());
+            let instructions = flag("instructions").unwrap_or_default();
+            let deps: Vec<String> = flag("deps")
+                .map(|list| {
+                    list.split(',')
+                        .map(|d| d.trim().to_string())
+                        .filter(|d| !d.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            (
+                "workflow.evolve",
+                json!({
+                    "node": { "key": key, "title": title, "instructions": instructions, "agent_instance_id": instance, "deps": deps }
+                }),
+            )
+        }
         _ => {
             bail!(
-                "用法:\n  mfctl step complete --summary \"...\"\n  mfctl step fail --reason \"...\"\n  mfctl agent-state <working|waiting|blocked|done>\n  mfctl pipeline propose --file draft.json"
+                "用法:\n  mfctl step complete --summary \"...\"\n  mfctl step fail --reason \"...\"\n  mfctl agent-state <working|waiting|blocked|done>\n  mfctl pipeline propose --file draft.json
+  mfctl workflow evolve --key k --title T [--instance i] [--instructions s] [--deps a,b]"
             )
         }
     };

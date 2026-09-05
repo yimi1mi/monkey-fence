@@ -46,6 +46,15 @@ pub enum RunControlCommand {
     Settle(Settlement),
     ReportState(AgentState),
     ProposePipeline(PipelineDraft),
+    /// #88 B 自主版:agent 在步骤内向源工作流模板提案新节点;
+    /// 影响后续 run(冻结语义完好)。预算护栏在内核执行分支。
+    EvolveWorkflow {
+        key: String,
+        title: String,
+        instructions: String,
+        agent_instance_id: String,
+        deps: Vec<String>,
+    },
 }
 
 impl RunControlCommand {
@@ -55,6 +64,7 @@ impl RunControlCommand {
             Self::Settle(Settlement::Fail { .. }) => "step.fail",
             Self::ReportState(_) => "agent.state",
             Self::ProposePipeline(_) => "pipeline.propose",
+            Self::EvolveWorkflow { .. } => "workflow.evolve",
         }
     }
 }
@@ -207,6 +217,16 @@ pub(crate) fn semantic_digest(
         RunControlCommand::Settle(settlement) => serde_json::to_value(settlement),
         RunControlCommand::ReportState(state) => serde_json::to_value(state),
         RunControlCommand::ProposePipeline(draft) => serde_json::to_value(draft),
+        RunControlCommand::EvolveWorkflow {
+            key,
+            title,
+            instructions,
+            agent_instance_id,
+            deps,
+        } => Ok(serde_json::json!({
+            "key": key, "title": title, "instructions": instructions,
+            "agent_instance_id": agent_instance_id, "deps": deps,
+        })),
     }
     .map_err(|error| KernelProblem::Internal(error.to_string()))?;
     root.insert("payload".into(), sorted_json(payload));
@@ -234,13 +254,22 @@ pub(crate) fn settlement_contains_token(settlement: &Settlement, token: &str) ->
     }
 }
 
-pub(crate) fn command_contains_token(command: &RunControlCommand, token: &str) -> bool {
+pub fn command_contains_token(command: &RunControlCommand, token: &str) -> bool {
     match command {
         RunControlCommand::Settle(settlement) => settlement_contains_token(settlement, token),
         RunControlCommand::ReportState(_) => false,
         RunControlCommand::ProposePipeline(draft) => serde_json::to_value(draft)
             .map(|value| value_contains_text(&value, token))
             .unwrap_or(true),
+        RunControlCommand::EvolveWorkflow {
+            key,
+            title,
+            instructions,
+            agent_instance_id,
+            ..
+        } => [key, title, instructions, agent_instance_id]
+            .iter()
+            .any(|field| field.contains(token)),
     }
 }
 

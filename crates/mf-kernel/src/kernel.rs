@@ -1698,17 +1698,19 @@ impl InProcessCoreKernel {
         }
         let command_type = match &run_control {
             RunControlCommand::Settle(_) => CommandType::WorkflowSettle,
-            RunControlCommand::ReportState(_) | RunControlCommand::ProposePipeline(_) => {
-                CommandType::WorkflowRun
-            }
+            RunControlCommand::ReportState(_)
+            | RunControlCommand::ProposePipeline(_)
+            | RunControlCommand::EvolveWorkflow { .. } => CommandType::WorkflowRun,
         };
         let target = AggregateRef::new(
             match &run_control {
-                RunControlCommand::ProposePipeline(_) => AggregateKind::WorkflowRun,
+                RunControlCommand::ProposePipeline(_)
+                | RunControlCommand::EvolveWorkflow { .. } => AggregateKind::WorkflowRun,
                 _ => AggregateKind::AgentRun,
             },
             match &run_control {
-                RunControlCommand::ProposePipeline(_) => workflow_run.as_str(),
+                RunControlCommand::ProposePipeline(_)
+                | RunControlCommand::EvolveWorkflow { .. } => workflow_run.as_str(),
                 _ => authority.agent_run.as_str(),
             }
             .to_owned(),
@@ -1850,6 +1852,13 @@ impl InProcessCoreKernel {
                                     "workflow_run":authorizer.workflow_run.as_str(),
                                     "outcome":"pipeline_proposed",
                                     "revision":revision,
+                                })
+                            }
+                            RunControlCommand::EvolveWorkflow { key, .. } => {
+                                serde_json::json!({
+                                    "workflow_run":authorizer.workflow_run.as_str(),
+                                    "outcome":"workflow_evolved",
+                                    "node":key,
                                 })
                             }
                         };
@@ -3584,6 +3593,125 @@ pub(crate) fn workflow_run_payload(command: &WorkflowRunCommand) -> Value {
     }
 }
 
+/// #88 B 自主版:agent 在步骤内扩展源模板。预算护栏 = 模板节点上限
+/// (MAX_NODES_PER_WORKFLOW, 默认 64)——超限 fail-closed。
+fn evolve_workflow_effect_tx(
+    tx: &Transaction<'_>,
+    run: &WorkflowRunHandle,
+    _agent_run: &AgentRunHandle,
+    key: &str,
+    title: &str,
+    instructions: &str,
+    agent_instance_id: &str,
+    deps: &[String],
+) -> Result<EffectOutput, CommandProblem> {
+    use mf_agent::{ProjectWorkflowMutation as M, Store};
+    const MAX_NODES_PER_WORKFLOW: usize = 64;
+    // 1) run → task → active revision snapshot → template_key
+    let task_id = tx
+        .query_row(
+            "SELECT id FROM agent_tasks WHERE public_handle=?1",
+            [run.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| CommandProblem::Internal(e.to_string()))?;
+    let snapshot_json: Option<String> = tx
+        .query_row(
+            "SELECT pr.snapshot_json FROM pipeline_revisions pr
+             JOIN agent_tasks t ON t.active_revision = pr.id
+             WHERE t.id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| CommandProblem::Internal(e.to_string()))?;
+    let Some(snapshot_json) = snapshot_json else {
+        return Err(CommandProblem::InvalidEnvelope(
+            "run 无 active revision 快照,无法定位源工作流".into(),
+        ));
+    };
+    let snapshot: serde_json::Value = serde_json::from_str(&snapshot_json)
+        .map_err(|e| CommandProblem::Internal(format!("快照解析失败:{e}")))?;
+    let template_key = snapshot["template_key"]
+        .as_str()
+        .unwrap_or_default()
+        .trim_start_matches("project-workflow/")
+        .to_string();
+    if template_key.is_empty() {
+        return Err(CommandProblem::InvalidEnvelope(
+            "run 的源模板键缺失(非工作流启动的 run 不支持演进)".into(),
+        ));
+    }
+    // 2) 模板行定位 + 预算护栏
+    let row = tx
+        .query_row(
+            "SELECT public_handle, semantic_revision, graph_json, name, allow_unsafe_parallel
+             FROM project_workflows WHERE workflow_key = ?1",
+            [&template_key],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| CommandProblem::Internal(e.to_string()))?;
+    let Some((workflow_handle, semantic_revision, graph_json, name, allow_unsafe)) = row else {
+        return Err(CommandProblem::ResourceNotFound);
+    };
+    let nodes: Vec<mf_agent::WorkflowNodeDraft> = serde_json::from_str(&graph_json)
+        .map_err(|e| CommandProblem::Internal(format!("模板图解析失败:{e}")))?;
+    if nodes.len() >= MAX_NODES_PER_WORKFLOW {
+        return Err(CommandProblem::InvalidEnvelope(format!(
+            "预算护栏:模板已有 {} 个节点(上限 {MAX_NODES_PER_WORKFLOW}),拒绝扩展——人工整理模板",
+            nodes.len()
+        )));
+    }
+    // 3) ReplaceSemantic mutation(节点键守卫; digest 复验由 Store 保证)
+    let mut draft = mf_agent::ProjectWorkflowDraft {
+        key: template_key.clone(),
+        name,
+        nodes,
+        allow_unsafe_parallel: allow_unsafe != 0,
+    };
+    if draft.nodes.iter().any(|n| n.key == key) {
+        return Err(CommandProblem::InvalidEnvelope(format!(
+            "节点键 `{key}` 已存在于模板"
+        )));
+    }
+    draft.nodes.push(mf_agent::WorkflowNodeDraft {
+        key: key.to_string(),
+        title: title.to_string(),
+        instructions: instructions.to_string(),
+        agent_instance_id: agent_instance_id.to_string(),
+        deps: deps.to_vec(),
+    });
+    let mutation = M::ReplaceSemantic {
+        draft,
+        expected_semantic_revision: semantic_revision,
+    };
+    let result =
+        Store::apply_project_workflow_mutation_tx(tx, mutation).map_err(workflow_domain_problem)?;
+    let after_semantic = result
+        .after
+        .as_ref()
+        .map(|record| record.semantic_revision)
+        .unwrap_or(semantic_revision);
+    Ok(EffectOutput {
+        result_revisions: serde_json::json!({
+            "outcome": "workflow_evolved",
+            "node": key,
+            "template": template_key,
+            "workflow": workflow_handle,
+            "semantic_revision": after_semantic,
+        }),
+        projections: Vec::new(),
+    })
+}
+
 fn validate_workflow_run_scope_tx(
     tx: &Transaction<'_>,
     command: &WorkflowRunCommand,
@@ -3988,7 +4116,31 @@ fn run_control_mutation_effect(
     expected: &[ExpectedRevision],
     target: &AggregateRef,
 ) -> Result<EffectOutput, CommandProblem> {
+    // #88 B 自主版:EvolveWorkflow 不走 RunMutation(ProjectWorkflow 域)
+    // —— 定位 run 的源模板(task active revision snapshot 的
+    // template_key), 预算护栏后经 add_node 事务扩展模板。
+    if let crate::run_control::RunControlCommand::EvolveWorkflow {
+        key,
+        title,
+        instructions,
+        agent_instance_id,
+        deps,
+    } = command
+    {
+        return evolve_workflow_effect_tx(
+            tx,
+            _workflow_run,
+            _agent_run,
+            key,
+            title,
+            instructions,
+            agent_instance_id,
+            deps,
+        );
+    }
     let mutation = match command {
+        // EvolveWorkflow 已在上方拦截(非 RunMutation 域)
+        crate::run_control::RunControlCommand::EvolveWorkflow { .. } => unreachable!(),
         crate::run_control::RunControlCommand::Settle(settlement) => {
             mf_agent::RunMutation::Settle {
                 run_id,
