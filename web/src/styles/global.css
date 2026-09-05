@@ -937,16 +937,20 @@ main.panes {
   }
 }
 
+/* 弹窗层:经典 block + margin auto 模式——短弹窗近似垂直居中,
+ * 高弹窗自动出滚动条,永不超出视口。 */
 .scrim {
   position: fixed;
   inset: 0;
   background: var(--scrim-bg);
   backdrop-filter: blur(4px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  overflow-y: auto;
   z-index: 90;
   animation: mf-boot 0.2s ease-out;
+}
+
+.scrim > .modal {
+  margin: 5vh auto 4vh;
 }
 
 .modal {
@@ -984,8 +988,6 @@ main.panes {
 
 .folder-modal {
   width: min(560px, calc(100vw - 48px));
-  display: flex;
-  flex-direction: column;
 }
 
 .folder-quick {
@@ -1053,7 +1055,7 @@ main.panes {
 
 .folder-list {
   max-height: 300px;
-  min-height: 120px;
+  min-height: 80px;
   overflow-y: auto;
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
