@@ -1304,6 +1304,15 @@ function SettingsPane({
   const prompt = useModalPrompt();
   const isController = client.isController;
   const projects = view?.projects ?? [];
+  // 子页签(#96):设置分区——项目 / Agent 与 CLI / 通用(通知+系统)
+  type SettingsSection = "projects" | "agents" | "general";
+  const [section, setSection] = useState<SettingsSection>(
+    () => (localStorage.getItem("mf.settingsTab") as SettingsSection | null) ?? "projects",
+  );
+  const openSection = (next: SettingsSection) => {
+    setSection(next);
+    localStorage.setItem("mf.settingsTab", next);
+  };
 
   return (
     <>
@@ -1311,7 +1320,19 @@ function SettingsPane({
         <h2>设置</h2>
         <span className="leaf-count">{projects.length} 项目</span>
       </div>
+      <nav className="subtabs" aria-label="设置分区">
+        <button aria-selected={section === "projects"} onClick={() => openSection("projects")}>
+          项目
+        </button>
+        <button aria-selected={section === "agents"} onClick={() => openSection("agents")}>
+          Agent 与 CLI
+        </button>
+        <button aria-selected={section === "general"} onClick={() => openSection("general")}>
+          通用
+        </button>
+      </nav>
       <div className="pane-body">
+        {section === "projects" && (
         <div className="settings-section">
           <div className="settings-title">
             <span>项目管理</span>
@@ -1421,26 +1442,10 @@ function SettingsPane({
             <p className="muted-note">当前没有在线项目。</p>
           )}
         </div>
+        )}
 
-        <div className="settings-section">
-          <div className="settings-title">
-            <span>通知</span>
-            <button
-              className="mf-btn ghost"
-              onClick={() => {
-                const next = localStorage.getItem("mf.notify") === "off" ? "on" : "off";
-                localStorage.setItem("mf.notify", next);
-                onDone(next === "off" ? "通知已关闭(刷新生效)" : "通知已开启(刷新生效)");
-              }}
-            >
-              {localStorage.getItem("mf.notify") === "off" ? "开启" : "关闭"}
-            </button>
-          </div>
-          <p className="muted-note">
-            运行进入「需要你」时发送系统通知与提示音(仅页面不在前台时打扰)。
-          </p>
-        </div>
-
+        {section === "agents" && (
+        <>
         <div className="settings-section">
           <div className="settings-title">
             <span>CLI 管理</span>
@@ -1517,6 +1522,29 @@ function SettingsPane({
             <p className="muted-note">目录中暂无实例。</p>
           )}
         </div>
+        </>
+        )}
+
+        {section === "general" && (
+        <>
+        <div className="settings-section">
+          <div className="settings-title">
+            <span>通知</span>
+            <button
+              className="mf-btn ghost"
+              onClick={() => {
+                const next = localStorage.getItem("mf.notify") === "off" ? "on" : "off";
+                localStorage.setItem("mf.notify", next);
+                onDone(next === "off" ? "通知已关闭(刷新生效)" : "通知已开启(刷新生效)");
+              }}
+            >
+              {localStorage.getItem("mf.notify") === "off" ? "开启" : "关闭"}
+            </button>
+          </div>
+          <p className="muted-note">
+            运行进入「需要你」时发送系统通知与提示音(仅页面不在前台时打扰)。
+          </p>
+        </div>
 
         <div className="settings-section">
           <div className="settings-title">
@@ -1537,6 +1565,8 @@ function SettingsPane({
             <dd>{client.leaseEpoch}</dd>
           </dl>
         </div>
+        </>
+        )}
       </div>
       {addOpen && (
         <AddProjectModal

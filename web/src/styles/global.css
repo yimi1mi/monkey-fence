@@ -404,6 +404,40 @@ main.panes {
   padding: 8px 18px 18px;
 }
 
+/* ── 设置子页签(#96):pill 风格,位于 pane-head 与 pane-body 之间 ── */
+
+nav.subtabs {
+  display: flex;
+  gap: 4px;
+  padding: 2px 18px 10px;
+  border-bottom: 1px solid var(--line);
+}
+
+nav.subtabs button {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12.5px;
+  padding: 5px 13px;
+  border-radius: 999px;
+  cursor: pointer;
+  transition:
+    color 0.15s,
+    background 0.15s;
+}
+
+nav.subtabs button:hover {
+  color: var(--text);
+}
+
+nav.subtabs button[aria-selected="true"] {
+  color: var(--brand-deep);
+  background: var(--brand-tint);
+  font-weight: 550;
+}
+
 /* ── 左栏:概览与项目 ─────────────────────────────────── */
 
 .stat-grid {
