@@ -92,6 +92,23 @@ export class WorkbenchClient {
     return envelope.data;
   }
 
+  /** 设置项目自定义名字(#custom-name;空串清除)。 */
+  async renameProject(projectHandle: string, displayName: string): Promise<void> {
+    const response = await fetch(
+      `/api/v1/projects/${encodeURIComponent(projectHandle)}/name`,
+      {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": this.context.csrfToken,
+          "X-Client-Id": this.context.clientId,
+        },
+        body: JSON.stringify({ display_name: displayName }),
+      },
+    );
+    if (!response.ok) throw new ApiError(await problemOf(response));
+  }
+
   /** 发起 ad-hoc 会话(#92;Controller-only)。 */
   async adhocSession(input: {
     projectHandle: string;

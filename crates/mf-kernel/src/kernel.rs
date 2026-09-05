@@ -2458,12 +2458,14 @@ impl InProcessCoreKernel {
                 .map_err(|error| KernelProblem::Internal(format!("{error:#}")))?
                 .into_iter()
                 .map(|project| {
-                    let name = Path::new(&project.display_path)
-                        .file_name()
-                        .and_then(|value| value.to_str())
-                        .filter(|value| !value.is_empty())
-                        .unwrap_or("Project")
-                        .to_owned();
+                    let name = project.display_name.clone().unwrap_or_else(|| {
+                        Path::new(&project.display_path)
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or("Project")
+                            .to_owned()
+                    });
                     (project.project_handle, (name, project.display_path))
                 })
                 .collect::<HashMap<_, _>>();

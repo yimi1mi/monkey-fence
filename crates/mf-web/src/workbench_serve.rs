@@ -121,6 +121,10 @@ pub fn serve_workbench_full(
         .route("/api/v1/cli/install", post(cli_install_route))
         .route("/api/v1/sessions/adhoc", post(adhoc_session_start))
         .route("/api/v1/sessions/{handle}", delete(adhoc_session_stop))
+        .route(
+            "/api/v1/projects/{handle}/name",
+            axum::routing::put(project_rename),
+        )
         .route("/api/v1/terminal/ws", get(terminal_ws))
         .route("/api/v1/commands", post(submit_command))
         .route("/api/v1/controller/takeover", post(controller_takeover))
@@ -1551,6 +1555,77 @@ async fn adhoc_session_stop(
         headers,
         serde_json::to_vec(&body).unwrap_or_default(),
     )
+}
+
+#[derive(serde::Deserialize)]
+struct ProjectRenameRequest {
+    display_name: String,
+}
+
+/// `PUT /api/v1/projects/{handle}/name`(#custom-name):设置项目自定义
+/// 名字(Controller-only;空串清除恢复路径目录名)。写 service DB 的
+/// project_registry.display_name(v5 additive)。
+async fn project_rename(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    axum::extract::Path(handle): axum::extract::Path<String>,
+    payload: Result<axum::Json<ProjectRenameRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if let Err(problem) = authorize(&state, &headers, csrf.as_deref(), true) {
+        return problem_response(&problem);
+    }
+    let request = match payload {
+        Ok(axum::Json(request)) => request,
+        Err(rejection) => {
+            return problem_response(&Problem::new(
+                ProblemCode::InvalidEnvelope,
+                rejection.body_text(),
+                Some(Retry::Never),
+            ))
+        }
+    };
+    // 校验 handle 形态(不要求已挂载——重命名可在挂载前)
+    if mf_kernel::handles::ProjectStoreHandle::parse(&handle).is_err() {
+        return problem_response(&Problem::new(
+            ProblemCode::ResourceNotFound,
+            "project handle 非法",
+            Some(Retry::Never),
+        ));
+    }
+    let service = mf_kernel::project_registry::ServiceStore::open_default();
+    let result = match service {
+        Ok(store) => store.set_project_display_name(&handle, &request.display_name),
+        Err(error) => Err(anyhow::anyhow!("service DB 打开失败:{error:#}")),
+    };
+    match result {
+        Ok(()) => {
+            let body = serde_json::json!({
+                "schema": "mf.project-rename.v1",
+                "project": handle,
+                "display_name": if request.display_name.trim().is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::String(request.display_name.trim().to_string())
+                },
+            });
+            let mut headers = security(&state);
+            headers.push((header_name("content-type"), "application/json".into()));
+            respond(
+                StatusCode::OK,
+                headers,
+                serde_json::to_vec(&body).unwrap_or_default(),
+            )
+        }
+        Err(error) => problem_response(&Problem::new(
+            ProblemCode::ResourceNotFound,
+            format!("重命名失败:{error:#}"),
+            Some(Retry::Never),
+        )),
+    }
 }
 
 #[derive(serde::Deserialize)]

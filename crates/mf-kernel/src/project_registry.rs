@@ -36,6 +36,8 @@ pub struct RegisteredProject {
     pub public_id: String,
     pub canonical_root: String,
     pub display_path: String,
+    /// 自定义名字(#custom-name;None = 用路径目录名)。
+    pub display_name: Option<String>,
     pub registered_at: String,
     pub status: ProjectStatus,
 }
@@ -251,6 +253,9 @@ impl ServiceStore {
                     }
                     if from < 4 && to >= 4 {
                         tx.execute_batch(SERVICE_SCHEMA_V4_DELTA)?;
+                    }
+                    if from < 5 && to >= 5 {
+                        tx.execute_batch(crate::service_schema::MIGRATION_V5_DISPLAY_NAME)?;
                     }
                     tx.execute(
                         "UPDATE meta SET schema_version=?1 WHERE id=1",
@@ -507,7 +512,7 @@ impl ServiceStore {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT project_handle, public_id, canonical_root, display_path,
-                    registered_at, status
+                    display_name, registered_at, status
              FROM project_registry ORDER BY canonical_root",
         )?;
         let rows = stmt
@@ -517,12 +522,29 @@ impl ServiceStore {
                     public_id: row.get(1)?,
                     canonical_root: row.get(2)?,
                     display_path: row.get(3)?,
-                    registered_at: row.get(4)?,
-                    status: parse_status(&row.get::<_, String>(5)?)?,
+                    display_name: row.get(4)?,
+                    registered_at: row.get(5)?,
+                    status: parse_status(&row.get::<_, String>(6)?)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// 设置项目自定义名字(#custom-name;空串 = 清除恢复路径目录名)。
+    pub fn set_project_display_name(&self, project_handle: &str, display_name: &str) -> Result<()> {
+        let name = if display_name.trim().is_empty() {
+            None
+        } else {
+            Some(display_name.trim().to_string())
+        };
+        let conn = self.conn.lock();
+        let updated = conn.execute(
+            "UPDATE project_registry SET display_name=?2 WHERE project_handle=?1",
+            rusqlite::params![project_handle, name],
+        )?;
+        anyhow::ensure!(updated == 1, "project `{project_handle}` 不存在");
+        Ok(())
     }
 
     /// 运行时显式登记 Project。canonical root 唯一，重复打开复用既有
@@ -552,7 +574,7 @@ impl ServiceStore {
         )?;
         let project = tx.query_row(
             "SELECT project_handle, public_id, canonical_root, display_path,
-                    registered_at, status
+                    display_name, registered_at, status
              FROM project_registry WHERE canonical_root=?1",
             [&canonical_root],
             |row| {
@@ -561,8 +583,9 @@ impl ServiceStore {
                     public_id: row.get(1)?,
                     canonical_root: row.get(2)?,
                     display_path: row.get(3)?,
-                    registered_at: row.get(4)?,
-                    status: parse_status(&row.get::<_, String>(5)?)?,
+                    display_name: row.get(4)?,
+                    registered_at: row.get(5)?,
+                    status: parse_status(&row.get::<_, String>(6)?)?,
                 })
             },
         )?;

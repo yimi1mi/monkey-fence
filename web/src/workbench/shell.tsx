@@ -1334,6 +1334,23 @@ function SettingsPane({
                   </div>
                   <button
                     className="mf-btn ghost"
+                    title="重命名(自定义显示名)"
+                    disabled={!isController}
+                    onClick={() => {
+                      const name = window.prompt("项目自定义名字(留空恢复路径名)", project.name);
+                      if (name === null) return;
+                      void client
+                        .renameProject(project.handle, name)
+                        .then(() => onDone(name.trim() ? `已重命名为「${name.trim()}」` : "已恢复路径名"))
+                        .catch((error) =>
+                          onDone(`重命名失败:${error instanceof Error ? error.message : String(error)}`),
+                        );
+                    }}
+                  >
+                    重命名
+                  </button>
+                  <button
+                    className="mf-btn ghost"
                     onClick={() => onBrowse(project.root)}
                     disabled={!project.root}
                     title={project.root ? "浏览代码" : "路径未知(重启后挂载的项目可见)"}

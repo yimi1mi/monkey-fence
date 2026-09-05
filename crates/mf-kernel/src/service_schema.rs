@@ -17,7 +17,7 @@ use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 /// service 库 schema 版本(新库新版本链,从 v1 起)。
-pub const SERVICE_SCHEMA_VERSION: i64 = 4;
+pub const SERVICE_SCHEMA_VERSION: i64 = 5;
 
 /// T5a(Issue #35)bundle 兼容性 DTO:当前 Core 代码支持的 schema
 /// 上限集合(bundle manager 的对照面)。schema 常量前滚时同步更新。
@@ -283,6 +283,9 @@ fn service_schema_version_ready(conn: &Connection, version: i64) -> Result<bool>
     if version >= 4 {
         expected.execute_batch(SERVICE_SCHEMA_V4_DELTA)?;
     }
+    if version >= 5 {
+        expected.execute_batch(MIGRATION_V5_DISPLAY_NAME)?;
+    }
     Ok(schema_fingerprint(conn)? == schema_fingerprint(&expected)?)
 }
 
@@ -336,3 +339,8 @@ pub(crate) fn is_service_home(parent: &Path) -> bool {
         Some(".monkeyfence")
     )
 }
+
+/// v5(#custom-name):project_registry.display_name(自定义名字;
+/// NULL = 用 display_path 的目录名)。
+pub const MIGRATION_V5_DISPLAY_NAME: &str =
+    "ALTER TABLE project_registry ADD COLUMN display_name TEXT";
