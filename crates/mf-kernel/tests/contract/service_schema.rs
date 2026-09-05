@@ -293,7 +293,7 @@ fn service_v3_upgrades_to_v4_preserving_existing_rows() {
     }
     let backup_dir = mf_agent::migration::backup_dir_for(&db);
     drop(ServiceStore::open(&db).unwrap());
-    assert_eq!(user_version_of(&db), 4);
+    assert_eq!(user_version_of(&db), 5);
     assert_eq!(counts_of(&db, "run_capability"), 0);
     let project: String = read_only(&db)
         .query_row("SELECT project_handle FROM project_registry", [], |row| {
@@ -337,6 +337,8 @@ fn project_registry_shape_matches_spec() {
             "display_path",
             "registered_at",
             "status",
+            // v5:display_name(自定义显示名;NULL=回退路径名)
+            "display_name",
         ]
     );
     let handle = columns_of(&db, "project_registry")
@@ -347,8 +349,10 @@ fn project_registry_shape_matches_spec() {
     assert!(
         columns_of(&db, "project_registry")
             .iter()
+            // display_name(v5)可空:NULL=回退路径名;其余列 NOT NULL
+            .filter(|c| c.name != "display_name")
             .all(|c| c.notnull || c.pk),
-        "全部列 NOT NULL(状态由导入方决定)"
+        "除 display_name 外全部 NOT NULL(状态由导入方决定)"
     );
     assert_unique_index(&db, "project_registry", &["canonical_root"]);
     assert_unique_index(&db, "project_registry", &["public_id"]);

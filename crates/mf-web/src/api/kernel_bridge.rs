@@ -220,7 +220,9 @@ pub fn translate_command(command: &CommandEnvelope) -> Result<KernelCommand, Tra
         }),
         Wire::WorkflowMoveNode => {
             KernelCommand::ProjectWorkflow(ProjectWorkflowCommand::MoveNode {
-                project: project_handle_of(&command.target.handle)?,
+                // #98:与 add_node/connect 一致从 payload 取 project
+                // (target.handle 是 wf_ 工作流句柄,混用会被当 proj_ 解析 404)
+                project: project_handle_of(payload_str(payload, "project_handle")?)?,
                 workflow: workflow_handle_of(payload_str(payload, "workflow_handle")?)?,
                 node_handle: payload_str(payload, "node_handle")?.to_string(),
                 x: payload.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),

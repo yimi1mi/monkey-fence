@@ -1052,6 +1052,7 @@ dependencies = [
  "axum",
  "base64",
  "chrono",
+ "crossbeam-channel",
  "hmac",
  "log",
  "mf-agent",

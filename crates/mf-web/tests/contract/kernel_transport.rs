@@ -268,6 +268,7 @@ fn translated_move_node_matches_kernel_native_semantics() {
     let command = fixture.command(
         CommandType::WorkflowMoveNode,
         serde_json::json!({
+            "project_handle": format!("proj_{}", fixture.project.as_str().trim_start_matches("proj_")),
             "workflow_handle": workflow,
             "node_handle": "node-a",
             "x": 420.0,

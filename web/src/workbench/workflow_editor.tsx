@@ -60,7 +60,14 @@ export function workflowViewOf(data: Row): WorkflowSnapshotView {
     workflowCollectionRevision: rev(data.workflow_collection_revision),
     nodes: (Array.isArray(data.nodes) ? data.nodes : []).map((raw) => {
       const row = raw as Row;
-      const position = row.position as { x: number; y: number } | null | undefined;
+      // wire 位置是 [x, y] 数组;旧快照/宽容路径也可能是 {x,y}
+      const rawPosition = row.position as unknown;
+      const position =
+        Array.isArray(rawPosition) && rawPosition.length >= 2
+          ? { x: Number(rawPosition[0]), y: Number(rawPosition[1]) }
+          : rawPosition && typeof rawPosition === "object"
+            ? (rawPosition as { x: number; y: number })
+            : null;
       return {
         handle: str(row.handle),
         key: str(row.key),
@@ -68,7 +75,8 @@ export function workflowViewOf(data: Row): WorkflowSnapshotView {
         instructions: str(row.instructions),
         agentInstanceId: str(row.agent_instance_id),
         deps: (Array.isArray(row.deps) ? row.deps : []).map((d) => str(d)),
-        position: position && typeof position === "object" ? position : null,
+        position:
+          position && Number.isFinite(position.x) && Number.isFinite(position.y) ? position : null,
       };
     }),
     edges: (Array.isArray(data.edges) ? data.edges : []).map((raw) => {
@@ -104,6 +112,9 @@ export function WorkflowEditor({
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [busy, setBusy] = useState(false);
   const nodeFormModal = useNodeFormModal();
+  // #98 布局稳定性:位置以本地缓存优先(拖动过的位置不因快照刷新被
+  // dagre 重排覆盖);快照持久位置次之;全图无位置(首次加载)才 dagre。
+  const positionsRef = useRef<Map<string, { x: number; y: number }>>(new Map());
 
   const reload = useCallback(async () => {
     const response = await fetch(
@@ -119,28 +130,51 @@ export function WorkflowEditor({
     void reload().catch((error) => onDone(`快照拉取失败:${String(error)}`));
   }, [reload, onDone]);
 
-  // 快照 → React Flow 节点/边(无位置时 dagre 自动布局)
+  // 快照 → React Flow 节点/边。位置决策:本地缓存 > 快照持久位置;
+  // 都没有(新节点)排到现有内容下方;全图首次加载才 dagre 自动布局。
   useEffect(() => {
     if (!snapshot) return;
-    const graph: DagGraph = {
-      nodes: snapshot.nodes.map((node) => ({
-        id: node.handle,
-        title: node.title,
-        instructions: node.instructions,
-        agentInstanceId: node.agentInstanceId,
-        deps: node.deps,
-        x: node.position?.x ?? 0,
-        y: node.position?.y ?? 0,
-      })),
-    };
-    const missing = snapshot.nodes.some((node) => !node.position);
-    const positions = missing
-      ? new Map(autoLayout(graph, "TB").map((p) => [p.id, p]))
-      : new Map(snapshot.nodes.map((n) => [n.handle, n.position ?? { x: 0, y: 0 }]));
+    const known = new Map(positionsRef.current);
+    for (const node of snapshot.nodes) {
+      if (!known.has(node.handle) && node.position) {
+        known.set(node.handle, node.position);
+      }
+    }
+    const unknown = snapshot.nodes.filter((node) => !known.has(node.handle));
+    if (unknown.length > 0) {
+      if (known.size === 0) {
+        // 首次加载:整图 dagre(TB 层次布局)
+        const graph: DagGraph = {
+          nodes: snapshot.nodes.map((node) => ({
+            id: node.handle,
+            title: node.title,
+            instructions: node.instructions,
+            agentInstanceId: node.agentInstanceId,
+            deps: node.deps,
+            x: 0,
+            y: 0,
+          })),
+        };
+        for (const p of autoLayout(graph, "TB")) {
+          known.set(p.id, { x: p.x, y: p.y });
+        }
+      } else {
+        // 新节点:排到当前最底部之下,居中
+        const placed = [...known.values()];
+        const maxY = Math.max(0, ...placed.map((p) => p.y + 160));
+        const avgX = placed.length
+          ? Math.max(0, ...placed.map((p) => p.x))
+          : 0;
+        for (const node of unknown) {
+          known.set(node.handle, { x: avgX, y: maxY });
+        }
+      }
+    }
+    positionsRef.current = known;
     setNodes(
       snapshot.nodes.map((node) => ({
         id: node.handle,
-        position: positions.get(node.handle) ?? { x: 0, y: 0 },
+        position: known.get(node.handle) ?? { x: 0, y: 0 },
         data: {
           label: `${node.title}\n${node.key} · ${node.agentInstanceId || "无实例"}`,
         },
@@ -210,6 +244,79 @@ export function WorkflowEditor({
     [editCommand],
   );
 
+  // #98 拖动结束:位置写入本地缓存(立即)并经 move_node 持久化
+  // (presentation 轴,不与语义编辑撞 CAS)。失败静默——位置是非关键呈现。
+  const onNodeDragStop = useCallback(
+    (_event: MouseEvent | TouchEvent, node: Node) => {
+      positionsRef.current.set(node.id, node.position);
+      void editCommand(
+        "workflow.move_node",
+        { node_handle: node.id, x: node.position.x, y: node.position.y },
+        "presentation",
+      ).catch(() => undefined);
+    },
+    [editCommand],
+  );
+
+  // #98 自动布局(格式化):dagre 全量重排,更新本地并串行持久化全部位置。
+  // 每条 move_node 会推进 presentation revision,按 +1 推算下一 CAS 值;
+  // 冲突时中断并 reload(用户可重点一次)。
+  const formatLayout = useCallback(async () => {
+    if (!snapshot) return;
+    const graph: DagGraph = {
+      nodes: snapshot.nodes.map((node) => ({
+        id: node.handle,
+        title: node.title,
+        instructions: node.instructions,
+        agentInstanceId: node.agentInstanceId,
+        deps: node.deps,
+        x: 0,
+        y: 0,
+      })),
+    };
+    const laid = new Map(autoLayout(graph, "TB").map((p) => [p.id, { x: p.x, y: p.y }]));
+    positionsRef.current = new Map(laid);
+    setNodes((prev) => prev.map((n) => ({ ...n, position: laid.get(n.id) ?? n.position })));
+    if (!client.isController) return;
+    setBusy(true);
+    try {
+      let revision = Number(snapshot.presentationRevision) || 0;
+      for (const node of snapshot.nodes) {
+        const pos = laid.get(node.handle);
+        if (!pos) continue;
+        await client.command({
+          schema: "mf.command.v1",
+          command_id: uuidv7(),
+          client_id: client.clientId,
+          controller_lease_epoch: client.leaseEpoch,
+          target: { kind: "project_workflow", handle: `wf_${workflowHandle}` },
+          expected: [
+            {
+              aggregate: { kind: "project_workflow", handle: `wf_${workflowHandle}` },
+              presentation_revision: String(revision),
+            },
+          ],
+          type: "workflow.move_node",
+          payload: {
+            project_handle: projectHandle,
+            workflow_handle: `wf_${workflowHandle}`,
+            node_handle: node.handle,
+            x: pos.x,
+            y: pos.y,
+          },
+        });
+        revision += 1;
+      }
+      await reload();
+      onDone("已按依赖层级自动布局");
+    } catch (error) {
+      onDone(`布局保存中断:${error instanceof Error ? error.message : String(error)}`);
+      await reload().catch(() => undefined);
+    } finally {
+      setBusy(false);
+    }
+  }, [snapshot, client, workflowHandle, projectHandle, setNodes, reload, onDone]);
+
   const selectedNode = useMemo(
     () => snapshot?.nodes.find((node) => node.handle === selected) ?? null,
     [snapshot, selected],
@@ -227,6 +334,14 @@ export function WorkflowEditor({
           语义 rev {snapshot.semanticRevision} · 呈现 rev {snapshot.presentationRevision}
         </span>
         <span className="header-space" />
+        <button
+          className="mf-btn ghost"
+          disabled={busy || !snapshot}
+          title="按依赖层级(TB)重排全部节点并保存位置"
+          onClick={() => void formatLayout()}
+        >
+          ⇅ 自动布局
+        </button>
         <AddNodeButton
           busy={busy}
           agentOptions={agentOptions}
@@ -285,6 +400,7 @@ export function WorkflowEditor({
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
+          onNodeDragStop={onNodeDragStop}
           onNodeClick={(_, node) => setSelected(node.id)}
           onEdgeDoubleClick={(_, edge) => {
             void editCommand("workflow.disconnect", { edge_handle: edge.id });

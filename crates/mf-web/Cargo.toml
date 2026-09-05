@@ -33,6 +33,8 @@ tower = "0.5"
 tempfile = "3"
 uuid = { workspace = true, features = ["v7"] }
 mf-kernel = { workspace = true, features = ["test-support"] }
+# pipe_server 合同测试(bin 集成)经 mf-kernel test-support 暴露的模块
+crossbeam-channel = { workspace = true }
 
 [[bin]]
 name = "mf-workbench"
