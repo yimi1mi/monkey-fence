@@ -1467,6 +1467,64 @@ nav.subtabs button[aria-selected="true"] {
   font-weight: 550;
 }
 
+/* ── 交接卡(#99):步骤时间轴原位展示 Handoff ── */
+
+.handoff-card {
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.handoff-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.handoff-summary {
+  margin: 0;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text);
+}
+
+.handoff-meta {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--text-faint);
+  word-break: break-all;
+}
+
+.handoff-meta.warn {
+  color: var(--warn);
+}
+
+.handoff-output summary {
+  cursor: pointer;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  user-select: none;
+}
+
+.handoff-output pre {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--bg-inset);
+  border: 1px solid var(--line);
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  overflow-x: auto;
+  max-height: 220px;
+}
+
 .question-card {
   border: 1px solid rgba(217, 119, 6, 0.3);
   border-radius: var(--radius-sm);
