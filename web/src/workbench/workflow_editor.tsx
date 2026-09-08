@@ -322,6 +322,25 @@ export function WorkflowEditor({
     [snapshot, selected],
   );
 
+  // #99 变量引用可见范围:从直接依赖 BFS 收集全部传递祖先 key
+  // (与编排器 upstream_handoffs 同语义:a→b→c 中 c 可引用 a)。
+  const upstreamKeysOf = useCallback(
+    (key: string): string[] => {
+      if (!snapshot) return [];
+      const depsOf = new Map(snapshot.nodes.map((n) => [n.key, n.deps]));
+      const seen = new Set<string>();
+      const queue = [...(depsOf.get(key) ?? [])];
+      while (queue.length > 0) {
+        const current = queue.shift();
+        if (current === undefined || seen.has(current)) continue;
+        seen.add(current);
+        queue.push(...(depsOf.get(current) ?? []));
+      }
+      return [...seen];
+    },
+    [snapshot],
+  );
+
   if (!snapshot) {
     return <div className="editor-loading">加载工作流…</div>;
   }
@@ -374,6 +393,7 @@ export function WorkflowEditor({
                       instance: selectedNode.agentInstanceId,
                       instructions: selectedNode.instructions,
                     },
+                    upstreamKeys: upstreamKeysOf(selectedNode.key),
                   });
                   if (!form) return;
                   void editCommand("workflow.update_node", {
@@ -413,7 +433,7 @@ export function WorkflowEditor({
         </ReactFlow>
       </div>
       <div className="editor-hint">
-        点击节点选中(删除/编辑);拖出连线建立依赖;双击连线断开。所有编辑经内核命令(双轴 CAS)。
+        点击节点选中(删除/编辑);拖出连线建立依赖;双击连线断开。上游输出在下游指令中以 {"${nodes.<上游key>.<字段>}"} 引用(编辑节点可见可引用清单)。所有编辑经内核命令(双轴 CAS)。
       </div>
       {nodeFormModal.modal}
     </div>
@@ -435,6 +455,8 @@ interface NodeFormSpec {
   initial: NodeFormValue;
   /** 新建节点时允许编辑 key(编辑节点时 key 不可变)。 */
   withKey?: boolean;
+  /** 编辑节点时该节点的传递祖先 key(变量引用可见范围;#99)。 */
+  upstreamKeys?: string[];
 }
 
 function useNodeFormModal(): {
@@ -549,14 +571,22 @@ function NodeFormModal({
           <label htmlFor="mf-node-instructions">指令(节点任务说明;可引用上游输出)</label>
           <textarea
             id="mf-node-instructions"
-            rows={4}
+            rows={5}
             value={value.instructions}
-            placeholder="这个节点让 agent 做什么…"
+            placeholder={"这个节点让 agent 做什么…\n例:汇总 ${nodes.build.output.tests_passed} 项测试结果,读取 ${nodes.build.summary} 后写报告"}
             onChange={(event) => setValue({ ...value, instructions: event.target.value })}
             onKeyDown={(event) => {
               if (event.key === "Escape") onSettle(null);
             }}
           />
+          <span className="hint">
+            {"上游引用语法 ${nodes.<上游key>.<字段>};可用字段 .summary / .status / .changed_files / .artifacts / .blockers / .recommendations / .output.<嵌套键>(上游结束时 mfctl step complete --output-json 写入的自定义输出)"}
+            {spec.upstreamKeys && spec.upstreamKeys.length > 0
+              ? `。本节点可引用上游:${spec.upstreamKeys.join("、")}`
+              : spec.upstreamKeys
+                ? "。本节点暂无上游(先连线才能引用)"
+                : ""}
+          </span>
         </div>
         <div className="actions">
           <button className="mf-btn ghost" onClick={() => onSettle(null)}>
