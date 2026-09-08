@@ -148,17 +148,18 @@ fn settlement_of(payload: &serde_json::Value) -> Result<mf_agent::Settlement, Tr
         .get("kind")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    // Settlement 是 internally tagged(#[serde(tag="kind")])——normalized
+    // 必须保持 {"kind":"complete",...} 形态;此前误转 externally tagged
+    // 的 {"Complete":{...}} 导致反序列化恒失败(web 待结算卡从未通过)。
     let normalized = match kind {
         "complete" | "Complete" => serde_json::json!({
-            "Complete": {
-                "summary": settlement.get("summary").cloned().unwrap_or_default(),
-                "output": settlement.get("output").cloned().unwrap_or_default(),
-            }
+            "kind": "complete",
+            "summary": settlement.get("summary").cloned().unwrap_or_default(),
+            "output": settlement.get("output").cloned().unwrap_or_default(),
         }),
         "fail" | "Fail" => serde_json::json!({
-            "Fail": {
-                "reason": settlement.get("reason").cloned().unwrap_or_default(),
-            }
+            "kind": "fail",
+            "reason": settlement.get("reason").cloned().unwrap_or_default(),
         }),
         other => {
             return Err(TranslateError::new(
@@ -381,7 +382,8 @@ fn workflow_expected(
                 "workflow_run_revision",
             )?;
             // run 级命令(RetryStep/Respond/Settle)要求 expected 携带
-            // 目标 Step 的语义 revision(kernel L-CMD 复验)。
+            // 目标 Step 的语义 revision(kernel L-CMD 复验);Settle 还要求
+            // 目标 Agent Run(kernel 复验结算目标)。
             let steps = expected
                 .iter()
                 .filter(|entry| entry.aggregate.kind == "workflow_step")
@@ -404,8 +406,54 @@ fn workflow_expected(
                     Ok(mf_kernel::kernel::VersionedHandle { handle, revision })
                 })
                 .collect::<Result<Vec<_>, TranslateError>>()?;
+            let agent_runs = expected
+                .iter()
+                .filter(|entry| entry.aggregate.kind == "agent_run")
+                .map(|entry| {
+                    let handle = mf_kernel::handles::AgentRunHandle::parse(strip_wire_prefix(
+                        &entry.aggregate.handle,
+                    ))
+                    .map_err(|e| {
+                        TranslateError::new(ProblemCode::ResourceNotFound, e.to_string())
+                    })?;
+                    let revision = u64_of(
+                        entry.semantic_revision.as_deref().ok_or_else(|| {
+                            TranslateError::new(
+                                ProblemCode::RevisionConflict,
+                                "expected 缺少 agent_run semantic_revision",
+                            )
+                        })?,
+                        "agent_run_revision",
+                    )?;
+                    Ok(mf_kernel::kernel::VersionedHandle { handle, revision })
+                })
+                .collect::<Result<Vec<_>, TranslateError>>()?;
+            let agent_sessions = expected
+                .iter()
+                .filter(|entry| entry.aggregate.kind == "agent_session")
+                .map(|entry| {
+                    let handle = mf_kernel::handles::AgentSessionHandle::parse(strip_wire_prefix(
+                        &entry.aggregate.handle,
+                    ))
+                    .map_err(|e| {
+                        TranslateError::new(ProblemCode::ResourceNotFound, e.to_string())
+                    })?;
+                    let revision = u64_of(
+                        entry.semantic_revision.as_deref().ok_or_else(|| {
+                            TranslateError::new(
+                                ProblemCode::RevisionConflict,
+                                "expected 缺少 agent_session semantic_revision",
+                            )
+                        })?,
+                        "agent_session_revision",
+                    )?;
+                    Ok(mf_kernel::kernel::VersionedHandle { handle, revision })
+                })
+                .collect::<Result<Vec<_>, TranslateError>>()?;
             let mut result = mf_kernel::kernel::WorkflowRunExpected::only_run(revision);
             result.steps = steps;
+            result.agent_runs = agent_runs;
+            result.agent_sessions = agent_sessions;
             return Ok(result);
         }
     }

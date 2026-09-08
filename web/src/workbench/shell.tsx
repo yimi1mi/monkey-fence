@@ -20,6 +20,7 @@ import {
 import { workflowCreateCommand } from "../state/workflow_commands.ts";
 import {
   agentRunOfStep,
+  agentRunViewOfStep,
   runDetailViewOf,
   runActionCommand,
   type RunDetailView,
@@ -799,9 +800,15 @@ function RunDetail({
       payload: Record<string, unknown>,
       stepHandle?: string,
       stepRevision?: string,
+      agentRun?: {
+        handle: string;
+        revision: string;
+        session?: { handle: string; revision: string };
+      },
     ) => {
       if (!detail) return;
-      // RetryStep/Respond/Settle 要求 expected 携带目标 Step 语义 revision
+      // RetryStep/Respond/Settle 要求 expected 携带目标 Step 语义 revision;
+      // Settle 还要求目标 Agent Run(kernel 复验结算目标)。
       const stepExpectation =
         stepHandle && stepRevision
           ? [
@@ -814,6 +821,32 @@ function RunDetail({
               },
             ]
           : [];
+      const agentRunExpectation = agentRun
+        ? [
+            {
+              aggregate: {
+                kind: "agent_run",
+                handle: agentRun.handle.startsWith("run_")
+                  ? agentRun.handle
+                  : `run_${agentRun.handle}`,
+              },
+              semantic_revision: agentRun.revision,
+            },
+            ...(agentRun.session
+              ? [
+                  {
+                    aggregate: {
+                      kind: "agent_session",
+                      handle: agentRun.session.handle.startsWith("sess_")
+                        ? agentRun.session.handle
+                        : `sess_${agentRun.session.handle}`,
+                    },
+                    semantic_revision: agentRun.session.revision,
+                  },
+                ]
+              : []),
+          ]
+        : [];
       try {
         await client.command({
           ...runActionCommand({
@@ -835,6 +868,7 @@ function RunDetail({
               semantic_revision: detail.revision,
             },
             ...stepExpectation,
+            ...agentRunExpectation,
           ],
         });
         onAction("已提交");
@@ -996,6 +1030,20 @@ function RunDetail({
                         },
                         step.step,
                         step.revision,
+                        (() => {
+                          const view = agentRunViewOfStep(detail, step.step);
+                          if (!view) return undefined;
+                          const session = view.agentSession
+                            ? detail.sessions.find((s) => s.agentSession === view.agentSession)
+                            : undefined;
+                          return {
+                            handle: view.agentRun,
+                            revision: view.revision,
+                            session: session
+                              ? { handle: session.agentSession, revision: session.revision }
+                              : undefined,
+                          };
+                        })(),
                       )
                     }
                   />
@@ -1015,6 +1063,35 @@ function RunDetail({
                     重试(新会话)
                   </button>
                 )}
+                {(() => {
+                  // #99 交接卡:该步骤的 Handoff 在时间轴原位展示
+                  const handoff = detail.handoffs.find((h) => h.step === step.step);
+                  if (!handoff) return null;
+                  return (
+                    <div className="handoff-card">
+                      <div className="handoff-head">
+                        <span className="badge tone-dim">交接</span>
+                        <span className="mono-dim">{handoff.status || "—"}</span>
+                      </div>
+                      {handoff.summary && <p className="handoff-summary">{handoff.summary}</p>}
+                      {handoff.changedFiles.length > 0 && (
+                        <p className="handoff-meta">变更 {handoff.changedFiles.length} 文件:{handoff.changedFiles.slice(0, 3).join("、")}{handoff.changedFiles.length > 3 ? "…" : ""}</p>
+                      )}
+                      {handoff.blockers.length > 0 && (
+                        <p className="handoff-meta warn">阻塞:{handoff.blockers.join("、")}</p>
+                      )}
+                      {handoff.recommendations.length > 0 && (
+                        <p className="handoff-meta">建议:{handoff.recommendations.slice(0, 2).join("、")}{handoff.recommendations.length > 2 ? "…" : ""}</p>
+                      )}
+                      {handoff.outputJson && (
+                        <details className="handoff-output">
+                          <summary>结构化输出(下游按 {"${nodes.<key>.output…}"} 引用)</summary>
+                          <pre>{handoff.outputJson}</pre>
+                        </details>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             );
           })}

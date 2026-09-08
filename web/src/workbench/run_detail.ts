@@ -22,6 +22,7 @@ export interface RunQuestionView {
 
 export interface RunAgentRunView {
   agentRun: string;
+  revision: string;
   step: string;
   agentSession: string | null;
   status: string;
@@ -31,6 +32,7 @@ export interface RunAgentRunView {
 
 export interface RunSessionView {
   agentSession: string;
+  revision: string;
   title: string;
   runtime: string;
   status: string;
@@ -40,6 +42,18 @@ export interface PendingProposalView {
   revisionHandle: string;
   revision: string;
   steps: Array<{ key: string; title: string; agent: string }>;
+}
+
+export interface RunHandoffView {
+  step: string;
+  summary: string;
+  status: string;
+  changedFiles: string[];
+  artifacts: string[];
+  blockers: string[];
+  recommendations: string[];
+  /** 自定义结构化输出(mfctl --output-json);空对象(null)省略显示。 */
+  outputJson: string | null;
 }
 
 export interface RunDetailView {
@@ -54,6 +68,7 @@ export interface RunDetailView {
   questions: RunQuestionView[];
   agentRuns: RunAgentRunView[];
   sessions: RunSessionView[];
+  handoffs: RunHandoffView[];
   focusStep: string | null;
   pendingProposals: PendingProposalView[];
 }
@@ -105,8 +120,13 @@ export function runDetailViewOf(data: Row): RunDetailView {
     ),
     agentRuns: (Array.isArray(data.agent_runs) ? data.agent_runs : []).map((raw) => {
       const row = raw as Row;
+      const agentRevision = row.revision as Row | number | string | undefined;
       return {
         agentRun: str(row.agent_run),
+        revision:
+          typeof agentRevision === "object" && agentRevision !== null
+            ? String(agentRevision.revision ?? "0")
+            : String(agentRevision ?? "0"),
         step: str(row.step),
         agentSession: typeof row.agent_session === "string" ? row.agent_session : null,
         status: str(row.status),
@@ -117,8 +137,13 @@ export function runDetailViewOf(data: Row): RunDetailView {
     sessions: (Array.isArray(data.agent_sessions) ? data.agent_sessions : []).map(
       (raw) => {
         const row = raw as Row;
+        const sessionRevision = row.revision as Row | number | string | undefined;
         return {
           agentSession: str(row.agent_session),
+          revision:
+            typeof sessionRevision === "object" && sessionRevision !== null
+              ? String(sessionRevision.revision ?? "0")
+              : String(sessionRevision ?? "0"),
           title: str(row.title),
           runtime: str(row.runtime),
           status: str(row.status),
@@ -126,6 +151,28 @@ export function runDetailViewOf(data: Row): RunDetailView {
       },
     ),
     focusStep: typeof data.focus_step === "string" ? data.focus_step : null,
+    handoffs: (Array.isArray(data.handoffs) ? data.handoffs : [])
+      .map((raw) => {
+        const row = raw as Row;
+        const handoff = (row.handoff ?? {}) as Row;
+        const output = handoff.output;
+        const outputJson =
+          output !== null && typeof output === "object" && Object.keys(output).length > 0
+            ? JSON.stringify(output, null, 2)
+            : null;
+        const listOf = (v: unknown): string[] =>
+          Array.isArray(v) ? v.map((item) => String(item)) : [];
+        return {
+          step: typeof row.step === "string" ? row.step : "",
+          summary: String(handoff.summary ?? ""),
+          status: String(handoff.status ?? ""),
+          changedFiles: listOf(handoff.changed_files),
+          artifacts: listOf(handoff.artifacts),
+          blockers: listOf(handoff.blockers),
+          recommendations: listOf(handoff.recommendations),
+          outputJson,
+        };
+      }),
     pendingProposals: (Array.isArray(data.pending_proposals) ? data.pending_proposals : []).map(
       (raw) => {
         const row = raw as Row;
@@ -144,8 +191,17 @@ export function runDetailViewOf(data: Row): RunDetailView {
 
 /** 该 step 最新的 agent run(settle 目标)。 */
 export function agentRunOfStep(detail: RunDetailView, step: string): string | null {
+  const view = agentRunViewOfStep(detail, step);
+  return view ? view.agentRun : null;
+}
+
+/** 该 step 最新的 agent run 完整视图(settle 需要 handle+revision)。 */
+export function agentRunViewOfStep(
+  detail: RunDetailView,
+  step: string,
+): RunAgentRunView | null {
   const candidates = detail.agentRuns.filter((run) => run.step === step);
-  return candidates.length > 0 ? candidates[candidates.length - 1].agentRun : null;
+  return candidates.length > 0 ? candidates[candidates.length - 1] : null;
 }
 
 /** run 级命令 envelope(target=run;project 经 payload——kernel_bridge
