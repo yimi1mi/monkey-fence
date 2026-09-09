@@ -49,6 +49,7 @@ impl TracerFixture {
                     instructions: String::new(),
                     agent_instance_id: "inst".into(),
                     deps: vec![],
+                    ..Default::default()
                 }],
                 allow_unsafe_parallel: false,
             })
@@ -631,6 +632,7 @@ fn tracer_journal_preflight_counts_utf8_bytes_not_characters() {
                 instructions: String::new(),
                 agent_instance_id: "inst".into(),
                 deps: vec![],
+                ..Default::default()
             }],
             allow_unsafe_parallel: false,
         })
@@ -699,6 +701,7 @@ fn runtime_open_reconciles_old_intent_and_outbox_before_serving() {
                 instructions: String::new(),
                 agent_instance_id: "inst".into(),
                 deps: vec![],
+                ..Default::default()
             }],
             allow_unsafe_parallel: false,
         })

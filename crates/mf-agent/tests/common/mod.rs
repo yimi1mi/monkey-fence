@@ -85,6 +85,7 @@ pub fn node(key: &str, deps: &[&str], instructions: &str, instance: &str) -> Wor
         instructions: instructions.into(),
         agent_instance_id: instance.into(),
         deps: deps.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
     }
 }
 

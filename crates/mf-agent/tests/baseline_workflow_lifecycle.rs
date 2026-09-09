@@ -165,6 +165,7 @@ impl World {
                 instructions,
                 agent_instance_id: self.instance_id.clone(),
                 deps,
+                ..Default::default()
             })
             .collect();
         self.orch

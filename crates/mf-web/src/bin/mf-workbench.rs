@@ -73,7 +73,16 @@ fn main() {
     let acceptance_mode = std::env::var("MF_WEB_ACCEPTANCE").ok().as_deref() == Some("1");
     // 管道面(动态调整 B/C):agent 经 MF_PIPE/MF_RUN_TOKEN 提交结算/
     // 状态/提案。capability 执行器身份固定,与 controller 轮换解耦。
-    let pipe_name = r"\\.\pipe\monkeyfence-mfctl".to_string();
+    // 管道名:默认生产实例保持稳定名(现有 mfctl 客户端兼容);仅当显式
+    // 设置 MF_CORE_INSTANCE_DIR(完整隔离实例,U2)时派生独立管道名,
+    // 隔离 Core 可与默认单例并存(互斥/owner/discovery 同样按命名空间)。
+    let pipe_name = match mf_kernel::singleton::instance_namespace_root() {
+        None => r"\\.\pipe\\monkeyfence-mfctl".to_string(),
+        Some(root) => format!(
+            r"\\.\pipe\\monkeyfence-mfctl-{}",
+            mf_kernel::singleton::core_mutex_name_fingerprint(&root.join("identity"))
+        ),
+    };
     let run_control_client = mf_kernel::kernel::LegacyKernelClient::new(
         kernel_runtime.kernel().clone(),
         mf_kernel::handles::Principal::parse("mf-workbench-run-control").expect("principal 合法"),

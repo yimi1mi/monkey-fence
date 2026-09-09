@@ -39,3 +39,28 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm test
+
+  # T0:真实浏览器验收(Playwright + mf-workbench 真实 Core fixture,
+  # Windows 上运行——mf-workbench 的 PTY/管道面按 Windows 形态验收)。
+  # 复用 rust job 的构建缓存,只构建 mf-web 单个 bin。
+  web-e2e:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p mf-web --bin mf-workbench
+        working-directory: .
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run e2e
+        env:
+          CI: "true"

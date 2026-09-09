@@ -351,6 +351,12 @@ pub(crate) fn sync_workflow_identity_tx_with_stats(
     nodes: &[crate::workflow::WorkflowNodeDraft],
 ) -> Result<IdentitySyncStats> {
     crate::workflow::validate_graph_structure(nodes)?;
+    // 每次语义保存都做完整 DAG 校验(含依赖环):无效图在写入点被拒,
+    // 不留到运行启动才暴露(原计划缺口:环反馈要有可操作入口)
+    crate::workflow_validation::validate_workflow(
+        crate::workflow_validation::WorkflowValidationInput::new(nodes),
+    )
+    .map_err(|errors| anyhow::anyhow!("工作流校验失败:{errors}"))?;
     let mut stats = IdentitySyncStats::default();
     let existing_nodes: Vec<(String, String)> = {
         let mut stmt = c.prepare(
@@ -680,6 +686,36 @@ impl Store {
 
     /// 在调用方已经持有的 Project Store transaction 中执行 Run 生命周期写入。
     /// 不开启/提交/回滚事务，也不触碰 RuntimeHost、目录提供器或事件总线。
+    /// 本 Run 所属步骤在冻结 Revision 里的输出约束(无快照/无约束为 None)。
+    fn frozen_output_schema_tx(
+        tx: &rusqlite::Transaction,
+        run: &RunView,
+    ) -> Result<Option<serde_json::Value>> {
+        // 旧 PipelineDraft Revision 的 snapshot_json 为 NULL(列级可空)
+        let snapshot_json: Option<Option<String>> = tx
+            .query_row(
+                "SELECT snapshot_json FROM pipeline_revisions WHERE id = ?1",
+                params![run.revision_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(json) = snapshot_json.flatten() else {
+            return Ok(None);
+        };
+        let snapshot: crate::workflow::WorkflowSnapshot = serde_json::from_str(&json)
+            .with_context(|| format!("revision {} 快照损坏", run.revision_id))?;
+        let step_key: String = tx.query_row(
+            "SELECT step_key FROM steps WHERE id = ?1",
+            params![run.step_id],
+            |r| r.get(0),
+        )?;
+        Ok(snapshot
+            .nodes
+            .into_iter()
+            .find(|node| node.key == step_key)
+            .and_then(|node| node.output_schema))
+    }
+
     pub fn apply_run_mutation_tx(
         tx: &rusqlite::Transaction,
         mutation: crate::run_mutation::RunMutation,
@@ -853,7 +889,7 @@ impl Store {
                 tx.execute(
                     "UPDATE agent_tasks
                      SET status=CASE WHEN status IN ('draft','ready','failed','needs-you') THEN 'running' ELSE status END,
-                         paused=0, updated_at=?2, revision=revision+1
+                         updated_at=?2, revision=revision+1
                      WHERE id=?1 AND (status IN ('draft','ready','failed','needs-you') OR paused<>0)",
                     params![step.task_id, now()],
                 )?;
@@ -936,7 +972,7 @@ impl Store {
                     TaskStatus::Running
                 };
                 tx.execute(
-                    "UPDATE agent_tasks SET status=?2,paused=0,unread=?3,
+                    "UPDATE agent_tasks SET status=?2,unread=?3,
                          updated_at=?4,revision=revision+1 WHERE id=?1",
                     params![
                         step.task_id,
@@ -959,6 +995,71 @@ impl Store {
                         step: updated_step,
                     },
                     actions,
+                })
+            }
+            RunMutation::SaveInputOverrides {
+                step_id,
+                expected_input_revision,
+                overrides,
+            } => {
+                let payload = serde_json::to_string(&overrides)
+                    .with_context(|| "input overrides 序列化失败")?;
+                let changed = tx.execute(
+                    "UPDATE node_inputs
+                     SET overrides_json=?2, updated_at=?3, input_revision=input_revision+1
+                     WHERE step_id=?1 AND review_state='awaiting_review' AND input_revision=?4
+                       AND id=(SELECT MAX(id) FROM node_inputs WHERE step_id=?1)",
+                    params![step_id, payload, now(), expected_input_revision],
+                )?;
+                if changed != 1 {
+                    anyhow::bail!(
+                        "步骤 {step_id} 输入版本冲突(expected rev {expected_input_revision})或没有可编辑的待确认输入"
+                    );
+                }
+                Ok(RunMutationResult {
+                    output: RunMutationOutput::InputOverridesSaved,
+                    actions: Vec::new(),
+                })
+            }
+            RunMutation::Pause { task_id } => {
+                // 不推进 revision:与 settle 同口径(run 聚合无事件,
+                // paused 由快照直读),避免与 journal head 不连续
+                let changed = tx.execute(
+                    "UPDATE agent_tasks SET paused=1, updated_at=?2 WHERE id=?1",
+                    params![task_id, now()],
+                )?;
+                anyhow::ensure!(changed == 1, "任务 {task_id} 不存在");
+                Ok(RunMutationResult {
+                    output: RunMutationOutput::PauseToggled(task_id, true),
+                    actions: Vec::new(),
+                })
+            }
+            RunMutation::Resume { task_id } => {
+                let changed = tx.execute(
+                    "UPDATE agent_tasks SET paused=0, updated_at=?2 WHERE id=?1",
+                    params![task_id, now()],
+                )?;
+                anyhow::ensure!(changed == 1, "任务 {task_id} 不存在");
+                // 派发由 tick 驱动(见 T3 投影载体说明)
+                Ok(RunMutationResult {
+                    output: RunMutationOutput::PauseToggled(task_id, false),
+                    actions: Vec::new(),
+                })
+            }
+            RunMutation::ConfirmInput {
+                task_id,
+                step_id,
+                expected_input_revision,
+            } => {
+                let input_id = tx.query_row(
+                    "SELECT id FROM node_inputs WHERE task_id=?1 AND step_id=?2 ORDER BY id DESC LIMIT 1",
+                    params![task_id, step_id], |row| row.get::<_, i64>(0),
+                ).optional()?.ok_or_else(|| anyhow::anyhow!("该步骤没有待确认输入"))?;
+                let transitioned =
+                    Self::confirm_node_input_tx(tx, input_id, step_id, expected_input_revision)?;
+                Ok(RunMutationResult {
+                    output: RunMutationOutput::InputConfirmed(input_id, transitioned),
+                    actions: Vec::new(),
                 })
             }
             RunMutation::Respond {
@@ -1096,6 +1197,18 @@ impl Store {
                 ) {
                     return Err(SettleError::RunNotActive(run.status).into());
                 }
+                // T2:成功结算的事务前置校验——Revision 冻结的输出约束
+                // 不合格时拒绝结算(保持待结算,Agent 可修正后重新提交;
+                // 下游不因失败解锁)。旧 Profile 路径(无快照节点)不校验。
+                if let Settlement::Complete { output, .. } = &settlement {
+                    if let Some(schema) = Self::frozen_output_schema_tx(tx, &run)? {
+                        if let Err(errors) =
+                            crate::node_input::validate_output_against_schema(&schema, output)
+                        {
+                            return Err(SettleError::OutputSchemaViolation { errors }.into());
+                        }
+                    }
+                }
                 let ts = now();
                 let applied = tx.execute(
                     "UPDATE agent_runs SET status=?2, outcome=?3, outcome_payload=?4, ended_at=?5, revision=revision+1
@@ -1163,7 +1276,7 @@ impl Store {
                                 params![step_id, ts],
                             )?;
                             tx.execute(
-                                "UPDATE agent_tasks SET status='running', paused=0, updated_at=?2,
+                                "UPDATE agent_tasks SET status='running', updated_at=?2,
                                     revision=revision+1 WHERE id=?1
                                     AND status IN ('ready','failed','needs-you')",
                                 params![run.task_id, ts],
@@ -1635,6 +1748,7 @@ impl Store {
                 })
                 .collect::<Result<Vec<_>>>()?
         };
+        let node_inputs = Self::node_input_summaries_tx(c, task.id)?;
         Ok(Some(crate::model::WorkflowRunProjectionSource {
             task,
             active_revision,
@@ -1646,6 +1760,7 @@ impl Store {
             handoffs,
             execution_leases,
             pending_merges,
+            node_inputs,
         }))
     }
 
@@ -2753,6 +2868,27 @@ impl Store {
         session_id: i64,
         expected_next_session: Option<crate::run_mutation::NextAttemptSession>,
     ) -> Result<RunView> {
+        self.dispatch_run_with_input(
+            task_id,
+            step_id,
+            revision_id,
+            session_id,
+            expected_next_session,
+            None,
+        )
+    }
+
+    /// 同一事务消费下一 attempt 与待发送输入；失败不创建运行或消耗 attempt。
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_run_with_input(
+        &self,
+        task_id: i64,
+        step_id: i64,
+        revision_id: i64,
+        session_id: i64,
+        expected_next_session: Option<crate::run_mutation::NextAttemptSession>,
+        input: Option<(i64, i64)>,
+    ) -> Result<RunView> {
         let ts = now();
         self.with_tx(|tx| {
             let current = tx
@@ -2777,14 +2913,29 @@ impl Store {
                 current == expected_next_session,
                 "Step {step_id} 的下一 attempt 会话策略已被并发消费或替换"
             );
+            // T4:暂停是创建 Agent Run 的事务性前置——暂停提交成功后
+            // 本 UPDATE 不得命中(即使调度 tick 读到的是旧 task.paused)。
             let changed = tx.execute(
                 "UPDATE steps SET attempts = attempts + 1, status = 'running',
                     started_at = COALESCE(started_at, ?2), updated_at = ?2,
                     revision = revision + 1
-                 WHERE id = ?1 AND revision_id=?3 AND task_id=?4 AND status='ready'",
+                 WHERE id = ?1 AND revision_id=?3 AND task_id=?4 AND status='ready'
+                   AND EXISTS(SELECT 1 FROM agent_tasks WHERE id=?4 AND paused=0
+                       AND active_revision=?3 AND status IN ('running','needs-you'))",
                 params![step_id, ts, revision_id, task_id],
             )?;
-            anyhow::ensure!(changed == 1, "Step {step_id} 已不是可派发的 ready 状态");
+            let paused_now: bool = tx
+                .query_row(
+                    "SELECT paused FROM agent_tasks WHERE id=?1",
+                    params![task_id],
+                    |r| r.get::<_, i64>(0).map(|v| v != 0),
+                )
+                .unwrap_or(false);
+            anyhow::ensure!(
+                changed == 1,
+                "Step {step_id} 已不是可派发的 ready 状态{}",
+                if paused_now { "(任务已暂停)" } else { "" }
+            );
             if let Some(expected) = expected_next_session {
                 let mode = match expected.mode {
                     RetryMode::FreshSession => "fresh",
@@ -2814,7 +2965,26 @@ impl Store {
                     ts
                 ],
             )?;
-            Self::run_view_by_id_tx(tx, tx.last_insert_rowid())?
+            let run_id = tx.last_insert_rowid();
+            if let Some((input_id, input_revision)) = input {
+                let consumed = tx.execute(
+                    "UPDATE node_inputs SET agent_run_id=?2, updated_at=?3
+                     WHERE id=?1 AND step_id=?4 AND revision_id=?5 AND task_id=?6
+                       AND input_revision=?7 AND status='frozen' AND agent_run_id IS NULL
+                       AND review_state IN ('none','confirmed')",
+                    params![
+                        input_id,
+                        run_id,
+                        ts,
+                        step_id,
+                        revision_id,
+                        task_id,
+                        input_revision
+                    ],
+                )?;
+                anyhow::ensure!(consumed == 1, "待发送输入已变化、未确认或已被消费");
+            }
+            Self::run_view_by_id_tx(tx, run_id)?
                 .ok_or_else(|| anyhow::anyhow!("run 插入后读取失败"))
         })
     }
@@ -3553,6 +3723,182 @@ impl Store {
         Self::project_workflow_steps_tx(c, task_id, rev_id, snapshot)?;
         Self::revision_view_by_id(c, rev_id)?
             .ok_or_else(|| anyhow::anyhow!("revision 插入后读取失败"))
+    }
+
+    /// T4 运行中改图:创建并激活补丁 Revision(一个事务)。
+    ///
+    /// 继承语义(§3.4):
+    /// - 旧 key 的 step 行继承 status/attempts/auto_retry/result/起止时间/
+    ///   session_policy,并把既有 handoffs.step_id 重映射到新行(同一条
+    ///   Handoff,不复制伪造);运行中节点的后续结算按 step_key 落到新行;
+    /// - 新 key 全新 pending 行;
+    /// - deps 按 key 重建;
+    /// - agent_tasks.active_revision 同事务切换;
+    /// - 受影响的未发送输入(门控待确认)复位,由下一 tick 重新编译。
+    pub fn create_patched_revision_tx(
+        c: &Connection,
+        task_id: i64,
+        snapshot: &crate::workflow::WorkflowSnapshot,
+        content_digest: &str,
+    ) -> Result<(RevisionView, i64)> {
+        let ts = now();
+        let old_revision: Option<i64> = c
+            .query_row(
+                "SELECT active_revision FROM agent_tasks WHERE id=?1",
+                params![task_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let old_steps: Vec<(i64, String)> = match old_revision {
+            Some(rev) => c
+                .prepare("SELECT id, step_key FROM steps WHERE revision_id=?1")?
+                .query_map(params![rev], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?,
+            None => Vec::new(),
+        };
+        // R2/S3/U1(事务内复验,基于提交时刻的活动图):prepare 与提交之间
+        // 状态可能变化,不能只信 UI/prepare。所有 attempts>0 的节点:
+        // 1) 必须保留(S2 删除拒绝);
+        // 2) 冻结定义不得修改——补丁快照节点必须与当前活动 Revision 的
+        //    冻结节点**整体相等**(完整 AgentInstanceSnapshot、PluginSourcePin
+        //    与全部职责字段;U1:同实例 ID 不同版本/argv/executable 也是
+        //    不同冻结配置)。用派生 PartialEq 整体比较,不再手工列字段,
+        //    避免再次漏项。读取/解析当前冻结快照失败时报错,不跳过校验。
+        if let Some(current_rev) = old_revision {
+            let current_snapshot: crate::workflow::WorkflowSnapshot = c
+                .query_row(
+                    "SELECT snapshot_json FROM pipeline_revisions WHERE id=?1",
+                    params![current_rev],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "当前活动 Revision {current_rev} 缺少可解析的冻结快照,拒绝图补丁提交"
+                    )
+                })?;
+            let started: Vec<String> = c
+                .prepare("SELECT step_key FROM steps WHERE revision_id=?1 AND attempts>0")?
+                .query_map(params![current_rev], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<_, _>>()?;
+            for key in started {
+                let patched = snapshot
+                    .nodes
+                    .iter()
+                    .find(|node| node.key == key)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("节点 `{key}` 已启动(attempts>0),不能从图中删除")
+                    })?;
+                let frozen = current_snapshot
+                    .nodes
+                    .iter()
+                    .find(|node| node.key == key)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("节点 `{key}` 已启动但当前冻结快照中不存在,拒绝图补丁提交")
+                    })?;
+                anyhow::ensure!(
+                    patched == frozen,
+                    "节点 `{key}` 已启动(attempts>0),冻结定义不得修改(完整实例配置/插件身份/职责/依赖/映射/输出要求/策略)"
+                );
+            }
+        }
+        let view = Self::create_workflow_revision_tx(c, task_id, snapshot, Some(content_digest))?;
+        let rev_id = view.id;
+        // 继承:按 key 对齐旧行
+        let mut new_id_of_key: HashMap<String, i64> = c
+            .prepare("SELECT id, step_key FROM steps WHERE revision_id=?1")?
+            .query_map(params![rev_id], |r| {
+                Ok((r.get::<_, String>(1)?, r.get::<_, i64>(0)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        for (old_id, key) in &old_steps {
+            let Some(new_id) = new_id_of_key.get(key).copied() else {
+                continue; // 节点被删除
+            };
+            c.execute(
+                "UPDATE steps AS fresh
+                 SET status = old.status,
+                     attempts = old.attempts,
+                     auto_retry = old.auto_retry,
+                     result = old.result,
+                     started_at = old.started_at,
+                     ended_at = old.ended_at,
+                     session_policy = old.session_policy
+                 FROM steps AS old
+                 WHERE fresh.id = ?1 AND old.id = ?2",
+                params![new_id, old_id],
+            )?;
+            // 既有 Handoff 重映射到新行(同一条记录,保留 run 谱系)
+            c.execute(
+                "UPDATE handoffs SET step_id=?2 WHERE step_id=?1",
+                params![old_id, new_id],
+            )?;
+        }
+        // 依赖图变化后的状态重算:非终态步骤按「全部上游成功 → ready,
+        // 否则 pending」重新门控(如 B 的上游从 A 换成未运行的 C)。
+        for (_key, new_id) in new_id_of_key.iter() {
+            // 只重算未启动的步骤:运行中/待结算/等待输入的节点(attempts>0)
+            // 保持继承状态,其后续结算按 step_key 落到新行
+            let (terminal, attempts): (bool, i64) = c
+                .query_row(
+                    "SELECT status, attempts FROM steps WHERE id=?1",
+                    params![new_id],
+                    |r| {
+                        Ok((
+                            matches!(
+                                r.get::<_, String>(0)?.as_str(),
+                                "succeeded" | "failed" | "skipped" | "cancelled"
+                            ),
+                            r.get::<_, i64>(1)?,
+                        ))
+                    },
+                )
+                .unwrap_or((false, 0));
+            if terminal || attempts > 0 {
+                continue;
+            }
+            let blocked: bool = c
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM step_deps d JOIN steps dep ON dep.id=d.dep_step_id
+                     WHERE d.step_id=?1 AND dep.status NOT IN ('succeeded','skipped'))",
+                    params![new_id],
+                    |r| r.get::<_, i64>(0).map(|v| v != 0),
+                )
+                .unwrap_or(false);
+            let next = if blocked { "pending" } else { "ready" };
+            c.execute(
+                "UPDATE steps SET status=?2, updated_at=?3 WHERE id=?1 AND status != ?2",
+                params![new_id, next, ts],
+            )?;
+        }
+        // 图或依赖源变化:未发送的门控输入复位待重建
+        c.execute(
+            "UPDATE node_inputs SET review_state='none', updated_at=?2
+             WHERE task_id=?1 AND status='frozen' AND review_state='awaiting_review'",
+            params![task_id, ts],
+        )?;
+        // 激活约定与 assign 确认路径一致:旧 active → superseded,新 → active
+        c.execute(
+            "UPDATE pipeline_revisions SET status='superseded'
+             WHERE task_id=?1 AND status='active' AND id!=?2",
+            params![task_id, rev_id],
+        )?;
+        c.execute(
+            "UPDATE pipeline_revisions SET status='active' WHERE id=?1",
+            params![rev_id],
+        )?;
+        // 不推进 agent_tasks.revision:与 settle/pause 同口径(run 聚合
+        // 无 replace 事件,active_revision 由快照直读),保持 journal 连续
+        let changed = c.execute(
+            "UPDATE agent_tasks SET active_revision=?2, updated_at=?3
+             WHERE id=?1 AND active_revision IS NOT NULL",
+            params![task_id, rev_id, ts],
+        )?;
+        anyhow::ensure!(changed == 1, "任务 {task_id} 无活动 Revision,不能打补丁");
+        Ok((view, rev_id))
     }
 
     /// 删除任务(Composer 分配失败的回滚):无任何 Agent Run 时才允许;
@@ -5944,6 +6290,371 @@ impl Store {
                 .collect()
         })
     }
+
+    // ── 节点输入冻结记录(T2;input_json 创建后不可变) ──────────────
+
+    /// 冻结一次节点输入(每个派发 attempt 一行),返回行 id。
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_node_input(
+        &self,
+        task_id: i64,
+        revision_id: i64,
+        step_id: i64,
+        node_key: &str,
+        compiled: &crate::node_input::CompiledNodeInput,
+        review_state: &str,
+    ) -> Result<i64> {
+        let summary = crate::node_input::input_summary(compiled);
+        let payload = serde_json::to_string(compiled).with_context(|| "node input 序列化失败")?;
+        let now = now();
+        self.with_conn(|c| {
+            c.execute(
+                "INSERT INTO node_inputs
+                    (task_id, revision_id, step_id, agent_run_id, node_key, status,
+                     input_json, summary, created_at, updated_at, review_state)
+                 VALUES (?1, ?2, ?3, NULL, ?4, 'frozen', ?5, ?6, ?7, ?7, ?8)",
+                params![
+                    task_id,
+                    revision_id,
+                    step_id,
+                    node_key,
+                    payload,
+                    summary,
+                    now,
+                    review_state
+                ],
+            )?;
+            Ok(c.last_insert_rowid())
+        })
+    }
+
+    /// T3 保存输入覆盖:仅 awaiting_review 期间可写(幂等重写)。
+    pub fn save_input_overrides(
+        &self,
+        input_id: i64,
+        step_id: i64,
+        overrides: &crate::node_input::InputOverrides,
+        expected_input_revision: i64,
+    ) -> Result<()> {
+        let payload =
+            serde_json::to_string(overrides).with_context(|| "input overrides 序列化失败")?;
+        let changed = self.with_conn(|c| {
+            Ok(c.execute(
+                "UPDATE node_inputs
+                 SET overrides_json = ?4, updated_at = ?5,
+                     input_revision = input_revision + 1
+                 WHERE id = ?1 AND step_id = ?2 AND review_state = 'awaiting_review'
+                   AND input_revision = ?3",
+                params![input_id, step_id, expected_input_revision, payload, now()],
+            )?)
+        })?;
+        if changed != 1 {
+            anyhow::bail!("输入版本冲突或已不在待确认状态(expected rev {expected_input_revision})");
+        }
+        Ok(())
+    }
+
+    /// T3 确认本次输入:awaiting_review → confirmed(重复确认幂等)。
+    /// 返回是否发生了本次转移(false = 已确认)。
+    pub fn confirm_node_input(
+        &self,
+        input_id: i64,
+        step_id: i64,
+        expected_input_revision: i64,
+    ) -> Result<bool> {
+        self.with_tx(|tx| {
+            Self::confirm_node_input_tx(tx, input_id, step_id, expected_input_revision)
+        })
+    }
+
+    fn confirm_node_input_tx(
+        c: &Connection,
+        input_id: i64,
+        step_id: i64,
+        expected_input_revision: i64,
+    ) -> Result<bool> {
+        let row = c
+            .query_row(
+                "SELECT i.input_json,i.overrides_json,i.input_revision,i.review_state,
+                    i.revision_id,t.active_revision,t.status,i.agent_run_id
+             FROM node_inputs i JOIN agent_tasks t ON t.id=i.task_id
+             WHERE i.id=?1 AND i.step_id=?2",
+                params![input_id, step_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, String>(3)?,
+                        r.get::<_, i64>(4)?,
+                        r.get::<_, Option<i64>>(5)?,
+                        r.get::<_, String>(6)?,
+                        r.get::<_, Option<i64>>(7)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("待确认输入不存在"))?;
+        anyhow::ensure!(
+            row.2 == expected_input_revision,
+            "输入版本冲突:用户确认 rev {expected_input_revision},当前 rev {}",
+            row.2
+        );
+        anyhow::ensure!(
+            Some(row.4) == row.5,
+            "输入所属 Pipeline Revision 已失效，请重新检查"
+        );
+        if row.3 == "confirmed" {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            row.3 == "awaiting_review" && row.7.is_none(),
+            "该输入已经不可确认"
+        );
+        anyhow::ensure!(
+            !matches!(
+                row.6.as_str(),
+                "succeeded" | "failed" | "cancelled" | "archived"
+            ),
+            "运行已经终结，不能确认输入"
+        );
+        let mut compiled: crate::node_input::CompiledNodeInput = serde_json::from_str(&row.0)?;
+        if let Some(overrides) = row.1 {
+            compiled =
+                crate::node_input::apply_overrides(compiled, &serde_json::from_str(&overrides)?);
+        }
+        anyhow::ensure!(
+            compiled.missing_required.is_empty(),
+            "输入仍缺少必填项:{}，请先补值",
+            compiled.missing_required.join("、")
+        );
+        let changed=c.execute(
+            "UPDATE node_inputs SET review_state='confirmed',updated_at=?3
+             WHERE id=?1 AND step_id=?2 AND input_revision=?4 AND review_state='awaiting_review' AND agent_run_id IS NULL",
+            params![input_id,step_id,now(),expected_input_revision],
+        )?;
+        anyhow::ensure!(changed == 1, "输入版本冲突或已被消费");
+        Ok(true)
+    }
+    /// 输入已随 Agent Run 发送:补关联(载荷本身不变)。
+    pub fn mark_node_input_dispatched(&self, input_id: i64, agent_run_id: i64) -> Result<()> {
+        self.with_conn(|c| {
+            let changed = c.execute(
+                "UPDATE node_inputs
+                 SET agent_run_id = ?2, status = 'dispatched', updated_at = ?3
+                 WHERE id = ?1 AND status = 'frozen'",
+                params![input_id, agent_run_id, chrono::Utc::now().to_rfc3339()],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("node_input {input_id} 不存在或已标记 dispatched");
+            }
+            Ok(())
+        })
+    }
+
+    /// 某步骤最新一条输入记录(完整载荷)。
+    pub fn latest_node_input_of_step(
+        &self,
+        task_id: i64,
+        step_id: i64,
+    ) -> Result<Option<NodeInputRecord>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, revision_id, step_id, agent_run_id, node_key, status, input_json,
+                        summary, created_at, review_state, overrides_json, input_revision
+                 FROM node_inputs WHERE task_id = ?1 AND step_id = ?2
+                 ORDER BY id DESC LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(params![task_id, step_id], NodeInputRow::read)?;
+            let first = rows.next().transpose()?;
+            drop(rows);
+            drop(stmt);
+            Self::node_input_record_of(first, task_id)
+        })
+    }
+
+    /// R6:按节点键查最新输入记录(改图继承后,历史记录仍挂在旧 Step 行,
+    /// 当前运行视图按 key 归属;原 step_id 保持历史事实不变)。
+    pub fn latest_node_input_of_key(
+        &self,
+        task_id: i64,
+        node_key: &str,
+    ) -> Result<Option<NodeInputRecord>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, revision_id, step_id, agent_run_id, node_key, status, input_json,
+                        summary, created_at, review_state, overrides_json, input_revision
+                 FROM node_inputs WHERE task_id = ?1 AND node_key = ?2
+                 ORDER BY id DESC LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(params![task_id, node_key], NodeInputRow::read)?;
+            let first = rows.next().transpose()?;
+            drop(rows);
+            drop(stmt);
+            Self::node_input_record_of(first, task_id)
+        })
+    }
+
+    /// 组装记录(查询列序见 [`NodeInputRow::read`])。
+    fn node_input_record_of(
+        row: Option<NodeInputRow>,
+        task_id: i64,
+    ) -> Result<Option<NodeInputRecord>> {
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let compiled: crate::node_input::CompiledNodeInput = serde_json::from_str(&row.payload)
+            .with_context(|| format!("node_input 行 {} 损坏", row.id))?;
+        let overrides = row
+            .overrides_json
+            .as_deref()
+            .map(serde_json::from_str::<crate::node_input::InputOverrides>)
+            .transpose()
+            .with_context(|| format!("node_input 行 {} overrides 损坏", row.id))?;
+        Ok(Some(NodeInputRecord {
+            id: row.id,
+            task_id,
+            revision_id: row.revision_id,
+            step_id: row.step_id,
+            agent_run_id: row.agent_run_id,
+            node_key: row.node_key,
+            status: row.status,
+            review_state: row.review_state,
+            input_revision: row.input_revision,
+            overrides,
+            compiled,
+            summary: row.summary,
+            created_at: row.created_at,
+        }))
+    }
+
+    /// 任务全部输入记录的摘要(运行总快照只带摘要/状态/句柄,不带长 prompt)。
+    pub fn node_input_summaries_tx(c: &Connection, task_id: i64) -> Result<Vec<NodeInputSummary>> {
+        let mut stmt = c.prepare(
+            "SELECT id, step_id, node_key, status, summary, agent_run_id, review_state
+             FROM node_inputs WHERE task_id = ?1 ORDER BY id",
+        )?;
+        let rows: Vec<NodeInputSummary> = stmt
+            .query_map(params![task_id], |r| {
+                Ok(NodeInputSummary {
+                    id: r.get(0)?,
+                    step_id: r.get(1)?,
+                    node_key: r.get(2)?,
+                    status: r.get(3)?,
+                    summary: r.get(4)?,
+                    agent_run_id: r.get(5)?,
+                    review_state: r.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn node_input_summaries(&self, task_id: i64) -> Result<Vec<NodeInputSummary>> {
+        self.with_conn(|c| {
+            let mut stmt = c.prepare(
+                "SELECT id, step_id, node_key, status, summary, agent_run_id, review_state
+                 FROM node_inputs WHERE task_id = ?1 ORDER BY id",
+            )?;
+            let rows: Vec<NodeInputSummary> = stmt
+                .query_map(params![task_id], |r| {
+                    Ok(NodeInputSummary {
+                        id: r.get(0)?,
+                        step_id: r.get(1)?,
+                        node_key: r.get(2)?,
+                        status: r.get(3)?,
+                        summary: r.get(4)?,
+                        agent_run_id: r.get(5)?,
+                        review_state: r.get(6)?,
+                    })
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// run id → 公开句柄(输入来源追踪用)。
+    pub fn agent_run_handles(&self, task_id: i64) -> Result<HashMap<i64, String>> {
+        self.with_conn(|c| {
+            let mut stmt =
+                c.prepare("SELECT id, public_handle FROM agent_runs WHERE task_id = ?1")?;
+            let rows: Vec<(i64, String)> = stmt
+                .query_map(params![task_id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?;
+            Ok(rows.into_iter().collect())
+        })
+    }
+}
+
+/// `node_inputs` 行的中间形态(列序: id, revision_id, step_id, agent_run_id,
+/// node_key, status, input_json, summary, created_at, review_state, overrides_json)。
+struct NodeInputRow {
+    id: i64,
+    revision_id: i64,
+    step_id: i64,
+    agent_run_id: Option<i64>,
+    node_key: String,
+    status: String,
+    payload: String,
+    summary: String,
+    created_at: String,
+    review_state: String,
+    overrides_json: Option<String>,
+    input_revision: i64,
+}
+
+impl NodeInputRow {
+    fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: r.get(0)?,
+            revision_id: r.get(1)?,
+            step_id: r.get(2)?,
+            agent_run_id: r.get(3)?,
+            node_key: r.get(4)?,
+            status: r.get(5)?,
+            payload: r.get(6)?,
+            summary: r.get(7)?,
+            created_at: r.get(8)?,
+            review_state: r.get(9)?,
+            overrides_json: r.get(10)?,
+            input_revision: r.get(11)?,
+        })
+    }
+}
+
+/// 节点输入冻结记录(完整)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeInputRecord {
+    pub id: i64,
+    pub task_id: i64,
+    pub revision_id: i64,
+    pub step_id: i64,
+    pub agent_run_id: Option<i64>,
+    pub node_key: String,
+    pub status: String,
+    /// none = 自动派发;awaiting_review/confirmed = T3 人工检查门控。
+    pub review_state: String,
+    /// R4:输入自身的版本轴——保存覆盖推进;确认必须绑定用户看过的版本。
+    pub input_revision: i64,
+    pub overrides: Option<crate::node_input::InputOverrides>,
+    pub compiled: crate::node_input::CompiledNodeInput,
+    pub summary: String,
+    pub created_at: String,
+}
+
+/// 节点输入摘要(投影/轮询形态)。
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct NodeInputSummary {
+    pub id: i64,
+    pub step_id: i64,
+    pub node_key: String,
+    pub status: String,
+    pub summary: String,
+    pub agent_run_id: Option<i64>,
+    /// T3 门控状态( awaiting_review = 等待用户)。
+    pub review_state: String,
 }
 
 // ---------------------------------------------------------------------------

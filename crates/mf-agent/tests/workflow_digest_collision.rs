@@ -14,6 +14,7 @@ fn node(key: &str, title: &str, instructions: &str, deps: &[&str]) -> WorkflowNo
         instructions: instructions.to_string(),
         agent_instance_id: "inst-1".to_string(),
         deps: deps.iter().map(|d| d.to_string()).collect(),
+        ..Default::default()
     }
 }
 

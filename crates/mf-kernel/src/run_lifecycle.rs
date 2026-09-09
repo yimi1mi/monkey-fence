@@ -26,6 +26,11 @@ pub enum RunPreparation {
     Cancel { run_stops: Vec<PreparedRunStop> },
     /// ContinueSession 已确认该会话存活。
     ContinueSessionAlive { session: AgentSessionHandle },
+    /// T4 图补丁:port 侧编译的新快照(序列化形态;Eq 兼容)+ 内容摘要。
+    GraphPatch {
+        pipeline_json: String,
+        digest: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

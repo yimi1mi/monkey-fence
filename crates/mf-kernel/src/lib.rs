@@ -56,6 +56,12 @@ mod command_support;
 #[path = "../tests/contract/feature_gate.rs"]
 mod feature_gate_contract;
 #[cfg(test)]
+#[path = "../tests/contract/input_gate_commands.rs"]
+mod input_gate_commands;
+#[cfg(test)]
+#[path = "../tests/contract/instance_isolation.rs"]
+mod instance_isolation;
+#[cfg(test)]
 #[path = "../tests/contract/intent_recovery.rs"]
 mod intent_recovery;
 #[cfg(test)]

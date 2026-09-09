@@ -247,6 +247,49 @@ pub fn translate_command(command: &CommandEnvelope) -> Result<KernelCommand, Tra
             )?,
         }),
         Wire::WorkflowUpdateNode => {
+            // T1 扩展字段:键缺失=不修改;显式 null=清除(output_schema/
+            // context_policy);值存在=替换。
+            let acceptance_criteria = match payload.get("acceptance_criteria") {
+                None => None,
+                Some(serde_json::Value::Null) => Some(String::new()),
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .ok_or_else(|| {
+                            TranslateError::new(
+                                ProblemCode::InvalidEnvelope,
+                                "acceptance_criteria 必须是字符串".to_string(),
+                            )
+                        })?
+                        .to_string(),
+                ),
+            };
+            let output_schema = match payload.get("output_schema") {
+                None => None,
+                Some(serde_json::Value::Null) => Some(None),
+                Some(value) if value.is_object() => Some(Some(value.clone())),
+                Some(_) => {
+                    return Err(TranslateError::new(
+                        ProblemCode::InvalidEnvelope,
+                        "output_schema 必须是 JSON 对象".to_string(),
+                    ))
+                }
+            };
+            let input_bindings = match payload.get("input_bindings") {
+                Some(value) if !value.is_null() => {
+                    Some(serde_json::from_value(value.clone()).map_err(|e| {
+                        TranslateError::new(ProblemCode::InvalidEnvelope, e.to_string())
+                    })?)
+                }
+                _ => None,
+            };
+            let context_policy = match payload.get("context_policy") {
+                None => None,
+                Some(serde_json::Value::Null) => Some(None),
+                Some(value) => Some(Some(serde_json::from_value(value.clone()).map_err(
+                    |e| TranslateError::new(ProblemCode::InvalidEnvelope, e.to_string()),
+                )?)),
+            };
             KernelCommand::ProjectWorkflow(ProjectWorkflowCommand::UpdateNode {
                 project: project_handle_of(payload_str(payload, "project_handle")?)?,
                 workflow: workflow_handle_of(payload_str(payload, "workflow_handle")?)?,
@@ -254,6 +297,28 @@ pub fn translate_command(command: &CommandEnvelope) -> Result<KernelCommand, Tra
                 title: payload_str(payload, "title")?.to_string(),
                 instructions: payload_str(payload, "instructions")?.to_string(),
                 agent_instance_id: payload_str(payload, "agent_instance_id")?.to_string(),
+                acceptance_criteria,
+                output_schema,
+                input_bindings,
+                context_policy,
+                require_input_review: payload
+                    .get("require_input_review")
+                    .and_then(|value| value.as_bool()),
+                expected_semantic_revision: revision_of(
+                    &command.expected,
+                    "project_workflow",
+                    "semantic",
+                )?,
+            })
+        }
+        Wire::WorkflowUpdateGraph => {
+            KernelCommand::ProjectWorkflow(ProjectWorkflowCommand::ReplaceGraph {
+                project: project_handle_of(payload_str(payload, "project_handle")?)?,
+                workflow: workflow_handle_of(payload_str(payload, "workflow_handle")?)?,
+                draft: serde_json::from_value(payload.get("draft").cloned().unwrap_or_default())
+                    .map_err(|e| {
+                        TranslateError::new(ProblemCode::InvalidEnvelope, e.to_string())
+                    })?,
                 expected_semantic_revision: revision_of(
                     &command.expected,
                     "project_workflow",
@@ -354,6 +419,51 @@ pub fn translate_command(command: &CommandEnvelope) -> Result<KernelCommand, Tra
             settlement: settlement_of(payload)?,
             expected: workflow_expected(&command.expected)?,
         }),
+        // T3 输入检查门控:保存覆盖 / 确认发送(权威状态在 node_inputs)
+        Wire::WorkflowRunSaveInputOverrides => {
+            KernelCommand::WorkflowRun(WorkflowRunCommand::SaveInputOverrides {
+                project: project_handle_of(payload_str(payload, "project_handle")?)?,
+                workflow_run: run_handle_of(&command.target.handle)?,
+                step: step_handle_of(payload_str(payload, "step_handle")?)?,
+                expected_input_revision: payload_u64(payload, "input_revision")?,
+                overrides: serde_json::from_value(
+                    payload.get("overrides").cloned().unwrap_or_default(),
+                )
+                .map_err(|e| TranslateError::new(ProblemCode::InvalidEnvelope, e.to_string()))?,
+                expected: workflow_expected(&command.expected)?,
+            })
+        }
+        Wire::WorkflowRunPause => KernelCommand::WorkflowRun(WorkflowRunCommand::Pause {
+            project: project_handle_of(payload_str(payload, "project_handle")?)?,
+            workflow_run: run_handle_of(&command.target.handle)?,
+            expected: workflow_expected(&command.expected)?,
+        }),
+        Wire::WorkflowRunResume => KernelCommand::WorkflowRun(WorkflowRunCommand::Resume {
+            project: project_handle_of(payload_str(payload, "project_handle")?)?,
+            workflow_run: run_handle_of(&command.target.handle)?,
+            expected: workflow_expected(&command.expected)?,
+        }),
+        Wire::WorkflowRunApplyGraphPatch => {
+            KernelCommand::WorkflowRun(WorkflowRunCommand::ApplyGraphPatch {
+                project: project_handle_of(payload_str(payload, "project_handle")?)?,
+                workflow_run: run_handle_of(&command.target.handle)?,
+                base_revision: payload_str(payload, "base_revision")?.to_string(),
+                nodes: serde_json::from_value(payload.get("nodes").cloned().unwrap_or_default())
+                    .map_err(|e| {
+                        TranslateError::new(ProblemCode::InvalidEnvelope, e.to_string())
+                    })?,
+                expected: workflow_expected(&command.expected)?,
+            })
+        }
+        Wire::WorkflowRunConfirmInput => {
+            KernelCommand::WorkflowRun(WorkflowRunCommand::ConfirmInput {
+                project: project_handle_of(payload_str(payload, "project_handle")?)?,
+                workflow_run: run_handle_of(&command.target.handle)?,
+                step: step_handle_of(payload_str(payload, "step_handle")?)?,
+                expected_input_revision: payload_u64(payload, "input_revision")?,
+                expected: workflow_expected(&command.expected)?,
+            })
+        }
         // kernel 尚未接管的命令族:fail-closed 明确拒绝(不旁路直写)
         other => {
             return Err(TranslateError::new(

@@ -4,6 +4,41 @@
 
 import type { CommandEnvelope, CommandType } from "../api/protocol.ts";
 
+export interface RunStepInputBindingView {
+  name: string;
+  sourceNodeKey: string;
+  fieldPath: string;
+  required: boolean;
+  value: string | null;
+  defaultValue: string | null;
+  missingReason: string | null;
+}
+
+export interface RunStepInputView {
+  status: string;
+  /** R4:输入版本轴(保存覆盖推进;确认/保存 CAS 绑定它)。 */
+  inputRevision: string;
+  summary: string;
+  createdAt: string;
+  agentRun: string | null;
+  template: string;
+  resolvedInstructions: string;
+  businessPrompt: string;
+  protocolSegment: string;
+  bindings: RunStepInputBindingView[];
+  upstreamSummaries: Array<{ nodeKey: string; summary: string; agentRun: string | null }>;
+  missingRequired: string[];
+  contextPolicy: string;
+  reviewState: string;
+  /** 用户覆盖(awaiting_review 期间可编辑)。 */
+  overrides: {
+    bindingValues: Record<string, string>;
+    businessPrompt: string | null;
+  } | null;
+  /** 应用覆盖后的业务 prompt(确认实际发送的内容)。 */
+  effectiveBusinessPrompt: string | null;
+}
+
 export interface RunStepView {
   step: string;
   revision: string;
@@ -12,6 +47,23 @@ export interface RunStepView {
   instructions: string;
   agentInstanceRef: string;
   status: string;
+  attempts: number;
+  /** 依赖步骤句柄 → 面板内映射回 key。 */
+  dependencies: string[];
+  input: RunStepInputView | null;
+  /** R1:活动 Revision 冻结的完整节点定义(真实实例 id + 扩展字段)。 */
+  agentInstanceId: string;
+  acceptanceCriteria: string;
+  outputSchema: unknown | null;
+  inputBindings: Array<{
+    name: string;
+    sourceNodeKey: string;
+    fieldPath: string;
+    required: boolean;
+    defaultValue: string | null;
+  }>;
+  contextPolicy: "legacy_ancestors" | "explicit_only" | "";
+  requireInputReview: boolean;
 }
 
 export interface RunQuestionView {
@@ -59,6 +111,9 @@ export interface RunHandoffView {
 export interface RunDetailView {
   workflowRun: string;
   revision: string;
+  /** 活动流水线版本(T4 图补丁的基线句柄)。 */
+  pipelineRevision: { handle: string; number: string } | null;
+  paused: boolean;
   title: string;
   goal: string;
   status: string;
@@ -75,6 +130,72 @@ export interface RunDetailView {
 
 type Row = Record<string, unknown>;
 
+/** 节点输入冻结记录(T2;dispatched = 已发送,只读)。 */
+function stepInputOf(raw: unknown): RunStepInputView | null {
+  if (typeof raw !== "object" || raw === null) return null;
+  const row = raw as Row;
+  const str = (v: unknown): string => String(v ?? "");
+  return {
+    status: str(row.status),
+    inputRevision: str(row.input_revision) || "1",
+    summary: str(row.summary),
+    createdAt: str(row.created_at),
+    agentRun: typeof row.agent_run === "string" ? row.agent_run : null,
+    template: str(row.template),
+    resolvedInstructions: str(row.resolved_instructions),
+    businessPrompt: str(row.business_prompt),
+    protocolSegment: str(row.protocol_segment),
+    bindings: (Array.isArray(row.bindings) ? row.bindings : []).map((entry) => {
+      const binding = entry as Row;
+      return {
+        name: str(binding.name),
+        sourceNodeKey: str(binding.source_node_key),
+        fieldPath: str(binding.field_path),
+        required: binding.required === true,
+        value: binding.value == null ? null : str(binding.value),
+        defaultValue: binding.default_value == null ? null : str(binding.default_value),
+        missingReason:
+          typeof binding.missing_reason === "string" ? binding.missing_reason : null,
+      };
+    }),
+    upstreamSummaries: (Array.isArray(row.upstream_summaries) ? row.upstream_summaries : []).map(
+      (entry) => {
+        const upstream = entry as Row;
+        return {
+          nodeKey: str(upstream.node_key),
+          summary: str(upstream.summary),
+          agentRun: typeof upstream.agent_run_handle === "string" ? upstream.agent_run_handle : null,
+        };
+      },
+    ),
+    missingRequired: (Array.isArray(row.missing_required) ? row.missing_required : []).map(
+      (entry) => str(entry),
+    ),
+    contextPolicy: str(row.context_policy),
+    reviewState: str(row.review_state) || "none",
+    overrides: stepOverridesOf(row.overrides),
+    effectiveBusinessPrompt:
+      typeof row.effective_business_prompt === "string" ? row.effective_business_prompt : null,
+  };
+}
+
+function stepOverridesOf(raw: unknown): RunStepInputView["overrides"] {
+  if (typeof raw !== "object" || raw === null) return null;
+  const row = raw as Row;
+  const str = (v: unknown): string => String(v ?? "");
+  const values = (typeof row.binding_values === "object" && row.binding_values !== null
+    ? row.binding_values
+    : {}) as Record<string, unknown>;
+  const bindingValues: Record<string, string> = {};
+  for (const [key, value] of Object.entries(values)) {
+    bindingValues[key] = str(value);
+  }
+  return {
+    bindingValues,
+    businessPrompt: typeof row.business_prompt === "string" ? row.business_prompt : null,
+  };
+}
+
 export function runDetailViewOf(data: Row): RunDetailView {
   const str = (v: unknown): string => String(v ?? "");
   // ScalarRevision 序列化为 {revision: "3"} 对象形态
@@ -83,9 +204,24 @@ export function runDetailViewOf(data: Row): RunDetailView {
     typeof revisionRaw === "object" && revisionRaw !== null
       ? String(revisionRaw.revision ?? "0")
       : String(revisionRaw ?? "0");
+  const pipelineRevisionRaw = data.pipeline_revision as Row | null | undefined;
+  const pipelineRevision =
+    pipelineRevisionRaw && typeof pipelineRevisionRaw === "object"
+      ? {
+          handle: str(pipelineRevisionRaw.handle),
+          number: str(pipelineRevisionRaw.number),
+        }
+      : null;
+  const handleToKey = new Map<string, string>();
+  for (const raw of Array.isArray(data.steps) ? data.steps : []) {
+    const row = raw as Row;
+    handleToKey.set(str(row.step), str(row.key));
+  }
   return {
     workflowRun: str(data.workflow_run),
     revision,
+    pipelineRevision,
+    paused: data.paused === true,
     title: str(data.title),
     goal: str(data.goal),
     status: str(data.status),
@@ -106,6 +242,32 @@ export function runDetailViewOf(data: Row): RunDetailView {
         instructions: str(row.instructions),
         agentInstanceRef: str(row.agent_instance_ref),
         status: str(row.status),
+        attempts: Number(row.attempts ?? 0),
+        dependencies: (Array.isArray(row.dependencies) ? row.dependencies : []).map(
+          (dep) => handleToKey.get(str(dep)) ?? str(dep),
+        ),
+        input: stepInputOf(row.input),
+        agentInstanceId: str(row.agent_instance_id),
+        acceptanceCriteria: str(row.acceptance_criteria),
+        outputSchema: row.output_schema ?? null,
+        inputBindings: (Array.isArray(row.input_bindings) ? row.input_bindings : []).map(
+          (entry) => {
+            const binding = entry as Row;
+            return {
+              name: str(binding.name),
+              sourceNodeKey: str(binding.source_node_key),
+              fieldPath: str(binding.field_path),
+              required: binding.required === true,
+              defaultValue:
+                binding.default_value == null ? null : str(binding.default_value),
+            };
+          },
+        ),
+        contextPolicy:
+          row.context_policy === "legacy_ancestors" || row.context_policy === "explicit_only"
+            ? row.context_policy
+            : "",
+        requireInputReview: row.require_input_review === true,
       };
     }),
     questions: (Array.isArray(data.open_questions) ? data.open_questions : []).map(

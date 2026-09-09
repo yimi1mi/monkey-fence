@@ -2303,6 +2303,12 @@ impl RuntimeHostImpl {
             launcher: Some(launcher),
         })
     }
+
+    /// 已接线的工作流启动器(插件注册表 + 目录库);供执行面派生
+    /// Revision 冻结用的插件 pin 表,无接线时为 None。
+    pub fn workflow_launcher(&self) -> Option<&WorkflowLauncher> {
+        self.launcher.as_ref()
+    }
 }
 
 /// 工作流 Step 的 Secret 解封授权令牌:Store 为每次 Agent Run 签发的

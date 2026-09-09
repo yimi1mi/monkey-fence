@@ -18,6 +18,7 @@ fn draft(task_id: i64, marker: &str) -> WorkflowTemplateDraft {
             instructions: "做 A".into(),
             agent_instance_id: "inst".into(),
             deps: vec![],
+            ..Default::default()
         }],
     }
 }

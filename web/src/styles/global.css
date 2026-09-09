@@ -1332,6 +1332,52 @@ nav.subtabs button[aria-selected="true"] {
   color: var(--text-faint);
 }
 
+/* T1 节点表单:预设/映射行内布局 */
+.field-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.field-row input,
+.field-row select {
+  min-width: 0;
+}
+
+.binding-row {
+  padding: 4px 0;
+  border-bottom: 1px dashed var(--line);
+}
+
+.inline-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+
+.inline-check input[type="checkbox"] {
+  accent-color: var(--brand);
+}
+
+.mono-input {
+  font-family: var(--mono) !important;
+  font-size: 12.5px !important;
+}
+
+.form-error {
+  margin-bottom: 10px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(220, 76, 92, 0.45);
+  background: rgba(220, 76, 92, 0.12);
+  color: #d34c5c;
+  font-size: 12.5px;
+}
+
 .field .hint {
   font-size: 11.5px;
   color: var(--text-faint);
@@ -1653,7 +1699,7 @@ nav.subtabs button[aria-selected="true"] {
   min-height: 0;
 }
 
-.editor-canvas .react-flow__node {
+.shared-graph-canvas .react-flow__node {
   font-family: var(--sans);
   font-size: 12px;
   border-radius: 10px;
@@ -1667,12 +1713,12 @@ nav.subtabs button[aria-selected="true"] {
   line-height: 1.5;
 }
 
-.editor-canvas .react-flow__node.selected {
+.shared-graph-canvas .react-flow__node.selected {
   border-color: rgba(27, 127, 212, 0.6);
   box-shadow: 0 0 0 3px var(--brand-ring);
 }
 
-.editor-canvas .react-flow__edge-path {
+.shared-graph-canvas .react-flow__edge-path {
   stroke: var(--brand);
 }
 
@@ -1765,3 +1811,146 @@ nav.subtabs button[aria-selected="true"] {
   flex-wrap: wrap;
   flex: 1;
 }
+
+/* T2 节点输入卡(只读预览) */
+.node-input-card {
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+}
+
+.node-input-card summary {
+  cursor: pointer;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.node-input-body {
+  padding: 4px 10px 10px;
+}
+
+.node-input-section {
+  margin-top: 8px;
+}
+
+.node-input-section h4 {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+.node-input-section pre {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.binding-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.mf-btn.tiny {
+  padding: 1px 8px;
+  font-size: 11px;
+  margin-left: 6px;
+}
+
+/* T3 输入检查门控 */
+.node-input-gate {
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--line);
+}
+
+.gate-editor .field {
+  margin-bottom: 10px;
+}
+
+/* T5 运行 DAG 画布 */
+.run-dag-card {
+  margin-top: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-soft);
+}
+
+.run-dag-card summary {
+  cursor: pointer;
+  padding: 6px 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
+.run-dag-canvas {
+  height: 260px;
+}
+
+.run-dag-node {
+  min-width: 120px;
+  font-size: 11px;
+  padding: 6px 8px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  white-space: pre-line;
+  text-align: left;
+}
+
+.run-dag-node.succeeded { border-color: #3a9d5d; }
+.run-dag-node.failed { border-color: #d34c5c; }
+.run-dag-node.running,
+.run-dag-node.awaiting-outcome { border-color: var(--brand); }
+.run-dag-node.selected { box-shadow: 0 0 0 3px var(--brand-ring); }
+.run-dag-node.ancestor { border-style: dashed; opacity: 0.85; }
+
+.run-dag-edge-highlight path {
+  stroke: var(--brand);
+  stroke-width: 2;
+}
+
+.run-dag-edge-info {
+  padding: 8px 10px;
+  border-top: 1px dashed var(--line);
+  font-size: 12px;
+}
+
+/* 工作流与运行共用的图工作区。 */
+.graph-workspace { display: flex; flex-direction: column; flex: 1; min-height: 300px; min-width: 0; }
+.project-graph { display: flex; flex-direction: column; }
+.shared-graph-canvas { min-height: 280px; flex: 1; }
+.graph-canvas-tools { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 14px; color: var(--text-faint); font-size: 11px; }
+.graph-node-label { display: flex; flex-direction: column; gap: 3px; }
+.graph-node-label strong { font-size: 13px; }
+.graph-node-label > span { font-size: 10px; color: var(--text-dim); overflow-wrap: anywhere; }
+.graph-node-label .graph-input-badge { color: var(--brand); font-weight: 600; }
+.workflow-graph-node.succeeded { border-color: #3a9d5d; }
+.workflow-graph-node.failed { border-color: #d34c5c; }
+.workflow-graph-node.graph-path { outline: 1px dashed var(--brand); outline-offset: 3px; }
+.graph-transfer-panel { border-top: 1px solid var(--line); padding: 10px 14px; max-height: 180px; overflow: auto; font-size: 12px; }
+.graph-transfer-panel ul { padding-left: 16px; margin: 6px 0; }
+.graph-transfer-panel li { margin: 4px 0; }
+.modal.run-graph-editor { width: min(1100px, 94vw); max-width: none; height: 84vh; display: flex; flex-direction: column; }
+.run-graph-editor > .graph-workspace { min-height: 240px; }
+.run-graph-editor > .graph-workspace .shared-graph-canvas { min-height: 220px; }
+.graph-change-summary { padding: 8px 12px; color: var(--text-dim); font-size: 12px; border-top: 1px solid var(--line); }
+.node-config-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
+.node-config-fields:disabled { opacity: .8; }
+.run-dag-card .graph-workspace { height: 360px; }
+.template-preview { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+.template-preview > summary { cursor: pointer; font-weight: 600; }
+.template-preview label { display: flex; flex-direction: column; gap: 6px; }
+.node-form-modal { z-index: 1; }

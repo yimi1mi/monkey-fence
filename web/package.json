@@ -6,7 +6,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "test": "node scripts/run-tests.mjs",
-    "e2e": "playwright test"
+    "test:ui": "node scripts/ui-tests.mjs",
+    "e2e": "npm run build && playwright test && playwright test --config playwright.core-restart.config.ts && npm run test:ui"
   },
   "dependencies": {
     "@dagrejs/dagre": "1.1.4",
@@ -24,6 +25,7 @@
     "@types/react": "^19.2.18",
     "@types/react-dom": "^19.2.7",
     "@vitejs/plugin-react": "4.3.4",
+    "esbuild": "0.24.2",
     "typescript": "5.8.3",
     "vite": "6.0.0"
   }

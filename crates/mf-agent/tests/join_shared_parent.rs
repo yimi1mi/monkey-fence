@@ -277,6 +277,7 @@ fn join_deferral_survives_restart_and_merges_full_batch() {
                     instructions: "做 A".into(),
                     agent_instance_id: fx_instance_id(&catalog),
                     deps: vec![],
+                    ..Default::default()
                 },
                 WorkflowNodeDraft {
                     key: "b".into(),
@@ -284,6 +285,7 @@ fn join_deferral_survives_restart_and_merges_full_batch() {
                     instructions: "做 B".into(),
                     agent_instance_id: fx_instance_id(&catalog),
                     deps: vec![],
+                    ..Default::default()
                 },
                 WorkflowNodeDraft {
                     key: "j1".into(),
@@ -291,6 +293,7 @@ fn join_deferral_survives_restart_and_merges_full_batch() {
                     instructions: "汇合".into(),
                     agent_instance_id: fx_instance_id(&catalog),
                     deps: vec!["a".into(), "b".into()],
+                    ..Default::default()
                 },
             ],
         })

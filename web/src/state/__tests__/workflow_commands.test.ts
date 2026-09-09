@@ -81,3 +81,39 @@ test("create command targets project with payload collection CAS and valid node"
   assert.equal(node.title, "第一步");
   assert.equal(envelope.payload.expected_collection_revision, "4", "collection CAS 在 payload(kernel_bridge 口径)");
 });
+
+test("create command defaults first node to explicit_only context policy", () => {
+  const envelope = workflowCreateCommand(
+    {
+      commandId: "018f3e2a-1b2c-7d3e-9f4a-5b6c7d8e9f0a",
+      clientId: "cl_x",
+      controllerLeaseEpoch: "17",
+      projectHandle: "proj_0123456789abcdef0123456789abcdef",
+      name: "新工作流",
+      firstNodeTitle: "第一步",
+      agentInstanceId: "agent-main",
+    },
+    "1",
+  );
+  const node = (envelope.payload.draft as { nodes: Array<Record<string, unknown>> }).nodes[0];
+  assert.equal(node.context_policy, "explicit_only", "新工作流显式上下文策略(旧工作流缺省按遗留语义)");
+});
+
+test("update_graph is a semantic-axis command", () => {
+  assert.equal(isSemanticCommand("workflow.update_graph"), true);
+  const envelope = workflowCommand({
+    commandId: "018f3e2a-1b2c-7d3e-9f4a-5b6c7d8e9f0b",
+    clientId: "cl_x",
+    controllerLeaseEpoch: "17",
+    projectHandle: "proj_0123456789abcdef0123456789abcdef",
+    workflowHandle: "wf_0123456789abcdef0123456789abcdef",
+    type: "workflow.update_graph",
+    payload: { draft: { nodes: [] } },
+    revisions: { semantic: "3", presentation: "1", collection: "1" },
+  });
+  assert.deepEqual(
+    envelope.expected[0].semantic_revision,
+    "3",
+    "整图替换 CAS semantic 轴(连线/删除/引用调整一个事务)",
+  );
+});

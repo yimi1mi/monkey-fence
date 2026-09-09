@@ -79,6 +79,7 @@ fn node(key: &str, deps: &[&str], instructions: &str, instance: &str) -> Workflo
         instructions: instructions.into(),
         agent_instance_id: instance.into(),
         deps: deps.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
     }
 }
 
@@ -1331,6 +1332,7 @@ fn parallel_siblings_same_file_conflict_needs_user_with_real_worktrees() {
                         instructions: "做 A".into(),
                         agent_instance_id: instance.id.clone(),
                         deps: vec![],
+                        ..Default::default()
                     },
                     WorkflowNodeDraft {
                         key: "b".into(),
@@ -1338,6 +1340,7 @@ fn parallel_siblings_same_file_conflict_needs_user_with_real_worktrees() {
                         instructions: "做 B".into(),
                         agent_instance_id: instance.id.clone(),
                         deps: vec![],
+                        ..Default::default()
                     },
                 ],
             })

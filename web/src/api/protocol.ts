@@ -23,11 +23,13 @@ export interface ExpectedRevision {
 /** 封闭命令族(spec §7.4;与 Rust `CommandType` 的 serde rename 一致)。 */
 export type CommandType =
   | "workflow.create" | "workflow.rename" | "workflow.delete"
-  | "workflow.add_node" | "workflow.update_node" | "workflow.remove_node"
+  | "workflow.add_node" | "workflow.update_node" | "workflow.update_graph" | "workflow.remove_node"
   | "workflow.move_node" | "workflow.connect" | "workflow.disconnect"
   | "workflow.viewport" | "workflow.set_unsafe_parallel_policy"
   | "workflow.run.start" | "workflow.run.cancel" | "workflow.run.retry_step"
   | "workflow.run.respond" | "workflow.run.settle" | "workflow.confirm_proposal"
+  | "workflow.run.save_input_overrides" | "workflow.run.confirm_input"
+  | "workflow.run.pause" | "workflow.run.resume" | "workflow.run.apply_graph_patch"
   | "session.start_preview" | "session.stop_preview"
   | "session.start_adhoc" | "session.stop_adhoc"
   | "catalog.refresh_discovery" | "catalog.provider_model_probe"

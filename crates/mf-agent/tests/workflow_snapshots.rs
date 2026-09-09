@@ -74,6 +74,7 @@ fn template(fx: &Fixture, key: &str, instructions: &str) -> WorkflowTemplateDraf
             instructions: instructions.into(),
             agent_instance_id: fx.instance_id.clone(),
             deps: vec![],
+            ..Default::default()
         }],
     }
 }
@@ -95,6 +96,7 @@ fn template_key_only(key: &str, instructions: &str) -> WorkflowTemplateDraft {
             instructions: instructions.into(),
             agent_instance_id: String::new(),
             deps: vec![],
+            ..Default::default()
         }],
     }
 }
@@ -319,6 +321,7 @@ fn task_workflow_roundtrips_per_project_and_task() {
         instructions: "做 A".into(),
         agent_instance_id: fixture.instance_id.clone(),
         deps: vec![],
+        ..Default::default()
     }];
 
     store
@@ -342,6 +345,7 @@ fn task_workflow_roundtrips_per_project_and_task() {
                     instructions: String::new(),
                     agent_instance_id: fixture.instance_id.clone(),
                     deps: vec![],
+                    ..Default::default()
                 }],
             ),
             false,

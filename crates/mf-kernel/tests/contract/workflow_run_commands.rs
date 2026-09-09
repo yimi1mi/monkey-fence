@@ -152,6 +152,7 @@ impl RunFixture {
                     instructions: "do it".into(),
                     agent_instance_id: "instance".into(),
                     deps: vec![],
+                    ..Default::default()
                 }],
                 allow_unsafe_parallel: false,
             })
@@ -238,6 +239,17 @@ impl RunFixture {
 
     pub fn dispatch(&self, command: WorkflowRunCommand) -> Result<(), KernelProblem> {
         self.kernel.dispatch(self.request(command)).map(|_| ())
+    }
+
+    /// 固定 command_id 派发(幂等/冲突语义测试)。
+    pub fn dispatch_id(
+        &self,
+        command_id: CommandId,
+        command: WorkflowRunCommand,
+    ) -> Result<(), KernelProblem> {
+        self.kernel
+            .dispatch(self.request_with_id(command_id, command))
+            .map(|_| ())
     }
 
     pub fn current_expected(&self) -> WorkflowRunExpected {

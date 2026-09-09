@@ -141,6 +141,7 @@ fn build_project_data(conn: &mut Connection) -> Result<()> {
             instructions: "固定指令:拉取依赖清单".into(),
             agent_instance_id: "fixture-inst-user".into(),
             deps: vec![],
+            ..Default::default()
         },
         WorkflowNodeDraft {
             key: "build".into(),
@@ -148,6 +149,7 @@ fn build_project_data(conn: &mut Connection) -> Result<()> {
             instructions: "固定指令:构建产物".into(),
             agent_instance_id: "fixture-inst-user".into(),
             deps: vec!["fetch".into()],
+            ..Default::default()
         },
     ];
     let instance = AgentInstanceSnapshot {
@@ -177,6 +179,11 @@ fn build_project_data(conn: &mut Connection) -> Result<()> {
                 instance: instance.clone(),
                 deps: node.deps.clone(),
                 plugin: Some(agent_plugin_pin()),
+                acceptance_criteria: String::new(),
+                output_schema: None,
+                input_bindings: Vec::new(),
+                context_policy: None,
+                require_input_review: false,
             })
             .collect(),
         directory_provider: Some(directory_plugin_pin()),
@@ -189,6 +196,7 @@ fn build_project_data(conn: &mut Connection) -> Result<()> {
             instructions: "固定指令".into(),
             agent_instance_id: "fixture-inst-user".into(),
             deps: vec![],
+            ..Default::default()
         },
         WorkflowNodeDraft {
             key: "n2".into(),
@@ -196,6 +204,7 @@ fn build_project_data(conn: &mut Connection) -> Result<()> {
             instructions: "固定指令".into(),
             agent_instance_id: "fixture-inst-user".into(),
             deps: vec!["n1".into()],
+            ..Default::default()
         },
     ];
     let project_workflow_digest = workflow_content_digest(&project_workflow_nodes, false);
@@ -314,6 +323,7 @@ fn fixture_template_nodes() -> Vec<WorkflowNodeDraft> {
         instructions: "固定指令".into(),
         agent_instance_id: "fixture-inst-user".into(),
         deps: vec![],
+        ..Default::default()
     }]
 }
 

@@ -47,6 +47,7 @@ impl ProjectionFixture {
                     instructions: String::new(),
                     agent_instance_id: "instance-a".into(),
                     deps: vec![],
+                    ..Default::default()
                 }],
                 allow_unsafe_parallel: false,
             })
@@ -157,6 +158,7 @@ impl ProjectionFixture {
                     instructions: String::new(),
                     agent_instance_id: "instance-a".into(),
                     deps: vec![],
+                    ..Default::default()
                 }],
                 allow_unsafe_parallel: false,
             })

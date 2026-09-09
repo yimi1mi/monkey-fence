@@ -14,6 +14,7 @@ fn node(key: &str, deps: &[&str]) -> WorkflowNodeDraft {
         instructions: String::new(),
         agent_instance_id: "inst-a".into(),
         deps: deps.iter().map(|dep| (*dep).to_string()).collect(),
+        ..Default::default()
     }
 }
 
@@ -86,6 +87,7 @@ fn node_required_fields_are_not_blank() {
         instructions: String::new(),
         agent_instance_id: "\n".into(),
         deps: vec![],
+        ..Default::default()
     }];
 
     let actual: std::collections::BTreeSet<_> = codes(&nodes).into_iter().collect();
@@ -141,4 +143,99 @@ fn validation_errors_are_stable_independent_of_node_input_order() {
 
     assert_eq!(signature(&first), signature(&second));
     assert_eq!(signature(&first)[0].0, "alpha");
+}
+
+// ── T1:输入映射与输出约束 ────────────────────────────────────────────
+
+use mf_agent::workflow::InputBinding;
+
+fn binding(name: &str, source: &str, path: &str, required: bool) -> InputBinding {
+    InputBinding {
+        name: name.into(),
+        source_node_key: source.into(),
+        field_path: path.into(),
+        required,
+        default_value: None,
+    }
+}
+
+#[test]
+fn input_binding_to_transitive_ancestor_is_accepted() {
+    // a→b→c:c 绑定 a(跨多跳的传递祖先)合法
+    let mut c = node("c", &["b"]);
+    c.input_bindings = vec![binding("report", "a", "output.report_path", true)];
+    let nodes = vec![node("a", &[]), node("b", &["a"]), c];
+
+    assert!(validate_workflow(WorkflowValidationInput::new(&nodes)).is_ok());
+}
+
+#[test]
+fn input_binding_to_non_ancestor_or_unknown_node_is_rejected() {
+    let mut bound = node("consumer", &[]);
+    bound.input_bindings = vec![
+        binding("x", "sibling", "summary", true), // 不是上游(并行兄弟)
+        binding("y", "ghost", "summary", true),   // 未知节点
+    ];
+    let nodes = vec![node("sibling", &[]), bound];
+
+    let actual: std::collections::BTreeSet<_> = codes(&nodes).into_iter().collect();
+    assert_eq!(
+        actual,
+        [
+            WorkflowValidationCode::BindingNotAncestor,
+            WorkflowValidationCode::BindingUnknownNode,
+        ]
+        .into_iter()
+        .collect()
+    );
+}
+
+#[test]
+fn input_binding_shape_is_validated() {
+    let mut bad = node("consumer", &["up"]);
+    bad.input_bindings = vec![InputBinding {
+        name: "非法 名".into(),
+        source_node_key: "up".into(),
+        field_path: "  ".into(),
+        required: true,
+        default_value: Some("默认".into()), // 必填 + 默认值
+    }];
+    let nodes = vec![node("up", &[]), bad];
+
+    assert_eq!(codes(&nodes).len(), 3, "名称非法/路径空/必填默认值各报一项");
+    assert_eq!(
+        codes(&nodes)[0],
+        WorkflowValidationCode::InvalidInputBinding
+    );
+}
+
+#[test]
+fn output_schema_must_be_object_with_supported_keywords() {
+    let ok = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "report_path": {"type": "string", "description": "报告路径"},
+            "issues": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["report_path"],
+    });
+    let mut good = node("good", &[]);
+    good.output_schema = Some(ok);
+    assert!(validate_workflow(WorkflowValidationInput::new(&[good])).is_ok());
+
+    let mut missing_type = node("no-type", &[]);
+    missing_type.output_schema = Some(serde_json::json!({"properties": {}}));
+    assert_eq!(
+        codes(&[missing_type]),
+        vec![WorkflowValidationCode::InvalidOutputSchema]
+    );
+
+    let mut unsupported = node("fancy", &[]);
+    unsupported.output_schema = Some(serde_json::json!({
+        "type": "object", "patternProperties": {"^x": {"type": "string"}}
+    }));
+    assert_eq!(
+        codes(&[unsupported]),
+        vec![WorkflowValidationCode::InvalidOutputSchema]
+    );
 }

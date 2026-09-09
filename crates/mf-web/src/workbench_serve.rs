@@ -133,6 +133,10 @@ pub fn serve_workbench_full(
         .route("/api/v1/fs/roots", get(fs_roots))
         .route("/api/v1/fs/dirs", get(fs_dirs))
         .route("/api/v1/events", get(events_ws))
+        .route(
+            "/api/v1/workflow-template/preview",
+            post(workflow_template_preview),
+        )
         .route("/acceptance/new-nonce", post(acceptance_new_nonce))
         .route("/assets/{*path}", get(asset))
         .with_state(state);
@@ -508,6 +512,69 @@ async fn acceptance_new_nonce(
     let nonce = state.auth.lock().issue_nonce();
     let body = serde_json::json!({ "nonce": nonce });
     respond(StatusCode::OK, Vec::new(), body.to_string().into_bytes())
+}
+
+/// `POST /api/v1/workflow-template/preview`:编辑阶段模板试算(只读)。
+/// 与正式派发共用 `node_input::compile_node_input`(同一解析/校验/渲染),
+/// 输入为节点草稿 + 可选示例绑定值;示例值只影响本次预览,不落库、
+/// 不进入覆盖或发送记录(4.2:示例数据隔离)。
+async fn workflow_template_preview(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    payload: Result<axum::Json<serde_json::Value>, axum::extract::rejection::JsonRejection>,
+) -> axum::response::Response {
+    if !session_of(&state, &headers).is_some() {
+        return problem_response(&Problem::new(
+            ProblemCode::Unauthenticated,
+            "会话不存在或已失效".to_string(),
+            Some(Retry::AfterReauth),
+        ));
+    }
+    let Ok(payload) = payload else {
+        return problem_response(&Problem::new(
+            ProblemCode::InvalidEnvelope,
+            "请求体必须是 JSON".to_string(),
+            None,
+        ));
+    };
+    let request =
+        match serde_json::from_value::<mf_agent::node_input::NodeInputPreviewRequest>(payload.0) {
+            Ok(request) => request,
+            Err(error) => {
+                return problem_response(&Problem::new(
+                    ProblemCode::InvalidEnvelope,
+                    format!("试算请求非法:{error}"),
+                    None,
+                ))
+            }
+        };
+    let compiled = match mf_agent::node_input::preview_node_input(request) {
+        Ok(compiled) => compiled,
+        Err(errors) => {
+            return problem_response(&Problem::new(
+                ProblemCode::ValidationFailed,
+                errors.join("；"),
+                None,
+            ))
+        }
+    };
+    let body = serde_json::json!({
+        "schema": "mf.node-input-preview.v1",
+        "preview_only": true,
+        "protocol_segment": compiled.protocol_segment,
+        "resolved_instructions": compiled.resolved_instructions,
+        "business_prompt": compiled.business_prompt,
+        "missing_required": compiled.missing_required,
+        "bindings": compiled.bindings,
+        "upstream_summaries": compiled.upstream_summaries,
+        "context_policy": match compiled.context_policy {
+            mf_agent::workflow::ContextPolicy::LegacyAncestors => "legacy_ancestors",
+            mf_agent::workflow::ContextPolicy::ExplicitOnly => "explicit_only",
+        },
+    });
+    let mut headers_out = security(&state);
+    headers_out.push((header_name("content-type"), "application/json".into()));
+    respond(StatusCode::OK, headers_out, body.to_string().into_bytes())
 }
 
 /// `POST /api/v1/commands`:Controller 写路径(kernel_bridge 全链)。

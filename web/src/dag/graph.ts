@@ -19,6 +19,38 @@ export interface DagGraph {
   nodes: DagNode[];
 }
 
+/** 工作流快照的节点 wire 形态:身份是 handle,依赖是语义 key。 */
+export interface WireNode {
+  handle: string;
+  key: string;
+  deps: string[];
+}
+
+/**
+ * wire 形态(handle 身份 + key 依赖)→ 单命名空间 DagGraph。
+ * 内核快照里节点身份与 deps 分属两个命名空间:node.handle 是
+ * React Flow 节点 id,deps 存语义 key(kernel Connect/Disconnect 按
+ * key 维护)。不翻译直接喂 autoLayout 会让分层查不到依赖、整图
+ * 坍缩;此处统一把 key 翻译成 handle,解析不到的依赖丢弃(内核
+ * 校验兜底)。
+ */
+export function wireGraph(nodes: WireNode[]): DagGraph {
+  const handleOfKey = new Map(nodes.map((node) => [node.key, node.handle]));
+  return {
+    nodes: nodes.map((node) => ({
+      id: node.handle,
+      title: "",
+      instructions: "",
+      agentInstanceId: "",
+      deps: node.deps
+        .map((dep) => handleOfKey.get(dep) ?? "")
+        .filter((handle): handle is string => handle !== "" && handle !== node.handle),
+      x: 0,
+      y: 0,
+    })),
+  };
+}
+
 /** cycle 预检:新增依赖后是否存在环(Web 预检;Rust 复检兜底)。 */
 export function wouldCreateCycle(
   graph: DagGraph,

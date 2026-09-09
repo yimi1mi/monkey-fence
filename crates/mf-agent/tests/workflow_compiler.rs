@@ -52,6 +52,7 @@ fn node(key: &str, deps: &[&str], instructions: &str, instance: &str) -> Workflo
         instructions: instructions.into(),
         agent_instance_id: instance.into(),
         deps: deps.iter().map(|s| s.to_string()).collect(),
+        ..Default::default()
     }
 }
 
@@ -444,4 +445,59 @@ fn plain_instance_ids_resolve_through_plugin_aware_resolver_unchanged() {
     let missing = template_with(vec![node("a", &[], "做 A", "inst-missing")]);
     let errors = compiler().compile(input(&missing, &resolve)).unwrap_err();
     assert_eq!(errors[0].code, "unknown-instance");
+}
+
+// ---------- T1:输入映射与 ${inputs.*} 引用 ----------
+
+use mf_agent::workflow::{ContextPolicy, InputBinding};
+
+#[test]
+fn t1_inputs_reference_requires_declared_binding_and_freezes_new_fields() {
+    let mut consumer = node("b", &["a"], "读取 ${inputs.report}", "inst-a");
+    consumer.acceptance_criteria = "结论可用".into();
+    consumer.output_schema = Some(serde_json::json!({"type": "object"}));
+    consumer.context_policy = Some(ContextPolicy::ExplicitOnly);
+    consumer.require_input_review = true;
+
+    // 未声明映射 → 拒绝
+    let bad = template_with(vec![node("a", &[], "做 A", "inst-a"), consumer.clone()]);
+    let errors = compile_default(&bad).unwrap_err();
+    assert!(errors.iter().any(|e| e.code == "unknown-input-binding"));
+
+    // 声明映射(来源是祖先) → 编译通过且新字段冻结进快照
+    consumer.input_bindings = vec![InputBinding {
+        name: "report".into(),
+        source_node_key: "a".into(),
+        field_path: "output.report_path".into(),
+        required: true,
+        default_value: None,
+    }];
+    let ok = template_with(vec![node("a", &[], "做 A", "inst-a"), consumer]);
+    let snapshot = compile_default(&ok).unwrap();
+    let frozen = snapshot.nodes.iter().find(|n| n.key == "b").unwrap();
+    assert_eq!(frozen.acceptance_criteria, "结论可用");
+    assert_eq!(frozen.output_schema.as_ref().unwrap()["type"], "object");
+    assert_eq!(frozen.input_bindings.len(), 1);
+    assert_eq!(frozen.context_policy, Some(ContextPolicy::ExplicitOnly));
+    assert!(frozen.require_input_review);
+}
+
+#[test]
+fn t1_binding_source_must_be_transitive_ancestor() {
+    let mut consumer = node("c", &["b"], "${inputs.x}", "inst-a");
+    consumer.input_bindings = vec![InputBinding {
+        name: "x".into(),
+        source_node_key: "sibling".into(), // 与 c 无祖先关系
+        field_path: "summary".into(),
+        required: true,
+        default_value: None,
+    }];
+    let template = template_with(vec![
+        node("a", &[], "做 A", "inst-a"),
+        node("b", &["a"], "做 B", "inst-a"),
+        node("sibling", &[], "兄弟", "inst-a"),
+        consumer,
+    ]);
+    let errors = compile_default(&template).unwrap_err();
+    assert!(errors.iter().any(|e| e.code == "binding-non-ancestor"));
 }

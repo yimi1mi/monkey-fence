@@ -47,13 +47,10 @@ fn project_workflow_record_projects_into_assign_path() {
     assert_eq!(snapshot.nodes[0].key, "a");
     assert_eq!(snapshot.nodes[0].instance.id, fx.instance_id);
 
-    // goal 进入节点 prompt 构造链
-    let prompt = mf_agent::orchestrator::build_workflow_prompt(
-        &task,
-        &snapshot.nodes[0],
-        "tok",
-        &Default::default(),
-    );
+    // goal 进入节点 prompt 构造链(T2:统一走 node_input 编译器)
+    let compiled =
+        mf_agent::node_input::compile_node_input(&task, &snapshot.nodes[0], &Default::default());
+    let prompt = mf_agent::node_input::full_prompt(&compiled);
     assert!(
         prompt.contains("完整目标"),
         "Task.goal 注入 prompt: {prompt}"
@@ -134,6 +131,7 @@ fn assign_failure_rolls_back_cleanly_for_caller() {
                 instructions: "做 B".into(),
                 agent_instance_id: fx.instance_id.clone(),
                 deps: vec!["ghost".into()],
+                ..Default::default()
             },
         ],
         created_at: String::new(),

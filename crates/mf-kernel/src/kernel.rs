@@ -146,6 +146,47 @@ pub enum WorkflowRunCommand {
         answer: String,
         expected: WorkflowRunExpected,
     },
+    /// T3 保存本次输入覆盖(仅 awaiting_review;input_id 为 Project Store
+    /// 内部关联,同 Respond 的 question_id 口径,不进入快照)。
+    SaveInputOverrides {
+        project: ProjectStoreHandle,
+        workflow_run: WorkflowRunHandle,
+        step: StepHandle,
+        /// R4:CAS 绑定用户编辑所基于的输入版本。
+        expected_input_revision: u64,
+        overrides: mf_agent::node_input::InputOverrides,
+        expected: WorkflowRunExpected,
+    },
+    /// T4 暂停派发(停止创建新 Agent Run;运行中的可继续结算)。
+    Pause {
+        project: ProjectStoreHandle,
+        workflow_run: WorkflowRunHandle,
+        expected: WorkflowRunExpected,
+    },
+    Resume {
+        project: ProjectStoreHandle,
+        workflow_run: WorkflowRunHandle,
+        expected: WorkflowRunExpected,
+    },
+    /// T4 运行中改图:整图节点补丁(基线 = 当前活动 Revision;只允许
+    /// 修改 attempts==0 的节点,任务必须已暂停)。编译在 port prepare。
+    ApplyGraphPatch {
+        project: ProjectStoreHandle,
+        workflow_run: WorkflowRunHandle,
+        /// 基线 Pipeline Revision 公开句柄;不等于活动 Revision 时拒绝。
+        base_revision: String,
+        nodes: Vec<mf_agent::WorkflowNodeDraft>,
+        expected: WorkflowRunExpected,
+    },
+    /// T3 确认本次输入(持久门控打开;重复确认幂等)。
+    ConfirmInput {
+        project: ProjectStoreHandle,
+        workflow_run: WorkflowRunHandle,
+        step: StepHandle,
+        /// R4:CAS 绑定用户看过的输入版本。
+        expected_input_revision: u64,
+        expected: WorkflowRunExpected,
+    },
     Settle {
         project: ProjectStoreHandle,
         workflow_run: WorkflowRunHandle,
@@ -248,6 +289,58 @@ impl std::fmt::Debug for WorkflowRunCommand {
                 .field("settlement_payload", &"<redacted>")
                 .field("expected", expected)
                 .finish(),
+            Self::SaveInputOverrides {
+                project,
+                workflow_run,
+                step,
+                ..
+            } => f
+                .debug_struct("SaveInputOverrides")
+                .field("project", project)
+                .field("workflow_run", workflow_run)
+                .field("step", step)
+                .field("overrides", &"<redacted>")
+                .finish(),
+            Self::Pause {
+                project,
+                workflow_run,
+                ..
+            } => f
+                .debug_struct("Pause")
+                .field("project", project)
+                .field("workflow_run", workflow_run)
+                .finish(),
+            Self::Resume {
+                project,
+                workflow_run,
+                ..
+            } => f
+                .debug_struct("Resume")
+                .field("project", project)
+                .field("workflow_run", workflow_run)
+                .finish(),
+            Self::ApplyGraphPatch {
+                project,
+                workflow_run,
+                base_revision,
+                ..
+            } => f
+                .debug_struct("ApplyGraphPatch")
+                .field("project", project)
+                .field("workflow_run", workflow_run)
+                .field("base_revision", base_revision)
+                .finish(),
+            Self::ConfirmInput {
+                project,
+                workflow_run,
+                step,
+                ..
+            } => f
+                .debug_struct("ConfirmInput")
+                .field("project", project)
+                .field("workflow_run", workflow_run)
+                .field("step", step)
+                .finish(),
             Self::ConfirmProposal {
                 project,
                 workflow_run,
@@ -289,6 +382,26 @@ pub enum ProjectWorkflowCommand {
         title: String,
         instructions: String,
         agent_instance_id: String,
+        /// T1 节点职责扩展字段(additive optional;None = 不修改)。
+        /// `output_schema`/`context_policy` 的外层 None=不改、Some(None)=清除。
+        #[serde(default)]
+        acceptance_criteria: Option<String>,
+        #[serde(default)]
+        output_schema: Option<Option<Value>>,
+        #[serde(default)]
+        input_bindings: Option<Vec<mf_agent::workflow::InputBinding>>,
+        #[serde(default)]
+        context_policy: Option<Option<mf_agent::workflow::ContextPolicy>>,
+        #[serde(default)]
+        require_input_review: Option<bool>,
+        expected_semantic_revision: u64,
+    },
+    /// 一次原子批量图编辑:整图节点(含 deps/引用/映射)替换,一个事务
+    /// 内完成连线/删除/引用调整,拒绝时无部分写入。
+    ReplaceGraph {
+        project: ProjectStoreHandle,
+        workflow: WorkflowHandle,
+        draft: mf_agent::ProjectWorkflowDraft,
         expected_semantic_revision: u64,
     },
     RemoveNode {
@@ -374,6 +487,11 @@ impl WorkflowRunCommand {
             Self::SkipStep { .. } => CommandType::WorkflowSkipStep,
             Self::Respond { .. } => CommandType::WorkflowRespond,
             Self::Settle { .. } => CommandType::WorkflowSettle,
+            Self::SaveInputOverrides { .. } => CommandType::WorkflowRunSaveInputOverrides,
+            Self::ConfirmInput { .. } => CommandType::WorkflowRunConfirmInput,
+            Self::Pause { .. } => CommandType::WorkflowRunPause,
+            Self::Resume { .. } => CommandType::WorkflowRunResume,
+            Self::ApplyGraphPatch { .. } => CommandType::WorkflowRunApplyGraphPatch,
             Self::ConfirmProposal { .. } => CommandType::WorkflowConfirmProposal,
         }
     }
@@ -386,6 +504,7 @@ impl ProjectWorkflowCommand {
             Self::Delete { .. } => CommandType::WorkflowDelete,
             Self::AddNode { .. } => CommandType::WorkflowAddNode,
             Self::UpdateNode { .. } => CommandType::WorkflowUpdateNode,
+            Self::ReplaceGraph { .. } => CommandType::WorkflowUpdateGraph,
             Self::RemoveNode { .. } => CommandType::WorkflowRemoveNode,
             Self::MoveNode { .. } => CommandType::WorkflowMoveNode,
             Self::Connect { .. } => CommandType::WorkflowConnect,
@@ -2406,6 +2525,11 @@ impl InProcessCoreKernel {
                         agent_instance_id: node.agent_instance_id.clone(),
                         deps: node.deps.clone(),
                         position: positions.get(&identity.node_handle).copied(),
+                        acceptance_criteria: node.acceptance_criteria.clone(),
+                        output_schema: node.output_schema.clone(),
+                        input_bindings: node.input_bindings.clone(),
+                        context_policy: node.context_policy,
+                        require_input_review: node.require_input_review,
                     })
             })
             .collect();
@@ -2426,6 +2550,7 @@ impl InProcessCoreKernel {
             data: SnapshotData::Workflow(WorkflowSnapshotData {
                 workflow: WorkflowHandle::parse(record.public_handle.clone())
                     .map_err(|error| KernelProblem::Internal(error.to_string()))?,
+                key: record.key.clone(),
                 name: record.name.clone(),
                 allow_unsafe_parallel: record.allow_unsafe_parallel,
                 revisions,
@@ -3403,6 +3528,11 @@ fn workflow_run_project(command: &WorkflowRunCommand) -> &ProjectStoreHandle {
         | WorkflowRunCommand::SkipStep { project, .. }
         | WorkflowRunCommand::Respond { project, .. }
         | WorkflowRunCommand::Settle { project, .. }
+        | WorkflowRunCommand::SaveInputOverrides { project, .. }
+        | WorkflowRunCommand::ConfirmInput { project, .. }
+        | WorkflowRunCommand::Pause { project, .. }
+        | WorkflowRunCommand::Resume { project, .. }
+        | WorkflowRunCommand::ApplyGraphPatch { project, .. }
         | WorkflowRunCommand::ConfirmProposal { project, .. } => project,
     }
 }
@@ -3420,6 +3550,13 @@ fn workflow_run_target(command: &WorkflowRunCommand) -> Result<AggregateRef, Ker
         | WorkflowRunCommand::Respond { step, .. } => (AggregateKind::Step, step.as_str()),
         WorkflowRunCommand::Settle { agent_run, .. } => {
             (AggregateKind::AgentRun, agent_run.as_str())
+        }
+        WorkflowRunCommand::SaveInputOverrides { step, .. }
+        | WorkflowRunCommand::ConfirmInput { step, .. } => (AggregateKind::Step, step.as_str()),
+        WorkflowRunCommand::Pause { workflow_run, .. }
+        | WorkflowRunCommand::Resume { workflow_run, .. }
+        | WorkflowRunCommand::ApplyGraphPatch { workflow_run, .. } => {
+            (AggregateKind::WorkflowRun, workflow_run.as_str())
         }
         WorkflowRunCommand::ConfirmProposal { workflow_run, .. } => {
             (AggregateKind::WorkflowRun, workflow_run.as_str())
@@ -3466,7 +3603,34 @@ fn workflow_run_expected_revisions(
                 step,
                 expected,
                 ..
+            }
+            | WorkflowRunCommand::SaveInputOverrides {
+                workflow_run,
+                step,
+                expected,
+                ..
+            }
+            | WorkflowRunCommand::ConfirmInput {
+                workflow_run,
+                step,
+                expected,
+                ..
             } => (workflow_run, expected, Some(step), None),
+            WorkflowRunCommand::Pause {
+                workflow_run,
+                expected,
+                ..
+            }
+            | WorkflowRunCommand::Resume {
+                workflow_run,
+                expected,
+                ..
+            }
+            | WorkflowRunCommand::ApplyGraphPatch {
+                workflow_run,
+                expected,
+                ..
+            } => (workflow_run, expected, None, None),
             WorkflowRunCommand::Settle {
                 workflow_run,
                 step,
@@ -3589,10 +3753,67 @@ pub(crate) fn workflow_run_payload(command: &WorkflowRunCommand) -> Value {
             "agent_run": agent_run.as_str(),
             "settlement": settlement,
         }),
+        WorkflowRunCommand::SaveInputOverrides {
+            workflow_run,
+            step,
+            expected_input_revision,
+            overrides,
+            ..
+        } => serde_json::json!({
+            "workflow_run": workflow_run.as_str(),
+            "step": step.as_str(),
+            "expected_input_revision": expected_input_revision.to_string(),
+            // R4:命令幂等摘要必须区分不同覆盖内容——日志脱敏不能等同于
+            // 语义忽略;放内容的安全摘要(sha256),Debug 输出仍脱敏
+            "overrides_digest": semantic_digest(
+                serde_json::to_value(overrides).unwrap_or_default()
+            ),
+        }),
+        WorkflowRunCommand::Pause { workflow_run, .. } => {
+            serde_json::json!({"workflow_run": workflow_run.as_str()})
+        }
+        WorkflowRunCommand::Resume { workflow_run, .. } => {
+            serde_json::json!({"workflow_run": workflow_run.as_str()})
+        }
+        WorkflowRunCommand::ApplyGraphPatch {
+            workflow_run,
+            base_revision,
+            nodes,
+            ..
+        } => serde_json::json!({
+            "workflow_run": workflow_run.as_str(),
+            "base_revision": base_revision,
+            // R4:图补丁幂等摘要必须区分不同节点集(安全摘要)
+            "nodes_digest": semantic_digest(serde_json::to_value(nodes).unwrap_or_default()),
+        }),
+        WorkflowRunCommand::ConfirmInput {
+            workflow_run,
+            step,
+            expected_input_revision,
+            ..
+        } => serde_json::json!({
+            "workflow_run": workflow_run.as_str(),
+            "step": step.as_str(),
+            "expected_input_revision": expected_input_revision.to_string(),
+        }),
         WorkflowRunCommand::ConfirmProposal { workflow_run, .. } => serde_json::json!({
             "workflow_run": workflow_run.as_str(),
         }),
     }
+}
+
+/// 内容的安全语义摘要(sha256):用于命令幂等 digest——不同内容得到
+/// 不同摘要(同 command_id 重放不同内容必须冲突),但不暴露明文。
+fn semantic_digest(value: serde_json::Value) -> String {
+    use sha2::{Digest, Sha256};
+    let payload = serde_json::to_string(&value).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(payload.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// #88 B 自主版:agent 在步骤内扩展源模板。预算护栏 = 模板节点上限
@@ -3690,6 +3911,7 @@ fn evolve_workflow_effect_tx(
         instructions: instructions.to_string(),
         agent_instance_id: agent_instance_id.to_string(),
         deps: deps.to_vec(),
+        ..Default::default()
     });
     let mutation = M::ReplaceSemantic {
         draft,
@@ -3720,7 +3942,32 @@ fn validate_workflow_run_scope_tx(
 ) -> Result<(), CommandProblem> {
     let WorkflowRunCommand::Start { .. } = command else {
         let (workflow_run, expected) = match command {
-            WorkflowRunCommand::Cancel {
+            WorkflowRunCommand::SaveInputOverrides {
+                workflow_run,
+                expected,
+                ..
+            }
+            | WorkflowRunCommand::ConfirmInput {
+                workflow_run,
+                expected,
+                ..
+            }
+            | WorkflowRunCommand::Pause {
+                workflow_run,
+                expected,
+                ..
+            }
+            | WorkflowRunCommand::Resume {
+                workflow_run,
+                expected,
+                ..
+            }
+            | WorkflowRunCommand::ApplyGraphPatch {
+                workflow_run,
+                expected,
+                ..
+            }
+            | WorkflowRunCommand::Cancel {
                 workflow_run,
                 expected,
                 ..
@@ -3765,7 +4012,14 @@ fn validate_workflow_run_scope_tx(
             WorkflowRunCommand::RetryStep { step, .. }
             | WorkflowRunCommand::SkipStep { step, .. }
             | WorkflowRunCommand::Respond { step, .. }
-            | WorkflowRunCommand::Settle { step, .. } => Some(scope_step_id(tx, step, task_id)?),
+            | WorkflowRunCommand::Settle { step, .. }
+            | WorkflowRunCommand::SaveInputOverrides { step, .. }
+            | WorkflowRunCommand::ConfirmInput { step, .. } => {
+                Some(scope_step_id(tx, step, task_id)?)
+            }
+            WorkflowRunCommand::Pause { .. }
+            | WorkflowRunCommand::Resume { .. }
+            | WorkflowRunCommand::ApplyGraphPatch { .. } => None,
             WorkflowRunCommand::Cancel { .. } | WorkflowRunCommand::ConfirmProposal { .. } => None,
             WorkflowRunCommand::Start { .. } => unreachable!(),
         };
@@ -3773,8 +4027,14 @@ fn validate_workflow_run_scope_tx(
             WorkflowRunCommand::RetryStep { step, .. }
             | WorkflowRunCommand::SkipStep { step, .. }
             | WorkflowRunCommand::Respond { step, .. }
-            | WorkflowRunCommand::Settle { step, .. } => Some(step),
-            WorkflowRunCommand::Cancel { .. } | WorkflowRunCommand::ConfirmProposal { .. } => None,
+            | WorkflowRunCommand::Settle { step, .. }
+            | WorkflowRunCommand::SaveInputOverrides { step, .. }
+            | WorkflowRunCommand::ConfirmInput { step, .. } => Some(step),
+            WorkflowRunCommand::Pause { .. }
+            | WorkflowRunCommand::Resume { .. }
+            | WorkflowRunCommand::ApplyGraphPatch { .. }
+            | WorkflowRunCommand::Cancel { .. }
+            | WorkflowRunCommand::ConfirmProposal { .. } => None,
             WorkflowRunCommand::Start { .. } => unreachable!(),
         } {
             let target = [step.as_str().to_owned()].into_iter().collect();
@@ -3785,6 +4045,13 @@ fn validate_workflow_run_scope_tx(
             )?;
         }
         match command {
+            // 输入门控命令不要求 active step 集合形态(目标步骤可能仍 ready);
+            // 暂停/恢复/改图同样只作用于 run 级状态
+            WorkflowRunCommand::SaveInputOverrides { .. }
+            | WorkflowRunCommand::ConfirmInput { .. }
+            | WorkflowRunCommand::Pause { .. }
+            | WorkflowRunCommand::Resume { .. }
+            | WorkflowRunCommand::ApplyGraphPatch { .. } => {}
             WorkflowRunCommand::Cancel { .. } => {
                 let steps = query_handle_set(
                     tx,
@@ -4235,6 +4502,96 @@ fn run_lifecycle_effect(
             return Err(CommandProblem::InvalidEnvelope(
                 "workflow.run start 必须由 Operation 承载".into(),
             ));
+        }
+        WorkflowRunCommand::Pause { workflow_run, .. } => mf_agent::RunMutation::Pause {
+            task_id: workflow_run_id_tx(tx, workflow_run)?,
+        },
+        WorkflowRunCommand::Resume { workflow_run, .. } => mf_agent::RunMutation::Resume {
+            task_id: workflow_run_id_tx(tx, workflow_run)?,
+        },
+        WorkflowRunCommand::ApplyGraphPatch {
+            workflow_run,
+            base_revision,
+            ..
+        } => {
+            // 编译已在 port prepare 完成(RunPreparation::GraphPatch);
+            // 此处在同一事务内复验基线与暂停,再创建并激活补丁 Revision。
+            let RunPreparation::GraphPatch {
+                pipeline_json,
+                digest,
+            } = preparation
+            else {
+                return Err(CommandProblem::InvalidEnvelope(
+                    "apply_graph_patch 缺少编译产物(preparation 不匹配)".into(),
+                ));
+            };
+            let task_id = workflow_run_id_tx(tx, workflow_run)?;
+            let paused: bool = tx
+                .query_row(
+                    "SELECT paused FROM agent_tasks WHERE id=?1",
+                    params![task_id],
+                    |r| r.get::<_, i64>(0).map(|v| v != 0),
+                )
+                .map_err(|e| CommandProblem::Internal(e.to_string()))?;
+            if !paused {
+                return Err(CommandProblem::ValidationFailed(
+                    "必须先暂停派发再应用图补丁".into(),
+                ));
+            }
+            let active_handle: Option<String> = tx
+                .query_row(
+                    "SELECT pr.public_handle FROM pipeline_revisions pr
+                     JOIN agent_tasks t ON t.active_revision = pr.id
+                     WHERE t.id = ?1",
+                    params![task_id],
+                    |r| r.get(0),
+                )
+                .map_err(|e| CommandProblem::Internal(e.to_string()))?;
+            if active_handle.as_deref() != Some(base_revision.as_str()) {
+                return Err(CommandProblem::RevisionConflict);
+            }
+            let snapshot: mf_agent::workflow::WorkflowSnapshot =
+                serde_json::from_str(pipeline_json)
+                    .map_err(|e| CommandProblem::Internal(format!("graph patch 快照损坏:{e}")))?;
+            let (view, _rev_id) =
+                mf_agent::Store::create_patched_revision_tx(tx, task_id, &snapshot, digest)
+                    .map_err(run_domain_problem)?;
+            let revision = u64::try_from(view.revision)
+                .map_err(|_| CommandProblem::Internal("revision 溢出".into()))?;
+            // 不发 run 聚合投影事件:task revision 未推进(与 settle 同
+            // 口径),replace 事件会破坏 journal 连续;UI 由命令 toast 后
+            // 的快照刷新看到新图。target revision 按当前 run 聚合回读。
+            let target = workflow_run_target(command)
+                .map_err(|error| CommandProblem::Internal(error.to_string()))?;
+            let (run_revision, _data) = run_aggregate_snapshot_tx(tx, &target)
+                .map_err(|e| CommandProblem::Internal(format!("{e:#}")))?;
+            return Ok(EffectOutput {
+                result_revisions: serde_json::json!({"revision": run_revision}),
+                projections: Vec::new(),
+            });
+        }
+        WorkflowRunCommand::SaveInputOverrides {
+            step,
+            expected_input_revision,
+            overrides,
+            ..
+        } => mf_agent::RunMutation::SaveInputOverrides {
+            step_id: step_id_tx(tx, step)?,
+            expected_input_revision: *expected_input_revision as i64,
+            overrides: overrides.clone(),
+        },
+        WorkflowRunCommand::ConfirmInput {
+            workflow_run,
+            step,
+            expected_input_revision,
+            ..
+        } => {
+            let task_id = workflow_run_id_tx(tx, workflow_run)?;
+            mf_agent::RunMutation::ConfirmInput {
+                task_id,
+                step_id: step_id_tx(tx, step)?,
+                expected_input_revision: *expected_input_revision as i64,
+            }
         }
         WorkflowRunCommand::Cancel { workflow_run, .. } => {
             let RunPreparation::Cancel { run_stops } = preparation else {
@@ -4747,6 +5104,7 @@ fn project_of(command: &ProjectWorkflowCommand) -> &ProjectStoreHandle {
         | ProjectWorkflowCommand::Delete { project, .. }
         | ProjectWorkflowCommand::AddNode { project, .. }
         | ProjectWorkflowCommand::UpdateNode { project, .. }
+        | ProjectWorkflowCommand::ReplaceGraph { project, .. }
         | ProjectWorkflowCommand::RemoveNode { project, .. }
         | ProjectWorkflowCommand::MoveNode { project, .. }
         | ProjectWorkflowCommand::Connect { project, .. }
@@ -4762,6 +5120,7 @@ fn workflow_of(command: &ProjectWorkflowCommand) -> Option<&WorkflowHandle> {
         ProjectWorkflowCommand::Delete { workflow, .. }
         | ProjectWorkflowCommand::AddNode { workflow, .. }
         | ProjectWorkflowCommand::UpdateNode { workflow, .. }
+        | ProjectWorkflowCommand::ReplaceGraph { workflow, .. }
         | ProjectWorkflowCommand::RemoveNode { workflow, .. }
         | ProjectWorkflowCommand::MoveNode { workflow, .. }
         | ProjectWorkflowCommand::Connect { workflow, .. }
@@ -4832,6 +5191,10 @@ fn expected_revisions(
             expected_semantic_revision,
             ..
         }
+        | ProjectWorkflowCommand::ReplaceGraph {
+            expected_semantic_revision,
+            ..
+        }
         | ProjectWorkflowCommand::RemoveNode {
             expected_semantic_revision,
             ..
@@ -4860,6 +5223,7 @@ fn project_workflow_payload(command: &ProjectWorkflowCommand) -> Result<Value, K
         ProjectWorkflowCommand::Delete { workflow, .. } => serde_json::json!({"workflow": workflow.as_str()}),
         ProjectWorkflowCommand::AddNode { workflow, node, .. } => serde_json::json!({"workflow": workflow.as_str(), "node": node}),
         ProjectWorkflowCommand::UpdateNode { workflow, node_handle, title, instructions, agent_instance_id, .. } => serde_json::json!({"workflow":workflow.as_str(),"node_handle":node_handle,"title":title,"instructions":instructions,"agent_instance_id":agent_instance_id}),
+        ProjectWorkflowCommand::ReplaceGraph { workflow, draft, .. } => serde_json::json!({"workflow":workflow.as_str(),"draft":draft}),
         ProjectWorkflowCommand::RemoveNode { workflow, node_handle, .. } => serde_json::json!({"workflow":workflow.as_str(),"node_handle":node_handle}),
         ProjectWorkflowCommand::MoveNode { workflow, node_handle, x, y, .. } => serde_json::json!({"workflow":workflow.as_str(),"node_handle":node_handle,"x":x,"y":y}),
         ProjectWorkflowCommand::Connect { workflow, upstream_node_handle, downstream_node_handle, .. } => serde_json::json!({"workflow":workflow.as_str(),"upstream_node_handle":upstream_node_handle,"downstream_node_handle":downstream_node_handle}),
@@ -4985,6 +5349,11 @@ fn project_workflow_effect(
                     title,
                     instructions,
                     agent_instance_id,
+                    acceptance_criteria,
+                    output_schema,
+                    input_bindings,
+                    context_policy,
+                    require_input_review,
                     expected_semantic_revision,
                     ..
                 } => {
@@ -4997,9 +5366,53 @@ fn project_workflow_effect(
                     node.title = title.clone();
                     node.instructions = instructions.clone();
                     node.agent_instance_id = agent_instance_id.clone();
+                    if let Some(value) = acceptance_criteria {
+                        node.acceptance_criteria = value.clone();
+                    }
+                    if let Some(value) = output_schema {
+                        node.output_schema = value.clone();
+                    }
+                    if let Some(value) = input_bindings {
+                        node.input_bindings = value.clone();
+                    }
+                    if let Some(value) = context_policy {
+                        node.context_policy = *value;
+                    }
+                    if let Some(value) = require_input_review {
+                        node.require_input_review = *value;
+                    }
+                    let mut data = serde_json::json!({"node_handle":node_handle,"title":title,"instructions":instructions,"agent_instance_id":agent_instance_id});
+                    if let Some(object) = data.as_object_mut() {
+                        if let Some(value) = acceptance_criteria {
+                            object.insert("acceptance_criteria".into(), serde_json::json!(value));
+                        }
+                        if let Some(value) = output_schema {
+                            object.insert("output_schema".into(), serde_json::json!(value));
+                        }
+                        if let Some(value) = input_bindings {
+                            object.insert("input_bindings".into(), serde_json::json!(value));
+                        }
+                        if let Some(value) = context_policy {
+                            object.insert("context_policy".into(), serde_json::json!(value));
+                        }
+                        if let Some(value) = require_input_review {
+                            object.insert("require_input_review".into(), serde_json::json!(value));
+                        }
+                    }
+                    ("workflow.update_node", data, *expected_semantic_revision)
+                }
+                ProjectWorkflowCommand::ReplaceGraph {
+                    draft: replacement,
+                    expected_semantic_revision,
+                    ..
+                } => {
+                    // 整图原子替换:节点 key 稳定则 handle 保留(identity 按
+                    // key 同步);引用调整与连线/删除在同一事务内生效。
+                    draft.nodes = replacement.nodes.clone();
+                    draft.allow_unsafe_parallel = replacement.allow_unsafe_parallel;
                     (
-                        "workflow.update_node",
-                        serde_json::json!({"node_handle":node_handle,"title":title,"instructions":instructions,"agent_instance_id":agent_instance_id}),
+                        "workflow.update_graph",
+                        serde_json::json!({"node_count": draft.nodes.len()}),
                         *expected_semantic_revision,
                     )
                 }

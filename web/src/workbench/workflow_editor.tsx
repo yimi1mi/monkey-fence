@@ -1,27 +1,13 @@
-// 工作流 DAG 编辑器(#76):React Flow 画布 + dagre 自动布局(graph.ts)。
-// 全部编辑经 workflow.* 命令(双轴 CAS);快照是唯一数据源。
-// #97:节点编辑/新增用表单弹窗,agent_instance_id 可从 catalog 实例与
-// 本机检测 CLI 中选择(datalist,仍允许自由输入)。
-
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import {
-  addEdge,
-  Background,
-  Controls,
-  ReactFlow,
-  useEdgesState,
-  useNodesState,
-  type Connection,
-  type Edge,
-  type Node,
-} from "@xyflow/react";
-import "@xyflow/react/dist/style.css";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ApiError, type WorkbenchClient } from "../api/client.ts";
 import { uuidv7 } from "../api/uuid.ts";
-import { autoLayout, type DagGraph } from "../dag/graph.ts";
-
+import { ancestorsOf } from "../dag/workflow_graph.ts";
+import { GraphCanvas, type GraphRemoval } from "./graph_canvas.tsx";
+import { AddNodeButton, nodeWireExtras, nodeDefinitionWire, toNodeForm, useNodeFormModal,
+  type InputBindingView, type ContextPolicyView } from "./node_form.tsx";
 export interface WorkflowSnapshotView {
   workflow: string;
+  key: string;
   name: string;
   allowUnsafeParallel: boolean;
   semanticRevision: string;
@@ -35,6 +21,11 @@ export interface WorkflowSnapshotView {
     agentInstanceId: string;
     deps: string[];
     position: { x: number; y: number } | null;
+    acceptanceCriteria: string;
+    outputSchema: unknown | null;
+    inputBindings: InputBindingView[];
+    contextPolicy: ContextPolicyView;
+    requireInputReview: boolean;
   }>;
   edges: Array<{
     handle: string;
@@ -53,6 +44,7 @@ export function workflowViewOf(data: Row): WorkflowSnapshotView {
   };
   return {
     workflow: str(data.workflow),
+    key: str(data.key),
     name: str(data.name),
     allowUnsafeParallel: data.allow_unsafe_parallel === true,
     semanticRevision: rev((data.revisions as Row | undefined)?.semantic_revision),
@@ -68,6 +60,7 @@ export function workflowViewOf(data: Row): WorkflowSnapshotView {
           : rawPosition && typeof rawPosition === "object"
             ? (rawPosition as { x: number; y: number })
             : null;
+      const policy = row.context_policy;
       return {
         handle: str(row.handle),
         key: str(row.key),
@@ -77,6 +70,23 @@ export function workflowViewOf(data: Row): WorkflowSnapshotView {
         deps: (Array.isArray(row.deps) ? row.deps : []).map((d) => str(d)),
         position:
           position && Number.isFinite(position.x) && Number.isFinite(position.y) ? position : null,
+        acceptanceCriteria: str(row.acceptance_criteria),
+        outputSchema: row.output_schema ?? null,
+        inputBindings: (Array.isArray(row.input_bindings) ? row.input_bindings : []).map(
+          (binding) => {
+            const b = binding as Row;
+            return {
+              name: str(b.name),
+              sourceNodeKey: str(b.source_node_key),
+              fieldPath: str(b.field_path),
+              required: b.required === true,
+              defaultValue: b.default_value == null ? null : str(b.default_value),
+            };
+          },
+        ),
+        contextPolicy:
+          policy === "legacy_ancestors" || policy === "explicit_only" ? policy : "",
+        requireInputReview: row.require_input_review === true,
       };
     }),
     edges: (Array.isArray(data.edges) ? data.edges : []).map((raw) => {
@@ -90,548 +100,99 @@ export function workflowViewOf(data: Row): WorkflowSnapshotView {
   };
 }
 
-export function WorkflowEditor({
-  client,
-  projectHandle,
-  workflowHandle,
-  agentOptions,
-  onDone,
-  onClose,
-}: {
-  client: WorkbenchClient;
-  projectHandle: string;
-  workflowHandle: string;
-  /** agent_instance_id 候选(catalog 实例 id + 本机检测 CLI;#97)。 */
-  agentOptions: string[];
-  onDone: (message: string) => void;
-  onClose: () => void;
+export function WorkflowEditor({ client, projectHandle, workflowHandle, agentOptions, onDone, onClose }: {
+  client: WorkbenchClient; projectHandle: string; workflowHandle: string; agentOptions: string[];
+  onDone: (message: string) => void; onClose: () => void;
 }) {
   const [snapshot, setSnapshot] = useState<WorkflowSnapshotView | null>(null);
+  const notice = useRef(onDone);
+  useEffect(() => { notice.current = onDone; }, [onDone]);
+  const current = useRef<WorkflowSnapshotView | null>(null);
+  const queue = useRef<Promise<unknown>>(Promise.resolve());
   const [selected, setSelected] = useState<string | null>(null);
-  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
   const [busy, setBusy] = useState(false);
-  const nodeFormModal = useNodeFormModal();
-  // #98 布局稳定性:位置以本地缓存优先(拖动过的位置不因快照刷新被
-  // dagre 重排覆盖);快照持久位置次之;全图无位置(首次加载)才 dagre。
-  const positionsRef = useRef<Map<string, { x: number; y: number }>>(new Map());
-
+  const wireWorkflow = workflowHandle.startsWith("wf_") ? workflowHandle : `wf_${workflowHandle}`;
+  const modal = useNodeFormModal(client, projectHandle, wireWorkflow);
   const reload = useCallback(async () => {
-    const response = await fetch(
-      `/api/v1/snapshots/workflow/${encodeURIComponent(projectHandle)}/${encodeURIComponent(workflowHandle)}`,
-      { headers: { "X-Client-Id": client.clientId } },
-    );
-    if (!response.ok) throw new ApiError(await (await response.json()) as never);
-    const envelope = (await response.json()) as { data: Row };
-    setSnapshot(workflowViewOf(envelope.data));
+    const response = await fetch(`/api/v1/snapshots/workflow/${encodeURIComponent(projectHandle)}/${encodeURIComponent(workflowHandle)}`,
+      { headers: { "X-Client-Id": client.clientId } });
+    if (!response.ok) throw new ApiError(await response.json());
+    const view = workflowViewOf(((await response.json()) as { data: Row }).data);
+    current.current = view;
+    setSnapshot((previous) => previous?.semanticRevision === view.semanticRevision &&
+      previous?.presentationRevision === view.presentationRevision && previous?.name === view.name ? previous : view);
   }, [client.clientId, projectHandle, workflowHandle]);
+  useEffect(() => { void reload().catch((error) => notice.current(`加载工作流失败:${String(error)}`)); }, [reload]);
 
-  useEffect(() => {
-    void reload().catch((error) => onDone(`快照拉取失败:${String(error)}`));
-  }, [reload, onDone]);
-
-  // 快照 → React Flow 节点/边。位置决策:本地缓存 > 快照持久位置;
-  // 都没有(新节点)排到现有内容下方;全图首次加载才 dagre 自动布局。
-  useEffect(() => {
-    if (!snapshot) return;
-    const known = new Map(positionsRef.current);
-    for (const node of snapshot.nodes) {
-      if (!known.has(node.handle) && node.position) {
-        known.set(node.handle, node.position);
-      }
-    }
-    const unknown = snapshot.nodes.filter((node) => !known.has(node.handle));
-    if (unknown.length > 0) {
-      if (known.size === 0) {
-        // 首次加载:整图 dagre(TB 层次布局)
-        const graph: DagGraph = {
-          nodes: snapshot.nodes.map((node) => ({
-            id: node.handle,
-            title: node.title,
-            instructions: node.instructions,
-            agentInstanceId: node.agentInstanceId,
-            deps: node.deps,
-            x: 0,
-            y: 0,
-          })),
-        };
-        for (const p of autoLayout(graph, "TB")) {
-          known.set(p.id, { x: p.x, y: p.y });
-        }
-      } else {
-        // 新节点:排到当前最底部之下,居中
-        const placed = [...known.values()];
-        const maxY = Math.max(0, ...placed.map((p) => p.y + 160));
-        const avgX = placed.length
-          ? Math.max(0, ...placed.map((p) => p.x))
-          : 0;
-        for (const node of unknown) {
-          known.set(node.handle, { x: avgX, y: maxY });
-        }
-      }
-    }
-    positionsRef.current = known;
-    setNodes(
-      snapshot.nodes.map((node) => ({
-        id: node.handle,
-        position: known.get(node.handle) ?? { x: 0, y: 0 },
-        data: {
-          label: `${node.title}\n${node.key} · ${node.agentInstanceId || "无实例"}`,
-        },
-        selected: node.handle === selected,
-      })),
-    );
-    setEdges(
-      snapshot.edges.map((edge) => ({
-        id: edge.handle,
-        source: edge.upstream,
-        target: edge.downstream,
-      })),
-    );
-  }, [snapshot, setNodes, setEdges, selected]);
-
-  const editCommand = useCallback(
-    async (
-      type: "workflow.add_node" | "workflow.update_node" | "workflow.remove_node" | "workflow.connect" | "workflow.disconnect" | "workflow.move_node",
-      payload: Record<string, unknown>,
-      axis: "semantic" | "presentation" = "semantic",
-    ) => {
-      if (!snapshot) return;
-      const revision =
-        axis === "semantic" ? snapshot.semanticRevision : snapshot.presentationRevision;
+  const command = useCallback((type: "workflow.add_node" | "workflow.update_node" | "workflow.update_graph" | "workflow.connect" | "workflow.move_node",
+    payload: (view: WorkflowSnapshotView) => Record<string, unknown>, presentation = false): Promise<boolean> => {
+    const operation = queue.current.then(async () => {
+      const view = current.current;
+      if (!view || !client.isController) return false;
       setBusy(true);
       try {
-        await client.command({
-          schema: "mf.command.v1",
-          command_id: uuidv7(),
-          client_id: client.clientId,
+        await client.command({ schema: "mf.command.v1", command_id: uuidv7(), client_id: client.clientId,
           controller_lease_epoch: client.leaseEpoch,
-          target: { kind: "project_workflow", handle: `wf_${workflowHandle}` },
-          expected: [
-            {
-              aggregate: { kind: "project_workflow", handle: `wf_${workflowHandle}` },
-              ...(axis === "semantic"
-                ? { semantic_revision: revision }
-                : { presentation_revision: revision }),
-            },
-          ],
-          type,
-          payload: { project_handle: projectHandle, workflow_handle: `wf_${workflowHandle}`, ...payload },
-        });
+          target: { kind: "project_workflow", handle: wireWorkflow },
+          expected: [{ aggregate: { kind: "project_workflow", handle: wireWorkflow },
+            ...(presentation ? { presentation_revision: view.presentationRevision } : { semantic_revision: view.semanticRevision }) }],
+          type, payload: { project_handle: projectHandle, workflow_handle: wireWorkflow, ...payload(view) } });
         await reload();
-        setBusy(false);
+        return true;
       } catch (error) {
-        setBusy(false);
-        const code = error instanceof ApiError ? error.problem.code : null;
-        if (code === "controller_required" || code === "controller_lease_expired") {
-          location.reload();
-          return;
-        }
         onDone(`编辑失败:${error instanceof Error ? error.message : String(error)}`);
-      }
-    },
-    [client, onDone, projectHandle, reload, snapshot, workflowHandle],
-  );
-
-  const onConnect = useCallback(
-    (connection: Connection) => {
-      if (!connection.source || !connection.target) return;
-      void editCommand("workflow.connect", {
-        upstream_node_handle: connection.source,
-        downstream_node_handle: connection.target,
-      });
-    },
-    [editCommand],
-  );
-
-  // #98 拖动结束:位置写入本地缓存(立即)并经 move_node 持久化
-  // (presentation 轴,不与语义编辑撞 CAS)。失败静默——位置是非关键呈现。
-  const onNodeDragStop = useCallback(
-    (_event: MouseEvent | TouchEvent, node: Node) => {
-      positionsRef.current.set(node.id, node.position);
-      void editCommand(
-        "workflow.move_node",
-        { node_handle: node.id, x: node.position.x, y: node.position.y },
-        "presentation",
-      ).catch(() => undefined);
-    },
-    [editCommand],
-  );
-
-  // #98 自动布局(格式化):dagre 全量重排,更新本地并串行持久化全部位置。
-  // 每条 move_node 会推进 presentation revision,按 +1 推算下一 CAS 值;
-  // 冲突时中断并 reload(用户可重点一次)。
-  const formatLayout = useCallback(async () => {
-    if (!snapshot) return;
-    const graph: DagGraph = {
-      nodes: snapshot.nodes.map((node) => ({
-        id: node.handle,
-        title: node.title,
-        instructions: node.instructions,
-        agentInstanceId: node.agentInstanceId,
-        deps: node.deps,
-        x: 0,
-        y: 0,
-      })),
-    };
-    const laid = new Map(autoLayout(graph, "TB").map((p) => [p.id, { x: p.x, y: p.y }]));
-    positionsRef.current = new Map(laid);
-    setNodes((prev) => prev.map((n) => ({ ...n, position: laid.get(n.id) ?? n.position })));
-    if (!client.isController) return;
-    setBusy(true);
-    try {
-      let revision = Number(snapshot.presentationRevision) || 0;
-      for (const node of snapshot.nodes) {
-        const pos = laid.get(node.handle);
-        if (!pos) continue;
-        await client.command({
-          schema: "mf.command.v1",
-          command_id: uuidv7(),
-          client_id: client.clientId,
-          controller_lease_epoch: client.leaseEpoch,
-          target: { kind: "project_workflow", handle: `wf_${workflowHandle}` },
-          expected: [
-            {
-              aggregate: { kind: "project_workflow", handle: `wf_${workflowHandle}` },
-              presentation_revision: String(revision),
-            },
-          ],
-          type: "workflow.move_node",
-          payload: {
-            project_handle: projectHandle,
-            workflow_handle: `wf_${workflowHandle}`,
-            node_handle: node.handle,
-            x: pos.x,
-            y: pos.y,
-          },
-        });
-        revision += 1;
-      }
-      await reload();
-      onDone("已按依赖层级自动布局");
-    } catch (error) {
-      onDone(`布局保存中断:${error instanceof Error ? error.message : String(error)}`);
-      await reload().catch(() => undefined);
-    } finally {
-      setBusy(false);
-    }
-  }, [snapshot, client, workflowHandle, projectHandle, setNodes, reload, onDone]);
-
-  const selectedNode = useMemo(
-    () => snapshot?.nodes.find((node) => node.handle === selected) ?? null,
-    [snapshot, selected],
-  );
-
-  // #99 变量引用可见范围:从直接依赖 BFS 收集全部传递祖先 key
-  // (与编排器 upstream_handoffs 同语义:a→b→c 中 c 可引用 a)。
-  const upstreamKeysOf = useCallback(
-    (key: string): string[] => {
-      if (!snapshot) return [];
-      const depsOf = new Map(snapshot.nodes.map((n) => [n.key, n.deps]));
-      const seen = new Set<string>();
-      const queue = [...(depsOf.get(key) ?? [])];
-      while (queue.length > 0) {
-        const current = queue.shift();
-        if (current === undefined || seen.has(current)) continue;
-        seen.add(current);
-        queue.push(...(depsOf.get(current) ?? []));
-      }
-      return [...seen];
-    },
-    [snapshot],
-  );
-
-  if (!snapshot) {
-    return <div className="editor-loading">加载工作流…</div>;
-  }
-
-  return (
-    <div className="workflow-editor">
-      <div className="editor-toolbar">
-        <span className="editor-title">{snapshot.name}</span>
-        <span className="mono-dim">
-          语义 rev {snapshot.semanticRevision} · 呈现 rev {snapshot.presentationRevision}
-        </span>
-        <span className="header-space" />
-        <button
-          className="mf-btn ghost"
-          disabled={busy || !snapshot}
-          title="按依赖层级(TB)重排全部节点并保存位置"
-          onClick={() => void formatLayout()}
-        >
-          ⇅ 自动布局
-        </button>
-        <AddNodeButton
-          busy={busy}
-          agentOptions={agentOptions}
-          onAdd={(key, title, instance, instructions) =>
-            editCommand("workflow.add_node", {
-              node: { key, title, instructions, agent_instance_id: instance, deps: [] },
-            })
-          }
-        />
-        {selectedNode && client.isController && (
-          <>
-            <button
-              className="mf-btn ghost"
-              disabled={busy}
-              onClick={() => void editCommand("workflow.remove_node", { node_handle: selectedNode.handle })}
-            >
-              删除节点
-            </button>
-            <button
-              className="mf-btn ghost"
-              disabled={busy}
-              onClick={() => {
-                void (async () => {
-                  const form = await nodeFormModal.ask({
-                    title: "编辑节点",
-                    agentOptions,
-                    initial: {
-                      key: selectedNode.key,
-                      title: selectedNode.title,
-                      instance: selectedNode.agentInstanceId,
-                      instructions: selectedNode.instructions,
-                    },
-                    upstreamKeys: upstreamKeysOf(selectedNode.key),
-                  });
-                  if (!form) return;
-                  void editCommand("workflow.update_node", {
-                    node_handle: selectedNode.handle,
-                    title: form.title,
-                    instructions: form.instructions,
-                    agent_instance_id: form.instance,
-                  });
-                })();
-              }}
-            >
-              编辑节点
-            </button>
-          </>
-        )}
-        <button className="mf-btn ghost" onClick={onClose}>
-          关闭编辑器
-        </button>
-      </div>
-      <div className="editor-canvas">
-        <ReactFlow
-          nodes={nodes}
-          edges={edges}
-          onNodesChange={onNodesChange}
-          onEdgesChange={onEdgesChange}
-          onConnect={onConnect}
-          onNodeDragStop={onNodeDragStop}
-          onNodeClick={(_, node) => setSelected(node.id)}
-          onEdgeDoubleClick={(_, edge) => {
-            void editCommand("workflow.disconnect", { edge_handle: edge.id });
-          }}
-          fitView
-          proOptions={{ hideAttribution: true }}
-        >
-          <Background />
-          <Controls />
-        </ReactFlow>
-      </div>
-      <div className="editor-hint">
-        点击节点选中(删除/编辑);拖出连线建立依赖;双击连线断开。上游输出在下游指令中以 {"${nodes.<上游key>.<字段>}"} 引用(编辑节点可见可引用清单)。所有编辑经内核命令(双轴 CAS)。
-      </div>
-      {nodeFormModal.modal}
-    </div>
-  );
-}
-
-// ── 节点表单弹窗(#97):标题 + agent 选择 + 指令 ───────────────────────
-
-export interface NodeFormValue {
-  key: string;
-  title: string;
-  instance: string;
-  instructions: string;
-}
-
-interface NodeFormSpec {
-  title: string;
-  agentOptions: string[];
-  initial: NodeFormValue;
-  /** 新建节点时允许编辑 key(编辑节点时 key 不可变)。 */
-  withKey?: boolean;
-  /** 编辑节点时该节点的传递祖先 key(变量引用可见范围;#99)。 */
-  upstreamKeys?: string[];
-}
-
-function useNodeFormModal(): {
-  ask: (spec: NodeFormSpec) => Promise<NodeFormValue | null>;
-  modal: ReactNode;
-} {
-  const [spec, setSpec] = useState<NodeFormSpec | null>(null);
-  const resolver = useRef<((value: NodeFormValue | null) => void) | null>(null);
-
-  const ask = useCallback((next: NodeFormSpec) => {
-    setSpec(next);
-    return new Promise<NodeFormValue | null>((resolve) => {
-      resolver.current = resolve;
+        await reload().catch(() => undefined);
+        return false;
+      } finally { setBusy(false); }
     });
-  }, []);
+    queue.current = operation.catch(() => undefined);
+    return operation;
+  }, [client, projectHandle, wireWorkflow, reload, onDone]);
 
-  const settle = useCallback((value: NodeFormValue | null) => {
-    resolver.current?.(value);
-    resolver.current = null;
-    setSpec(null);
-  }, []);
-
-  return {
-    ask,
-    modal: spec ? <NodeFormModal spec={spec} onSettle={settle} /> : null,
+  const edit = async (key: string) => {
+    const view = current.current;
+    const node = view?.nodes.find((item) => item.key === key);
+    if (!view || !node) return;
+    const form = await modal.ask({ title: client.isController ? "编辑节点" : "查看节点", agentOptions,
+      initial: toNodeForm(node), upstreamKeys: ancestorsOf(view.nodes, key), readOnly: !client.isController });
+    if (form) await command("workflow.update_node", () => ({ node_handle: node.handle,
+      title: form.title, instructions: form.instructions, agent_instance_id: form.instance, ...nodeWireExtras(form) }));
   };
-}
-
-function NodeFormModal({
-  spec,
-  onSettle,
-}: {
-  spec: NodeFormSpec;
-  onSettle: (value: NodeFormValue | null) => void;
-}) {
-  const [value, setValue] = useState<NodeFormValue>(spec.initial);
-
-  useEffect(() => {
-    setValue(spec.initial);
-  }, [spec]);
-
-  const submit = () => {
-    const key = value.key.trim();
-    const title = value.title.trim() || key;
-    const instance = value.instance.trim();
-    if (!key && spec.withKey) return; // 新建必须有 key
-    onSettle({ ...value, key, title, instance });
-  };
-
-  return (
-    <div
-      className="scrim"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onSettle(null);
-      }}
-    >
-      <div className="modal node-form-modal" role="dialog" aria-modal="true" aria-label={spec.title}>
-        <h3>{spec.title}</h3>
-        {spec.withKey && (
-          <div className="field">
-            <label htmlFor="mf-node-key">节点 key(ASCII,创建后不可改)</label>
-            <input
-              id="mf-node-key"
-              autoFocus
-              value={value.key}
-              placeholder="如 build / test / report"
-              onChange={(event) => setValue({ ...value, key: event.target.value })}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") submit();
-                if (event.key === "Escape") onSettle(null);
-              }}
-            />
-          </div>
-        )}
-        <div className="field">
-          <label htmlFor="mf-node-title">标题</label>
-          <input
-            id="mf-node-title"
-            autoFocus={!spec.withKey}
-            value={value.title}
-            placeholder="节点显示名"
-            onChange={(event) => setValue({ ...value, title: event.target.value })}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") submit();
-              if (event.key === "Escape") onSettle(null);
-            }}
-          />
-        </div>
-        <div className="field">
-          <label htmlFor="mf-node-agent">Agent 实例(每个节点可选不同 agent;下拉候选或自由输入)</label>
-          <input
-            id="mf-node-agent"
-            list="mf-agent-options"
-            value={value.instance}
-            placeholder="如 codex / claude / agent-main"
-            onChange={(event) => setValue({ ...value, instance: event.target.value })}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") submit();
-              if (event.key === "Escape") onSettle(null);
-            }}
-          />
-          <datalist id="mf-agent-options">
-            {spec.agentOptions.map((option) => (
-              <option key={option} value={option} />
-            ))}
-          </datalist>
-          {spec.agentOptions.length === 0 && (
-            <span className="hint">暂无候选——在「设置 → Agent 与 CLI」安装/注册后可选</span>
-          )}
-        </div>
-        <div className="field">
-          <label htmlFor="mf-node-instructions">指令(节点任务说明;可引用上游输出)</label>
-          <textarea
-            id="mf-node-instructions"
-            rows={5}
-            value={value.instructions}
-            placeholder={"这个节点让 agent 做什么…\n例:汇总 ${nodes.build.output.tests_passed} 项测试结果,读取 ${nodes.build.summary} 后写报告"}
-            onChange={(event) => setValue({ ...value, instructions: event.target.value })}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") onSettle(null);
-            }}
-          />
-          <span className="hint">
-            {"上游引用语法 ${nodes.<上游key>.<字段>};可用字段 .summary / .status / .changed_files / .artifacts / .blockers / .recommendations / .output.<嵌套键>(上游结束时 mfctl step complete --output-json 写入的自定义输出)"}
-            {spec.upstreamKeys && spec.upstreamKeys.length > 0
-              ? `。本节点可引用上游:${spec.upstreamKeys.join("、")}`
-              : spec.upstreamKeys
-                ? "。本节点暂无上游(先连线才能引用)"
-                : ""}
-          </span>
-        </div>
-        <div className="actions">
-          <button className="mf-btn ghost" onClick={() => onSettle(null)}>
-            取消
-          </button>
-          <button className="mf-btn primary" onClick={submit}>
-            保存
-          </button>
-        </div>
-      </div>
+  const remove = (removal: GraphRemoval) => command("workflow.update_graph", (view) => {
+    const removed = new Set(removal.nodes);
+    return { draft: { key: view.key, name: view.name, allow_unsafe_parallel: view.allowUnsafeParallel,
+      nodes: view.nodes.filter((node) => !removed.has(node.key)).map((node) => nodeDefinitionWire({
+        ...node, deps: node.deps.filter((dep) => !removed.has(dep) && !removal.edges.some((edge) => edge.source === dep && edge.target === node.key)),
+      })) } };
+  });
+  if (!snapshot) return <div className="editor-loading">加载工作流…</div>;
+  const selectedNode = snapshot.nodes.find((node) => node.key === selected);
+  return <div className="workflow-editor">
+    <div className="editor-toolbar">
+      <span className="editor-title">{snapshot.name}</span>
+      <span className="hint">保存到项目工作流 · 不影响已有运行</span>
+      <span className="header-space" />
+      <AddNodeButton busy={busy || !client.isController} agentOptions={[...new Set([...agentOptions, ...snapshot.nodes.map((node) => node.agentInstanceId)])]} client={client}
+        projectHandle={projectHandle} workflowHandle={wireWorkflow}
+        onAdd={(form) => { void command("workflow.add_node", () => ({ node: {
+          key: form.key, title: form.title, instructions: form.instructions, agent_instance_id: form.instance,
+          deps: [], ...nodeWireExtras(form),
+        } })); }} />
+      {selectedNode && <>
+        <button className="mf-btn ghost" disabled={busy} onClick={() => void edit(selectedNode.key)}>{client.isController ? "编辑节点" : "查看节点"}</button>
+        {client.isController && <button className="mf-btn ghost" disabled={busy} onClick={() => void remove({ nodes: [selectedNode.key], edges: [] })}>删除节点</button>}
+      </>}
+      <button className="mf-btn ghost" disabled={busy} onClick={onClose}>关闭编辑器</button>
     </div>
-  );
-}
-
-function AddNodeButton({
-  busy,
-  agentOptions,
-  onAdd,
-}: {
-  busy: boolean;
-  agentOptions: string[];
-  onAdd: (key: string, title: string, instance: string, instructions: string) => void;
-}) {
-  const nodeFormModal = useNodeFormModal();
-  return (
-    <>
-      {nodeFormModal.modal}
-      <button
-        className="mf-btn primary"
-        disabled={busy}
-        onClick={() => {
-          void (async () => {
-            const form = await nodeFormModal.ask({
-              title: "添加节点",
-              agentOptions,
-              withKey: true,
-              initial: { key: "", title: "", instance: "agent-main", instructions: "" },
-            });
-            if (!form || !form.key) return;
-            onAdd(form.key, form.title, form.instance, form.instructions);
-          })();
-        }}
-      >
-        ＋节点
-      </button>
-    </>
-  );
+    <div className="editor-canvas project-graph"><GraphCanvas graph={snapshot.nodes} editable={client.isController} busy={busy} selectedKey={selected}
+      onSelect={setSelected} onEdit={(key) => void edit(key)} onNotice={onDone}
+      onConnect={(source, target) => command("workflow.connect", (view) => ({
+        upstream_node_handle: view.nodes.find((node) => node.key === source)?.handle,
+        downstream_node_handle: view.nodes.find((node) => node.key === target)?.handle,
+      }))} onRemove={remove}
+      onMove={(key, position) => command("workflow.move_node", (view) => ({
+        node_handle: view.nodes.find((node) => node.key === key)?.handle, ...position,
+      }), true)} /></div>
+    {modal.modal}
+  </div>;
 }

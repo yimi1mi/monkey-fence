@@ -49,6 +49,7 @@ impl Fixture {
                     instructions: "做事".into(),
                     agent_instance_id: "instance".into(),
                     deps: vec![],
+                    ..Default::default()
                 }],
                 allow_unsafe_parallel: false,
             })

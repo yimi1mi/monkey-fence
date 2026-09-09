@@ -26,6 +26,9 @@ pub enum CommandType {
     WorkflowAddNode,
     #[serde(rename = "workflow.update_node")]
     WorkflowUpdateNode,
+    /// T1 原子批量图编辑(additive):整图节点/依赖/引用一个事务内替换。
+    #[serde(rename = "workflow.update_graph")]
+    WorkflowUpdateGraph,
     #[serde(rename = "workflow.remove_node")]
     WorkflowRemoveNode,
     #[serde(rename = "workflow.move_node")]
@@ -49,6 +52,18 @@ pub enum CommandType {
     WorkflowRunRespond,
     #[serde(rename = "workflow.run.settle")]
     WorkflowRunSettle,
+    /// T3 输入检查门控(additive):保存覆盖 / 确认发送。
+    #[serde(rename = "workflow.run.save_input_overrides")]
+    WorkflowRunSaveInputOverrides,
+    #[serde(rename = "workflow.run.confirm_input")]
+    WorkflowRunConfirmInput,
+    /// T4 运行控制(additive):暂停派发 / 恢复 / 应用图补丁。
+    #[serde(rename = "workflow.run.pause")]
+    WorkflowRunPause,
+    #[serde(rename = "workflow.run.resume")]
+    WorkflowRunResume,
+    #[serde(rename = "workflow.run.apply_graph_patch")]
+    WorkflowRunApplyGraphPatch,
     /// 激活 agent 提案的 draft revision(#89 additive)。
     #[serde(rename = "workflow.confirm_proposal")]
     WorkflowConfirmProposal,

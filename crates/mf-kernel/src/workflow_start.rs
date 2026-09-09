@@ -168,6 +168,7 @@ pub fn workflow_start_payload(plan: &PreparedWorkflowStartPlan) -> Result<Value,
     }
     let payload = serde_json::json!({
         "schema": WORKFLOW_START_PAYLOAD_SCHEMA,
+        "step_id_version": 2,
         "plan": plan,
     });
     if plaintext_secret_in_payload(&payload) {
@@ -236,11 +237,24 @@ pub fn prepared_plan_of_payload(
 
 /// 从 initiating command_id 确定性派生 step_id:同 command_id 重试/重启
 /// 重新编译得到完全相同的 saga 身份(accept 幂等比对依赖这一点)。
-fn derived_step_id(command_id: &CommandId, phase: u8) -> StepId {
+fn derived_step_id(command_id: &CommandId, phase: u8, version: u64) -> StepId {
     let base =
         uuid::Uuid::parse_str(command_id.as_str()).expect("CommandId 持有合法 UUIDv7 字符串");
     let mut bytes = *base.as_bytes();
-    bytes[7] = phase;
+    if version == 1 {
+        // 已落盘的旧 Operation 必须重建原来的 step 身份。
+        bytes[7] = phase;
+    } else {
+        let mut hash = Sha256::new();
+        hash.update(b"monkeyfence.workflow-start.step.v2\0");
+        hash.update(base.as_bytes());
+        hash.update([phase]);
+        bytes[6..].copy_from_slice(&hash.finalize()[..10]);
+        // 保留 UUIDv7 时间部分；独立 bit 保证永不等于 initiating command，
+        // phase bits 保证同一 Operation 的三个 step 互不相同。
+        bytes[6] = (bytes[6] & 0xfe) | ((base.as_bytes()[6] ^ 1) & 1);
+        bytes[7] = (bytes[7] & 0xfc) | phase;
+    }
     bytes[6] = (bytes[6] & 0x0f) | 0x70;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     let derived = uuid::Uuid::from_bytes(bytes);
@@ -265,6 +279,15 @@ pub fn compile_workflow_start_plan(
     semantic_revision: u64,
     payload: &Value,
 ) -> Result<OperationPlan, KernelProblem> {
+    let step_id_version = match payload.get("step_id_version") {
+        None => 1,
+        Some(value) => value
+            .as_u64()
+            .filter(|version| matches!(version, 1 | 2))
+            .ok_or_else(|| {
+                KernelProblem::ValidationFailed("未知的 Workflow Start step ID 版本".into())
+            })?,
+    };
     let plan_digest = workflow_start_plan_digest(payload)?;
     let kind = OperationKind::parse(WORKFLOW_START_OPERATION_KIND)
         .map_err(|error| KernelProblem::Internal(error.to_string()))?;
@@ -277,7 +300,7 @@ pub fn compile_workflow_start_plan(
     };
     let materialize = SagaStepPlan::new(
         StepRole::Forward,
-        derived_step_id(command_id, PHASE_MATERIALIZE),
+        derived_step_id(command_id, PHASE_MATERIALIZE, step_id_version),
         CommandType::WorkflowRun,
         target.clone(),
         vec![ExpectedRevision {
@@ -293,7 +316,7 @@ pub fn compile_workflow_start_plan(
     .map_err(plan_problem)?;
     let activate = SagaStepPlan::new(
         StepRole::Forward,
-        derived_step_id(command_id, PHASE_ACTIVATE),
+        derived_step_id(command_id, PHASE_ACTIVATE, step_id_version),
         CommandType::WorkflowRun,
         target.clone(),
         Vec::new(),
@@ -306,7 +329,7 @@ pub fn compile_workflow_start_plan(
     // saga 已 Complete,保留 Run/Needs You,不删除调度中的 Run。
     let discard = SagaStepPlan::new(
         StepRole::Compensate,
-        derived_step_id(command_id, PHASE_DISCARD),
+        derived_step_id(command_id, PHASE_DISCARD, step_id_version),
         CommandType::WorkflowRun,
         target,
         Vec::new(),

@@ -123,6 +123,7 @@ pub enum SnapshotQuery {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkflowSnapshotData {
     pub workflow: WorkflowHandle,
+    pub key: String,
     pub name: String,
     pub allow_unsafe_parallel: bool,
     pub revisions: RevisionVector,
@@ -144,6 +145,17 @@ pub struct WorkflowSnapshotNode {
     pub agent_instance_id: String,
     pub deps: Vec<String>,
     pub position: Option<(f64, f64)>,
+    /// T1 职责扩展(默认值不序列化,旧 wire 形态保持字节稳定)。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub acceptance_criteria: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub input_bindings: Vec<mf_agent::workflow::InputBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_policy: Option<mf_agent::workflow::ContextPolicy>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub require_input_review: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -221,6 +233,65 @@ pub struct WorkflowRunStepSnapshot {
     pub auto_retry: i32,
     pub result: Option<String>,
     pub dependencies: Vec<StepHandle>,
+    /// 该步骤最近一次冻结输入(T2;从未派发过为 None)。运行总快照
+    /// 携带完整记录(按选中/revision 变化拉取,不是持续轮询载荷);
+    /// 列表/概要级投影只带 summary。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<NodeInputSnapshot>,
+    /// R1:活动 Revision 冻结的完整节点定义(真实 Agent Instance id 与五个
+    /// 扩展字段)。运行图编辑必须原样回传,不得从展示字段反推。
+    pub agent_instance_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub acceptance_criteria: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_bindings: Vec<mf_agent::workflow::InputBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_policy: Option<mf_agent::workflow::ContextPolicy>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub require_input_review: bool,
+}
+
+/// 节点输入冻结记录的只读投影(不暴露 rowid/capability token)。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct NodeInputSnapshot {
+    /// frozen = 已冻结未发送;dispatched = 已随 Agent Run 发送(只读)。
+    pub status: String,
+    pub summary: String,
+    pub created_at: String,
+    /// 已发送时关联的 Agent Run 句柄。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_run: Option<AgentRunHandle>,
+    /// 指令模板原文(未替换)。
+    pub template: String,
+    /// 替换后的工作说明。
+    pub resolved_instructions: String,
+    /// 最终业务 prompt(用户可见/可复制;T3 起可编辑覆盖)。
+    pub business_prompt: String,
+    /// 结算协议段(只读)。
+    pub protocol_segment: String,
+    /// 输入映射解析结果(含来源与缺失原因)。
+    pub bindings: serde_json::Value,
+    /// legacy 策略注入 prompt 的上游摘要。
+    pub upstream_summaries: serde_json::Value,
+    /// 缺失的必填绑定名(非空 = 未启动)。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub missing_required: Vec<String>,
+    /// 生效的上下文策略。
+    pub context_policy: String,
+    /// T3 检查门控状态:none = 自动派发;awaiting_review = 等待用户;
+    /// confirmed = 已确认(随后派发)。
+    pub review_state: String,
+    /// R4:输入版本轴——保存覆盖推进;确认/保存必须 CAS 绑定它。
+    #[serde(serialize_with = "serialize_u64_decimal")]
+    pub input_revision: u64,
+    /// 用户覆盖(仅 awaiting_review 期间可编辑)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overrides: Option<serde_json::Value>,
+    /// 应用覆盖后的业务 prompt(确认/派发实际发送的内容)。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_business_prompt: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -627,6 +698,7 @@ fn validate_projection(
                 "workflow.rename"
                     | "workflow.add_node"
                     | "workflow.update_node"
+                    | "workflow.update_graph"
                     | "workflow.remove_node"
                     | "workflow.connect"
                     | "workflow.disconnect"

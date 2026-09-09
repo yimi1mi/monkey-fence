@@ -169,6 +169,50 @@ fn summary_of(
             .unwrap_or_default();
         reasons.insert((2, key, "merge-conflict".into()), step);
     }
+    // T3/S5:人工检查门控纳入「需要你」(与运行详情投影同口径)。
+    // 只汇总当前仍可操作的有效门控:终态运行、已终态步骤、或记录挂在
+    // 旧 Step 行(改图换版后的过期门控)都不贡献提醒。
+    let task_terminal = matches!(
+        task.status.as_str(),
+        "succeeded" | "failed" | "cancelled" | "archived"
+    );
+
+    if !task_terminal {
+        let active_step_ids: std::collections::HashSet<i64> =
+            source.steps.iter().map(|step| step.id).collect();
+        let terminal_keys: std::collections::HashSet<&str> = source
+            .steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step.status.as_str(),
+                    "succeeded" | "failed" | "skipped" | "cancelled"
+                )
+            })
+            .map(|step| step.step_key.as_str())
+            .collect();
+        for summary in &source.node_inputs {
+            if summary.review_state != "awaiting_review" {
+                continue;
+            }
+            if terminal_keys.contains(summary.node_key.as_str()) {
+                continue;
+            }
+            // 同代判定:awaiting 记录挂着的 step_id 仍在当前活动图步骤集内
+            // (改图后新 Step 行是全新 id,旧记录挂旧行 → 过期门控)
+            if !active_step_ids.contains(&summary.step_id) {
+                continue;
+            }
+            let Some(step) = step_by_key.get(&summary.node_key) else {
+                continue;
+            };
+
+            reasons.insert(
+                (0, step.as_str().to_owned(), "input-review".into()),
+                Some(step.clone()),
+            );
+        }
+    }
     let focus_step = reasons.values().find_map(Clone::clone);
     let reason_count = reasons.len();
     let active_agent_runs = source
@@ -191,7 +235,13 @@ fn summary_of(
         status: task.status.as_str().to_owned(),
         paused: task.paused,
         unread: task.unread,
-        needs_you: task.status == mf_agent::TaskStatus::NeedsYou,
+        needs_you: reason_count > 0
+            && !matches!(
+                task.status,
+                mf_agent::TaskStatus::Succeeded
+                    | mf_agent::TaskStatus::Cancelled
+                    | mf_agent::TaskStatus::Archived
+            ),
         reason_count,
         focus_step,
         active_agent_runs,

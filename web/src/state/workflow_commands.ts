@@ -18,6 +18,7 @@ const SEMANTIC_COMMANDS = new Set<string>([
   "workflow.delete",
   "workflow.add_node",
   "workflow.update_node",
+  "workflow.update_graph",
   "workflow.remove_node",
   "workflow.connect",
   "workflow.disconnect",
@@ -112,6 +113,9 @@ export function workflowCreateCommand(
             instructions: "",
             agent_instance_id: input.agentInstanceId.trim(),
             deps: [],
+            // 新工作流默认显式上下文策略(只传显式选择内容);
+            // 旧工作流缺省按遗留祖先摘要语义解释。
+            context_policy: "explicit_only",
           },
         ],
         allow_unsafe_parallel: false,

@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
-pub const PROJECT_SCHEMA_VERSION: i64 = 11;
+pub const PROJECT_SCHEMA_VERSION: i64 = 13;
 pub const CATALOG_SCHEMA_VERSION: i64 = 1;
 /// Catalog v2 使用独立文件与独立版本链，不能复用 v1 的 user_version
 /// 含义，否则 pre-Bridge 旧程序可能把新库当作 v1 打开。
@@ -142,6 +142,12 @@ fn apply_project_chain(
         if to >= 11 {
             backfill_project_v11_transcript(tx)?;
         }
+        if to >= 12 {
+            tx.execute_batch(PROJECT_SCHEMA_V12_DELTA)?;
+        }
+        if to >= 13 {
+            apply_guarded_alters(tx, V13_ALTER_DDLS)?;
+        }
         return Ok(Some(stats));
     }
     if to >= 8 {
@@ -155,6 +161,12 @@ fn apply_project_chain(
     }
     if to >= 11 {
         backfill_project_v11_transcript(tx)?;
+    }
+    if to >= 12 {
+        tx.execute_batch(PROJECT_SCHEMA_V12_DELTA)?;
+    }
+    if to >= 13 {
+        apply_guarded_alters(tx, V13_ALTER_DDLS)?;
     }
     Ok(None)
 }
@@ -1089,6 +1101,39 @@ BEFORE UPDATE ON execution_leases
 WHEN EXISTS(SELECT 1 FROM run_cancel_fence f WHERE f.task_id=OLD.task_id AND f.state IN ('reserved','stopping','outcomes'))
 BEGIN SELECT RAISE(ABORT, 'run_cancel_fenced'); END;
 ";
+
+/// v12(T2):节点输入冻结记录——每个派发 attempt 一行,`input_json`
+/// 整存编译结果(模板/解析值/来源/最终 prompt/协议段版本),创建后
+/// 不可变(只补 `agent_run_id` 关联);运行总快照只携带摘要列。
+pub const PROJECT_SCHEMA_V12_DELTA: &str = "
+CREATE TABLE IF NOT EXISTS node_inputs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES agent_tasks(id),
+    revision_id INTEGER NOT NULL REFERENCES pipeline_revisions(id),
+    step_id INTEGER NOT NULL REFERENCES steps(id),
+    agent_run_id INTEGER REFERENCES agent_runs(id),
+    node_key TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('frozen','dispatched')),
+    input_json TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    review_state TEXT NOT NULL DEFAULT 'none' CHECK(review_state IN ('none','awaiting_review','confirmed')),
+    overrides_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_node_inputs_step
+    ON node_inputs(task_id, step_id, id);
+";
+
+/// v13(第二轮 S1):上一轮开发期 v12 库补 `input_revision` 列(全新 v13
+/// 库由 v12 DDL + 本列合成;apply_guarded_alters 幂等,重复打开 no-op)。
+pub const PROJECT_SCHEMA_V13_DELTA: &str = "
+ALTER TABLE node_inputs ADD COLUMN input_revision INTEGER NOT NULL DEFAULT 1;
+";
+
+/// v13 列 ALTER(经 has_column 守卫幂等;列存在则跳过)。
+const V13_ALTER_DDLS: &[&str] =
+    &["ALTER TABLE node_inputs ADD COLUMN input_revision INTEGER NOT NULL DEFAULT 1"];
 
 /// v7 handle 列 ALTER(经 has_column 守卫幂等;残缺库缺表跳过)。
 const V7_HANDLE_COLUMN_DDLS: &[&str] = &[

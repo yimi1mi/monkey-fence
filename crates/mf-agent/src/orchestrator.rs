@@ -3191,7 +3191,7 @@ impl Orchestrator {
             .collect();
         let mut candidates: Vec<(TaskView, StepView)> = Vec::new();
         for task in self.store.list_tasks(false)? {
-            if task.status != TaskStatus::Running || task.paused {
+            if !matches!(task.status, TaskStatus::Running | TaskStatus::NeedsYou) || task.paused {
                 continue;
             }
             let Some(rev) = self.store.active_revision(task.id)? else {
@@ -3263,6 +3263,18 @@ impl Orchestrator {
             .store
             .revision_snapshot(step.revision_id)?
             .and_then(|s| s.nodes.into_iter().find(|n| n.key == step.step_key));
+        // 输入准备与人工门控先于 attempt 创建；存储失败不降级为无记录派发。
+        let prepared_input = if let Some(node) = &snapshot_node {
+            match self.prepare_node_input(task, step, node)? {
+                Some(input) => Some(input),
+                None => {
+                    self.global.end();
+                    return Ok(());
+                }
+            }
+        } else {
+            None
+        };
         let agent_label = snapshot_node
             .as_ref()
             .map(|n| n.instance.agent_type.clone())
@@ -3360,12 +3372,15 @@ impl Orchestrator {
             }
         }
         // 原子派发:bump attempts + step→running + 建 run 同事务(崩溃窗口不留孤儿)
-        let run = match self.store.dispatch_run_consuming(
+        let run = match self.store.dispatch_run_with_input(
             task.id,
             step.id,
             step.revision_id,
             session.id,
             next_attempt_session,
+            prepared_input
+                .as_ref()
+                .map(|(record, _)| (record.id, record.input_revision)),
         ) {
             Ok(run) => run,
             Err(error) => {
@@ -3486,7 +3501,9 @@ impl Orchestrator {
         self.emit(SchedulerEvent::RunUpdated(run.clone()));
 
         if let Some(node) = snapshot_node {
-            // 工作流路径:插件 pin 校验 → 冻结实例经宿主真实 Adapter 编译启动
+            // 工作流路径:插件 pin 校验 → 节点输入编译并冻结(T2)→
+            // 冻结实例经宿主真实 Adapter 编译启动。Adapter 消费的是已
+            // 持久输入记录里的 prompt,不在发送时重新组装。
             if let (Some(pin), Some(pins)) = (&node.plugin, &self.workflow.pins) {
                 if let Err(e) = pins.resolve_pin(pin) {
                     self.settle_dispatch_failure(
@@ -3496,8 +3513,9 @@ impl Orchestrator {
                     return Ok(());
                 }
             }
-            let upstream = self.upstream_handoffs(step, &node.deps);
-            let prompt = build_workflow_prompt(task, &node, &run.capability_token, &upstream);
+            let (record, compiled) = prepared_input.expect("工作流派发必须消费已准备的输入");
+            let input_id = record.id;
+            let prompt = crate::node_input::full_prompt(&compiled);
             let run_temp = trusted_run_temp(run.id);
             let spec = WorkflowLaunchSpec {
                 project_root: self.root.clone(),
@@ -3523,8 +3541,18 @@ impl Orchestrator {
                 run_temp: run_temp.clone(),
             };
             let tx = self.runtime_tx.clone();
-            if let Err(e) = self.host.launch_workflow(spec, tx) {
-                self.settle_dispatch_failure(&run, format!("工作流节点启动失败: {e:#}"));
+            match self.host.launch_workflow(spec, tx) {
+                Err(e) => {
+                    self.settle_dispatch_failure(&run, format!("工作流节点启动失败: {e:#}"));
+                }
+                Ok(()) => {
+                    if input_id >= 0 {
+                        if let Err(error) = self.store.mark_node_input_dispatched(input_id, run.id)
+                        {
+                            log::error!("node_input 派发标记失败: {error:?} input_id={input_id}");
+                        }
+                    }
+                }
             }
             return Ok(());
         }
@@ -3579,11 +3607,66 @@ impl Orchestrator {
     /// 上游节点(按节点键)最近一次 Handoff。加载**全部传递祖先**
     /// (不只直接依赖):深链节点(如 a→b→c 中的 a)的输出对 c 可见,
     /// `${nodes.a.output.report_path}` 等传递引用才能解析。
-    fn upstream_handoffs(
+    /// 人工检查门控:确保待确认输入记录存在(幂等),返回 gate 是否
+    /// 已打开(记录 confirmed)。未确认时每个 tick 都会重查,确认命令
+    /// 提交后无需通知调度器。
+    fn prepare_node_input(
+        &self,
+        task: &TaskView,
+        step: &StepView,
+        node: &crate::workflow::WorkflowNodeSnapshot,
+    ) -> Result<
+        Option<(
+            crate::store::NodeInputRecord,
+            crate::node_input::CompiledNodeInput,
+        )>,
+    > {
+        let existing = self
+            .store
+            .latest_node_input_of_step(task.id, step.id)?
+            .filter(|record| {
+                record.status == "frozen"
+                    && record.agent_run_id.is_none()
+                    && record.revision_id == step.revision_id
+            });
+        let record = match existing {
+            Some(record) => record,
+            None => {
+                let upstream = self.upstream_handoffs_with_sources(step, &node.deps);
+                let compiled = crate::node_input::compile_node_input(task, node, &upstream);
+                let review = node.require_input_review || !compiled.missing_required.is_empty();
+                self.store.insert_node_input(
+                    task.id,
+                    step.revision_id,
+                    step.id,
+                    &node.key,
+                    &compiled,
+                    if review { "awaiting_review" } else { "none" },
+                )?;
+                self.store
+                    .latest_node_input_of_step(task.id, step.id)?
+                    .ok_or_else(|| anyhow::anyhow!("准备输入后读取失败"))?
+            }
+        };
+        if record.review_state == "awaiting_review" {
+            return Ok(None);
+        }
+        let compiled = match &record.overrides {
+            Some(overrides) => {
+                crate::node_input::apply_overrides(record.compiled.clone(), overrides)
+            }
+            None => record.compiled.clone(),
+        };
+        if !compiled.missing_required.is_empty() {
+            anyhow::bail!("输入仍缺少必填项:{}", compiled.missing_required.join("、"));
+        }
+        Ok(Some((record, compiled)))
+    }
+    fn upstream_handoffs_with_sources(
         &self,
         step: &StepView,
         deps: &[String],
-    ) -> HashMap<String, crate::handoff::Handoff> {
+    ) -> HashMap<String, crate::node_input::UpstreamHandoff> {
         let mut out = HashMap::new();
         let Ok(steps) = self.store.revision_steps(step.revision_id) else {
             return out;
@@ -3591,6 +3674,10 @@ impl Orchestrator {
         let Ok(rows) = self.store.list_handoff_rows(step.task_id) else {
             return out;
         };
+        let handles = self
+            .store
+            .agent_run_handles(step.task_id)
+            .unwrap_or_default();
         // 依赖图(id → 键)展开:从直接依赖 BFS 收集全部祖先键
         let id_to_key: HashMap<i64, &str> =
             steps.iter().map(|s| (s.id, s.step_key.as_str())).collect();
@@ -3628,7 +3715,14 @@ impl Orchestrator {
                 .filter(|r| r.step_id == Some(dep_step.id))
                 .next_back()
             {
-                out.insert(dep_key.clone(), row.handoff.clone());
+                out.insert(
+                    dep_key.clone(),
+                    crate::node_input::UpstreamHandoff {
+                        handoff: row.handoff.clone(),
+                        agent_run_id: row.run_id,
+                        agent_run_handle: row.run_id.and_then(|id| handles.get(&id).cloned()),
+                    },
+                );
             }
         }
         out
@@ -4076,136 +4170,6 @@ fn release_provider_lease(
 
 /// 工作流节点初始提示:Task goal + 上游 Handoff 注入 + `${nodes.*}` 变量替换
 /// + mfctl 结算纪律(与旧路径同一纪律文本)。
-pub fn build_workflow_prompt(
-    task: &TaskView,
-    node: &crate::workflow::WorkflowNodeSnapshot,
-    _token: &str,
-    upstream: &HashMap<String, crate::handoff::Handoff>,
-) -> String {
-    let instructions = substitute_node_references(&node.instructions, upstream);
-    let mut sections = vec![format!(
-        "你在 MonkeyFence 中执行工作流节点「{}」(任务: {})。",
-        node.title, task.title
-    )];
-    if !task.goal.trim().is_empty() {
-        sections.push(format!("任务目标:\n{}", task.goal));
-    }
-    if !upstream.is_empty() {
-        let mut keys: Vec<&String> = upstream.keys().collect();
-        keys.sort();
-        let lines: Vec<String> = std::iter::once("上游交接:".to_string())
-            .chain(keys.into_iter().map(|key| {
-                let handoff = &upstream[key];
-                format!(
-                    "- {key}: {}",
-                    if handoff.summary.trim().is_empty() {
-                        "(无摘要)"
-                    } else {
-                        &handoff.summary
-                    }
-                )
-            }))
-            .collect();
-        sections.push(lines.join("\n"));
-    }
-    sections.push(format!(
-        "工作说明:\n{}",
-        if instructions.trim().is_empty() {
-            "(无补充说明)".to_string()
-        } else {
-            instructions
-        }
-    ));
-    format!(
-        "{}\n\n完成后必须显式结算(MonkeyFence 已通过 MF_RUN_TOKEN 环境变量注入本步骤令牌,不要打印或复制令牌):\n- 成功:mfctl step complete --summary \"一句话总结\"\n- 失败:mfctl step fail --reason \"失败原因\"\n\n规则:\n- 不要提交、推送或搁置任何版本控制变更。\n- 需要用户决策时,直接在终端中说明并等待。\n- 令牌仅对本步骤有效;重复提交相同结算是幂等的,提交冲突结算会被拒绝。",
-        sections.join("\n\n")
-    )
-}
-
-/// 替换 `${nodes.<key>.output...}` 变量:引用上游节点最近一次 Handoff。
-/// 支持的路径:``(整个 Handoff 的 JSON)、`.summary`、`.status`、
-/// `.changed_files`、`.artifacts`、`.blockers`、`.recommendations`、
-/// `.verification`、`.output`(自定义 JSON)与其下的嵌套键。
-/// 上游无输出(跳过/未结算)替换为占位说明,不保留原始变量。
-pub fn substitute_node_references(
-    text: &str,
-    upstream: &HashMap<String, crate::handoff::Handoff>,
-) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find("${nodes.") {
-        out.push_str(&rest[..at]);
-        let after = &rest[at + "${nodes.".len()..];
-        // 取到最近的 `}` 作为引用结束(引用语法内不嵌套花括号)
-        let Some(end_rel) = after.find('}') else {
-            out.push_str("${nodes.");
-            out.push_str(after);
-            return out;
-        };
-        let reference = &after[..end_rel];
-        let key: String = reference
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-            .collect();
-        if key.is_empty() {
-            out.push_str(&rest[at..at + "${nodes.".len() + end_rel + 1]);
-            rest = &after[end_rel + 1..];
-            continue;
-        }
-        let path = reference[key.len()..].trim_start_matches('.');
-        match upstream.get(&key) {
-            Some(handoff) => out.push_str(&resolve_handoff_path(handoff, path)),
-            None => out.push_str(&format!("(上游节点 `{key}` 暂无交接输出)")),
-        }
-        rest = &after[end_rel + 1..];
-    }
-    out.push_str(rest);
-    out
-}
-
-/// 解析 Handoff 输出路径(`output.` 之后的部分)。
-fn resolve_handoff_path(handoff: &crate::handoff::Handoff, path: &str) -> String {
-    let path = path.trim();
-    if path.is_empty() {
-        return serde_json::to_string_pretty(handoff).unwrap_or_default();
-    }
-    match path {
-        "summary" => return handoff.summary.clone(),
-        "status" => return handoff.status.clone(),
-        "changed_files" => return handoff.changed_files.join("\n"),
-        "artifacts" => return handoff.artifacts.join("\n"),
-        "blockers" => return handoff.blockers.join("\n"),
-        "recommendations" => return handoff.recommendations.join("\n"),
-        _ => {}
-    }
-    // `output` 或 `output.<嵌套键...>`:走自定义 JSON
-    let is_output = path == "output" || path.starts_with("output.");
-    let json_path = if is_output {
-        path["output".len()..].trim_start_matches('.')
-    } else {
-        path
-    };
-    let mut value = if is_output {
-        handoff.output.clone()
-    } else {
-        serde_json::to_value(handoff).unwrap_or(serde_json::Value::Null)
-    };
-    if json_path.is_empty() {
-        return serde_json::to_string_pretty(&value).unwrap_or_default();
-    }
-    for segment in json_path.split('.') {
-        if let serde_json::Value::Object(map) = &value {
-            value = map.get(segment).cloned().unwrap_or(serde_json::Value::Null);
-        } else {
-            value = serde_json::Value::Null;
-        }
-    }
-    match &value {
-        serde_json::Value::Null => format!("(交接输出无字段 `{path}`)"),
-        serde_json::Value::String(s) => s.clone(),
-        other => serde_json::to_string_pretty(other).unwrap_or_default(),
-    }
-}
 
 #[cfg(test)]
 mod pin_key_tests {

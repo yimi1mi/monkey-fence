@@ -312,6 +312,7 @@ pub fn graph_json(nodes: &[(&str, &[&str])]) -> String {
             instructions: "固定指令".to_string(),
             agent_instance_id: "fixture-inst".to_string(),
             deps: deps.iter().map(|d| d.to_string()).collect(),
+            ..Default::default()
         })
         .collect();
     serde_json::to_string(&drafts).unwrap()

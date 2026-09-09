@@ -61,6 +61,26 @@ pub enum RunMutation {
         question_id: i64,
         answer: String,
     },
+    /// T3/R4 保存本次输入覆盖(仅 awaiting_review;CAS 绑定 input_revision)。
+    SaveInputOverrides {
+        step_id: i64,
+        expected_input_revision: i64,
+        overrides: crate::node_input::InputOverrides,
+    },
+    /// T4 暂停/恢复派发(不改领域终态;运行中 Agent 可继续结算)。
+    Pause {
+        task_id: i64,
+    },
+    Resume {
+        task_id: i64,
+    },
+    /// T3/R4 确认本次输入(awaiting_review → confirmed;CAS 绑定
+    /// input_revision 与活动 Pipeline Revision)。
+    ConfirmInput {
+        task_id: i64,
+        step_id: i64,
+        expected_input_revision: i64,
+    },
     Settle {
         run_id: i64,
         settlement: Settlement,
@@ -111,6 +131,24 @@ impl std::fmt::Debug for RunMutation {
                 .field("question_id", question_id)
                 .field("answer", &"<redacted>")
                 .finish(),
+            // T3:覆盖正文可能包含敏感内容,Debug 一律脱敏(同 Respond)
+            Self::SaveInputOverrides { step_id, .. } => f
+                .debug_struct("SaveInputOverrides")
+                .field("step_id", step_id)
+                .field("overrides", &"<redacted>")
+                .finish(),
+            Self::ConfirmInput {
+                task_id,
+                step_id,
+                expected_input_revision,
+            } => f
+                .debug_struct("ConfirmInput")
+                .field("task_id", task_id)
+                .field("step_id", step_id)
+                .field("expected_input_revision", expected_input_revision)
+                .finish(),
+            Self::Pause { task_id } => f.debug_struct("Pause").field("task_id", task_id).finish(),
+            Self::Resume { task_id } => f.debug_struct("Resume").field("task_id", task_id).finish(),
             Self::Settle { run_id, settlement } => f
                 .debug_struct("Settle")
                 .field("run_id", run_id)
@@ -243,6 +281,12 @@ pub struct RunMutationResult {
 #[derive(Debug, Clone)]
 pub enum RunMutationOutput {
     Started(TaskView),
+    /// (task_id, paused?)
+    PauseToggled(i64, bool),
+    /// 覆盖已保存(无 side effect)。
+    InputOverridesSaved,
+    /// (input_id, 是否发生了确认转移)
+    InputConfirmed(i64, bool),
     Cancelled(TaskView),
     CancelNeedsYou(TaskView),
     Retried(StepView),

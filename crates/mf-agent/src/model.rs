@@ -205,6 +205,8 @@ pub struct WorkflowRunProjectionSource {
     pub handoffs: Vec<HandoffRow>,
     pub execution_leases: Vec<ExecutionLeaseRow>,
     pub pending_merges: Vec<PendingMergeRow>,
+    /// T3 门控输入摘要(awaiting_review 进入「需要你」)。
+    pub node_inputs: Vec<crate::store::NodeInputSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -557,6 +559,9 @@ pub enum SettleError {
     RunNotActive(RunStatus),
     #[error("冲突结算:已有 `{existing}`,拒绝 `{attempted}`")]
     Conflict { existing: String, attempted: String },
+    #[error("输出约束校验未通过,结算被拒绝(保持待结算,可修正后重新结算):{}",
+        errors.join(";"))]
+    OutputSchemaViolation { errors: Vec<String> },
     #[error("数据库错误: {0}")]
     Db(String),
 }

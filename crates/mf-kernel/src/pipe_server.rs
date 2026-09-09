@@ -677,6 +677,7 @@ pub(crate) mod contract_tests {
                     instructions: "执行".into(),
                     agent_instance_id: instance.id.clone(),
                     deps: vec![],
+                    ..Default::default()
                 }],
                 allow_unsafe_parallel: false,
             })

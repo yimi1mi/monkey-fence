@@ -19,6 +19,7 @@ pub mod execution_directory;
 pub mod handoff;
 pub mod migration;
 pub mod model;
+pub mod node_input;
 pub mod observability;
 pub mod orchestrator;
 pub mod pipeline;

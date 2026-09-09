@@ -15,6 +15,7 @@ fn node(key: &str, title: &str) -> WorkflowNodeDraft {
         instructions: format!("做 {title}"),
         agent_instance_id: "inst-a".into(),
         deps: vec![],
+        ..Default::default()
     }
 }
 
@@ -291,4 +292,91 @@ fn legacy_v5_database_upgrade_preserves_task_workflows() {
             .contains(&"project_workflows".to_string()),
         "v6 迁移必须创建 project_workflows 表"
     );
+}
+
+// ── T1:节点职责扩展字段的摘要/往返/旧数据兼容 ──────────────────────
+
+use mf_agent::workflow::{ContextPolicy, InputBinding};
+
+#[test]
+fn t1_new_node_fields_participate_in_digest_only_when_set() {
+    let base = node("a", "A");
+    // 全默认:与旧公式摘要一致(旧库存量 content_digest 不失配)
+    let legacy_equivalent = WorkflowNodeDraft { ..base.clone() };
+    assert_eq!(
+        workflow_content_digest(&[base.clone()], false),
+        workflow_content_digest(&[legacy_equivalent], false)
+    );
+
+    let mut enriched = base.clone();
+    enriched.acceptance_criteria = "覆盖目标与风险".into();
+    enriched.output_schema = Some(serde_json::json!({"type": "object"}));
+    enriched.input_bindings = vec![InputBinding {
+        name: "report".into(),
+        source_node_key: "b".into(),
+        field_path: "summary".into(),
+        required: true,
+        default_value: None,
+    }];
+    enriched.context_policy = Some(ContextPolicy::ExplicitOnly);
+    enriched.require_input_review = true;
+    assert_ne!(
+        workflow_content_digest(&[base], false),
+        workflow_content_digest(&[enriched], false),
+        "任一新字段变化都必须推进内容身份(semantic revision/冻结去重)"
+    );
+}
+
+#[test]
+fn t1_new_node_fields_roundtrip_through_store_and_old_graph_json_loads() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("db.sqlite")).unwrap();
+
+    let mut consumer = node("consumer", "下游");
+    consumer.deps = vec!["producer".into()];
+    consumer.acceptance_criteria = "结论可被实现直接使用".into();
+    consumer.output_schema = Some(serde_json::json!({
+        "type": "object",
+        "properties": {"report_path": {"type": "string"}},
+        "required": ["report_path"]
+    }));
+    consumer.input_bindings = vec![InputBinding {
+        name: "report".into(),
+        source_node_key: "producer".into(),
+        field_path: "output.report_path".into(),
+        required: true,
+        default_value: None,
+    }];
+    consumer.context_policy = Some(ContextPolicy::ExplicitOnly);
+    consumer.require_input_review = true;
+
+    store
+        .save_project_workflow(&ProjectWorkflowDraft {
+            key: "wf-t1".into(),
+            name: "T1 字段往返".into(),
+            nodes: vec![node("producer", "上游"), consumer],
+            allow_unsafe_parallel: false,
+        })
+        .unwrap();
+
+    let loaded = store.load_project_workflow("wf-t1").unwrap().unwrap();
+    let consumer = loaded.nodes.iter().find(|n| n.key == "consumer").unwrap();
+    assert_eq!(consumer.acceptance_criteria, "结论可被实现直接使用");
+    assert_eq!(
+        consumer.output_schema.as_ref().unwrap()["required"],
+        serde_json::json!(["report_path"])
+    );
+    assert_eq!(consumer.input_bindings.len(), 1);
+    assert_eq!(consumer.input_bindings[0].source_node_key, "producer");
+    assert_eq!(consumer.context_policy, Some(ContextPolicy::ExplicitOnly));
+    assert!(consumer.require_input_review);
+
+    // 旧 graph_json(无新字段)仍可反序列化并按默认值解释
+    let legacy_json =
+        r#"[{"key":"old","title":"旧节点","instructions":"i","agent_instance_id":"x","deps":[]}]"#;
+    let parsed: Vec<WorkflowNodeDraft> = serde_json::from_str(legacy_json).unwrap();
+    assert_eq!(parsed[0].acceptance_criteria, "");
+    assert!(parsed[0].input_bindings.is_empty());
+    assert_eq!(parsed[0].context_policy, None);
+    assert!(!parsed[0].require_input_review);
 }

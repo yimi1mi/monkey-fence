@@ -1,209 +1,86 @@
-# MonkeyFence 🐒
+# MonkeyFence
 
-**多项目 Agent 工作台 · 插件化智能体 · 可编辑 DAG 流水线 · 原生编辑 · 人工审阅**
+面向 Windows 的多项目 Agent 工作台。用户在浏览器中编排节点职责、配置交接输入并控制运行，Rust Core 持有工作流、执行记录和真实 CLI 会话。
 
-MonkeyFence 是一个面向 Windows 研发团队的原生 AI Agent 工作台:同时打开多个项目,每个项目内维护可重复运行的项目工作流,通过插件贡献的本地 CLI Agent、API Agent 与 mock Agent 混合执行可编辑的 DAG 流水线(ADR 0002)。用户主路径是**项目工作流 → 运行 → 需要你**:从项目工作流直接发起运行,系统自动创建 Task 并冻结 Pipeline Revision;需要人工介入时以运行级提醒召回,点击直达具体节点(ADR 0004)。
+## 工作流闭环
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│ 活动栏 │ 任务(按项目分组) │ 编辑器 / Agents 看板 / Pipeline │ 版控 │
-└──────────────────────────────────────────────────────────────────┘
-```
+1. 添加项目，创建项目工作流。每个节点选择自己的 Agent 实例、职责说明、验收说明与输出要求。
+2. 在画布上拖动连线建立依赖；工作流编辑和运行中改图使用同一套画布与节点表单。点击连线可查看传递字段，点击字段可高亮间接上游路径。
+3. 在节点表单中试算输入：填写示例目标和上游 Handoff JSON，查看 Core 编译后的业务 prompt、结算协议与缺失诊断。示例不会保存到工作流或正式运行。
+4. 启动运行后，系统冻结 Pipeline Revision。上游通过显式 Settlement 提交结构化 Handoff，下游读取映射字段或模板引用。
+5. 启用“派发前人工检查”的节点会等待用户查看、修改并确认本次输入。必填输入缺失也进入可补值的等待状态，确认前不创建 attempt；修改本次输入不会篡改上游交接。
+6. 运行中先“暂停派发”，再“编辑运行图”。可以增删和修改尚未启动的节点，应用新版本后仍保持暂停；已启动节点及其完整 Agent 配置保持冻结，已有结果被继承。
 
-## 快速开始
+节点说明支持 `${inputs.report}`、`${nodes.build.summary}`、`${nodes.build.output.report_path}` 等引用。显式输入策略只注入声明的映射和引用；旧工作流的祖先摘要策略会在配置和连线说明中标明。
 
-```bash
-cargo run [项目路径]        # 默认二进制是 monkeyfence(default-members)
-cargo run --release -- [项目路径]
-```
+失败只阻塞依赖该结果的分支；独立分支可以继续。重试不会隐式解除暂停。终端空闲、进程退出和 `done` 均不等于成功结算。
 
-- `Ctrl+Shift+O` 打开文件夹(**可重复打开多个项目**,互不干扰)
-- `Ctrl+Shift+W` 任务侧边栏(按项目分组:新建 / 选择 / 归档)
-- `Ctrl+Shift+/` Agent 工作区(`工作流` / `运行` 两个页签;有「需要你」时直达运行)
-- `Ctrl+,` 设置(智能体 / 插件 / Provider / 引擎 / 编辑器)
-- 活动栏顶部 `⋮` 打开“所有操作”:添加项目、快速打开、任务、版控、
-  Agent、Pipeline、搜索、终端、设置及常用编辑操作均可鼠标触达;快捷键只做加速
-- 任务侧栏同时提供 `+ 添加项目` 与 `+ 新建任务`,无需记忆快捷键
+## 本地启动
 
-### 无 GUI 自测(v2 冒烟:验证流水线状态机端到端)
+需要 Rust 工具链、Node.js 24+ 和 npm。在项目根目录执行：
 
-```bash
-cargo run -- --agent-smoke .
+```powershell
+Push-Location web
+npm ci
+npm run build
+Pop-Location
+cargo run -p mf-web --bin mf-workbench
 ```
 
-冒烟覆盖:CLI Agent PATH 检测表 → 手工 DAG → 自动派发 → mock 结构化结算 → 下游解锁 → 失败进入「需要你」→ 能力令牌断言(错误拒绝 / 幂等 / 冲突拒绝)→ 人工跳过 → 收敛,并在 `.mf-agent/` 留下产物与历史。
+打开控制台打印的 `WEB_ENTRY` 浏览器入口。默认端口为 80；设置 `$env:MF_WEB_PORT='0'` 可使用系统分配的端口。默认每个操作系统用户一个 Core；已有默认 Core 时沿用原入口，更新程序时正常退出旧实例再启动。
 
-## 领域模型(见 `CONTEXT.md` 与 `docs/adr/`)
+CLI Agent 收到 `MF_PIPE` 与 `MF_RUN_TOKEN` 后，可使用 `mfctl` 提交结果：
 
-| 概念 | 说明 |
-|---|---|
-| **Project** | 同时打开的一个目录;独立的任务数据库 / 调度器 / 会话注册表 |
-| **Project Workflow** | 项目内可编辑、可重复运行的 DAG;默认编排单位,直接发起运行 |
-| **Workflow Run** | 一次项目工作流的冻结执行视图(内部由 Task + Pipeline Revision 承载) |
-| **Needs You** | 运行级提醒:存在可由用户动作解除的介入点;徽标按运行数计数 |
-| **Task** | 项目内一级目标(不绑定 Git/P4/worktree/分支/变更集);运行时自动创建 |
-| **Pipeline Revision** | Task 的不可变 DAG 版本;编辑产生新 Revision |
-| **Step** | DAG 节点:工作说明 + 依赖 + Agent 指派 + 会话策略 |
-| **Agent Type** | 插件贡献的可配置执行器(pty / http / plugin-worker) |
-| **Agent Instance** | 用户保存的一套独立 Agent Type 配置 |
-| **Agent Session** | 后台 Session Registry 拥有的 CLI/API 会话,可复用 |
-| **Agent Run** | Step 的一次执行尝试,持有一次性能力令牌 |
-| **Settlement** | 显式结算(`mfctl step complete/fail` 或结构化 Runtime),唯一成功依据 |
-
-状态机:
-- Task:`draft → ready → running → needs-you ⇄ running → succeeded/failed/cancelled`(另有 `archived`)
-- Step:`pending → ready → running →(awaiting-outcome|needs-input)→ succeeded/failed/blocked/skipped/cancelled`
-- 调度规则:依赖全部成功或显式跳过后 Step 就绪并**自动派发**;失败只阻塞后代,独立分支继续;`done` / `tui-idle` **不能**自动结算;默认全局并发 4、每项目 2(设置可改);运行中修改 DAG 必须先暂停,且只允许修改尚未启动的 Step。
-
-## Agent 工作区(工作流 / 运行 两个页签)
-
-### 工作流页(项目工作流编辑器)
-
-- 左侧 Agent 库分组:**检测到的默认 CLI**(`default-cli:` 引用,沿用外部配置零写入)·**保存的智能体配置**(隔离配置)·「管理智能体配置……」(打开设置,编辑状态不丢失)
-- 中间 DAG 画布(拓扑自动分层)+ 右侧可折叠节点检查器(标题/工作说明/改绑/依赖/删除);**每个原子编辑动作后自动保存**到项目库(跨重启保留)
-- 工具栏:新建/重命名/复制/删除/从全局模板创建(复制当前版本,之后互不联动)/另存为全局模板/**运行工作流**主按钮(dirty 保存失败时阻止运行)
-- 「运行工作流」打开 Run Composer:唯一必填输入是**本次目标**(标题取第一行,完整目标进 Task.goal);提交后自动创建 Task、冻结 Revision 并开始调度
-
-### 运行页(WorkflowRunsPage + Run Monitor)
-
-- 左侧过滤:**需要你** · 运行中 · 最近完成;列表项以一次运行(内部 Task)为单位,只把存在 Pipeline Revision 的 Task 投影为工作流运行
-- 右侧复用 Run Monitor 展示 DAG 与节点动作 —— 继续会话、新会话重试、跳过(人工确认)、人工结算、取消;未知状态(重启后 interrupted)提供"继续观察/结算/重试",绝不显示成功徽标
-- 需要人工介入时,左侧 Agent 入口与「运行」页签显示同一**运行级徽标**(按运行数计数,不按被阻塞节点数);点击直达优先处理节点(等待输入 → 待结算 → 合并冲突 → 失败/中断)
-- 处理完成后徽标经统一 overview 快照消失(不手工减计数);重启恢复完全依赖 Store + overview 重建
-
-
-## Agent 工作流(实例 / 工作流 / 运行监控)
-
-- **Agent 实例**(设置 → 智能体):同一 Agent Type 可创建任意数量的独立实例;每个实例有自己的命令、参数、环境与加密 Secret(Secret 只以引用存在,明文仅启动瞬间解密并零化)。未检测到 CLI 的类型可见但不可保存实例。编辑实例只影响下一次启动,绝不写 `~/.claude`、`~/.codex` 等真实 CLI 全局配置 —— Claude 用每次运行独立的 `CLAUDE_CONFIG_DIR`,Codex 用独立 `CODEX_HOME`。
-- **工作流编辑器**(工作区 → 工作流):左侧实例库、中间 DAG 画布(拓扑自动分层)、右侧可折叠节点检查器(默认布局 B;可切换上下布局 A 并记住偏好)。环与自依赖在编辑期即拒绝;保存为任务本地草稿(默认私有,可另存为全局模板)。
-- **任务 + 菜单**:任务列表行尾 `＋` 可添加普通终端、已检测的默认 CLI(沿用外部已有配置,零写入)、既有 Agent 实例(冻结隔离配置)或临时实例。离散 CLI 会话不改变任务状态,可显式提交 Handoff。
-- **Run Monitor**:Pipeline 页按节点展示状态与动作 —— 新会话重试、续会话重试、跳过、人工结算、取消;未知状态(重启后 interrupted)提供"继续观察/结算/重试",绝不显示成功徽标;失败与合并冲突集中进"需要你"。
-- **重试语义**:节点可配置有限自动重试(自动重试创建新会话并保留文件修改);手动重试可选继续存活会话或新会话;重试成功自动解除下游阻塞。
-- **执行目录与并行安全**:默认项目目录(共享,不隔离);Git worktree 插件提供并行隔离(`.worktrees/mf-run-<task>-<step>-<attempt>`),汇合按拓扑序合并,冲突进入"需要你"而不覆盖。不支持隔离时并行默认禁止,可由用户显式开启"共享目录并行"风险开关。
-- **安全边界**:启动默认 executable+argv 直启(不经 Shell;Shell 模式需要插件 `shell` 权限授权);CLI 输出进入屏幕/日志前做跨块流式 Secret 脱敏;临时文件只允许位于本次运行的可信 run-temp 内(拒绝绝对路径、`..`、符号链接/接合点逃逸)。
-
-## 插件系统(`mf-plugins`)
-
-统一扩展缝隙:Agent、流水线模板、技能、工具都由插件贡献;内置内容以**合成插件**暴露,与第三方走同一权限模型。
-
-插件根清单 `monkeyfence-plugin.toml` 示例:
-
-```toml
-[manifest]
-version = 1
-publisher = "zhipu"
-id = "demo-agent"
-name = "Demo Agent"
-version_str = "0.1.0"
-min_app_version = "0.1.0"
-description = "演示插件"
-homepage = "https://example.com"
-
-[capabilities]
-fs_read = false
-fs_write = false
-net = true
-spawn = false
-hooks = false
-
-# 可选后台 worker(独立进程 + NDJSON 协议)
-# [worker]
-# command = "worker.exe"
-
-[[agents]]
-id = "demo"
-name = "Demo"
-runtime = "pty"                 # pty | http | plugin-worker
-command = "demo-cli"
-args = []
-permission_args = ["--yes"]
-
-[[pipelines]]
-id = "default"
-name = "默认流水线"
-file = "pipelines/default.json"  # PipelineDraft JSON
-
-[[skills]]
-path = "skills/demo"
+```powershell
+mfctl step complete --summary "完成检查" --output-json '{"report_path":"reports/check.md"}'
+mfctl step fail --reason "检查未通过"
+mfctl agent-state done
 ```
 
-- 安装来源:`bundled` / 本地目录 / Git URL / marketplace(首版前三种)
-- 安装流程:复制或 clone 到 staging → 校验清单与路径(拒绝 `..`、绝对路径、符号链接逃逸)→ 内容 SHA-256 → 原子发布到 `~/.monkeyfence/plugins/` → 锁文件 `plugins.lock.json` 记录来源/版本/commit/哈希/授权指纹
-- **新插件默认禁用**;用户审查权限后启用;worker、钩子、能力或说明内容变化改变指纹,需要**重新授权**;插件代码授权前不运行;禁用/未授权插件的 worker 不得启动
-- ⚠ 权限只约束 MonkeyFence 宿主接口;worker 进程与 CLI 始终以当前 Windows 用户权限运行
+也可在运行详情中手工结算。输出不满足节点要求时会拒绝成功结算，保留输入供修正后再提交。
 
-### 内置智能体(设置 → 智能体)
+## 数据与恢复
 
-- **CLI**(只检测 PATH,不复制凭据/配置目录):Codex · Claude · OpenCode · Cursor · Kimi · Gemini CLI · GitHub Copilot · Qwen Code · iFlow CLI · Aider · Amp;「可安装」区常驻,用户自行选择安装——codex/claude/opencode/gemini/copilot/qwen/iflow(官方 npm 包,已逐一核实仓库归属)与 aider(官方 PyPI)支持一键安装,cursor/kimi/amp 为官方独立安装器(跳官方页,npm 同名包非官方不自动执行)
-- **API**:OpenAI 兼容 · Anthropic · mock(来自 `~/.monkeyfence/config.toml` 的 providers)
-- **空白终端**;默认智能体(Auto / 指定);权限模式 Yolo / Manual;状态钩子总开关(命名空间内写入 + 备份 + 可逆移除);自动生成标签标题;Agent 工作时保持唤醒
-- Agent 详情可配置:Command · Arguments · Environment · Permission arguments · Hook 安装状态 · 插件来源/版本
+- 项目数据库：`<project>/.mf-agent/workflow-v1.db`，保存工作流、Revision、步骤、交接与按 attempt 关联的节点输入。
+- 用户目录库：`~/.monkeyfence/catalog-v1.db` 和 `catalog-v2.db`；服务库：`~/.monkeyfence/service-v1.db`。
+- 数据库版本升级通过备份屏障和事务迁移；已有 v12 输入库可自动升级。
+- Core 重启后恢复持久运行状态。已确认但未派发的输入保持原确认；未结算的执行需要明确恢复或结算，不会假定成功。
+- 编辑原项目工作流只影响以后发起的运行；运行图补丁和本次输入覆盖有独立作用域，历史发送内容保持只读。
 
-## mfctl 显式结算
+领域术语见 [CONTEXT.md](CONTEXT.md)，架构决策见 [docs/adr](docs/adr)。
 
-Agent Run 启动时获得一次性能力令牌(环境变量 `MF_RUN_TOKEN` / `MF_PIPE` 自动注入 Agent shell),MonkeyFence 通过本地命名管道 `\\.\pipe\monkeyfence-mfctl-<pid>` 接收:
+## 验证
 
-```bash
-mfctl step complete --summary "一句话总结"   # 相同结算重复提交幂等
-mfctl step fail --reason "失败原因"
-mfctl agent-state <working|waiting|blocked|done>
-mfctl pipeline propose --file draft.json     # Planner 提案,须用户确认
+```powershell
+cargo fmt --all -- --check
+cargo check --workspace --tests
+$env:RUST_TEST_THREADS = '1'
+cargo test --workspace
+
+Push-Location web
+npm ci
+npx playwright install chromium
+npm test
+npm run build
+npm run test:ui
+npm run e2e
+Pop-Location
 ```
 
-冲突结算被拒绝;`done` 无显式结算 → Step 进入 `awaiting-outcome`、看板进入「需要你」;用户可手工判定成功/失败或继续发送提示。
+E2E 使用真实 Core 和测试 Agent，自动隔离 instance namespace、service/catalog 数据及临时项目，不需要停止日常 Core。`MF_CORE_INSTANCE_DIR` 是显式测试/嵌入命名空间；fixture 同时设置 `MF_SERVICE_DB`、`MF_CATALOG_DB`、`MF_CATALOG_V2_DB`，不能把指向生产数据库的配置当成隔离环境。
 
-## 多项目与数据
+重启套件真正终止并重启测试进程，并读取 Core 的 attempt/Agent Run 数量验证单次派发。主套件检查画布编排、节点表单、模板试算与真实交接隔离、输入编辑确认、暂停改图和结算纠错。组件测试直接导入产品组件，不依赖历史研究探针。
 
-- 每项目 `<project>/.mf-agent/orchestration.db`(带 `schema_migrations` 正式迁移)
-- 迁移:旧 `runs→Task`、`tasks→Step`、`dispatches→Agent Run`;旧表与消息/问题历史保留为只读;`work-items.json` 兼容导入一次(忽略 `vcs_ref`,原文件保留)
-- 崩溃恢复:重开时未结算 Agent Run → `interrupted`,对应 Task → `needs-you`
-- 统一项目上下文:当前项目/任务由 `project_context.rs` 的原子 activation seam 唯一决定(`ProjectId` 为规范化绝对路径);项目、任务、编辑器标签、文件树、VCS、搜索与终端 cwd 属于同一个原子激活的项目上下文;点击项目标题、任务、Agent 卡片或跨项目文件都会先原子切换到所属项目
-- 编辑器标签与 ConsoleDock 按项目分桶:A→B→A 后标签顺序、活动标签与终端内容原样恢复;每项目终端首次创建时 cwd 即该项目根
-- 前台只显示一个项目的文件树/编辑上下文;其他项目的任务与 Agent 后台继续运行;关闭含活动 Agent Run 的项目必须先确认停止;关闭当前项目回退到最近激活的剩余项目
-- 新建任务使用显式 Composer(Project 必选、Title/Goal 必填),不存在"第一个项目"隐式归属
-- TaskSidebar 与 Agents 看板消费同一份带 revision 的统一项目总览快照(`project_overview.rs`):每个 Orchestrator 的 UI 事件由 Event Hub 持续消费(drain 线程),UI 变慢不会反压调度
-- 会话持久化到 `~/.monkeyfence/session.json`(原子写):打开项目、前台项目、每项目最近选中 Task 与干净编辑器文件;重启自动恢复(Diff/未保存 Buffer/终端 PTY 不持久化),旧格式仍可读取
+## 模块
 
-## P4 / Git 面板(独立)
+| 模块 | 职责 |
+| --- | --- |
+| `mf-agent` | 领域存储、DAG 编译、调度、输入准备与显式结算 |
+| `mf-kernel` | 命令权限、CAS/幂等、运行投影、持久 Operation 与恢复 |
+| `mf-web` / `web` | HTTP/WS 与浏览器工作台，共享图画布和节点表单 |
+| `mf-terminal` / `mf-plugins` | 真实会话、Agent 适配器和插件生命周期 |
+| `mfctl` | CLI 结算与状态上报 |
 
-自动检测:Perforce client root 下 → P4 模式;否则 Git。变更集、Diff 审阅(Alt+Y/Z hunk 级)、提交/搁置/同步/历史照旧,与 Task 生命周期完全解耦。
+首版以 Windows 本地 DAG 为范围。循环执行、远程主机和 Agent 自主批准改图不属于当前工作流闭环。
 
-## 架构
-
-```
-crates/
-  mf-core     Buffer(ropey + 事务式 undo)、tree-sitter 高亮
-  mf          GPUI 应用:多项目 Workspace、任务侧边栏、Agents 看板、
-              Pipeline 视图、Agent 终端/transcript、设置(智能体/插件)、
-              SessionRegistry(PTY/HTTP/PluginWorker)、mfctl 管道服务
-  mf-agent    v2 编排:Store 迁移 + Task/Revision/Step/Session/Run、
-              DAG 校验、Orchestrator 调度器、显式结算、崩溃恢复;
-              提供方层(OpenAI 兼容 / Anthropic / mock)
-  mf-plugins  插件系统:清单、安装/锁文件/权限指纹、内置 Agent、
-              状态钩子写入器、NDJSON worker
-  mf-vcs      p4 CLI 封装、git2、统一 diff 解析
-  mf-skills   技能加载/匹配/注入
-  mfctl       显式结算 / 状态上报 / 流水线提案(命名管道客户端)
-```
-
-## 测试
-
-```bash
-cargo test --workspace   # 100+ 项:迁移/回滚/数据保留、两项目隔离、DAG 校验、
-                         # 并发/串行化/失败阻塞、暂停编辑规则、结算令牌、
-                         # interrupted 恢复、插件逃逸/禁用/重授权、钩子不破坏用户配置、
-                         # PATH 检测、mfctl 管道往返、work-items 导入、
-                         # 两项目 E2E、终端模拟器、配置往返
-```
-
-## 已知限制(首版)
-
-- 仅 Windows 本地运行;WSL/SSH/远程主机未支持(设置页明确标注)
-- 第三方插件不能注入任意 GPUI 界面;plugin-worker Runtime 已定义协议但未接入调度
-- AI 生成草案当前由 mock Planner 演示;真实 provider 的结构化规划待接入
-- Agent 命令/参数覆盖为会话级(未持久化);agent 修改后的打开文件在重新聚焦标签时重载
-- 编辑器多光标/分栏/软换行、终端鼠标选择未实现(终端 dock 支持任意嵌套分屏)
-
-## 许可
-
-Apache-2.0
+Apache-2.0。

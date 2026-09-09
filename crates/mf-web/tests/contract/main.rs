@@ -2,6 +2,7 @@
 
 mod assets_and_headers;
 mod golden_codecs;
+mod input_review_regress;
 mod kernel_transport;
 mod security_matrix;
 mod terminal_ws;

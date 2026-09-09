@@ -1,26 +1,31 @@
-// bootstrap/resume/takeover e2e(T8a;Playwright + 真实 Core fixture)。
-// 本地无浏览器环境时以 spec 骨架交付;CI 接入 playwright 后运行。
+// bootstrap/resume/takeover e2e(T0;Playwright + 真实 Core fixture)。
 import { test, expect } from "@playwright/test";
+import { baseUrl, openWorkbench } from "./fixtures/helpers.ts";
+import { newNonce } from "./fixtures/core.ts";
 
-test("bootstrap nonce exchange issues session and csrf", async ({ page }) => {
-  // launcher 发放 nonce fragment → 首屏交换 → fragment 清除
-  await page.goto("http://127.0.0.1:0/#nonce=fixture");
-  await expect(page.locator("[role=badge]")).toHaveText(/Controller|Observer/);
-  // URL/query 无凭据
+test("bootstrap nonce exchange issues session and clears fragment", async ({ page }) => {
+  await openWorkbench(page);
+  // 真实端口 + 真实一次性 nonce;交换后 fragment 清除、URL 不含凭据
+  expect(page.url().startsWith(baseUrl())).toBe(true);
   expect(page.url()).not.toContain("csrf");
   expect(page.url()).not.toContain("?");
 });
 
-test("observer cannot mutate; server rejects forged writes", async ({ page }) => {
-  await page.goto("http://127.0.0.1:0/#nonce=fixture-observer");
-  await expect(page.getByTitle("Observer 禁写")).toBeDisabled();
+test("observer cannot mutate; server rejects forged writes", async ({ browser }) => {
+  const first = await browser.newContext().then((c) => c.newPage());
+  await openWorkbench(first);
+  // 第二个 bootstrap 使旧会话降 Observer;旧页面经重载探活 /auth/session
+  // 后呈现禁写 UI
+  const second = await browser.newContext().then((c) => c.newPage());
+  await openWorkbench(second);
+  await first.reload();
+  await expect(first.getByTitle(/Observer 禁写/).first()).toBeVisible({ timeout: 20_000 });
+  await expect(first.getByRole("button", { name: "接管为 Controller" })).toBeVisible();
+  await first.close();
+  await second.close();
 });
 
-test("two tabs takeover: only new controller writes", async ({ browser }) => {
-  const first = await browser.newContext().then((c) => c.newPage());
-  const second = await browser.newContext().then((c) => c.newPage());
-  await first.goto("http://127.0.0.1:0/#nonce=fixture-a");
-  await second.goto("http://127.0.0.1:0/#nonce=fixture-b");
-  // 新 bootstrap 使旧标签降 Observer(禁写)
-  await expect(first.getByTitle("Observer 禁写")).toBeVisible();
+test("acceptance new-nonce reissues fresh bootstrap credentials", async ({ request }) => {
+  const nonce = await newNonce(baseUrl());
+  expect(nonce).toMatch(/^[0-9a-f]{32}$/);
 });

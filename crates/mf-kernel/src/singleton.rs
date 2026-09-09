@@ -41,6 +41,41 @@ use std::time::Duration;
 
 /// Windows per-user 命名 mutex(§11.1;`Local\` 命名空间,生产固定名)。
 pub const CORE_MUTEX_NAME: &str = r"Local\MonkeyFence.Core";
+
+/// 完整隔离实例的显式入口(U2):`MF_CORE_INSTANCE_DIR` 指向独立根目录时,
+/// 该 Core 获得自己的完整命名空间——互斥名、owner lock、discovery 全部
+/// 落在该目录下,与默认单例(以及其它隔离实例)互不共享;未设置时一切
+/// 保持生产默认:用户级互斥 CORE_MUTEX_NAME、`~/.monkeyfence/core.lock`
+/// 与 discovery.json(ADR 0005:每用户一个跨项目 Core)。
+///
+/// 注意:仅重定向 MF_SERVICE_DB 不构成隔离(owner/discovery 仍共享,
+/// 第二实例会被 owner lock 仲裁)——测试/嵌入环境必须同时设置本变量。
+pub fn instance_namespace_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("MF_CORE_INSTANCE_DIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// 隔离实例的互斥名指纹(互斥/管道名共用;十六进制 16 位)。
+pub fn core_mutex_name_fingerprint(service_path: &std::path::Path) -> String {
+    use std::hash::{Hash, Hasher};
+    let canonical = service_path.to_string_lossy().to_lowercase();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// 互斥名:默认生产实例恒为 CORE_MUTEX_NAME(旧契约原样保留);
+/// 仅当显式设置 MF_CORE_INSTANCE_DIR 时派生独立互斥名。
+pub fn core_mutex_name_for(service_path: &std::path::Path) -> String {
+    match instance_namespace_root() {
+        None => CORE_MUTEX_NAME.to_string(),
+        Some(root) => format!(
+            "{CORE_MUTEX_NAME}.{}",
+            core_mutex_name_fingerprint(&root.join("identity"))
+        ),
+    }
+}
 /// owner 身份水位文件名(`~/.monkeyfence/core.lock`)。
 pub const CORE_LOCK_FILE_NAME: &str = "core.lock";
 /// discovery 文件名(平台 per-user 目录下)。
@@ -791,8 +826,12 @@ impl OwnerLockSetup {
 
     /// 生产装配:平台互斥(CORE_MUTEX_NAME)+ 系统时钟 + 真实存活探针。
     pub fn platform(service_path: impl Into<PathBuf>, build: impl Into<String>, port: u16) -> Self {
-        let paths = OwnerLockPaths::platform_default();
-        let mutex = platform_owner_mutex(CORE_MUTEX_NAME, &paths.flock_path());
+        let service_path: PathBuf = service_path.into();
+        let paths = match instance_namespace_root() {
+            None => OwnerLockPaths::platform_default(),
+            Some(root) => OwnerLockPaths::in_dir(&root),
+        };
+        let mutex = platform_owner_mutex(&core_mutex_name_for(&service_path), &paths.flock_path());
         Self::new(
             paths,
             mutex,

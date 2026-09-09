@@ -1,3 +1,4 @@
+import { NodeInputCard, SettleCard } from "./run_node_forms.tsx";
 // Workbench 壳(T8a,Issue #52):顶部「工作流 / 运行」、三栏布局与
 // 窄屏 Inspector 下移;Observer 禁写 + 显式 takeover;全局 problem
 // toast;断线重连(resume→4409→全量 resync)。数据全部来自 Core 权威
@@ -18,12 +19,15 @@ import {
   type ProjectionState,
 } from "../state/reducer.ts";
 import { workflowCreateCommand } from "../state/workflow_commands.ts";
+import { GraphCanvas } from "./graph_canvas.tsx";
+import { RunGraphEditor, runGraphNodes } from "./run_graph_editor.tsx";
 import {
   agentRunOfStep,
   agentRunViewOfStep,
   runDetailViewOf,
   runActionCommand,
   type RunDetailView,
+  type RunStepInputView,
 } from "./run_detail.ts";
 import type { CommandType } from "../api/protocol.ts";
 import { WorkflowEditor } from "./workflow_editor.tsx";
@@ -343,7 +347,7 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
                 setToast(message);
                 void refresh();
               }}
-              onClose={() => setEditing(null)}
+              onClose={() => { void refresh().then(() => setEditing(null)); }}
             />
           </section>
         ) : tab === "settings" ? (
@@ -776,23 +780,33 @@ function RunDetail({
 }) {
   const meta = runStatusMeta(run.status);
   const [detail, setDetail] = useState<RunDetailView | null>(null);
+  const [showGraphEditor, setShowGraphEditor] = useState(false);
+  // 命令成功后强制重拉详情(图补丁等不推进 run revision 的命令
+  // 不会触发 revision 变化重拉,旧 step 句柄会导致后续命令 404)
+  const [commandSeq, setCommandSeq] = useState(0);
   const prompt = useModalPrompt();
 
-  // 选中运行时拉取权威详情(轮询由外层 refresh 触发重拉)
+  // 输入门控也会变化；不能只等 Task revision 才刷新当前运行详情。
   useEffect(() => {
     let cancelled = false;
-    void (async () => {
+    let loading = false;
+    const load = async () => {
+      if (loading || document.hidden) return;
+      loading = true;
       try {
         const data = await client.workflowRunSnapshot(run.projectHandle, run.handle);
         if (!cancelled) setDetail(runDetailViewOf(data));
       } catch {
         /* 详情拉取失败时保留摘要;动作面不可用 */
-      }
-    })();
+      } finally { loading = false; }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 1500);
     return () => {
       cancelled = true;
+      window.clearInterval(timer);
     };
-  }, [client, run.handle, run.projectHandle, run.revision]);
+  }, [client, run.handle, run.projectHandle, run.revision, commandSeq]);
 
   const act = useCallback(
     async (
@@ -805,8 +819,8 @@ function RunDetail({
         revision: string;
         session?: { handle: string; revision: string };
       },
-    ) => {
-      if (!detail) return;
+    ): Promise<boolean> => {
+      if (!detail) return false;
       // RetryStep/Respond/Settle 要求 expected 携带目标 Step 语义 revision;
       // Settle 还要求目标 Agent Run(kernel 复验结算目标)。
       const stepExpectation =
@@ -872,13 +886,16 @@ function RunDetail({
           ],
         });
         onAction("已提交");
+        setCommandSeq((seq) => seq + 1);
+        return true;
       } catch (error) {
         const code = error instanceof ApiError ? error.problem.code : null;
         if (code === "controller_required" || code === "controller_lease_expired") {
           location.reload();
-          return;
+          return false;
         }
         onAction(`操作失败:${error instanceof Error ? error.message : String(error)}`);
+        return false;
       }
     },
     [client, detail, onAction, run.handle, run.projectHandle],
@@ -901,6 +918,35 @@ function RunDetail({
         </div>
       </div>
       <dl className="kv">
+        {client.isController && (
+          <div className="field-row" style={{ marginBottom: 8 }}>
+            {run.paused ? (
+              <>
+                <button
+                  className="mf-btn primary"
+                  onClick={() => act("workflow.run.resume", {})}
+                >
+                  ▶ 恢复派发
+                </button>
+                {detail && detail.pipelineRevision && (
+                  <button
+                    className="mf-btn ghost"
+                    onClick={() => setShowGraphEditor(true)}
+                  >
+                    ✎ 编辑运行图(未启动节点)
+                  </button>
+                )}
+              </>
+            ) : (
+              <button
+                className="mf-btn ghost"
+                onClick={() => act("workflow.run.pause", {})}
+              >
+                ⏸ 暂停派发(运行中的节点可继续结算)
+              </button>
+            )}
+          </div>
+        )}
         <dt>运行句柄</dt>
         <dd>{run.handle}</dd>
         <dt>项目</dt>
@@ -1005,6 +1051,7 @@ function RunDetail({
                 <div className="step-head">
                   <span className={`badge tone-${stepMeta.tone}`}>{stepMeta.label}</span>
                   <span className="step-title">{step.title}</span>
+                  <span className="mono-dim run-attempts" data-attempts={step.attempts}>尝试 {step.attempts}</span>
                 </div>
                 {question && (
                   <QuestionCard
@@ -1017,7 +1064,7 @@ function RunDetail({
                 {step.status === "awaiting-outcome" && (
                   <SettleCard
                     disabled={!client.isController || agentRunOfStep(detail, step.step) === null}
-                    onSettle={(kind, text) =>
+                    onSettle={(kind, text, outputJson) =>
                       act(
                         "workflow.run.settle",
                         {
@@ -1025,7 +1072,13 @@ function RunDetail({
                           agent_run_handle: agentRunOfStep(detail, step.step),
                           settlement:
                             kind === "complete"
-                              ? { kind: "complete", summary: text }
+                              ? {
+                                  kind: "complete",
+                                  summary: text,
+                                  ...(outputJson !== null
+                                    ? { output: JSON.parse(outputJson) }
+                                    : {}),
+                                }
                               : { kind: "fail", reason: text },
                         },
                         step.step,
@@ -1063,6 +1116,16 @@ function RunDetail({
                     重试(新会话)
                   </button>
                 )}
+                {step.input && (
+                  <NodeInputCard
+                    key={`${step.step}:${step.input?.createdAt}`}
+                    input={step.input}
+                    canEdit={client.isController}
+                    stepHandle={step.step}
+                    stepRevision={step.revision}
+                    onAct={act}
+                  />
+                )}
                 {(() => {
                   // #99 交接卡:该步骤的 Handoff 在时间轴原位展示
                   const handoff = detail.handoffs.find((h) => h.step === step.step);
@@ -1097,11 +1160,34 @@ function RunDetail({
           })}
         </div>
       )}
+      {detail && showGraphEditor && detail.pipelineRevision && (
+        <RunGraphEditor
+          detail={detail}
+          client={client}
+          projectHandle={run.projectHandle}
+          agentOptions={instances.map((instance) => instance.id)}
+          onClose={() => setShowGraphEditor(false)}
+          onApply={async (nodes, baseRevision) => {
+            return act("workflow.run.apply_graph_patch", {
+              base_revision: baseRevision,
+              nodes,
+            });
+          }}
+        />
+      )}
+      {detail && detail.steps.length > 0 && <RunDagCanvas detail={detail} />}
       {prompt.modal}
     </>
   );
 }
 
+function RunDagCanvas({ detail }: { detail: RunDetailView }) {
+  const graph = useMemo(() => runGraphNodes(detail), [detail]);
+  return <details className="run-dag-card" open>
+    <summary>运行图 · {detail.steps.length} 个节点</summary>
+    <GraphCanvas graph={graph} />
+  </details>;
+}
 /** 工作流卡片(#75):名称 + 双轴修订 + 启动运行(goal 输入)。 */
 function WorkflowCard({
   workflow,
@@ -1318,50 +1404,6 @@ function QuestionCard({
   );
 }
 
-function SettleCard({
-  disabled,
-  onSettle,
-}: {
-  disabled: boolean;
-  onSettle: (kind: "complete" | "fail", text: string) => void;
-}) {
-  const [text, setText] = useState("");
-  const [busy, setBusy] = useState(false);
-  return (
-    <div className="question-card">
-      <div className="question-text">该步骤在等待结算(exit/idle 都不是结算——由你判定)。</div>
-      <div className="question-actions">
-        <input
-          value={text}
-          placeholder={text === "" ? "总结(可选)" : "总结"}
-          onChange={(event) => setText(event.target.value)}
-        />
-        <button
-          className="mf-btn primary"
-          disabled={busy}
-          onClick={() => {
-            setBusy(true);
-            onSettle("complete", text.trim() || "完成");
-          }}
-        >
-          结算成功
-        </button>
-        <button
-          className="mf-btn danger"
-          disabled={busy}
-          onClick={() => {
-            setBusy(true);
-            onSettle("fail", text.trim() || "未说明原因");
-          }}
-        >
-          结算失败
-        </button>
-      </div>
-    </div>
-  );
-}
-
-/** 设置页:项目管理(多项目同时在线)+ 系统信息。 */
 function SettingsPane({
   client,
   view,

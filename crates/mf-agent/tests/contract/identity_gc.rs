@@ -17,6 +17,7 @@ fn node(key: &str, deps: &[&str]) -> mf_agent::workflow::WorkflowNodeDraft {
         instructions: "固定指令".to_string(),
         agent_instance_id: "inst".to_string(),
         deps: deps.iter().map(|d| d.to_string()).collect(),
+        ..Default::default()
     }
 }
 

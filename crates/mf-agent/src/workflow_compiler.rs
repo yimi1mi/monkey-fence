@@ -161,6 +161,38 @@ impl WorkflowCompiler {
                     ));
                 }
             }
+            // `${inputs.<name>}` 只能引用本节点已声明的输入映射
+            let binding_names: HashSet<&str> = node
+                .input_bindings
+                .iter()
+                .map(|binding| binding.name.as_str())
+                .collect();
+            for referenced in Self::input_references(&node.instructions) {
+                if !binding_names.contains(referenced.as_str()) {
+                    errors.push(CompileError::new(
+                        "unknown-input-binding",
+                        &node.key,
+                        format!("指令引用了 `${{{referenced}.…}}`,但节点未声明该输入映射",),
+                    ));
+                }
+            }
+            // 输入映射来源必须是传递祖先(结构级;与 validation 同语义)
+            let node_ancestors = ancestors.get(node.key.as_str());
+            for binding in &node.input_bindings {
+                let is_ancestor = node_ancestors
+                    .map(|set| set.contains(binding.source_node_key.as_str()))
+                    .unwrap_or(false);
+                if !is_ancestor {
+                    errors.push(CompileError::new(
+                        "binding-non-ancestor",
+                        &node.key,
+                        format!(
+                            "输入映射 `{}` 的来源 `{}` 不是该节点的传递上游",
+                            binding.name, binding.source_node_key
+                        ),
+                    ));
+                }
+            }
         }
 
         // 6. 并行安全
@@ -212,6 +244,11 @@ impl WorkflowCompiler {
                     instance,
                     deps: node.deps.clone(),
                     plugin: resolved_plugin.get(node.key.as_str()).cloned(),
+                    acceptance_criteria: node.acceptance_criteria.clone(),
+                    output_schema: node.output_schema.clone(),
+                    input_bindings: node.input_bindings.clone(),
+                    context_policy: node.context_policy,
+                    require_input_review: node.require_input_review,
                 }
             })
             .collect();
@@ -272,6 +309,29 @@ impl WorkflowCompiler {
             }
             rest = after;
             // 跳过本引用剩余部分,继续找下一个
+            if let Some(end) = rest.find('}') {
+                rest = &rest[end + 1..];
+            } else {
+                break;
+            }
+        }
+        refs
+    }
+
+    /// 提取 instructions 里的 `${inputs.<name>...}` 引用的映射名。
+    fn input_references(text: &str) -> Vec<String> {
+        let mut refs = Vec::new();
+        let mut rest = text;
+        while let Some(at) = rest.find("${inputs.") {
+            let after = &rest[at + "${inputs.".len()..];
+            let name: String = after
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .collect();
+            if !name.is_empty() {
+                refs.push(name);
+            }
+            rest = after;
             if let Some(end) = rest.find('}') {
                 rest = &rest[end + 1..];
             } else {

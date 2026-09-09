@@ -19,6 +19,11 @@ use serde::{Deserialize, Serialize};
 /// `task_workflows` 与 `pipeline_revisions` 都持久化此摘要;
 /// 「分配并确认」只按摘要等值复用 Revision —— 时间戳(时钟回拨/
 /// 同秒)不参与判定。
+///
+/// 新增语义字段(验收说明/输出约束/输入映射/上下文策略/输入检查)
+/// **条件性参与哈希**:全默认(空/None/空表/false)时不写入任何
+/// 字节,保证旧数据摘要不变 —— 否则全库存量 `content_digest` 失配,
+/// 启动复验(execution_ports)与 no-op 判定(store)都会误判。
 pub fn workflow_content_digest(nodes: &[WorkflowNodeDraft], allow_unsafe_parallel: bool) -> String {
     use sha2::{Digest, Sha256};
     fn field(h: &mut sha2::Sha256, bytes: &[u8]) {
@@ -41,13 +46,49 @@ pub fn workflow_content_digest(nodes: &[WorkflowNodeDraft], allow_unsafe_paralle
         for d in deps {
             field(&mut hasher, d.as_bytes());
         }
+        if !n.acceptance_criteria.is_empty() {
+            field(&mut hasher, b"ac");
+            field(&mut hasher, n.acceptance_criteria.as_bytes());
+        }
+        if let Some(schema) = &n.output_schema {
+            field(&mut hasher, b"os");
+            // serde_json Value 的对象键按序序列化(BTreeMap),确定性成立
+            field(&mut hasher, schema.to_string().as_bytes());
+        }
+        if !n.input_bindings.is_empty() {
+            field(&mut hasher, b"ib");
+            field(&mut hasher, &n.input_bindings.len().to_le_bytes());
+            for binding in &n.input_bindings {
+                field(&mut hasher, binding.name.as_bytes());
+                field(&mut hasher, binding.source_node_key.as_bytes());
+                field(&mut hasher, binding.field_path.as_bytes());
+                field(&mut hasher, &[u8::from(binding.required)]);
+                if let Some(default) = &binding.default_value {
+                    field(&mut hasher, b"d");
+                    field(&mut hasher, default.as_bytes());
+                }
+            }
+        }
+        if let Some(policy) = n.context_policy {
+            let name = match policy {
+                ContextPolicy::LegacyAncestors => "legacy_ancestors",
+                ContextPolicy::ExplicitOnly => "explicit_only",
+            };
+            field(&mut hasher, b"cp");
+            field(&mut hasher, name.as_bytes());
+        }
+        if n.require_input_review {
+            field(&mut hasher, b"review");
+        }
     }
     let out = hasher.finalize();
     out.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// 工作流节点草案:稳定键 + 依赖 + Agent Instance 引用。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Default 仅为测试/字面量构造便利(全空);生产构造必须显式给
+/// key/title/agent_instance_id。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowNodeDraft {
     /// 稳定节点键(变量引用 `${nodes.<key>.output...}` 使用它)。
     pub key: String,
@@ -57,6 +98,70 @@ pub struct WorkflowNodeDraft {
     pub agent_instance_id: String,
     /// 上游节点键列表(串行/并行/汇合;禁止循环 —— 编译器校验)。
     pub deps: Vec<String>,
+    /// 验收说明(进入业务 prompt;文字要求不由程序验证,机器只验证
+    /// output_schema 这类可执行约束)。旧数据缺省为空;默认值不序列化
+    /// (graph_json/快照字节与旧数据保持一致)。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub acceptance_criteria: String,
+    /// 自定义 Handoff.output 的 JSON Schema 约束(object 形态;首版
+    /// 支持 type/properties/required/items/description)。None=无约束。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
+    /// 输入映射:下游节点显式选择上游 Handoff 字段进入本次输入,
+    /// 以 `${inputs.<name>}` 引用。保存在下游节点上。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_bindings: Vec<InputBinding>,
+    /// prompt 上下文策略。None(旧数据)= 按遗留语义(祖先摘要 +
+    /// 模板引用)解释,界面显式提示;新节点显式设置为 explicit_only。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_policy: Option<ContextPolicy>,
+    /// 派发前是否需要人工检查并确认本次输入(持久派发门控;T3 接线)。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_input_review: bool,
+}
+
+/// 输入映射条目:把一个上游 Handoff 字段绑定为本地名称。
+/// 来源必须是指向合法(含传递)祖先的节点键;字段路径是 Handoff
+/// 内的点分路径(如 `summary`、`output.report_path`)。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputBinding {
+    /// 本地名称(`${inputs.<name>}` 引用;节点内唯一,键字符规则同节点键)。
+    pub name: String,
+    /// 来源节点 key(必须是本节点的传递祖先)。
+    pub source_node_key: String,
+    /// Handoff 字段路径(点分;根字段或 output 下的嵌套键)。
+    pub field_path: String,
+    /// 必填:来源缺失/字段缺失时不启动本节点。
+    pub required: bool,
+    /// 可选默认值(仅 optional 字段使用;不得冒充上游真实输出)。
+    #[serde(default)]
+    pub default_value: Option<String>,
+}
+
+/// 节点 prompt 上下文策略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextPolicy {
+    /// 遗留行为(旧工作流):prompt 自动附带全部祖先摘要 + 显式引用替换。
+    LegacyAncestors,
+    /// 只传显式选择的内容(输入映射 + 显式 `${nodes.*}` 引用),
+    /// 不再自动注入祖先摘要。
+    ExplicitOnly,
+}
+
+impl ContextPolicy {
+    /// 未显式设置(旧数据)时的解释:保持遗留语义,不静默改变旧工作流。
+    pub fn resolve(policy: Option<ContextPolicy>) -> ContextPolicy {
+        policy.unwrap_or(ContextPolicy::LegacyAncestors)
+    }
+}
+
+impl WorkflowNodeDraft {
+    /// 生效的上下文策略(None = 遗留语义)。
+    pub fn effective_context_policy(&self) -> ContextPolicy {
+        self.context_policy
+            .unwrap_or(ContextPolicy::LegacyAncestors)
+    }
 }
 
 /// 图结构校验(T1b 深模块缝隙):节点键唯一、依赖必须指向已知节点。
@@ -173,6 +278,22 @@ pub struct WorkflowNodeSnapshot {
     /// 贡献该节点 Agent Type 的插件包身份(旧快照无此字段)。
     #[serde(default)]
     pub plugin: Option<PluginSourcePin>,
+    /// 验收说明(旧快照缺省为空;随 Revision 冻结,不随草稿编辑变化;
+    /// 默认值不序列化,快照字节与旧数据一致)。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub acceptance_criteria: String,
+    /// 输出约束(JSON Schema object;旧快照无此字段)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
+    /// 输入映射(旧快照缺省为空)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_bindings: Vec<InputBinding>,
+    /// 上下文策略(旧快照缺省按遗留语义解释)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_policy: Option<ContextPolicy>,
+    /// 派发前人工检查开关(旧快照缺省为否)。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_input_review: bool,
 }
 
 /// 不可变工作流快照:Revision 保存的就是它。
@@ -206,6 +327,11 @@ pub fn freeze_workflow(
             instance,
             deps: draft.deps.clone(),
             plugin: None,
+            acceptance_criteria: draft.acceptance_criteria.clone(),
+            output_schema: draft.output_schema.clone(),
+            input_bindings: draft.input_bindings.clone(),
+            context_policy: draft.context_policy,
+            require_input_review: draft.require_input_review,
         });
     }
     Ok(WorkflowSnapshot {

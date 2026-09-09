@@ -45,6 +45,10 @@ export class WorkbenchClient {
   }
 
   /** 本会话 client id(envelope 构造)。 */
+  get csrfToken(): string {
+    return this.context.csrfToken;
+  }
+
   get clientId(): string {
     return this.context.clientId;
   }

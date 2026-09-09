@@ -62,6 +62,11 @@ fn fake_snapshot() -> WorkflowSnapshot {
             instance: fake_instance(),
             deps: vec![],
             plugin: None,
+            acceptance_criteria: String::new(),
+            output_schema: None,
+            input_bindings: Vec::new(),
+            context_policy: None,
+            require_input_review: false,
         }],
         directory_provider: None,
     }
@@ -77,6 +82,7 @@ fn fake_content_digest(snapshot: &WorkflowSnapshot) -> String {
             instructions: node.instructions.clone(),
             agent_instance_id: node.instance.id.clone(),
             deps: node.deps.clone(),
+            ..Default::default()
         })
         .collect();
     workflow_content_digest(&drafts, false)
@@ -563,6 +569,83 @@ fn worker_crash_after_step_receipt_resumes_without_replaying_effect() {
     );
 }
 
+#[test]
+fn start_step_ids_never_reuse_the_acceptance_command_id() {
+    // 旧实现覆盖 command UUID 的 byte 7；当它原本就是 phase 时，step
+    // 与 acceptance 共用同一个 receipt ID，正常启动会被补偿回滚。
+    for phase in 0..=2 {
+        let f = StartFixture::new();
+        let before = f.task_count();
+        let mut bytes = *uuid::Uuid::now_v7().as_bytes();
+        bytes[7] = phase;
+        let command_id = CommandId::parse(uuid::Uuid::from_bytes(bytes).to_string()).unwrap();
+        let handle = accepted_handle(
+            f.fixture
+                .kernel
+                .dispatch(f.start_request_with_id(command_id.clone(), "receipt identity")),
+        );
+        let records = crate::operation::steps_of(&f.fixture.service, &handle).unwrap();
+        assert!(records
+            .iter()
+            .all(|step| step.step_id.as_str() != command_id.as_str()));
+        let outcome = f
+            .fixture
+            .kernel
+            .run_workflow_start_operation(&f.fixture.project, &handle)
+            .unwrap();
+        assert_eq!(outcome, OperationOutcome::Completed { compensated: false });
+        assert_eq!(f.task_count(), before + 1);
+    }
+}
+
+#[test]
+fn legacy_start_payload_rebuilds_original_step_identities() {
+    let prepared = prepared_plan(fake_snapshot());
+    let mut payload = workflow_start_payload(&prepared).unwrap();
+    payload.as_object_mut().unwrap().remove("step_id_version");
+    let command = CommandId::new();
+    let project = crate::handles::ProjectStoreHandle::generate();
+    let plan = crate::workflow_start::compile_workflow_start_plan(
+        &command,
+        &project,
+        &prepared.workflow,
+        1,
+        &payload,
+    )
+    .unwrap();
+    let records = plan
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| crate::operation::StepRecord {
+            step_index: index,
+            role: step.role,
+            step_id: step.step_id.clone(),
+            target_store: step.target.store_key(),
+            aggregate: step.target.aggregate.handle.clone(),
+            semantic_digest: step.semantic_digest().to_string(),
+            expected_json: serde_json::to_string(&crate::command::canonical_expected_revisions(
+                &step.expected,
+            ))
+            .unwrap(),
+            compensates: step.compensates,
+            state: crate::operation::StepState::Pending,
+            result: serde_json::Value::Null,
+            problem_code: None,
+        })
+        .collect::<Vec<_>>();
+    let (rebuilt, _) =
+        crate::workflow_start::rebuild_workflow_start_plan(&command, &project, &payload, &records)
+            .unwrap();
+    assert_eq!(rebuilt, plan);
+    let mut bytes = *uuid::Uuid::parse_str(command.as_str()).unwrap().as_bytes();
+    bytes[7] = 0;
+    assert_eq!(
+        records[0].step_id.as_str(),
+        uuid::Uuid::from_bytes(bytes).to_string()
+    );
+}
+
 /// 重启 reconcile:durable Workflow Start 不被通用只读 reconcile 撤销；
 /// 生产 worker 随后凭 receipt 跳过 materialize 并继续 activate。
 #[test]
@@ -635,6 +718,7 @@ fn runtime_open_project_resumes_accepted_start_in_background() {
                 instructions: "do it".into(),
                 agent_instance_id: "instance".into(),
                 deps: vec![],
+                ..Default::default()
             }],
             allow_unsafe_parallel: false,
         })
@@ -766,7 +850,7 @@ fn discard_compensation_removes_draft_task_before_scheduling() {
     let handle = accepted_handle(f.fixture.kernel.dispatch(request));
 
     // materialize 完整生效(Draft Task + target receipt),activate 未执行。
-    let _ = f
+    let fault = f
         .fixture
         .kernel
         .run_workflow_start_operation_with_fault(
@@ -775,6 +859,10 @@ fn discard_compensation_removes_draft_task_before_scheduling() {
             Some(OperationFaultPoint::AfterStepFinalized(0)),
         )
         .unwrap_err();
+    assert!(
+        format!("{fault:?}").contains("after_step_finalized"),
+        "未到达预期故障点:{fault:?}"
+    );
     assert_eq!(f.task_count(), before_tasks + 1);
 
     // 直接执行 kernel 编译的真实 discard effect(从事务内 receipt 读 handle)。
