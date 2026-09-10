@@ -10,3 +10,4 @@
 pub mod bundle;
 pub mod commands;
 pub mod journeys;
+pub mod tray_status;
