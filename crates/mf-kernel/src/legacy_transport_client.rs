@@ -135,6 +135,34 @@ mod tests {
                 "no kernel".into(),
             ))
         }
+        fn add_project_folder(
+            &self,
+            _project_handle: &str,
+            _path: &std::path::Path,
+        ) -> Result<Vec<crate::project_registry::RegisteredFolder>, crate::kernel::KernelProblem>
+        {
+            Err(crate::kernel::KernelProblem::ServiceUnavailable(
+                "no kernel".into(),
+            ))
+        }
+        fn remove_project_folder(
+            &self,
+            _project_handle: &str,
+            _path: &std::path::Path,
+        ) -> Result<Vec<crate::project_registry::RegisteredFolder>, crate::kernel::KernelProblem>
+        {
+            Err(crate::kernel::KernelProblem::ServiceUnavailable(
+                "no kernel".into(),
+            ))
+        }
+        fn resolve_project_folder(
+            &self,
+            _path: &std::path::Path,
+        ) -> Result<Option<String>, crate::kernel::KernelProblem> {
+            Err(crate::kernel::KernelProblem::ServiceUnavailable(
+                "no kernel".into(),
+            ))
+        }
     }
 
     struct ReadHalf {

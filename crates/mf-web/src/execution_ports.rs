@@ -451,6 +451,11 @@ pub fn assemble_with_host(
     pipe_name: Option<&str>,
 ) -> Result<(), String> {
     let _ = registry;
+    // 幂等守卫(#multi-folder):同项目重复挂载(同路径或经附加文件夹
+    // 路径进入)不重启调度器——Orchestrator 重启会打断进行中的派发。
+    if ad_hoc_orchestrators().lock().contains_key(project.as_str()) {
+        return Ok(());
+    }
     let store = mf_agent::Store::open(&mf_agent::project_db_path(root))
         .map_err(|error| format!("打开项目库失败:{error:#}"))?;
     let directory: Arc<dyn ExecutionDirectoryProvider> =

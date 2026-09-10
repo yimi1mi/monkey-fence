@@ -3,8 +3,10 @@
 //! 因此本文件聚合全部契约模块。
 
 mod discovery_fencing;
+mod instance_isolation;
 mod limits_defaults;
 mod owner_lock;
+mod project_folders;
 mod service_schema;
 mod session_import;
 mod support;

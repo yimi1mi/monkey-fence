@@ -3,25 +3,33 @@
 use crate::handles::{ProjectStoreHandle, StepHandle, WorkflowHandle, WorkflowRunHandle};
 use crate::kernel::KernelProblem;
 use crate::projection::{
-    ScalarRevision, WorkflowRunSummarySnapshot, WorkflowSummarySnapshot, WorkspaceProjectSnapshot,
-    WorkspaceSnapshotData,
+    ScalarRevision, WorkflowRunSummarySnapshot, WorkflowSummarySnapshot, WorkspaceFolderSnapshot,
+    WorkspaceProjectSnapshot, WorkspaceSnapshotData,
 };
 use mf_agent::model::WorkflowRunProjectionSource;
 use mf_agent::Store;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+/// service 注册表提供的项目展示信息(name/主目录/文件夹列表)。
+#[derive(Clone)]
+pub(crate) struct ProjectDisplayInfo {
+    pub display_name: String,
+    pub display_root: String,
+    pub folders: Vec<WorkspaceFolderSnapshot>,
+}
+
 pub(crate) fn read_workspace(
-    projects: Vec<(ProjectStoreHandle, (String, String), Arc<Store>)>,
+    projects: Vec<(ProjectStoreHandle, ProjectDisplayInfo, Arc<Store>)>,
 ) -> Result<WorkspaceSnapshotData, KernelProblem> {
     let mut project_rows = Vec::with_capacity(projects.len());
     let mut active_workflow_runs = 0usize;
     let mut needs_you_count = 0usize;
-    for (project, (display_name, display_root), store) in projects {
-        let display_root = if display_root.is_empty() {
+    for (project, info, store) in projects {
+        let display_root = if info.display_root.is_empty() {
             None
         } else {
-            Some(display_root)
+            Some(info.display_root)
         };
         let sources = store
             .with_tx(|tx| Store::workflow_run_projection_sources_tx(tx))
@@ -74,12 +82,13 @@ pub(crate) fn read_workspace(
         needs_you_count += workflow_runs.iter().filter(|run| run.needs_you).count();
         project_rows.push(WorkspaceProjectSnapshot {
             project,
-            display_name,
+            display_name: info.display_name,
             workflow_collection_revision,
             workflows,
             workflow_runs,
             active_agent_sessions,
             display_root,
+            folders: info.folders,
         });
     }
     Ok(WorkspaceSnapshotData {

@@ -468,6 +468,26 @@ mod tests {
             fn detach_project(&self, _project_handle: &str) -> Result<(), KernelProblem> {
                 Err(KernelProblem::ServiceUnavailable("fake".into()))
             }
+            fn add_project_folder(
+                &self,
+                _project_handle: &str,
+                _path: &std::path::Path,
+            ) -> Result<Vec<crate::project_registry::RegisteredFolder>, KernelProblem> {
+                Err(KernelProblem::ServiceUnavailable("fake".into()))
+            }
+            fn remove_project_folder(
+                &self,
+                _project_handle: &str,
+                _path: &std::path::Path,
+            ) -> Result<Vec<crate::project_registry::RegisteredFolder>, KernelProblem> {
+                Err(KernelProblem::ServiceUnavailable("fake".into()))
+            }
+            fn resolve_project_folder(
+                &self,
+                _path: &std::path::Path,
+            ) -> Result<Option<String>, KernelProblem> {
+                Err(KernelProblem::ServiceUnavailable("fake".into()))
+            }
         }
         Arc::new(FakeKernel)
     }

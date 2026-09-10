@@ -379,6 +379,17 @@ pub struct WorkspaceProjectSnapshot {
     /// 项目根目录(代码浏览/版控入口;v1 additive,service 路径只读)。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_root: Option<String>,
+    /// 项目包含的文件夹,primary 恒在首位(#multi-folder;v1 additive,
+    /// 旧客户端忽略;空 = service 注册表未提供,回退 display_root)。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub folders: Vec<WorkspaceFolderSnapshot>,
+}
+
+/// 项目文件夹摘要(#multi-folder):`kind` ∈ primary|additional。
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct WorkspaceFolderSnapshot {
+    pub path: String,
+    pub kind: String,
 }
 
 /// 项目工作流摘要(启动运行/编辑器入口的数据面)。

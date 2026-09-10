@@ -81,6 +81,11 @@ impl BootstrapAuth {
         }
     }
 
+    /// 当前生效的 nonce TTL(秒;entry.url 保新鲜线程按它派生节奏)。
+    pub fn bootstrap_nonce_ttl_secs(&self) -> u64 {
+        self.limits.bootstrap_nonce_ttl_secs
+    }
+
     /// 生成一次性 128-bit nonce(launcher 放入 URL fragment)。
     pub fn issue_nonce(&mut self) -> String {
         let nonce = uuid::Uuid::new_v4().simple().to_string();

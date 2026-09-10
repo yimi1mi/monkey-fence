@@ -86,7 +86,22 @@ pub fn serve_workbench_full(
     let bound_port = listener.local_addr()?.port();
     // tokio from_std 要求 non-blocking;否则注册后请求挂起
     listener.set_nonblocking(true)?;
-    let mut auth = BootstrapAuth::new(WebLimits::default());
+    // nonce TTL 工程覆盖(默认见 WebLimits;E2E 用短 TTL 验证 entry.url
+    // 保新鲜,构造时 clamp 到安全范围)
+    let mut limits = WebLimits::default();
+    if let Some(ttl) = std::env::var("MF_WEB_NONCE_TTL_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        limits.bootstrap_nonce_ttl_secs = ttl;
+    }
+    if let Some(rate) = std::env::var("MF_WEB_EXCHANGE_RATE_PER_MIN")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        limits.auth_exchange_rate_per_minute = rate;
+    }
+    let mut auth = BootstrapAuth::new(limits);
     let nonce = auth.issue_nonce();
     let acceptance = std::env::var("MF_WEB_ACCEPTANCE").ok().as_deref() == Some("1");
     let state = Arc::new(WorkbenchState {
@@ -99,6 +114,9 @@ pub fn serve_workbench_full(
         on_project_attached,
         terminal_host,
     });
+    // entry.url 保新鲜:nonce TTL 有限,无人访问时文件里的 nonce 会过期
+    // (托盘读到的将是死入口)——后台按 TTL/3 节奏重签
+    spawn_entry_url_refresher(Arc::clone(&state));
     let router = Router::new()
         .route("/", get(index))
         .route("/auth/exchange", post(auth_exchange))
@@ -130,6 +148,10 @@ pub fn serve_workbench_full(
         .route("/api/v1/controller/takeover", post(controller_takeover))
         .route("/api/v1/projects", post(attach_project_route))
         .route("/api/v1/projects/{handle}", delete(detach_project_route))
+        .route(
+            "/api/v1/projects/{handle}/folders",
+            post(add_project_folder_route).delete(remove_project_folder_route),
+        )
         .route("/api/v1/fs/roots", get(fs_roots))
         .route("/api/v1/fs/dirs", get(fs_dirs))
         .route("/api/v1/events", get(events_ws))
@@ -155,12 +177,72 @@ pub fn serve_workbench_full(
                     .expect("workbench serve");
             });
         })?;
-    let url = if bound_port == 80 {
+    let url = entry_url_for(&nonce, bound_port);
+    publish_entry_url(&nonce, bound_port);
+    Ok(url)
+}
+
+/// 引导入口本地文件名:与 discovery.json 同目录(per-user 状态目录)。
+pub const ENTRY_URL_FILE_NAME: &str = mf_kernel::singleton::ENTRY_URL_FILE_NAME;
+
+/// 入口 URL(WEB_ENTRY 同构;端口 80 省略端口段)。
+fn entry_url_for(nonce: &str, port: u16) -> String {
+    if port == 80 {
         format!("http://127.0.0.1/#nonce={nonce}")
     } else {
-        format!("http://127.0.0.1:{bound_port}/#nonce={nonce}")
-    };
-    Ok(url)
+        format!("http://127.0.0.1:{port}/#nonce={nonce}")
+    }
+}
+
+/// 把入口 URL 原子写入状态目录(临时文件 + rename;失败仅报错返回,
+/// 不影响服务)。文件与 discovery.json 同目录、同受用户配置文件 ACL
+/// 保护;本地同用户进程(托盘/launcher)读取它直达工作台,不降低
+/// 现有信任边界(此类进程本就能读 Core 的 stdout 与状态库)。
+pub fn write_entry_url_to(dir: &std::path::Path, url: &str) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let target = dir.join(ENTRY_URL_FILE_NAME);
+    let staging = dir.join(format!("{ENTRY_URL_FILE_NAME}.new"));
+    std::fs::write(&staging, url.as_bytes())?;
+    match std::fs::rename(&staging, &target) {
+        Ok(()) => Ok(()),
+        // Windows 对已存在目标的 rename 可能失败:退化为先删后改名
+        // (读者最多短暂看不到文件,不会读到半行 URL)
+        Err(error) => {
+            let _ = std::fs::remove_file(&target);
+            std::fs::rename(&staging, &target).map_err(|_| error)
+        }
+    }
+}
+
+/// 发布当前有效入口到 per-user 状态目录(尽力而为)。
+fn publish_entry_url(nonce: &str, port: u16) {
+    let url = entry_url_for(nonce, port);
+    if let Err(error) = write_entry_url_to(&mf_kernel::singleton::platform_state_dir(), &url) {
+        eprintln!("mf-workbench: 写入入口文件 entry.url 失败(不影响服务):{error}");
+    }
+}
+
+/// entry.url 重签节奏:远小于 nonce TTL(保证任意时刻读取文件,其中
+/// nonce 的剩余寿命仍足够完成一次交换),又不至于过于频繁。
+fn entry_refresh_interval_secs(ttl_secs: u64) -> u64 {
+    (ttl_secs / 3).clamp(10, 60)
+}
+
+/// 后台保新鲜线程:无人访问时交换触发的重签不会发生,文件里的 nonce
+/// 会在 TTL 后过期(托盘读到的将是死入口)。重签不影响已发出的旧
+/// nonce(它们到自身 TTL 前仍可交换),只保证文件始终持有最新一个。
+fn spawn_entry_url_refresher(state: Arc<WorkbenchState>) {
+    std::thread::Builder::new()
+        .name("mf-entry-url-refresh".to_string())
+        .spawn(move || loop {
+            let ttl = state.auth.lock().bootstrap_nonce_ttl_secs();
+            std::thread::sleep(std::time::Duration::from_secs(entry_refresh_interval_secs(
+                ttl,
+            )));
+            let nonce = state.auth.lock().issue_nonce();
+            publish_entry_url(&nonce, state.port);
+        })
+        .ok();
 }
 
 fn respond(
@@ -415,6 +497,11 @@ async fn auth_exchange(
     let mut auth = state.auth.lock();
     match auth.exchange(&request.nonce, &source) {
         Ok(session) => {
+            // 交换成功即消耗了文件中的 nonce:先重签 entry.url(此时已
+            // 持有 auth 锁),再走 kernel 授予——即使后续 grant 失败,
+            // 本地引导文件也不会停留在已消耗的入口上。
+            let fresh_nonce = auth.issue_nonce();
+            publish_entry_url(&fresh_nonce, state.port);
             // 新 bootstrap 即 Controller:kernel lease 旋转使旧 web
             // controller 的 dispatch 立即失效(§6.4;与角色降级一致)。
             let epoch = match grant_web_controller(state.kernel.as_ref(), &session.client_id) {
@@ -510,6 +597,7 @@ async fn acceptance_new_nonce(
         return respond(StatusCode::NOT_FOUND, Vec::new(), Vec::new());
     }
     let nonce = state.auth.lock().issue_nonce();
+    publish_entry_url(&nonce, state.port);
     let body = serde_json::json!({ "nonce": nonce });
     respond(StatusCode::OK, Vec::new(), body.to_string().into_bytes())
 }
@@ -2193,18 +2281,31 @@ async fn attach_project_route(
             Some(Retry::Never),
         ));
     }
-    match state.kernel.attach_project(&root) {
+    // #multi-folder:路径若已是某项目的附加文件夹,幂等返回该项目本身
+    // (以主文件夹为库根挂载),不为附加文件夹另开新项目。
+    let effective_root = match state.kernel.resolve_project_folder(&root) {
+        Ok(Some(canonical_root)) => std::path::PathBuf::from(canonical_root),
+        Ok(None) => root.clone(),
+        Err(problem) => {
+            return problem_response(&Problem::new(
+                ProblemCode::ServiceUnavailable,
+                format!("项目路径解析失败:{problem}"),
+                Some(Retry::Never),
+            ))
+        }
+    };
+    match state.kernel.attach_project(&effective_root) {
         Ok(handle) => {
             // 执行面装配(#75):失败不回滚数据面挂载(快照可见),
-            // 错误进入响应供 UI 提示。
+            // 错误进入响应供 UI 提示。已装配项目重复挂载时装配钩幂等跳过。
             let execution_error = state
                 .on_project_attached
                 .as_ref()
-                .and_then(|hook| hook(&handle, &root).err());
+                .and_then(|hook| hook(&handle, &effective_root).err());
             let body = serde_json::json!({
                 "schema": "mf.project-attach.v1",
                 "project": handle,
-                "display_name": root
+                "display_name": effective_root
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or("Project"),
@@ -2252,6 +2353,128 @@ async fn detach_project_route(
     }
 }
 
+#[derive(serde::Deserialize)]
+struct ProjectFolderRequest {
+    path: String,
+}
+
+#[derive(serde::Deserialize)]
+struct ProjectFolderQuery {
+    path: String,
+}
+
+fn folder_wire(
+    folders: &[mf_kernel::project_registry::RegisteredFolder],
+) -> Vec<serde_json::Value> {
+    folders
+        .iter()
+        .map(|folder| {
+            serde_json::json!({
+                "path": folder.canonical_path,
+                "kind": match folder.kind {
+                    mf_kernel::project_registry::FolderKind::Primary => "primary",
+                    mf_kernel::project_registry::FolderKind::Additional => "additional",
+                },
+            })
+        })
+        .collect()
+}
+
+/// kernel 校验类错误 → problem(验证失败);其余按服务不可用。
+fn folder_problem(problem: mf_kernel::kernel::KernelProblem) -> Problem {
+    match problem {
+        mf_kernel::kernel::KernelProblem::ValidationFailed(detail) => {
+            Problem::new(ProblemCode::ValidationFailed, detail, Some(Retry::Never))
+        }
+        other => Problem::new(
+            ProblemCode::ServiceUnavailable,
+            format!("文件夹操作失败:{other}"),
+            Some(Retry::Never),
+        ),
+    }
+}
+
+/// `POST /api/v1/projects/{handle}/folders`:添加附加文件夹
+/// (#multi-folder;Controller-only)。同一项目重复添加幂等。
+async fn add_project_folder_route(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    axum::extract::Path(handle): axum::extract::Path<String>,
+    payload: Result<axum::Json<ProjectFolderRequest>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if let Err(problem) = authorize(&state, &headers, csrf.as_deref(), true) {
+        return problem_response(&problem).into_response();
+    }
+    let request = match payload {
+        Ok(axum::Json(request)) => request,
+        Err(rejection) => {
+            return problem_response(&Problem::new(
+                ProblemCode::InvalidEnvelope,
+                rejection.body_text(),
+                Some(Retry::Never),
+            ))
+            .into_response()
+        }
+    };
+    let path = std::path::PathBuf::from(request.path.trim_end_matches(['/', '\\']));
+    if !path.is_dir() {
+        return problem_response(&Problem::new(
+            ProblemCode::ValidationFailed,
+            format!("文件夹不存在或不是目录:{}", path.display()),
+            Some(Retry::Never),
+        ))
+        .into_response();
+    }
+    match state.kernel.add_project_folder(&handle, &path) {
+        Ok(folders) => {
+            let body = serde_json::json!({
+                "schema": "mf.project-folders.v1",
+                "project": handle,
+                "folders": folder_wire(&folders),
+            });
+            let mut headers = security(&state);
+            headers.push((header_name("content-type"), "application/json".into()));
+            respond(StatusCode::OK, headers, body.to_string().into_bytes()).into_response()
+        }
+        Err(problem) => problem_response(&folder_problem(problem)).into_response(),
+    }
+}
+
+/// `DELETE /api/v1/projects/{handle}/folders?path=…`:移除附加文件夹
+/// (主文件夹不可移除;Controller-only)。path 传注册表存储拼写。
+async fn remove_project_folder_route(
+    State(state): State<Arc<WorkbenchState>>,
+    headers: HeaderMap,
+    axum::extract::Path(handle): axum::extract::Path<String>,
+    axum::extract::Query(query): axum::extract::Query<ProjectFolderQuery>,
+) -> impl IntoResponse {
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    if let Err(problem) = authorize(&state, &headers, csrf.as_deref(), true) {
+        return problem_response(&problem).into_response();
+    }
+    let path = std::path::PathBuf::from(query.path.trim_end_matches(['/', '\\']));
+    match state.kernel.remove_project_folder(&handle, &path) {
+        Ok(folders) => {
+            let body = serde_json::json!({
+                "schema": "mf.project-folders.v1",
+                "project": handle,
+                "folders": folder_wire(&folders),
+            });
+            let mut headers = security(&state);
+            headers.push((header_name("content-type"), "application/json".into()));
+            respond(StatusCode::OK, headers, body.to_string().into_bytes()).into_response()
+        }
+        Err(problem) => problem_response(&folder_problem(problem)).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2274,6 +2497,30 @@ mod tests {
             Self {
                 lease: StdMutex::new((0, String::new(), String::new())),
             }
+        }
+    }
+
+    impl FakeKernel {
+        /// 目录存在性校验 + 空文件夹列表(路由契约测试只验证门控与
+        /// 参数路径;真实 add/remove 语义由 mf-kernel 契约测试覆盖)。
+        fn folders(
+            &self,
+            project_handle: &str,
+            path: &std::path::Path,
+            adding: bool,
+        ) -> Result<Vec<mf_kernel::project_registry::RegisteredFolder>, KernelProblem> {
+            if adding && !path.is_dir() {
+                return Err(KernelProblem::ValidationFailed(format!(
+                    "project_folder_not_a_directory:{}",
+                    path.display()
+                )));
+            }
+            if project_handle.is_empty() {
+                return Err(KernelProblem::ValidationFailed(
+                    "project_unknown:".to_string(),
+                ));
+            }
+            Ok(Vec::new())
         }
     }
 
@@ -2341,6 +2588,26 @@ mod tests {
         fn detach_project(&self, _project_handle: &str) -> Result<(), KernelProblem> {
             Ok(())
         }
+        fn add_project_folder(
+            &self,
+            project_handle: &str,
+            path: &std::path::Path,
+        ) -> Result<Vec<mf_kernel::project_registry::RegisteredFolder>, KernelProblem> {
+            self.folders(project_handle, path, true)
+        }
+        fn remove_project_folder(
+            &self,
+            project_handle: &str,
+            path: &std::path::Path,
+        ) -> Result<Vec<mf_kernel::project_registry::RegisteredFolder>, KernelProblem> {
+            self.folders(project_handle, path, false)
+        }
+        fn resolve_project_folder(
+            &self,
+            _path: &std::path::Path,
+        ) -> Result<Option<String>, KernelProblem> {
+            Ok(None)
+        }
     }
 
     fn test_state(kernel: Arc<dyn CoreKernel>) -> Arc<WorkbenchState> {
@@ -2361,6 +2628,48 @@ mod tests {
         let session = state.auth.lock().exchange(&nonce, "127.0.0.1:80").unwrap();
         grant_web_controller(state.kernel.as_ref(), &session.client_id).unwrap();
         session
+    }
+
+    #[test]
+    fn entry_url_format_matches_web_entry_line() {
+        assert_eq!(entry_url_for("abc", 80), "http://127.0.0.1/#nonce=abc");
+        assert_eq!(
+            entry_url_for("abc", 8080),
+            "http://127.0.0.1:8080/#nonce=abc"
+        );
+    }
+
+    #[test]
+    fn entry_refresh_interval_stays_well_below_nonce_ttl() {
+        // 默认 TTL 120s → 40s 重签(留足读取→打开→交换的时间窗)
+        assert_eq!(entry_refresh_interval_secs(120), 40);
+        // clamp 下限:TTL 30s(E2E 短 TTL)也至少 10s 节奏,且远小于 TTL
+        assert_eq!(entry_refresh_interval_secs(30), 10);
+        // clamp 上限:极长 TTL 也不会退化为分钟级以上的陈旧文件
+        assert_eq!(entry_refresh_interval_secs(600), 60);
+        assert_eq!(entry_refresh_interval_secs(u64::MAX), 60);
+    }
+
+    #[test]
+    fn entry_url_file_writes_and_replaces_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        write_entry_url_to(dir.path(), "http://127.0.0.1/#nonce=first").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(ENTRY_URL_FILE_NAME)).unwrap(),
+            "http://127.0.0.1/#nonce=first"
+        );
+        // 覆盖写(目标已存在,Windows rename 退化路径)且不残留临时文件
+        write_entry_url_to(dir.path(), "http://127.0.0.1/#nonce=second").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(ENTRY_URL_FILE_NAME)).unwrap(),
+            "http://127.0.0.1/#nonce=second"
+        );
+        assert!(
+            !dir.path()
+                .join(format!("{ENTRY_URL_FILE_NAME}.new"))
+                .exists(),
+            "原子替换不应残留临时文件"
+        );
     }
 
     fn auth_headers(session: &WebSession, csrf: Option<&str>) -> HeaderMap {
@@ -2507,6 +2816,60 @@ mod tests {
         let handle = state.kernel.attach_project(tmp.path()).unwrap();
         assert!(handle.starts_with("proj_"));
         state.kernel.detach_project(&handle).unwrap();
+    }
+
+    #[test]
+    fn project_folder_routes_require_controller_and_validate_paths() {
+        let state = test_state(Arc::new(FakeKernel::new()));
+        let controller = exchange_with_grant(&state);
+        let observer_session = {
+            // 第二次 bootstrap 使 controller 降 Observer
+            let nonce = state.auth.lock().issue_nonce();
+            let _new = state.auth.lock().exchange(&nonce, "127.0.0.1:80").unwrap();
+            controller
+        };
+        // Observer 增/删文件夹 → controller_required(路由同款门控)
+        let problem = authorize(
+            &state,
+            &auth_headers(&observer_session, Some(&observer_session.csrf_token)),
+            Some(&observer_session.csrf_token),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(problem.code, ProblemCode::ControllerRequired);
+
+        // Controller + 存在目录 → kernel 调用成功(真实增删语义由
+        // mf-kernel project_folders 契约覆盖;此处验证路由映射形状)
+        let tmp = tempfile::tempdir().unwrap();
+        let folders = state
+            .kernel
+            .add_project_folder("proj_x", tmp.path())
+            .unwrap();
+        assert!(folders.is_empty(), "fake kernel 返回空列表");
+
+        // kernel 校验类错误 → ValidationFailed problem(路由 folder_problem 映射)
+        let problem = folder_problem(
+            state
+                .kernel
+                .add_project_folder("proj_x", std::path::Path::new("Z:/definitely/not/here"))
+                .unwrap_err(),
+        );
+        assert_eq!(problem.code, ProblemCode::ValidationFailed);
+        assert!(problem.message.contains("project_folder_not_a_directory"));
+        let problem = folder_problem(
+            state
+                .kernel
+                .remove_project_folder("", tmp.path())
+                .unwrap_err(),
+        );
+        assert_eq!(problem.code, ProblemCode::ValidationFailed);
+        assert!(problem.message.contains("project_unknown"));
+
+        // 路径解析(fake 未登记 → None:挂载按新项目走)
+        assert_eq!(
+            state.kernel.resolve_project_folder(tmp.path()).unwrap(),
+            None
+        );
     }
 
     #[test]

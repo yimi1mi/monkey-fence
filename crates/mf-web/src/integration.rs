@@ -231,6 +231,38 @@ mod tests {
                 "no kernel".into(),
             ))
         }
+        fn add_project_folder(
+            &self,
+            _project_handle: &str,
+            _path: &std::path::Path,
+        ) -> Result<
+            Vec<mf_kernel::project_registry::RegisteredFolder>,
+            mf_kernel::kernel::KernelProblem,
+        > {
+            Err(mf_kernel::kernel::KernelProblem::ServiceUnavailable(
+                "no kernel".into(),
+            ))
+        }
+        fn remove_project_folder(
+            &self,
+            _project_handle: &str,
+            _path: &std::path::Path,
+        ) -> Result<
+            Vec<mf_kernel::project_registry::RegisteredFolder>,
+            mf_kernel::kernel::KernelProblem,
+        > {
+            Err(mf_kernel::kernel::KernelProblem::ServiceUnavailable(
+                "no kernel".into(),
+            ))
+        }
+        fn resolve_project_folder(
+            &self,
+            _path: &std::path::Path,
+        ) -> Result<Option<String>, mf_kernel::kernel::KernelProblem> {
+            Err(mf_kernel::kernel::KernelProblem::ServiceUnavailable(
+                "no kernel".into(),
+            ))
+        }
     }
 
     #[test]

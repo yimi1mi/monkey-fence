@@ -6,7 +6,7 @@
 //!   同一根的第二个实例仍被仲裁。
 //! - 仅重定向 MF_SERVICE_DB 不构成隔离(仍共享用户级 owner lock)。
 
-use crate::singleton::{
+use mf_kernel::singleton::{
     core_mutex_name_for, instance_namespace_root, CoreOwnerLock, OwnerLockSetup,
 };
 use tempfile::TempDir;
@@ -55,23 +55,35 @@ fn home_guard() -> (EnvGuard, TempDir) {
     (guard, tmp)
 }
 
+/// 环境变量类测试的串行锁:本模块用例都改进程级环境
+/// (MF_CORE_INSTANCE_DIR/USERPROFILE),cargo 默认并行会互相污染;
+/// 套件其余用例均为封闭 in_dir 装配,不受影响。
+static ENV_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serial_env() -> std::sync::MutexGuard<'static, ()> {
+    ENV_TESTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 fn default_setup_keeps_legacy_singleton_contract() {
     // 用户日常 Core 正持有默认互斥——默认契约断言只验证名称/路径派生
     // (真实默认仲裁行为由隔离测试的同根仲裁用例覆盖:同一命名空间的
     // 第二个装配必然 MutexHeld)。
+    let _serial = serial_env();
     let _ns = EnvGuard::set("MF_CORE_INSTANCE_DIR", None);
     let (_home, home_tmp) = home_guard();
 
     // 互斥名与旧契约完全一致(默认不派生后缀)
     assert_eq!(
         core_mutex_name_for(&home_tmp.path().join("a-service.db")),
-        crate::singleton::CORE_MUTEX_NAME
+        mf_kernel::singleton::CORE_MUTEX_NAME
     );
     // 任意路径(含 MF_SERVICE_DB 重定向)都不改变默认互斥名
     assert_eq!(
         core_mutex_name_for(std::path::Path::new(r"Z:\elsewhere\svc.db")),
-        crate::singleton::CORE_MUTEX_NAME
+        mf_kernel::singleton::CORE_MUTEX_NAME
     );
     // owner/discovery 仍落用户级(HOME 重定向后的 .monkeyfence)
     let setup = setup_for(&home_tmp.path().join("a-service.db"), "iso-a");
@@ -86,6 +98,7 @@ fn default_setup_keeps_legacy_singleton_contract() {
 
 #[test]
 fn isolated_setups_get_full_namespace_and_coexist() {
+    let _serial = serial_env();
     let root_a = TempDir::new().unwrap();
     let root_b = TempDir::new().unwrap();
     let (_home, _home_tmp) = home_guard();
@@ -96,7 +109,7 @@ fn isolated_setups_get_full_namespace_and_coexist() {
     );
     assert_eq!(instance_namespace_root().as_deref(), Some(root_a.path()));
     let name_a = core_mutex_name_for(&root_a.path().join("service.db"));
-    assert_ne!(name_a, crate::singleton::CORE_MUTEX_NAME);
+    assert_ne!(name_a, mf_kernel::singleton::CORE_MUTEX_NAME);
 
     let owner_a = CoreOwnerLock::acquire(setup_for(&root_a.path().join("service.db"), "iso-a"))
         .expect("isolated instance A acquires");
@@ -128,6 +141,7 @@ fn service_db_redirect_alone_keeps_shared_owner_paths() {
     // 仅重定向 service DB(不设 MF_CORE_INSTANCE_DIR):装配关系仍是
     // 共享用户级 owner/discovery(即不构成隔离)。同样因日常 Core 持有
     // 默认互斥,此处断言装配路径关系而非真实 acquire。
+    let _serial = serial_env();
     let _ns = EnvGuard::set("MF_CORE_INSTANCE_DIR", None);
     let (_home, home_tmp) = home_guard();
     let one = setup_for(&home_tmp.path().join("one.db"), "solo-a");
@@ -139,5 +153,33 @@ fn service_db_redirect_alone_keeps_shared_owner_paths() {
     assert_eq!(
         one.paths.discovery_path, two.paths.discovery_path,
         "不同 service DB 的 discovery 路径必须共享(默认装配)"
+    );
+}
+
+#[test]
+fn state_dir_holds_entry_url_alongside_discovery() {
+    // 默认装配:状态目录 = discovery.json 所在目录(entry.url 与之同目录,
+    // 同受用户文件 ACL 保护)
+    let _serial = serial_env();
+    let _ns = EnvGuard::set("MF_CORE_INSTANCE_DIR", None);
+    let tmp = TempDir::new().unwrap();
+    let setup = setup_for(&tmp.path().join("state-dir-service.db"), "state-dir");
+    let state = mf_kernel::singleton::platform_state_dir();
+    assert_eq!(
+        Some(state.as_path()),
+        setup.paths.discovery_path.parent(),
+        "默认状态目录必须是 discovery.json 的父目录"
+    );
+
+    // 隔离装配:状态目录 = 隔离根目录(entry.url 不落入用户级目录)
+    let root = TempDir::new().unwrap();
+    let _iso = EnvGuard::set(
+        "MF_CORE_INSTANCE_DIR",
+        Some(root.path().to_string_lossy().to_string()),
+    );
+    assert_eq!(
+        mf_kernel::singleton::platform_state_dir(),
+        root.path(),
+        "隔离实例的状态目录必须是其根目录"
     );
 }

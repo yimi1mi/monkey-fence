@@ -703,6 +703,26 @@ pub trait CoreKernel: Send + Sync {
     fn attach_project(&self, root: &std::path::Path) -> Result<String, KernelProblem>;
     /// 卸载项目(handle 为 opaque 形态);未注册/关闭中 → not found。
     fn detach_project(&self, project_handle: &str) -> Result<(), KernelProblem>;
+    /// 给已登记项目添加附加文件夹(#multi-folder;一主多附,文件夹全局
+    /// 唯一归属)。同一项目重复添加幂等;跨项目占用报错。
+    fn add_project_folder(
+        &self,
+        project_handle: &str,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::project_registry::RegisteredFolder>, KernelProblem>;
+    /// 移除附加文件夹;主文件夹不可移除(项目库/执行语义锚点)。
+    fn remove_project_folder(
+        &self,
+        project_handle: &str,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::project_registry::RegisteredFolder>, KernelProblem>;
+    /// 路径 → 所属已登记项目的主文件夹(canonical_root)。主/附加
+    /// 文件夹都命中;`None` = 该路径未被任何项目登记(挂载入口据此
+    /// 保持幂等:附加文件夹路径返回既有项目而非新建)。
+    fn resolve_project_folder(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Option<String>, KernelProblem>;
 }
 
 // ---------------------------------------------------------------------------
@@ -2591,7 +2611,26 @@ impl InProcessCoreKernel {
                             .unwrap_or("Project")
                             .to_owned()
                     });
-                    (project.project_handle, (name, project.display_path))
+                    let folders = project
+                        .folders
+                        .iter()
+                        .map(|folder| crate::projection::WorkspaceFolderSnapshot {
+                            path: folder.canonical_path.clone(),
+                            kind: match folder.kind {
+                                crate::project_registry::FolderKind::Primary => "primary",
+                                crate::project_registry::FolderKind::Additional => "additional",
+                            }
+                            .to_string(),
+                        })
+                        .collect::<Vec<_>>();
+                    (
+                        project.project_handle,
+                        crate::workspace_projection::ProjectDisplayInfo {
+                            display_name: name,
+                            display_root: project.display_path,
+                            folders,
+                        },
+                    )
                 })
                 .collect::<HashMap<_, _>>();
             let mut projects = self
@@ -2603,10 +2642,13 @@ impl InProcessCoreKernel {
                     Ok((
                         ProjectStoreHandle::parse(handle.clone())
                             .map_err(|error| KernelProblem::Internal(error.to_string()))?,
-                        display_names
-                            .get(handle)
-                            .cloned()
-                            .unwrap_or_else(|| ("Project".into(), String::new())),
+                        display_names.get(handle).cloned().unwrap_or_else(|| {
+                            crate::workspace_projection::ProjectDisplayInfo {
+                                display_name: "Project".into(),
+                                display_root: String::new(),
+                                folders: Vec::new(),
+                            }
+                        }),
                         registration.store.clone(),
                     ))
                 })
@@ -2862,6 +2904,36 @@ impl CoreKernel for InProcessCoreKernel {
         let handle = crate::handles::ProjectStoreHandle::parse(project_handle)
             .map_err(|error| KernelProblem::ResourceNotFound)?;
         self.unregister_project_store(&handle)
+    }
+
+    fn add_project_folder(
+        &self,
+        project_handle: &str,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::project_registry::RegisteredFolder>, KernelProblem> {
+        self.service
+            .add_project_folder(project_handle, path)
+            .map_err(|error| KernelProblem::ValidationFailed(format!("{error:#}")))
+    }
+
+    fn remove_project_folder(
+        &self,
+        project_handle: &str,
+        path: &std::path::Path,
+    ) -> Result<Vec<crate::project_registry::RegisteredFolder>, KernelProblem> {
+        self.service
+            .remove_project_folder(project_handle, path)
+            .map_err(|error| KernelProblem::ValidationFailed(format!("{error:#}")))
+    }
+
+    fn resolve_project_folder(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<Option<String>, KernelProblem> {
+        self.service
+            .find_project_by_path(path)
+            .map(|found| found.map(|project| project.canonical_root))
+            .map_err(|error| KernelProblem::Internal(format!("{error:#}")))
     }
 }
 

@@ -12,7 +12,7 @@ use crate::service_schema::{
     service_schema_ready, service_schema_v1_ready, service_schema_v2_ready,
     service_schema_v3_ready, table_names_of, validate_singletons, SERVICE_SCHEMA_V1,
     SERVICE_SCHEMA_V2_DELTA, SERVICE_SCHEMA_V3_DELTA, SERVICE_SCHEMA_V4_DELTA,
-    SERVICE_SCHEMA_VERSION,
+    SERVICE_SCHEMA_V6_DELTA, SERVICE_SCHEMA_VERSION,
 };
 use anyhow::{Context as _, Result};
 use hmac::{Hmac, Mac};
@@ -29,7 +29,7 @@ use zeroize::Zeroizing;
 /// session.json → Project Registry 导入的幂等 marker 名。
 pub const SESSION_IMPORT_MARKER: &str = "session_json.project_registry.v1";
 
-/// 已登记 Project 的读视图(`project_registry` 行)。
+/// 已登记 Project 的读视图(`project_registry` 行 + 所属文件夹)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegisteredProject {
     pub project_handle: String,
@@ -40,6 +40,41 @@ pub struct RegisteredProject {
     pub display_name: Option<String>,
     pub registered_at: String,
     pub status: ProjectStatus,
+    /// 项目包含的文件夹(primary 恒在首位;#multi-folder)。
+    pub folders: Vec<RegisteredFolder>,
+}
+
+/// 项目包含的一个文件夹。`primary`(= canonical_root)决定项目库
+/// 落点(`<primary>/.mf-agent/`)与 Agent 执行 cwd;`additional` 仅用于
+/// 浏览/版控/组织,不改变执行语义(ADR 0007)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredFolder {
+    pub canonical_path: String,
+    pub kind: FolderKind,
+    pub added_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderKind {
+    Primary,
+    Additional,
+}
+
+impl FolderKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Additional => "additional",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "primary" => Ok(Self::Primary),
+            "additional" => Ok(Self::Additional),
+            other => anyhow::bail!("project_folder_kind_invalid:{other}"),
+        }
+    }
 }
 
 /// §3.4:`status(registered|missing)`;`missing` 保留供用户清理,不删目录。
@@ -256,6 +291,10 @@ impl ServiceStore {
                     }
                     if from < 5 && to >= 5 {
                         tx.execute_batch(crate::service_schema::MIGRATION_V5_DISPLAY_NAME)?;
+                    }
+                    if from < 6 && to >= 6 {
+                        // v6:project_folders 表 + 既有项目 primary 行 backfill
+                        tx.execute_batch(SERVICE_SCHEMA_V6_DELTA)?;
                     }
                     tx.execute(
                         "UPDATE meta SET schema_version=?1 WHERE id=1",
@@ -516,19 +555,11 @@ impl ServiceStore {
              FROM project_registry ORDER BY canonical_root",
         )?;
         let rows = stmt
-            .query_map([], |row| {
-                Ok(RegisteredProject {
-                    project_handle: row.get(0)?,
-                    public_id: row.get(1)?,
-                    canonical_root: row.get(2)?,
-                    display_path: row.get(3)?,
-                    display_name: row.get(4)?,
-                    registered_at: row.get(5)?,
-                    status: parse_status(&row.get::<_, String>(6)?)?,
-                })
-            })?
+            .query_map([], |row| project_row(row))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        Ok(rows)
+        rows.into_iter()
+            .map(|project| attach_folders(&conn, project))
+            .collect()
     }
 
     /// 设置项目自定义名字(#custom-name;空串 = 清除恢复路径目录名)。
@@ -572,25 +603,124 @@ impl ServiceStore {
                 now,
             ],
         )?;
+        // 主文件夹行随注册落位(v6;OR IGNORE 与迁移 backfill 幂等一致)
+        tx.execute(
+            "INSERT OR IGNORE INTO project_folders
+                 (project_handle, canonical_path, kind, added_at)
+             SELECT project_handle, canonical_root, 'primary', registered_at
+             FROM project_registry WHERE canonical_root=?1",
+            [&canonical_root],
+        )?;
         let project = tx.query_row(
             "SELECT project_handle, public_id, canonical_root, display_path,
                     display_name, registered_at, status
              FROM project_registry WHERE canonical_root=?1",
             [&canonical_root],
-            |row| {
-                Ok(RegisteredProject {
-                    project_handle: row.get(0)?,
-                    public_id: row.get(1)?,
-                    canonical_root: row.get(2)?,
-                    display_path: row.get(3)?,
-                    display_name: row.get(4)?,
-                    registered_at: row.get(5)?,
-                    status: parse_status(&row.get::<_, String>(6)?)?,
-                })
-            },
+            project_row,
         )?;
+        let project = attach_folders(&tx, project)?;
         tx.commit()?;
         Ok(project)
+    }
+
+    /// 按文件夹路径反查所属项目(primary 与 additional 都命中)。
+    /// `None` = 该路径未被任何项目登记。匹配 canonical 拼写或输入原文
+    /// (UI 回传存储值;目录已删除时不再依赖文件系统)。
+    pub fn find_project_by_path(&self, path: &Path) -> Result<Option<RegisteredProject>> {
+        let conn = self.conn.lock();
+        let handle = find_folder_owner(&conn, path)?;
+        match handle {
+            None => Ok(None),
+            Some(handle) => {
+                let project = conn.query_row(
+                    "SELECT project_handle, public_id, canonical_root, display_path,
+                            display_name, registered_at, status
+                     FROM project_registry WHERE project_handle=?1",
+                    [&handle],
+                    project_row,
+                )?;
+                Ok(Some(attach_folders(&conn, project)?))
+            }
+        }
+    }
+
+    /// 给项目添加附加文件夹(一主多附;#multi-folder)。同一文件夹重复
+    /// 添加到同一项目幂等返回;已被其它项目占用则报错并指明占用者。
+    pub fn add_project_folder(
+        &self,
+        project_handle: &str,
+        path: &Path,
+    ) -> Result<Vec<RegisteredFolder>> {
+        anyhow::ensure!(
+            path.is_dir(),
+            "project_folder_not_a_directory:{}",
+            path.display()
+        );
+        let (canonical, warning) = canonical_root_of(path);
+        if let Some(warning) = warning {
+            anyhow::bail!("project_folder_invalid:{warning}");
+        }
+        let canonical_path = canonical.to_string_lossy().into_owned();
+        let now = chrono::Utc::now().to_rfc3339();
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let known: Option<String> = tx
+            .query_row(
+                "SELECT project_handle FROM project_registry WHERE project_handle=?1",
+                [project_handle],
+                |row| row.get(0),
+            )
+            .optional()?;
+        anyhow::ensure!(known.is_some(), "project_unknown:{project_handle}");
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT project_handle FROM project_folders WHERE canonical_path=?1",
+                [&canonical_path],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match owner.as_deref() {
+            Some(owner) if owner != project_handle => {
+                anyhow::bail!("project_folder_conflict:{canonical_path} 已属于项目 {owner}")
+            }
+            _ => {}
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO project_folders
+                 (project_handle, canonical_path, kind, added_at)
+             VALUES (?1, ?2, 'additional', ?3)",
+            params![project_handle, canonical_path, now],
+        )?;
+        let folders = folders_of(&tx, project_handle)?;
+        tx.commit()?;
+        Ok(folders)
+    }
+
+    /// 移除附加文件夹。主文件夹不可移除(项目库/执行语义锚点)。
+    /// 匹配 canonical 拼写或输入原文(UI 回传存储值;目录已删除时
+    /// 不依赖文件系统)。
+    pub fn remove_project_folder(
+        &self,
+        project_handle: &str,
+        path: &Path,
+    ) -> Result<Vec<RegisteredFolder>> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let matched = match_folder_of(&tx, project_handle, path)?;
+        let Some((canonical_path, kind)) = matched else {
+            anyhow::bail!("project_folder_unknown:{}", path.display());
+        };
+        if kind == "primary" {
+            anyhow::bail!("project_folder_primary_immutable:{canonical_path}");
+        }
+        tx.execute(
+            "DELETE FROM project_folders
+             WHERE project_handle=?1 AND canonical_path=?2 AND kind='additional'",
+            params![project_handle, canonical_path],
+        )?;
+        let folders = folders_of(&tx, project_handle)?;
+        tx.commit()?;
+        Ok(folders)
     }
 
     /// session.json → `project_registry` 幂等导入(§3.5)。
@@ -720,6 +850,15 @@ impl ServiceStore {
                 )
                 .context("写入 project_registry 失败")?;
         }
+        // session 导入的项目同样补齐 primary 文件夹行(v6 幂等 backfill)
+        tx.execute(
+            "INSERT OR IGNORE INTO project_folders
+                 (project_handle, canonical_path, kind, added_at)
+             SELECT project_handle, canonical_root, 'primary', registered_at
+             FROM project_registry",
+            [],
+        )
+        .context("写入 project_folders 失败")?;
         let payload = serde_json::json!({
             "source": session_json
                 .file_name()
@@ -788,6 +927,104 @@ fn parse_status(raw: &str) -> std::result::Result<ProjectStatus, rusqlite::Error
             ))),
         )),
     }
+}
+
+/// `project_registry` 行 → `RegisteredProject`(不含 folders;调用方经
+/// [`attach_folders`] 补齐,便于在事务/连接两种上下文复用)。
+fn project_row(row: &rusqlite::Row) -> std::result::Result<RegisteredProject, rusqlite::Error> {
+    Ok(RegisteredProject {
+        project_handle: row.get(0)?,
+        public_id: row.get(1)?,
+        canonical_root: row.get(2)?,
+        display_path: row.get(3)?,
+        display_name: row.get(4)?,
+        registered_at: row.get(5)?,
+        status: parse_status(&row.get::<_, String>(6)?)?,
+        folders: Vec::new(),
+    })
+}
+
+/// 为项目读视图补齐文件夹列表(primary 恒在首位)。
+fn attach_folders(conn: &Connection, mut project: RegisteredProject) -> Result<RegisteredProject> {
+    project.folders = folders_of(conn, &project.project_handle)?;
+    Ok(project)
+}
+
+fn folders_of(conn: &Connection, project_handle: &str) -> Result<Vec<RegisteredFolder>> {
+    let mut stmt = conn.prepare(
+        "SELECT canonical_path, kind, added_at FROM project_folders
+         WHERE project_handle=?1
+         ORDER BY kind DESC, added_at, canonical_path",
+    )?;
+    let folders = stmt
+        .query_map([project_handle], |row| {
+            Ok(RegisteredFolder {
+                canonical_path: row.get(0)?,
+                kind: FolderKind::parse(&row.get::<_, String>(1)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::other(error.to_string())),
+                    )
+                })?,
+                added_at: row.get(2)?,
+            })
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(folders)
+}
+
+/// 文件夹路径解析候选:canonicalize 结果(去 `\\?\`;失败词法回退)与
+/// 输入原文。注册表以 canonical 拼写为权威,但 UI 回传的是存储值
+/// 原文——两个候选都匹配,目录已删除时同样可用。
+fn folder_path_candidates(path: &Path) -> Vec<String> {
+    let (canonical, _warning) = canonical_root_of(path);
+    let canonical = canonical.to_string_lossy().into_owned();
+    let raw = path.to_string_lossy().into_owned();
+    if canonical == raw {
+        vec![raw]
+    } else {
+        vec![canonical, raw]
+    }
+}
+
+/// 按候选路径查文件夹所属项目 handle(全局唯一归属)。
+fn find_folder_owner(conn: &Connection, path: &Path) -> Result<Option<String>> {
+    for candidate in folder_path_candidates(path) {
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT project_handle FROM project_folders WHERE canonical_path=?1",
+                [&candidate],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if owner.is_some() {
+            return Ok(owner);
+        }
+    }
+    Ok(None)
+}
+
+/// 按候选路径在指定项目内查文件夹行,返回匹配到的存储拼写与 kind。
+fn match_folder_of(
+    conn: &Connection,
+    project_handle: &str,
+    path: &Path,
+) -> Result<Option<(String, String)>> {
+    for candidate in folder_path_candidates(path) {
+        let matched: Option<(String, String)> = conn
+            .query_row(
+                "SELECT canonical_path, kind FROM project_folders
+                 WHERE project_handle=?1 AND canonical_path=?2",
+                params![project_handle, candidate],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if matched.is_some() {
+            return Ok(matched);
+        }
+    }
+    Ok(None)
 }
 
 struct CapabilityIdentity {

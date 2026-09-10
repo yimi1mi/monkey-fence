@@ -80,6 +80,22 @@ pub fn core_mutex_name_for(service_path: &std::path::Path) -> String {
 pub const CORE_LOCK_FILE_NAME: &str = "core.lock";
 /// discovery 文件名(平台 per-user 目录下)。
 pub const DISCOVERY_FILE_NAME: &str = "discovery.json";
+/// 引导入口文件名(entry.url:内容始终是未消耗的一次性入口 URL,
+/// Core 启动与每次成功 /auth/exchange 后重签;ADR 0005)。
+pub const ENTRY_URL_FILE_NAME: &str = "entry.url";
+
+/// Core 本地状态目录:默认生产实例为 discovery.json 所在 per-user 目录;
+/// 显式隔离实例(MF_CORE_INSTANCE_DIR)为其根目录。entry.url 等本地
+/// 引导文件与 discovery 同目录、同受用户配置文件 ACL 保护。
+pub fn platform_state_dir() -> PathBuf {
+    match instance_namespace_root() {
+        Some(root) => root,
+        None => platform_discovery_path()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(".")),
+    }
+}
 /// Unix 平台的互斥文件名(flock;与 lock 记录文件分离)。
 pub const CORE_FLOCK_FILE_NAME: &str = "core.flock";
 /// 启动竞争的 acquire 超时(败者快速失败向胜者转发 open 意图,§11.1;

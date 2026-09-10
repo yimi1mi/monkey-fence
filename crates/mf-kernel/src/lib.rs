@@ -15,6 +15,12 @@
 //! resume/gap、独立 client queue、epoch rotate/recovery 与 A1/A9 契约。
 //! standalone Core bin、WebGateway 与 attach_terminal 属后续 ticket。
 
+// 双编译上下文兼容:`tests/contract/` 契约文件同时作为本 lib 的
+// #[cfg(test)] 单元模块(#[path] include)与聚合集成测试 crate 的模块
+// 编译——后者中 `crate::` 不是本 crate。别名让两种路径(`crate::`/
+// `mf_kernel::`)在两个上下文都成立。
+extern crate self as mf_kernel;
+
 pub mod app_runtime;
 pub mod command;
 pub mod core_lifecycle;

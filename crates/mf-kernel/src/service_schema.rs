@@ -17,7 +17,7 @@ use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
 /// service 库 schema 版本(新库新版本链,从 v1 起)。
-pub const SERVICE_SCHEMA_VERSION: i64 = 5;
+pub const SERVICE_SCHEMA_VERSION: i64 = 6;
 
 /// T5a(Issue #35)bundle 兼容性 DTO:当前 Core 代码支持的 schema
 /// 上限集合(bundle manager 的对照面)。schema 常量前滚时同步更新。
@@ -233,6 +233,25 @@ CREATE INDEX IF NOT EXISTS idx_run_capability_agent_run
     ON run_capability(agent_run_handle);
 ";
 
+/// v6:项目多文件夹(#multi-folder)。`project_folders` 是权威文件夹表
+/// ——每项目恰好一行 `primary`(= project_registry.canonical_root,
+/// v6 迁移从既有行 backfill)与任意多行 `additional`;`canonical_path`
+/// 全局 UNIQUE 保证一个文件夹至多属于一个项目。
+/// backfill 的 INSERT 与 DDL 同批:全新库 registry 为空,升级库补齐
+/// 既有项目的 primary 行(OR IGNORE 幂等)。
+pub const SERVICE_SCHEMA_V6_DELTA: &str = "
+CREATE TABLE IF NOT EXISTS project_folders (
+    project_handle TEXT NOT NULL
+        REFERENCES project_registry(project_handle),
+    canonical_path TEXT NOT NULL UNIQUE,
+    kind TEXT NOT NULL CHECK(kind IN ('primary', 'additional')),
+    added_at TEXT NOT NULL,
+    PRIMARY KEY(project_handle, canonical_path)
+);
+INSERT OR IGNORE INTO project_folders (project_handle, canonical_path, kind, added_at)
+SELECT project_handle, canonical_root, 'primary', registered_at FROM project_registry;
+";
+
 /// 与 DDL 配套的 singleton 种子行(初始化事务内与 DDL 同事务执行)。
 /// `meta.instance_id` 是该 service 库的持久实例身份(建库时生成一次,
 /// 重开不变);`root_state` 建库即 `mode=off`(§3.4:Core 启动强制 off)。
@@ -285,6 +304,9 @@ fn service_schema_version_ready(conn: &Connection, version: i64) -> Result<bool>
     }
     if version >= 5 {
         expected.execute_batch(MIGRATION_V5_DISPLAY_NAME)?;
+    }
+    if version >= 6 {
+        expected.execute_batch(SERVICE_SCHEMA_V6_DELTA)?;
     }
     Ok(schema_fingerprint(conn)? == schema_fingerprint(&expected)?)
 }

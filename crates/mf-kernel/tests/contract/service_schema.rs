@@ -40,6 +40,7 @@ fn fresh_service_db_has_exactly_spec_tables() {
         "migration_marker",
         "operation",
         "operation_step",
+        "project_folders",
         "project_registry",
         "root_state",
         "run_capability",
@@ -293,8 +294,18 @@ fn service_v3_upgrades_to_v4_preserving_existing_rows() {
     }
     let backup_dir = mf_agent::migration::backup_dir_for(&db);
     drop(ServiceStore::open(&db).unwrap());
-    assert_eq!(user_version_of(&db), 5);
+    assert_eq!(user_version_of(&db), SERVICE_SCHEMA_VERSION);
     assert_eq!(counts_of(&db, "run_capability"), 0);
+    // v6 backfill:既有项目的 primary 文件夹行自动补齐
+    assert_eq!(counts_of(&db, "project_folders"), 1);
+    let folder: (String, String) = read_only(&db)
+        .query_row(
+            "SELECT canonical_path, kind FROM project_folders",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(folder, ("/keep".to_string(), "primary".to_string()));
     let project: String = read_only(&db)
         .query_row("SELECT project_handle FROM project_registry", [], |row| {
             row.get(0)
