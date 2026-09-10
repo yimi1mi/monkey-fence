@@ -100,10 +100,8 @@ export function CodeBrowserModal({
   return (
     <div
       className="scrim"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-    >
+      // 弹窗只经显式关闭退出(误触遮罩不丢失浏览位置)
+      >
       <div className="modal folder-modal" role="dialog" aria-modal="true" aria-label="代码浏览">
         <h3>
           <span className="mark">▤</span>代码浏览 · {title}
@@ -190,10 +188,8 @@ export function VcsPanel({
   return (
     <div
       className="scrim"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-    >
+      // 弹窗只经显式关闭退出(误触遮罩不丢失浏览位置)
+      >
       <div className="modal folder-modal" role="dialog" aria-modal="true" aria-label="版控状态">
         <h3>
           <span className="mark">⑂</span>版控 · {active}

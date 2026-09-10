@@ -363,9 +363,7 @@ export function NodeFormModal({
   return (
     <div
       className="scrim"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onSettle(null);
-      }}
+      // 表单只经显式取消/关闭退出(误触遮罩不丢失输入)
     >
       <div className="modal node-form-modal" role="dialog" aria-modal="true" aria-label={spec.title}>
         <h3>{spec.title}</h3>

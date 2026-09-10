@@ -68,7 +68,8 @@ export function RunGraphEditor({ detail, client, projectHandle, agentOptions, on
     })));
     setError(null); return true;
   };
-  return <div className="scrim" onClick={(event) => { if (event.target === event.currentTarget && !busy) onClose(); }}>
+  // 编辑器只经显式「关闭编辑器」退出(误触遮罩不丢失图编辑;busy 保护由按钮承担)
+return <div className="scrim">
     <div className="modal run-graph-editor" role="dialog" aria-modal="true" aria-label="编辑运行图">
       <h3>编辑运行图</h3>
       <p className="hint">仅影响本次运行。已启动节点保留冻结配置；应用后仍暂停，确认新图后再恢复。</p>

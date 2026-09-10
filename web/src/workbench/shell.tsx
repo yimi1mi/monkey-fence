@@ -2152,10 +2152,8 @@ function CreateWorkflowModal({
   return (
     <div
       className="scrim"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-    >
+      // 弹窗只经显式取消/关闭退出(误触遮罩不丢失输入)
+      >
       <div className="modal" role="dialog" aria-modal="true" aria-label="新建工作流">
         <h3>
           <span className="mark">◤</span>新建工作流
