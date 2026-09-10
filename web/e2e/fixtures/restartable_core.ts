@@ -21,6 +21,10 @@ export class RestartableCore {
       env: { ...process.env, MF_WEB_DIST: dist, MF_WEB_PORT: "0", MF_WEB_ACCEPTANCE: "1",
         MF_CORE_INSTANCE_DIR: this.dataDir, MF_SERVICE_DB: join(this.dataDir, "service.db"),
         MF_CATALOG_DB: join(this.dataDir, "catalog.db"), MF_CATALOG_V2_DB: join(this.dataDir, "catalog-v2.db"),
+        // 短 nonce TTL:把 entry.url 保新鲜周期压缩到 10s 级,用例无需真实等待分钟
+        MF_WEB_NONCE_TTL_SECS: "30",
+        // 串行套件多次 openWorkbench 交换(>10/min)会被速率限制拒绝
+        MF_WEB_EXCHANGE_RATE_PER_MIN: "60",
         TEMP: this.dataDir, TMP: this.dataDir } });
     this.proc = proc;
     let output = "";

@@ -288,6 +288,47 @@ export class WorkbenchClient {
     );
   }
 
+  /** 添加附加文件夹(#multi-folder;同一项目重复添加幂等;Controller-only)。 */
+  async addProjectFolder(
+    projectHandle: string,
+    path: string,
+  ): Promise<Array<{ path: string; kind: string }>> {
+    const response = await this.write(() =>
+      fetch(`/api/v1/projects/${encodeURIComponent(projectHandle)}/folders`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": this.context.csrfToken,
+          "X-Client-Id": this.context.clientId,
+        },
+        body: JSON.stringify({ path }),
+      }),
+    );
+    const body = (await response.json()) as { folders?: Array<{ path: string; kind: string }> };
+    return body.folders ?? [];
+  }
+
+  /** 移除附加文件夹(主文件夹不可移除;Controller-only)。 */
+  async removeProjectFolder(
+    projectHandle: string,
+    path: string,
+  ): Promise<Array<{ path: string; kind: string }>> {
+    const response = await this.write(() =>
+      fetch(
+        `/api/v1/projects/${encodeURIComponent(projectHandle)}/folders?path=${encodeURIComponent(path)}`,
+        {
+          method: "DELETE",
+          headers: {
+            "X-CSRF-Token": this.context.csrfToken,
+            "X-Client-Id": this.context.clientId,
+          },
+        },
+      ),
+    );
+    const body = (await response.json()) as { folders?: Array<{ path: string; kind: string }> };
+    return body.folders ?? [];
+  }
+
   /** Observer 显式 takeover(CAS:最后观察 epoch);成功返回新会话
    *  形态(角色升 Controller + 新 lease epoch),前端续存后生效。 */
   async takeover(lastObservedEpoch: string): Promise<BootstrapSession> {

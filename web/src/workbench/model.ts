@@ -61,11 +61,18 @@ export interface WorkflowView {
   presentationRevision: string;
 }
 
+export interface ProjectFolderView {
+  path: string;
+  primary: boolean;
+}
+
 export interface ProjectView {
   handle: string;
   name: string;
-  /** 项目根目录(代码浏览/版控入口;快照未含时为空)。 */
+  /** 项目主文件夹(代码浏览/版控默认入口;快照未含时为空)。 */
   root: string;
+  /** 项目包含的文件夹(primary 恒在首位;#multi-folder)。 */
+  folders: ProjectFolderView[];
   /** workflow.create/delete 的 collection CAS 轴。 */
   collectionRevision: string;
   workflows: WorkflowView[];
@@ -139,6 +146,15 @@ export function workspaceViewOf(snapshot: SnapshotEnvelope): WorkspaceView {
       handle,
       name,
       root: typeof project.display_root === "string" ? project.display_root : "",
+      folders: (
+        Array.isArray(project.folders) ? project.folders : []
+      ).map((raw): ProjectFolderView => {
+        const row = raw as Record<string, unknown>;
+        return {
+          path: String(row.path ?? ""),
+          primary: String(row.kind ?? "additional") === "primary",
+        };
+      }),
       collectionRevision,
       workflows,
       activeSessions: Number(project.active_agent_sessions ?? 0),

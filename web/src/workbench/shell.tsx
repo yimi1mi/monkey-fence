@@ -5,7 +5,7 @@ import { NodeInputCard, SettleCard } from "./run_node_forms.tsx";
 // snapshot(model.ts 映射),3s 轮询保持活性;事件流接入 WS 后经
 // reducer 增量投影。
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ApiError, type WorkbenchClient } from "../api/client.ts";
 import { EventSocket } from "../api/events.ts";
 import { storeSession } from "../api/session.ts";
@@ -90,8 +90,10 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
   }, [instances, clis]);
   // #91 通知: needs-you 系统通知 + 提示音(设置开关;默认开)
   const notificationsOn = localStorage.getItem("mf.notify") !== "off";
-  const [codeBrowser, setCodeBrowser] = useState<string | null>(null);
-  const [vcsRoot, setVcsRoot] = useState<string | null>(null);
+  const [codeBrowser, setCodeBrowser] = useState<{ path: string; folders: string[] } | null>(
+    null,
+  );
+  const [vcsRoot, setVcsRoot] = useState<{ root: string; folders: string[] } | null>(null);
   const projectionRef = useRef<ProjectionState | null>(null);
   const socketStarted = useRef(false);
 
@@ -382,8 +384,8 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
                   void client.cliDetect().then(setClis).catch(() => {});
                 }
               }}
-              onBrowse={(root) => setCodeBrowser(root)}
-              onVcs={(root) => setVcsRoot(root)}
+              onBrowse={(root, folders) => setCodeBrowser({ path: root, folders })}
+              onVcs={(root, folders) => setVcsRoot({ root, folders })}
               onDone={(message) => {
                 setToast(message);
                 void refresh();
@@ -412,7 +414,15 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
                         {project.activeSessions} 活跃会话
                       </span>
                       <span className="group-actions">
-                        <button className="mf-btn ghost card-action" onClick={() => setCodeBrowser(project.root ?? "")}>
+                        <button
+                          className="mf-btn ghost card-action"
+                          onClick={() =>
+                            setCodeBrowser({
+                              path: project.root ?? "",
+                              folders: project.folders.map((folder) => folder.path),
+                            })
+                          }
+                        >
                           代码
                         </button>
                       </span>
@@ -626,15 +636,18 @@ export function WorkbenchShell({ client }: { client: WorkbenchClient }) {
           ]}
         />
       )}
-      {codeBrowser && codeBrowser !== "" && (
+      {codeBrowser && codeBrowser.path !== "" && (
         <CodeBrowserModal
           client={client}
-          startPath={codeBrowser}
-          title={codeBrowser.split(/[\/]/).pop() ?? codeBrowser}
+          startPath={codeBrowser.path}
+          title={codeBrowser.path.split(/[\/]/).pop() ?? codeBrowser.path}
+          folders={codeBrowser.folders}
           onClose={() => setCodeBrowser(null)}
         />
       )}
-      {vcsRoot && <VcsPanel root={vcsRoot} onClose={() => setVcsRoot(null)} />}
+      {vcsRoot && (
+        <VcsPanel root={vcsRoot.root} folders={vcsRoot.folders} onClose={() => setVcsRoot(null)} />
+      )}
       {terminalSession && (
         <TerminalPanel sessionHandle={terminalSession} onClose={() => setTerminalSession(null)} />
       )}
@@ -1423,11 +1436,21 @@ function SettingsPane({
   recipes: Array<{ agent_type: string; package: string; display: string }>;
   installing: string | null;
   onInstall: (agentType: string) => Promise<void>;
-  onBrowse: (root: string) => void;
-  onVcs: (root: string) => void;
+  onBrowse: (root: string, folders: string[]) => void;
+  onVcs: (root: string, folders: string[]) => void;
   onDone: (message: string) => void;
 }) {
   const [addOpen, setAddOpen] = useState(false);
+  const [addFolderFor, setAddFolderFor] = useState<{ handle: string; name: string } | null>(null);
+  // 文件夹明细行展开态(#multi-folder;添加文件夹后自动展开该项目)
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(() => new Set());
+  const toggleFolders = (handle: string) =>
+    setExpandedFolders((prev) => {
+      const next = new Set(prev);
+      if (next.has(handle)) next.delete(handle);
+      else next.add(handle);
+      return next;
+    });
   const prompt = useModalPrompt();
   const isController = client.isController;
   const projects = view?.projects ?? [];
@@ -1482,22 +1505,64 @@ function SettingsPane({
                 <span className="num">工作流</span>
                 <span className="num">运行</span>
                 <span className="num">会话</span>
-                <span className="path">路径</span>
+                <span className="folders-head">文件夹</span>
                 <span className="ops" aria-hidden="true" />
               </div>
-              {projects.map((project) => (
-                <div key={project.handle} className="project-table-row">
+              {projects.map((project) => {
+                const folders = project.folders;
+                const primary =
+                  folders.find((folder) => folder.primary) ??
+                  (project.root ? { path: project.root, primary: true } : null);
+                const additionalCount = folders.filter((folder) => !folder.primary).length;
+                const folderPaths = folders.map((folder) => folder.path);
+                const expanded = expandedFolders.has(project.handle);
+                return (
+                <Fragment key={project.handle}>
+                  <div className="project-table-row">
                   <span className="pname" title={`proj_${project.handle.slice(5, 13)}`}>
                     {project.name}
                   </span>
                   <span className="num">{project.workflows.length}</span>
                   <span className="num">{project.runs.length}</span>
                   <span className="num">{project.activeSessions}</span>
-                  <span
-                    className="path"
-                    title={project.root || "路径未知(重启后挂载的项目可见)"}
-                  >
-                    {project.root || "—"}
+                  {/* 紧凑摘要:单行省略,永不换行重叠;点开展开明细行 */}
+                  <span className="folders-cell">
+                    {primary ? (
+                      <button
+                        type="button"
+                        className={"folders-toggle" + (expanded ? " open" : "")}
+                        aria-expanded={expanded}
+                        title={primary.path}
+                        onClick={() => toggleFolders(project.handle)}
+                      >
+                        <span className="folders-icon" aria-hidden="true">📂</span>
+                        <span className="folders-name">
+                          {folderNameOf(primary.path)}
+                        </span>
+                        {additionalCount > 0 && (
+                          <span className="folders-badge">+{additionalCount}</span>
+                        )}
+                        <span className="folders-caret" aria-hidden="true">
+                          {expanded ? "▾" : "▸"}
+                        </span>
+                      </button>
+                    ) : (
+                      <span className="folders-none" title="路径未知(重启后挂载的项目可见)">
+                        —
+                      </span>
+                    )}
+                    {isController && (
+                      <button
+                        type="button"
+                        className="icon-btn folders-add"
+                        title="添加附加文件夹"
+                        onClick={() =>
+                          setAddFolderFor({ handle: project.handle, name: project.name })
+                        }
+                      >
+                        ＋
+                      </button>
+                    )}
                   </span>
                   <span className="ops">
                     <button
@@ -1530,7 +1595,12 @@ function SettingsPane({
                     </button>
                     <button
                       className="icon-btn"
-                      onClick={() => onBrowse(project.root)}
+                      onClick={() =>
+                        onBrowse(
+                          project.root,
+                          project.folders.map((folder) => folder.path),
+                        )
+                      }
                       disabled={!project.root}
                       title={project.root ? "浏览代码" : "路径未知(重启后挂载的项目可见)"}
                     >
@@ -1538,7 +1608,13 @@ function SettingsPane({
                     </button>
                     <button
                       className="icon-btn"
-                      onClick={() => project.root && onVcs(project.root)}
+                      onClick={() =>
+                        project.root &&
+                        onVcs(
+                          project.root,
+                          project.folders.map((folder) => folder.path),
+                        )
+                      }
                       disabled={!project.root}
                       title="查看 Git 变更"
                     >
@@ -1562,8 +1638,75 @@ function SettingsPane({
                       ✕
                     </button>
                   </span>
-                </div>
-              ))}
+                  </div>
+                  {expanded && (
+                    <div
+                      className="folders-detail"
+                      role="group"
+                      aria-label={`${project.name} 的文件夹`}
+                    >
+                      {folders.length === 0 ? (
+                        <p className="muted-note">路径未知(重启后挂载的项目可见)。</p>
+                      ) : (
+                        folders.map((folder) => (
+                          <div key={folder.path} className="pfd-row">
+                            <span
+                              className={"pfd-kind" + (folder.primary ? " primary" : "")}
+                              title={folder.primary ? "主文件夹(库/执行目录锚点)" : "附加文件夹"}
+                            >
+                              {folder.primary ? "主" : "附"}
+                            </span>
+                            <span className="pfd-name" title={folder.path}>
+                              {folderNameOf(folder.path)}
+                            </span>
+                            <span className="pfd-path" title={folder.path}>
+                              {folder.path}
+                            </span>
+                            <span className="pfd-ops">
+                              <button
+                                type="button"
+                                className="icon-btn"
+                                title={`浏览「${folderNameOf(folder.path)}」`}
+                                onClick={() => onBrowse(folder.path, folderPaths)}
+                              >
+                                {"</>"}
+                              </button>
+                              <button
+                                type="button"
+                                className="icon-btn"
+                                title={`查看「${folderNameOf(folder.path)}」的 Git 变更`}
+                                onClick={() => onVcs(folder.path, folderPaths)}
+                              >
+                                ⎇
+                              </button>
+                              {!folder.primary && isController && (
+                                <button
+                                  type="button"
+                                  className="icon-btn danger"
+                                  title="移除附加文件夹"
+                                  onClick={async () => {
+                                    try {
+                                      await client.removeProjectFolder(project.handle, folder.path);
+                                      onDone(`已移除文件夹「${folder.path}」`);
+                                    } catch (error) {
+                                      onDone(
+                                        `移除失败:${error instanceof Error ? error.message : String(error)}`,
+                                      );
+                                    }
+                                  }}
+                                >
+                                  ✕
+                                </button>
+                              )}
+                            </span>
+                          </div>
+                        ))
+                      )}
+                    </div>
+                  )}
+                </Fragment>
+                );
+              })}
             </div>
           ) : (
             <p className="muted-note">当前没有在线项目。</p>
@@ -1705,20 +1848,47 @@ function SettingsPane({
           }}
         />
       )}
+      {addFolderFor && (
+        <AddFolderModal
+          client={client}
+          projectHandle={addFolderFor.handle}
+          projectName={addFolderFor.name}
+          onClose={() => setAddFolderFor(null)}
+          onDone={(message) => {
+            // 添加后自动展开明细行,新文件夹立即可见
+            setExpandedFolders((prev) => new Set(prev).add(addFolderFor.handle));
+            setAddFolderFor(null);
+            onDone(message);
+          }}
+        />
+      )}
       {prompt.modal}
     </>
   );
 }
 
-/** 添加项目弹层(#73):服务端目录浏览选择(浏览器沙箱拿不到真实
- * 路径,原生 showDirectoryPicker 不可用)。面包屑 + 目录列表 +
- * 上级 + 快速入口;选中仍走 POST /api/v1/projects。 */
-function AddProjectModal({
+/** 目录浏览选择弹层(#73;#multi-folder 泛化):服务端目录浏览(浏览器
+ * 沙箱拿不到真实路径,原生 showDirectoryPicker 不可用)。面包屑 +
+ * 目录列表 + 上级 + 快速入口;确认动作由包装层注入(挂载项目/添加
+ * 附加文件夹共用同一浏览交互)。 */
+function FolderPickerModal({
   client,
+  title,
+  mark,
+  hint,
+  confirmLabel,
+  busyLabel,
+  onConfirm,
   onDone,
   onClose,
 }: {
   client: WorkbenchClient;
+  title: string;
+  mark: string;
+  hint: string;
+  confirmLabel: string;
+  busyLabel: string;
+  onConfirm: (path: string) => Promise<string>;
   onDone: (message: string) => void;
   onClose: () => void;
 }) {
@@ -1775,9 +1945,10 @@ function AddProjectModal({
         if (event.target === event.currentTarget) onClose();
       }}
     >
-      <div className="modal folder-modal" role="dialog" aria-modal="true" aria-label="选择项目目录">
+      <div className="modal folder-modal" role="dialog" aria-modal="true" aria-label={title}>
         <h3>
-          <span className="mark">＋</span>添加项目
+          <span className="mark">{mark}</span>
+          {title}
         </h3>
 
         <div className="folder-quick">
@@ -1850,9 +2021,7 @@ function AddProjectModal({
         </div>
         {error && dirs.length > 0 && <p className="muted-note">{error}</p>}
 
-        <p className="muted-note">
-          选中「选择此文件夹」挂载当前目录;Core 将在其中初始化/复用 .mf-agent 存储,同一目录重复添加幂等。
-        </p>
+        <p className="muted-note">{hint}</p>
 
         <div className="actions">
           <button className="mf-btn ghost" onClick={onClose}>
@@ -1865,19 +2034,84 @@ function AddProjectModal({
               if (!current) return;
               setBusy(true);
               try {
-                const result = await client.attachProject(current.path);
-                onDone(`项目「${result.display_name}」已挂载`);
+                const message = await onConfirm(current.path);
+                onDone(message);
               } catch (err) {
                 setBusy(false);
                 setError(err instanceof Error ? err.message : String(err));
               }
             }}
           >
-            {busy ? "挂载中…" : "选择此文件夹"}
+            {busy ? busyLabel : confirmLabel}
           </button>
         </div>
       </div>
     </div>
+  );
+}
+
+/** 文件夹显示名(路径最后一段;空段回退全路径)。 */
+function folderNameOf(path: string): string {
+  return path.split(/[\/]/).filter(Boolean).pop() ?? path;
+}
+
+/** 添加项目(#73):以所选目录为主文件夹挂载新项目。 */
+function AddProjectModal({
+  client,
+  onDone,
+  onClose,
+}: {
+  client: WorkbenchClient;
+  onDone: (message: string) => void;
+  onClose: () => void;
+}) {
+  return (
+    <FolderPickerModal
+      client={client}
+      title="添加项目"
+      mark="＋"
+      hint="选中「选择此文件夹」以当前目录为主文件夹挂载项目;Core 将在其中初始化/复用 .mf-agent 存储,同一目录重复添加幂等。挂载后可在设置中继续添加附加文件夹。"
+      confirmLabel="选择此文件夹"
+      busyLabel="挂载中…"
+      onConfirm={async (path) => {
+        const result = await client.attachProject(path);
+        return `项目「${result.display_name}」已挂载`;
+      }}
+      onDone={onDone}
+      onClose={onClose}
+    />
+  );
+}
+
+/** 添加附加文件夹(#multi-folder):浏览选择目录加入既有项目。 */
+function AddFolderModal({
+  client,
+  projectHandle,
+  projectName,
+  onDone,
+  onClose,
+}: {
+  client: WorkbenchClient;
+  projectHandle: string;
+  projectName: string;
+  onDone: (message: string) => void;
+  onClose: () => void;
+}) {
+  return (
+    <FolderPickerModal
+      client={client}
+      title={`添加文件夹 → ${projectName}`}
+      mark="▤"
+      hint="附加文件夹用于代码浏览/版控与项目组织;主文件夹(第一个)决定 .mf-agent 存储位置与 Agent 执行目录,不因添加附加文件夹而改变。一个文件夹只能属于一个项目;同项目重复添加幂等。"
+      confirmLabel="添加此文件夹"
+      busyLabel="添加中…"
+      onConfirm={async (path) => {
+        await client.addProjectFolder(projectHandle, path);
+        return `已向「${projectName}」添加文件夹「${path}」`;
+      }}
+      onDone={onDone}
+      onClose={onClose}
+    />
   );
 }
 

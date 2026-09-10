@@ -62,6 +62,8 @@ export async function startCore(): Promise<CoreHandle> {
       MF_WEB_DIST: dist,
       MF_WEB_PORT: "0",
       MF_WEB_ACCEPTANCE: "1",
+      // 串行套件多次 openWorkbench 交换(>10/min)会被速率限制拒绝
+      MF_WEB_EXCHANGE_RATE_PER_MIN: "60",
       MF_SERVICE_DB: join(dataDir, "service-v1.db"),
       MF_CATALOG_DB: join(dataDir, "catalog-v1.db"),
       MF_CATALOG_V2_DB: join(dataDir, "catalog-v2.db"),

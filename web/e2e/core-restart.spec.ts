@@ -1,4 +1,6 @@
 import { test, expect, type Page } from "@playwright/test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { RestartableCore } from "./fixtures/restartable_core.ts";
 import { addNode, connectNodes, clickGraphEdge, editableCanvas, readRunSnapshot, settleStep, stepItem, waitForStepStatus } from "./fixtures/helpers.ts";
 
@@ -41,6 +43,48 @@ async function expectAttempts(page: Page, goal: string, counts: Record<string, n
     return { counts: Object.fromEntries(snapshot.steps.map((step) => [step.key, step.attempts])), total: snapshot.agent_runs.length };
   }).toEqual({ counts, total });
 }
+
+test("entry.url 引导文件每次交换后重签：无会话的新浏览器随时直达（托盘场景）", async ({ browser }) => {
+  const core = new RestartableCore();
+  const entryFile = () => readFileSync(join(core.dataDir, "entry.url"), "utf8").trim();
+  try {
+    await core.start();
+    // 启动即写入,内容与 stdout WEB_ENTRY 一致
+    const bootUrl = entryFile();
+    expect(bootUrl).toBe(core.entryUrl);
+
+    // 第一个浏览器消耗启动 nonce 交换进入
+    const first = await browser.newContext();
+    const pageA = await first.newPage();
+    await pageA.goto(core.entryUrl);
+    await expect(pageA.getByRole("status")).toContainText("已连接", { timeout: 20000 });
+
+    // 交换后文件被 Core 重签:nonce 不再是启动时那个
+    await expect.poll(entryFile).not.toBe(bootUrl);
+    const refreshedUrl = entryFile();
+    expect(refreshedUrl).toMatch(/^http:\/\/127\.0\.0\.1(:\d+)?\/#nonce=\S+$/);
+
+    // 托盘场景:无任何既有会话的新浏览器,用 entry.url 直达工作台
+    const second = await browser.newContext();
+    const pageB = await second.newPage();
+    await pageB.goto(refreshedUrl);
+    await expect(pageB.getByRole("status")).toContainText("已连接", { timeout: 20000 });
+    await second.close();
+
+    // 保新鲜:此后无任何交换发生,只有后台线程会写文件——等待文件
+    // 换成新 nonce(短 TTL 30s → 约 10s 节奏),第三个无会话浏览器直达
+    const afterB = entryFile();
+    let renewedUrl = "";
+    await expect.poll(() => entryFile(), { timeout: 90000 }).not.toBe(afterB);
+    renewedUrl = entryFile();
+    expect(renewedUrl).not.toBe(bootUrl);
+    const third = await browser.newContext();
+    const pageC = await third.newPage();
+    await pageC.goto(renewedUrl);
+    await expect(pageC.getByRole("status")).toContainText("已连接", { timeout: 20000 });
+    await first.close(); await third.close();
+  } finally { await core.dispose(); }
+});
 
 test("待确认和已派发待结算跨真实 Core 重启，不重复创建 attempt", async ({ browser }) => {
   const core = new RestartableCore();

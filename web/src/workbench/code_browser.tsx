@@ -1,18 +1,57 @@
 // 代码浏览与版控面板(#80/#81):目录树浏览(fs/dirs + fs/file 只读)
 // 与 git 状态(mf-vcs 只读;stage/commit 等写操作留后续)。
+// #multi-folder:项目含多个文件夹时顶部提供切换(primary 恒为第一项)。
 
 import { useCallback, useEffect, useState } from "react";
 import type { WorkbenchClient } from "../api/client.ts";
+
+/** 多文件夹切换器:单文件夹时不渲染。value 按前缀匹配当前路径所属
+ *  文件夹(浏览进入子目录后仍保持选中)。 */
+function FolderSwitcher({
+  folders,
+  current,
+  onSwitch,
+  label,
+}: {
+  folders?: string[];
+  current: string;
+  onSwitch: (path: string) => void;
+  label: string;
+}) {
+  if (!folders || folders.length < 2) return null;
+  const selected =
+    folders.find(
+      (path) => current === path || current.startsWith(path + "\\") || current.startsWith(path + "/"),
+    ) ?? "";
+  return (
+    <div className="field folder-filter">
+      <select
+        aria-label={label}
+        value={selected}
+        onChange={(event) => onSwitch(event.target.value)}
+      >
+        {folders.map((path, index) => (
+          <option key={path} value={path}>
+            {index === 0 ? "主 " : "附 "}
+            {path.split(/[\\/]/).pop() || path}({path})
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
 
 export function CodeBrowserModal({
   client,
   startPath,
   title,
+  folders,
   onClose,
 }: {
   client: WorkbenchClient;
   startPath: string;
   title: string;
+  folders?: string[];
   onClose: () => void;
 }) {
   const [current, setCurrent] = useState(startPath);
@@ -69,6 +108,12 @@ export function CodeBrowserModal({
         <h3>
           <span className="mark">▤</span>代码浏览 · {title}
         </h3>
+        <FolderSwitcher
+          folders={folders}
+          current={current}
+          onSwitch={(path) => void openDir(path)}
+          label="切换项目文件夹"
+        />
         <div className="folder-breadcrumb">
           <button className="crumb" disabled={!parent} onClick={() => parent && openDir(parent)}>
             ↑
@@ -119,7 +164,16 @@ export function CodeBrowserModal({
   );
 }
 
-export function VcsPanel({ root, onClose }: { root: string; onClose: () => void }) {
+export function VcsPanel({
+  root,
+  folders,
+  onClose,
+}: {
+  root: string;
+  folders?: string[];
+  onClose: () => void;
+}) {
+  const [active, setActive] = useState(root);
   const [status, setStatus] = useState<{
     repo: boolean;
     branch?: string;
@@ -128,10 +182,10 @@ export function VcsPanel({ root, onClose }: { root: string; onClose: () => void 
 
   useEffect(() => {
     void (async () => {
-      const response = await fetch(`/api/v1/vcs/status?root=${encodeURIComponent(root)}`);
+      const response = await fetch(`/api/v1/vcs/status?root=${encodeURIComponent(active)}`);
       if (response.ok) setStatus(await response.json());
     })();
-  }, [root]);
+  }, [active]);
 
   return (
     <div
@@ -142,8 +196,14 @@ export function VcsPanel({ root, onClose }: { root: string; onClose: () => void 
     >
       <div className="modal folder-modal" role="dialog" aria-modal="true" aria-label="版控状态">
         <h3>
-          <span className="mark">⑂</span>版控 · {root}
+          <span className="mark">⑂</span>版控 · {active}
         </h3>
+        <FolderSwitcher
+          folders={folders}
+          current={active}
+          onSwitch={setActive}
+          label="切换项目文件夹"
+        />
         {!status ? (
           <p className="muted-note">读取中…</p>
         ) : !status.repo ? (
