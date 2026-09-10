@@ -1939,12 +1939,9 @@ function FolderPickerModal({
   const segments = current ? current.path.split(/[\\/]+/).filter(Boolean) : [];
 
   return (
-    <div
-      className="scrim"
-      onClick={(event) => {
-        if (event.target === event.currentTarget) onClose();
-      }}
-    >
+    // 目录浏览选择不走「点外部关闭」:浏览层级深时误触 scrim 会丢失
+    // 浏览位置,只能经「取消」显式退出
+    <div className="scrim">
       <div className="modal folder-modal" role="dialog" aria-modal="true" aria-label={title}>
         <h3>
           <span className="mark">{mark}</span>
