@@ -5,7 +5,7 @@ MonkeyFence 围绕项目内的任务组织 AI 辅助开发。任务从意图、�
 ## 统一语言
 
 **项目（Project）**:
-MonkeyFence 登记并可同时打开的一个目录。每个项目拥有独立任务数据库与调度状态；Agent Session 由每用户跨项目 Core Session Registry 统一持有，并按 Project scope 隔离。
+MonkeyFence 登记并可同时打开的一组目录——一个主文件夹与任意多个附加文件夹(ADR 0007)。主文件夹决定项目任务数据库(`<主文件夹>/.mf-agent/`)与 Agent 执行目录,不可移除;附加文件夹用于代码浏览、版控与项目组织,一个文件夹至多属于一个项目。每个项目拥有独立任务数据库与调度状态；Agent Session 由每用户跨项目 Core Session Registry 统一持有，并按 Project scope 隔离。
 _避免_: 仓库、工作区(Workspace 一词专指工作台界面)
 
 **任务（Task）**:

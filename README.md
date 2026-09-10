@@ -41,7 +41,7 @@ mfctl agent-state done
 
 ## 数据与恢复
 
-- 项目数据库：`<project>/.mf-agent/workflow-v1.db`，保存工作流、Revision、步骤、交接与按 attempt 关联的节点输入。
+- 项目数据库：`<主文件夹>/.mf-agent/workflow-v1.db`，保存工作流、Revision、步骤、交接与按 attempt 关联的节点输入。项目可含一个主文件夹与多个附加文件夹（ADR 0007），主文件夹决定数据库与 Agent 执行目录。
 - 用户目录库：`~/.monkeyfence/catalog-v1.db` 和 `catalog-v2.db`；服务库：`~/.monkeyfence/service-v1.db`。
 - 数据库版本升级通过备份屏障和事务迁移；已有 v12 输入库可自动升级。
 - Core 重启后恢复持久运行状态。已确认但未派发的输入保持原确认；未结算的执行需要明确恢复或结算，不会假定成功。
